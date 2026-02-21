@@ -190,6 +190,20 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         columns: &[ColumnDef],
         mode: WriteMode,
     ) -> Result<WriteSetupResult>;
+
+    /// Drop a table by setting its end_snapshot.
+    /// Creates a new snapshot and marks the table as dropped.
+    /// Data files are NOT deleted (preserved for time travel).
+    /// Also ends all active columns for this table.
+    fn drop_table(&self, table_id: i64) -> Result<i64>;
+
+    /// Drop a schema by setting its end_snapshot.
+    /// Creates a new snapshot and marks the schema as dropped.
+    /// Returns the snapshot_id created for the drop.
+    fn drop_schema(&self, schema_id: i64) -> Result<i64>;
+
+    /// List active table IDs in a schema (tables with no end_snapshot).
+    fn list_active_table_ids(&self, schema_id: i64) -> Result<Vec<i64>>;
 }
 
 #[cfg(test)]

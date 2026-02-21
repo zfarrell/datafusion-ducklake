@@ -168,6 +168,53 @@ impl SchemaProvider for DuckLakeSchema {
             .unwrap_or(false)
     }
 
+    /// Deregister (drop) a table from this schema.
+    ///
+    /// This is called by DataFusion for DROP TABLE statements.
+    /// It marks the table as dropped in metadata (sets end_snapshot).
+    /// Data files are NOT deleted (preserved for time travel).
+    /// Returns the dropped table provider, or None if the table doesn't exist.
+    #[cfg(feature = "write")]
+    fn deregister_table(&self, name: &str) -> DataFusionResult<Option<Arc<dyn TableProvider>>> {
+        let writer = self.writer.as_ref().ok_or_else(|| {
+            DataFusionError::Plan(
+                "Schema is read-only. Use DuckLakeCatalog::with_writer() to enable writes."
+                    .to_string(),
+            )
+        })?;
+
+        // Look up the table to get its ID
+        let table_meta = self
+            .provider
+            .get_table_by_name(self.schema_id, name, self.snapshot_id)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        let Some(meta) = table_meta else {
+            // Table doesn't exist - return None (DataFusion handles IF EXISTS)
+            return Ok(None);
+        };
+
+        // Resolve table path for constructing the table provider to return
+        let table_path = resolve_path(&self.schema_path, &meta.path, meta.path_is_relative);
+
+        let table = DuckLakeTable::new(
+            meta.table_id,
+            meta.table_name.clone(),
+            self.provider.clone(),
+            self.snapshot_id,
+            self.object_store_url.clone(),
+            table_path,
+        )
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        // Drop the table in metadata (creates new snapshot, sets end_snapshot)
+        writer
+            .drop_table(meta.table_id)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        Ok(Some(Arc::new(table) as Arc<dyn TableProvider>))
+    }
+
     /// Register a new table in this schema.
     ///
     /// This is called by DataFusion for CREATE TABLE AS SELECT statements.

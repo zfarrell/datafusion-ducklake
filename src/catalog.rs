@@ -10,6 +10,7 @@ use crate::path_resolver::{parse_object_store_url, resolve_path};
 use crate::schema::DuckLakeSchema;
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
 use datafusion::datasource::object_store::ObjectStoreUrl;
+use datafusion::error::Result as DataFusionResult;
 
 #[cfg(feature = "write")]
 use crate::metadata_writer::MetadataWriter;
@@ -136,6 +137,87 @@ impl DuckLakeCatalog {
 impl CatalogProvider for DuckLakeCatalog {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    /// Deregister (drop) a schema from this catalog.
+    ///
+    /// If `cascade` is false, fails if the schema contains active tables.
+    /// If `cascade` is true, drops all tables in the schema first, then drops the schema.
+    /// Returns the dropped schema provider, or None if the schema doesn't exist.
+    #[cfg(feature = "write")]
+    fn deregister_schema(
+        &self,
+        name: &str,
+        cascade: bool,
+    ) -> DataFusionResult<Option<Arc<dyn SchemaProvider>>> {
+        use datafusion::error::DataFusionError;
+
+        let config = self.write_config.as_ref().ok_or_else(|| {
+            DataFusionError::Plan(
+                "Catalog is read-only. Use DuckLakeCatalog::with_writer() to enable writes."
+                    .to_string(),
+            )
+        })?;
+
+        // Cannot drop information_schema
+        if name == "information_schema" {
+            return Err(DataFusionError::Plan(
+                "Cannot drop information_schema".to_string(),
+            ));
+        }
+
+        // Look up the schema
+        let schema_meta = self
+            .provider
+            .get_schema_by_name(name, self.snapshot_id)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        let Some(meta) = schema_meta else {
+            // Schema doesn't exist - return None (DataFusion handles IF EXISTS)
+            return Ok(None);
+        };
+
+        // Check for active tables
+        let active_table_ids = config
+            .writer
+            .list_active_table_ids(meta.schema_id)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        if !active_table_ids.is_empty() && !cascade {
+            return Err(DataFusionError::Plan(format!(
+                "Cannot drop schema \"{}\" because there are entries that depend on it. Use DROP...CASCADE to drop all dependents.",
+                name
+            )));
+        }
+
+        // If cascade, drop all tables first
+        if cascade {
+            for table_id in &active_table_ids {
+                config
+                    .writer
+                    .drop_table(*table_id)
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            }
+        }
+
+        // Drop the schema itself
+        config
+            .writer
+            .drop_schema(meta.schema_id)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        // Return the schema provider that was dropped
+        let schema_path = resolve_path(&self.catalog_path, &meta.path, meta.path_is_relative);
+        let schema = DuckLakeSchema::new(
+            meta.schema_id,
+            meta.schema_name,
+            Arc::clone(&self.provider),
+            self.snapshot_id,
+            self.object_store_url.clone(),
+            schema_path,
+        );
+
+        Ok(Some(Arc::new(schema) as Arc<dyn SchemaProvider>))
     }
 
     fn schema_names(&self) -> Vec<String> {

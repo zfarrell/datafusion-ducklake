@@ -321,6 +321,108 @@ impl MetadataWriter for SqliteMetadataWriter {
         })
     }
 
+    fn drop_table(&self, table_id: i64) -> Result<i64> {
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+
+            // Create a new snapshot for the drop
+            let row = sqlx::query(
+                "INSERT INTO ducklake_snapshot (snapshot_time) VALUES (CURRENT_TIMESTAMP) RETURNING snapshot_id",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            let snapshot_id: i64 = row.try_get(0)?;
+
+            // Mark the table as dropped by setting end_snapshot
+            sqlx::query(
+                "UPDATE ducklake_table SET end_snapshot = ?
+                 WHERE table_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(snapshot_id)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // End all active columns for this table
+            sqlx::query(
+                "UPDATE ducklake_column SET end_snapshot = ?
+                 WHERE table_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(snapshot_id)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // End all active data files for this table (metadata only, files remain)
+            sqlx::query(
+                "UPDATE ducklake_data_file SET end_snapshot = ?
+                 WHERE table_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(snapshot_id)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // End all active delete files for this table
+            sqlx::query(
+                "UPDATE ducklake_delete_file SET end_snapshot = ?
+                 WHERE table_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(snapshot_id)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
+            Ok(snapshot_id)
+        })
+    }
+
+    fn drop_schema(&self, schema_id: i64) -> Result<i64> {
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+
+            // Create a new snapshot for the drop
+            let row = sqlx::query(
+                "INSERT INTO ducklake_snapshot (snapshot_time) VALUES (CURRENT_TIMESTAMP) RETURNING snapshot_id",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            let snapshot_id: i64 = row.try_get(0)?;
+
+            // Mark the schema as dropped
+            sqlx::query(
+                "UPDATE ducklake_schema SET end_snapshot = ?
+                 WHERE schema_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(snapshot_id)
+            .bind(schema_id)
+            .execute(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
+            Ok(snapshot_id)
+        })
+    }
+
+    fn list_active_table_ids(&self, schema_id: i64) -> Result<Vec<i64>> {
+        block_on(async {
+            let rows = sqlx::query(
+                "SELECT table_id FROM ducklake_table
+                 WHERE schema_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(schema_id)
+            .fetch_all(&self.pool)
+            .await?;
+
+            let mut ids = Vec::with_capacity(rows.len());
+            for row in rows {
+                ids.push(row.try_get(0)?);
+            }
+            Ok(ids)
+        })
+    }
+
     fn begin_write_transaction(
         &self,
         schema_name: &str,

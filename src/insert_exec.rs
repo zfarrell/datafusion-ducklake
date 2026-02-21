@@ -169,6 +169,21 @@ impl ExecutionPlan for DuckLakeInsertExec {
                 return Ok(RecordBatch::try_new(output_schema, vec![count_array])?);
             }
 
+            // Enforce NOT NULL constraints before writing
+            for batch in &batches {
+                for (i, field) in arrow_schema.fields().iter().enumerate() {
+                    if !field.is_nullable() {
+                        let column = batch.column(i);
+                        if column.null_count() > 0 {
+                            return Err(DataFusionError::Execution(format!(
+                                "NOT NULL constraint failed: {}",
+                                field.name()
+                            )));
+                        }
+                    }
+                }
+            }
+
             // Get object store from runtime environment
             let object_store = context
                 .runtime_env()
