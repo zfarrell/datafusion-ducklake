@@ -1,6 +1,7 @@
 # name: test/sql/alter/drop_column.test
 # description: test ducklake drop columns
 # group: [alter]
+# adapted: statement error format, FROM table → SELECT * FROM table
 
 require ducklake
 
@@ -23,30 +24,24 @@ ALTER TABLE ducklake.test DROP COLUMN col3
 statement ok
 ALTER TABLE ducklake.test DROP COLUMN col2
 
-statement error
+statement error does not
 ALTER TABLE ducklake.test DROP COLUMN col2
-----
-does not
 
 statement ok
 ALTER TABLE ducklake.test DROP COLUMN IF EXISTS col2
 
-statement error
+statement error only has one column remaining
 ALTER TABLE ducklake.test DROP COLUMN col1
-----
-only has one column remaining
 
 statement ok
 INSERT INTO ducklake.test VALUES (1), (2), (3);
 
 query I
-FROM ducklake.test
+SELECT * FROM ducklake.test
 ----
 1
 2
 3
 
-statement error
+statement error nonexistent_column
 ALTER TABLE ducklake.test DROP COLUMN nonexistent_column
-----
-nonexistent_column

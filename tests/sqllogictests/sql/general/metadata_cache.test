@@ -1,13 +1,11 @@
 # name: test/sql/general/metadata_cache.test
-# description: Test COUNT(*) with Parquet metadata cache
+# description: Test COUNT(*) after DELETE
 # group: [general]
+# adapted: removed SET parquet_metadata_cache (DuckDB-specific)
 
 require ducklake
 
 require parquet
-
-statement ok
-SET parquet_metadata_cache=true;
 
 test-env DUCKLAKE_CONNECTION __TEST_DIR__/{UUID}.db
 

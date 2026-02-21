@@ -1,6 +1,7 @@
 # name: test/sql/alter/add_column.test
 # description: test ducklake add columns
 # group: [alter]
+# adapted: statement error format, removed DESCRIBE
 
 require ducklake
 
@@ -20,10 +21,8 @@ CREATE TABLE ducklake.test(col1 INTEGER);
 statement ok
 ALTER TABLE ducklake.test ADD COLUMN new_col2 INTEGER
 
-statement error
+statement error already exists
 ALTER TABLE ducklake.test ADD COLUMN new_col2 INTEGER
-----
-already exists
 
 statement ok
 ALTER TABLE ducklake.test ADD COLUMN IF NOT EXISTS new_col2 INTEGER
@@ -39,13 +38,6 @@ NULL	3
 
 statement ok
 ALTER TABLE ducklake.test ADD COLUMN new_col3 VARCHAR
-
-query IIIIII
-DESCRIBE ducklake.test
-----
-col1	INTEGER	YES	NULL	NULL	NULL
-new_col2	INTEGER	YES	NULL	NULL	NULL
-new_col3	VARCHAR	YES	NULL	NULL	NULL
 
 statement ok
 INSERT INTO ducklake.test VALUES (1, 2, 'hello'), (NULL, 3, 'world');

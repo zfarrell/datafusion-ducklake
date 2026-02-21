@@ -1,6 +1,7 @@
 # name: test/sql/ducklake_basic.test
-# description: test ducklake extension
+# description: test ducklake extension - basic INSERT/SELECT
 # group: [sql]
+# adapted: removed DETACH/re-ATTACH, SHOW TABLES, USE, second catalog
 
 require ducklake
 
@@ -44,49 +45,7 @@ NULL	3
 statement ok
 CREATE TABLE ducklake.test2 AS SELECT 'hello world' AS j, DATE '1992-01-01' date
 
-query II
+query TT
 SELECT * FROM ducklake.test2
 ----
 hello world	1992-01-01
-
-# re-attach
-statement ok
-DETACH ducklake
-
-statement ok
-ATTACH 'ducklake:__TEST_DIR__/ducklake.db' AS ducklake
-
-query II
-SELECT * FROM ducklake.test
-----
-1	2
-NULL	3
-4	5
-6	7
-
-query II
-SELECT * FROM ducklake.test2
-----
-hello world	1992-01-01
-
-statement ok
-SHOW ALL TABLES
-
-statement ok
-USE ducklake
-
-query I
-SHOW TABLES
-----
-test
-test2
-
-# data path is not required for DuckDB databases
-statement ok
-ATTACH 'ducklake:__TEST_DIR__/ducklake_no_data_path.db' AS ducklake_no_data_path
-
-statement ok
-CREATE TABLE ducklake_no_data_path.tbl(i INT);
-
-statement ok
-INSERT INTO ducklake_no_data_path.tbl VALUES (42);

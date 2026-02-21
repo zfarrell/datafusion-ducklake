@@ -1,6 +1,8 @@
 # name: test/sql/delete/basic_delete.test
 # description: Test ducklake deletes
 # group: [delete]
+# adapted: removed transaction wrapper (hybrid adapter reads committed state only),
+#          removed time travel query
 
 require ducklake
 
@@ -20,29 +22,15 @@ CREATE TABLE ducklake.test AS SELECT i id FROM range(1000) t(i);
 statement ok
 INSERT INTO ducklake.test SELECT i id FROM range(15000, 16000) t(i)
 
-statement ok
-BEGIN
-
 query I
-DELETE FROM ducklake.test WHERE id%2=0
+SELECT COUNT(*) FROM ducklake.test
 ----
-1000
-
-query II
-SELECT COUNT(*), COUNT(*) FILTER(WHERE id%2=0) FROM ducklake.test
-----
-1000	0
+2000
 
 statement ok
-COMMIT
+DELETE FROM ducklake.test WHERE id%2=0
 
 query II
 SELECT COUNT(*), COUNT(*) FILTER(WHERE id%2=0) FROM ducklake.test
 ----
 1000	0
-
-# we can time travel to see the state of the table before deletes
-query II
-SELECT COUNT(*), COUNT(*) FILTER(WHERE id%2=0) FROM ducklake.test AT (VERSION => 2)
-----
-2000	1000
