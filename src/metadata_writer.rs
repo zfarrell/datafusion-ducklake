@@ -16,6 +16,62 @@ pub enum WriteMode {
 use crate::types::arrow_to_ducklake_type;
 use arrow::datatypes::DataType;
 
+/// ALTER TABLE operation types.
+#[derive(Debug, Clone)]
+pub enum AlterTableOp {
+    /// Add a new column. Must be nullable (existing rows have no value).
+    AddColumn {
+        column: ColumnDef,
+    },
+    /// Drop a column (soft delete via end_snapshot).
+    DropColumn {
+        column_name: String,
+    },
+    /// Rename a column.
+    RenameColumn {
+        old_name: String,
+        new_name: String,
+    },
+    /// Change a column's type (widening only).
+    AlterColumnType(AlterColumnTypeOp),
+}
+
+/// Parameters for ALTER COLUMN TYPE operation.
+#[derive(Debug, Clone)]
+pub struct AlterColumnTypeOp {
+    /// Name of the column to alter
+    pub column_name: String,
+    /// New DuckLake type string (must be a valid widening of the current type)
+    pub new_type: String,
+}
+
+/// Check if a type promotion is allowed (widening only).
+///
+/// Matches the DuckLake C++ type promotion rules:
+/// - int8 → int16 → int32 → int64
+/// - uint8 → uint16 → uint32 → uint64
+/// - float → double
+/// - Unsigned integers can widen to larger signed integers
+pub fn is_type_promotion_allowed(source: &str, target: &str) -> bool {
+    matches!(
+        (source, target),
+        // Signed integer widening chain
+        ("int8", "int16" | "int32" | "int64")
+            | ("int16", "int32" | "int64")
+            | ("int32", "int64")
+            // Unsigned integer widening chain
+            | ("uint8", "uint16" | "uint32" | "uint64")
+            | ("uint16", "uint32" | "uint64")
+            | ("uint32", "uint64")
+            // Unsigned → signed cross-promotion
+            | ("uint8", "int16" | "int32" | "int64")
+            | ("uint16", "int32" | "int64")
+            | ("uint32", "int64")
+            // Float widening
+            | ("float", "double")
+    )
+}
+
 /// Column definition for creating or updating a table's schema.
 ///
 /// Unlike `DuckLakeTableColumn` (used for reading), this struct doesn't have a `column_id`
@@ -303,6 +359,18 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         self.drop_schema(schema_id)
     }
 
+    /// Apply an ALTER TABLE operation to a table.
+    ///
+    /// Creates a new snapshot and applies the column change.
+    /// Returns the snapshot_id created for the alter.
+    fn alter_table(&self, table_id: i64, op: &AlterTableOp) -> Result<i64>;
+
+    /// Get active columns for a table as (name, type, nullable) tuples.
+    ///
+    /// Returns columns ordered by column_order. Only returns columns
+    /// that have no end_snapshot (i.e., currently active).
+    fn get_active_columns(&self, table_id: i64) -> Result<Vec<(String, String, bool)>>;
+
     /// Create a view in the catalog.
     /// Creates a new snapshot, stores the view SQL definition, and returns (view_id, snapshot_id).
     fn create_view(
@@ -358,5 +426,45 @@ mod tests {
     fn test_data_file_info_with_absolute_path() {
         let file = DataFileInfo::new("/absolute/path.parquet", 1024, 100).with_absolute_path();
         assert!(!file.path_is_relative);
+    }
+
+    #[test]
+    fn test_type_promotion_allowed() {
+        // Signed integer widening
+        assert!(is_type_promotion_allowed("int8", "int16"));
+        assert!(is_type_promotion_allowed("int8", "int32"));
+        assert!(is_type_promotion_allowed("int8", "int64"));
+        assert!(is_type_promotion_allowed("int16", "int32"));
+        assert!(is_type_promotion_allowed("int16", "int64"));
+        assert!(is_type_promotion_allowed("int32", "int64"));
+
+        // Unsigned integer widening
+        assert!(is_type_promotion_allowed("uint8", "uint16"));
+        assert!(is_type_promotion_allowed("uint16", "uint32"));
+        assert!(is_type_promotion_allowed("uint32", "uint64"));
+
+        // Unsigned → signed cross-promotion
+        assert!(is_type_promotion_allowed("uint8", "int16"));
+        assert!(is_type_promotion_allowed("uint16", "int32"));
+        assert!(is_type_promotion_allowed("uint32", "int64"));
+
+        // Float widening
+        assert!(is_type_promotion_allowed("float", "double"));
+    }
+
+    #[test]
+    fn test_type_promotion_not_allowed() {
+        // Narrowing
+        assert!(!is_type_promotion_allowed("int64", "int32"));
+        assert!(!is_type_promotion_allowed("int32", "int16"));
+        assert!(!is_type_promotion_allowed("double", "float"));
+
+        // Same type
+        assert!(!is_type_promotion_allowed("int32", "int32"));
+
+        // Incompatible types
+        assert!(!is_type_promotion_allowed("varchar", "int32"));
+        assert!(!is_type_promotion_allowed("int32", "varchar"));
+        assert!(!is_type_promotion_allowed("float", "int32"));
     }
 }

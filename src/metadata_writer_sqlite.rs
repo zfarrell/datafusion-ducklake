@@ -5,7 +5,8 @@
 use crate::Result;
 use crate::metadata_provider::block_on;
 use crate::metadata_writer::{
-    ColumnDef, DataFileInfo, DeleteFileInfo, MetadataWriter, WriteMode, WriteSetupResult,
+    AlterTableOp, ColumnDef, DataFileInfo, DeleteFileInfo, MetadataWriter, WriteMode,
+    WriteSetupResult,
 };
 use sqlx::Row;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
@@ -869,6 +870,253 @@ impl MetadataWriter for SqliteMetadataWriter {
 
             tx.commit().await?;
             Ok(snapshot_id)
+        })
+    }
+
+    fn alter_table(&self, table_id: i64, op: &AlterTableOp) -> Result<i64> {
+        use crate::metadata_writer::is_type_promotion_allowed;
+
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+
+            // Get active columns for validation
+            let col_rows = sqlx::query(
+                "SELECT column_id, column_name, column_type, column_order, nulls_allowed
+                 FROM ducklake_column
+                 WHERE table_id = ? AND end_snapshot IS NULL
+                 ORDER BY column_order",
+            )
+            .bind(table_id)
+            .fetch_all(&mut *tx)
+            .await?;
+
+            if col_rows.is_empty() {
+                return Err(crate::error::DuckLakeError::Internal(
+                    "Cannot alter table: no active columns found (table may be dropped)".to_string(),
+                ));
+            }
+
+            // Create a new snapshot
+            let row = sqlx::query(
+                "INSERT INTO ducklake_snapshot (snapshot_time) VALUES (CURRENT_TIMESTAMP) RETURNING snapshot_id",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            let snapshot_id: i64 = row.try_get(0)?;
+
+            match op {
+                AlterTableOp::AddColumn { column } => {
+                    // Validate: must be nullable
+                    if !column.is_nullable {
+                        return Err(crate::error::DuckLakeError::InvalidConfig(
+                            format!(
+                                "Cannot add non-nullable column '{}': new columns must be nullable since existing rows have no value",
+                                column.name
+                            ),
+                        ));
+                    }
+
+                    // Validate: no duplicate name
+                    for row in &col_rows {
+                        let name: String = row.try_get(1)?;
+                        if name == column.name {
+                            return Err(crate::error::DuckLakeError::InvalidConfig(
+                                format!("Column '{}' already exists in table", column.name),
+                            ));
+                        }
+                    }
+
+                    // Determine next column_order
+                    let max_order: i64 = col_rows
+                        .iter()
+                        .map(|r| r.try_get::<i64, _>(3).unwrap_or(0))
+                        .max()
+                        .unwrap_or(-1);
+
+                    sqlx::query(
+                        "INSERT INTO ducklake_column (table_id, column_name, column_type, column_order, nulls_allowed, begin_snapshot)
+                         VALUES (?, ?, ?, ?, ?, ?)",
+                    )
+                    .bind(table_id)
+                    .bind(&column.name)
+                    .bind(&column.ducklake_type)
+                    .bind(max_order + 1)
+                    .bind(column.is_nullable)
+                    .bind(snapshot_id)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+
+                AlterTableOp::DropColumn { column_name } => {
+                    // Validate: cannot drop last column
+                    if col_rows.len() == 1 {
+                        return Err(crate::error::DuckLakeError::InvalidConfig(
+                            "Cannot drop column: table only has one column remaining".to_string(),
+                        ));
+                    }
+
+                    // Find the column
+                    let target = col_rows.iter().find(|r| {
+                        r.try_get::<String, _>(1).unwrap_or_default() == *column_name
+                    });
+
+                    let Some(target_row) = target else {
+                        return Err(crate::error::DuckLakeError::InvalidConfig(
+                            format!("Column '{}' not found in table", column_name),
+                        ));
+                    };
+
+                    let column_id: i64 = target_row.try_get(0)?;
+
+                    // Soft delete: set end_snapshot
+                    sqlx::query(
+                        "UPDATE ducklake_column SET end_snapshot = ?
+                         WHERE column_id = ?",
+                    )
+                    .bind(snapshot_id)
+                    .bind(column_id)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+
+                AlterTableOp::RenameColumn { old_name, new_name } => {
+                    // Find the column to rename
+                    let target = col_rows.iter().find(|r| {
+                        r.try_get::<String, _>(1).unwrap_or_default() == *old_name
+                    });
+
+                    let Some(target_row) = target else {
+                        return Err(crate::error::DuckLakeError::InvalidConfig(
+                            format!("Column '{}' not found in table", old_name),
+                        ));
+                    };
+
+                    // Validate: new name doesn't conflict
+                    for row in &col_rows {
+                        let name: String = row.try_get(1)?;
+                        if name == *new_name {
+                            return Err(crate::error::DuckLakeError::InvalidConfig(
+                                format!("Column '{}' already exists in table", new_name),
+                            ));
+                        }
+                    }
+
+                    let column_id: i64 = target_row.try_get(0)?;
+                    let col_type: String = target_row.try_get(2)?;
+                    let col_order: i64 = target_row.try_get(3)?;
+                    let nullable: bool = target_row.try_get::<Option<bool>, _>(4)?.unwrap_or(true);
+
+                    // End old column, create new with same type/order/nullable
+                    sqlx::query(
+                        "UPDATE ducklake_column SET end_snapshot = ?
+                         WHERE column_id = ?",
+                    )
+                    .bind(snapshot_id)
+                    .bind(column_id)
+                    .execute(&mut *tx)
+                    .await?;
+
+                    sqlx::query(
+                        "INSERT INTO ducklake_column (table_id, column_name, column_type, column_order, nulls_allowed, begin_snapshot)
+                         VALUES (?, ?, ?, ?, ?, ?)",
+                    )
+                    .bind(table_id)
+                    .bind(new_name)
+                    .bind(&col_type)
+                    .bind(col_order)
+                    .bind(nullable)
+                    .bind(snapshot_id)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+
+                AlterTableOp::AlterColumnType(alter_type) => {
+                    // Find the column
+                    let target = col_rows.iter().find(|r| {
+                        r.try_get::<String, _>(1).unwrap_or_default() == alter_type.column_name
+                    });
+
+                    let Some(target_row) = target else {
+                        return Err(crate::error::DuckLakeError::InvalidConfig(
+                            format!("Column '{}' not found in table", alter_type.column_name),
+                        ));
+                    };
+
+                    let column_id: i64 = target_row.try_get(0)?;
+                    let current_type: String = target_row.try_get(2)?;
+                    let col_order: i64 = target_row.try_get(3)?;
+                    let nullable: bool = target_row.try_get::<Option<bool>, _>(4)?.unwrap_or(true);
+
+                    // Validate type promotion
+                    if !is_type_promotion_allowed(&current_type, &alter_type.new_type) {
+                        return Err(crate::error::DuckLakeError::InvalidConfig(
+                            format!(
+                                "Cannot change type of column '{}' from '{}' to '{}': only widening type promotions are allowed",
+                                alter_type.column_name, current_type, alter_type.new_type
+                            ),
+                        ));
+                    }
+
+                    // End old column, create new with new type
+                    sqlx::query(
+                        "UPDATE ducklake_column SET end_snapshot = ?
+                         WHERE column_id = ?",
+                    )
+                    .bind(snapshot_id)
+                    .bind(column_id)
+                    .execute(&mut *tx)
+                    .await?;
+
+                    sqlx::query(
+                        "INSERT INTO ducklake_column (table_id, column_name, column_type, column_order, nulls_allowed, begin_snapshot)
+                         VALUES (?, ?, ?, ?, ?, ?)",
+                    )
+                    .bind(table_id)
+                    .bind(&alter_type.column_name)
+                    .bind(&alter_type.new_type)
+                    .bind(col_order)
+                    .bind(nullable)
+                    .bind(snapshot_id)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
+
+            // Record change for conflict detection
+            sqlx::query(
+                "INSERT INTO ducklake_snapshot_changes (snapshot_id, change_type, table_id)
+                 VALUES (?, 'ALTER_TABLE', ?)",
+            )
+            .bind(snapshot_id)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
+            Ok(snapshot_id)
+        })
+    }
+
+    fn get_active_columns(&self, table_id: i64) -> Result<Vec<(String, String, bool)>> {
+        block_on(async {
+            let rows = sqlx::query(
+                "SELECT column_name, column_type, nulls_allowed
+                 FROM ducklake_column
+                 WHERE table_id = ? AND end_snapshot IS NULL
+                 ORDER BY column_order",
+            )
+            .bind(table_id)
+            .fetch_all(&self.pool)
+            .await?;
+
+            let mut columns = Vec::with_capacity(rows.len());
+            for row in rows {
+                let name: String = row.try_get(0)?;
+                let col_type: String = row.try_get(1)?;
+                let nullable: bool = row.try_get::<Option<bool>, _>(2)?.unwrap_or(true);
+                columns.push((name, col_type, nullable));
+            }
+            Ok(columns)
         })
     }
 }
