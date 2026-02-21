@@ -99,6 +99,51 @@ impl DataFileInfo {
     }
 }
 
+/// Information about a delete file to register in the catalog.
+///
+/// Delete files contain (file_path: VARCHAR, pos: INT64) records that
+/// identify which rows in a data file have been deleted.
+#[derive(Debug, Clone)]
+pub struct DeleteFileInfo {
+    /// ID of the data file this delete file applies to
+    pub data_file_id: i64,
+    /// Path to the delete file (relative to table path or absolute)
+    pub path: String,
+    /// Whether the path is relative to the table's path
+    pub path_is_relative: bool,
+    /// Size of the delete file in bytes
+    pub file_size_bytes: i64,
+    /// Size of the Parquet footer in bytes (optimization hint for reads)
+    pub footer_size: Option<i64>,
+    /// Number of deleted rows recorded in this file
+    pub delete_count: i64,
+}
+
+impl DeleteFileInfo {
+    /// Create a new delete file info with relative path.
+    pub fn new(
+        data_file_id: i64,
+        path: impl Into<String>,
+        file_size_bytes: i64,
+        delete_count: i64,
+    ) -> Self {
+        Self {
+            data_file_id,
+            path: path.into(),
+            path_is_relative: true,
+            file_size_bytes,
+            footer_size: None,
+            delete_count,
+        }
+    }
+
+    /// Set the footer size for read optimization.
+    pub fn with_footer_size(mut self, footer_size: i64) -> Self {
+        self.footer_size = Some(footer_size);
+        self
+    }
+}
+
 /// Result of a write operation.
 #[derive(Debug)]
 pub struct WriteResult {
@@ -191,6 +236,17 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         mode: WriteMode,
     ) -> Result<WriteSetupResult>;
 
+    /// Register a new delete file for a data file. Returns the assigned delete_file_id.
+    ///
+    /// If the data file already has an active delete file, the existing one should
+    /// be ended (set end_snapshot) before registering the new one.
+    fn register_delete_file(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        file: &DeleteFileInfo,
+    ) -> Result<i64>;
+
     /// Drop a table by setting its end_snapshot.
     /// Creates a new snapshot and marks the table as dropped.
     /// Data files are NOT deleted (preserved for time travel).
@@ -204,6 +260,62 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
 
     /// List active table IDs in a schema (tables with no end_snapshot).
     fn list_active_table_ids(&self, schema_id: i64) -> Result<Vec<i64>>;
+
+    /// Begin a write transaction with conflict detection.
+    ///
+    /// Like `begin_write_transaction`, but checks for conflicting changes
+    /// (e.g., table drops) that occurred after `since_snapshot`. If a conflict
+    /// is detected, returns `Err(TransactionConflict)`.
+    ///
+    /// Default implementation delegates to `begin_write_transaction` without
+    /// conflict checking.
+    fn begin_checked_write_transaction(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        columns: &[ColumnDef],
+        mode: WriteMode,
+        since_snapshot: i64,
+    ) -> Result<WriteSetupResult> {
+        let _ = since_snapshot;
+        self.begin_write_transaction(schema_name, table_name, columns, mode)
+    }
+
+    /// Drop a table with conflict detection.
+    ///
+    /// Like `drop_table`, but checks that the table hasn't been dropped by
+    /// another transaction since `since_snapshot`.
+    ///
+    /// Default implementation delegates to `drop_table` without conflict checking.
+    fn drop_table_checked(&self, table_id: i64, since_snapshot: i64) -> Result<i64> {
+        let _ = since_snapshot;
+        self.drop_table(table_id)
+    }
+
+    /// Drop a schema with conflict detection.
+    ///
+    /// Like `drop_schema`, but checks that the schema hasn't been dropped by
+    /// another transaction since `since_snapshot`.
+    ///
+    /// Default implementation delegates to `drop_schema` without conflict checking.
+    fn drop_schema_checked(&self, schema_id: i64, since_snapshot: i64) -> Result<i64> {
+        let _ = since_snapshot;
+        self.drop_schema(schema_id)
+    }
+
+    /// Create a view in the catalog.
+    /// Creates a new snapshot, stores the view SQL definition, and returns (view_id, snapshot_id).
+    fn create_view(
+        &self,
+        schema_id: i64,
+        view_name: &str,
+        sql: &str,
+    ) -> Result<(i64, i64)>;
+
+    /// Drop a view by setting its end_snapshot.
+    /// Creates a new snapshot and marks the view as dropped.
+    /// Returns the snapshot_id created for the drop.
+    fn drop_view(&self, view_id: i64) -> Result<i64>;
 }
 
 #[cfg(test)]

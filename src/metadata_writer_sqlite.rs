@@ -5,7 +5,7 @@
 use crate::Result;
 use crate::metadata_provider::block_on;
 use crate::metadata_writer::{
-    ColumnDef, DataFileInfo, MetadataWriter, WriteMode, WriteSetupResult,
+    ColumnDef, DataFileInfo, DeleteFileInfo, MetadataWriter, WriteMode, WriteSetupResult,
 };
 use sqlx::Row;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
@@ -79,6 +79,23 @@ CREATE TABLE IF NOT EXISTS ducklake_delete_file (
     footer_size INTEGER,
     encryption_key VARCHAR,
     delete_count INTEGER,
+    begin_snapshot INTEGER NOT NULL,
+    end_snapshot INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS ducklake_snapshot_changes (
+    id INTEGER PRIMARY KEY,
+    snapshot_id INTEGER NOT NULL,
+    change_type TEXT NOT NULL,
+    table_id INTEGER,
+    schema_id INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS ducklake_view (
+    view_id INTEGER PRIMARY KEY,
+    schema_id INTEGER NOT NULL,
+    view_name VARCHAR NOT NULL,
+    sql VARCHAR NOT NULL,
     begin_snapshot INTEGER NOT NULL,
     end_snapshot INTEGER
 );
@@ -321,6 +338,47 @@ impl MetadataWriter for SqliteMetadataWriter {
         })
     }
 
+    fn register_delete_file(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        file: &DeleteFileInfo,
+    ) -> Result<i64> {
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+
+            // End any existing active delete file for this data file
+            sqlx::query(
+                "UPDATE ducklake_delete_file SET end_snapshot = ?
+                 WHERE data_file_id = ? AND table_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(snapshot_id)
+            .bind(file.data_file_id)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // Insert the new delete file
+            let row = sqlx::query(
+                "INSERT INTO ducklake_delete_file (data_file_id, table_id, path, path_is_relative, file_size_bytes, footer_size, delete_count, begin_snapshot)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING delete_file_id",
+            )
+            .bind(file.data_file_id)
+            .bind(table_id)
+            .bind(&file.path)
+            .bind(file.path_is_relative)
+            .bind(file.file_size_bytes)
+            .bind(file.footer_size)
+            .bind(file.delete_count)
+            .bind(snapshot_id)
+            .fetch_one(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
+            Ok(row.try_get(0)?)
+        })
+    }
+
     fn drop_table(&self, table_id: i64) -> Result<i64> {
         block_on(async {
             let mut tx = self.pool.begin().await?;
@@ -373,6 +431,16 @@ impl MetadataWriter for SqliteMetadataWriter {
             .execute(&mut *tx)
             .await?;
 
+            // Record the change for conflict detection
+            sqlx::query(
+                "INSERT INTO ducklake_snapshot_changes (snapshot_id, change_type, table_id)
+                 VALUES (?, 'DROP_TABLE', ?)",
+            )
+            .bind(snapshot_id)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
             tx.commit().await?;
             Ok(snapshot_id)
         })
@@ -400,6 +468,16 @@ impl MetadataWriter for SqliteMetadataWriter {
             .execute(&mut *tx)
             .await?;
 
+            // Record the change for conflict detection
+            sqlx::query(
+                "INSERT INTO ducklake_snapshot_changes (snapshot_id, change_type, schema_id)
+                 VALUES (?, 'DROP_SCHEMA', ?)",
+            )
+            .bind(snapshot_id)
+            .bind(schema_id)
+            .execute(&mut *tx)
+            .await?;
+
             tx.commit().await?;
             Ok(snapshot_id)
         })
@@ -420,6 +498,144 @@ impl MetadataWriter for SqliteMetadataWriter {
                 ids.push(row.try_get(0)?);
             }
             Ok(ids)
+        })
+    }
+
+    fn begin_checked_write_transaction(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        columns: &[ColumnDef],
+        mode: WriteMode,
+        since_snapshot: i64,
+    ) -> Result<WriteSetupResult> {
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+
+            // Check for table drops: look up the table_id by name to see if it
+            // existed previously but was dropped since our snapshot.
+            // We check the snapshot_changes table for DROP_TABLE entries affecting
+            // any table with this name in this schema.
+            let schema_row = sqlx::query(
+                "SELECT schema_id FROM ducklake_schema
+                 WHERE schema_name = ?
+                 ORDER BY schema_id DESC LIMIT 1",
+            )
+            .bind(schema_name)
+            .fetch_optional(&mut *tx)
+            .await?;
+
+            if let Some(schema_row) = schema_row {
+                let schema_id: i64 = schema_row.try_get(0)?;
+
+                // Check if the schema was dropped since our snapshot
+                let schema_drop = sqlx::query(
+                    "SELECT COUNT(*) FROM ducklake_snapshot_changes
+                     WHERE snapshot_id > ? AND schema_id = ? AND change_type = 'DROP_SCHEMA'",
+                )
+                .bind(since_snapshot)
+                .bind(schema_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                let schema_drop_count: i64 = schema_drop.try_get(0)?;
+                if schema_drop_count > 0 {
+                    return Err(crate::error::DuckLakeError::TransactionConflict(format!(
+                        "Transaction conflict: schema '{}' was dropped by another transaction since snapshot {}",
+                        schema_name, since_snapshot
+                    )));
+                }
+
+                // Check if any table with this name in this schema was dropped
+                let table_row = sqlx::query(
+                    "SELECT table_id FROM ducklake_table
+                     WHERE schema_id = ? AND table_name = ?
+                     ORDER BY table_id DESC LIMIT 1",
+                )
+                .bind(schema_id)
+                .bind(table_name)
+                .fetch_optional(&mut *tx)
+                .await?;
+
+                if let Some(table_row) = table_row {
+                    let table_id: i64 = table_row.try_get(0)?;
+
+                    let table_drop = sqlx::query(
+                        "SELECT COUNT(*) FROM ducklake_snapshot_changes
+                         WHERE snapshot_id > ? AND table_id = ? AND change_type = 'DROP_TABLE'",
+                    )
+                    .bind(since_snapshot)
+                    .bind(table_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    let table_drop_count: i64 = table_drop.try_get(0)?;
+                    if table_drop_count > 0 {
+                        return Err(crate::error::DuckLakeError::TransactionConflict(format!(
+                            "Transaction conflict: table '{}.{}' was dropped by another transaction since snapshot {}",
+                            schema_name, table_name, since_snapshot
+                        )));
+                    }
+                }
+            }
+
+            // No conflict detected - release the transaction and delegate
+            tx.commit().await?;
+            self.begin_write_transaction(schema_name, table_name, columns, mode)
+        })
+    }
+
+    fn drop_table_checked(&self, table_id: i64, since_snapshot: i64) -> Result<i64> {
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+
+            // Check if this table was already dropped since our snapshot
+            let drop_check = sqlx::query(
+                "SELECT COUNT(*) FROM ducklake_snapshot_changes
+                 WHERE snapshot_id > ? AND table_id = ? AND change_type = 'DROP_TABLE'",
+            )
+            .bind(since_snapshot)
+            .bind(table_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let drop_count: i64 = drop_check.try_get(0)?;
+
+            if drop_count > 0 {
+                return Err(crate::error::DuckLakeError::TransactionConflict(format!(
+                    "Transaction conflict: table (id={}) was already dropped by another transaction since snapshot {}",
+                    table_id, since_snapshot
+                )));
+            }
+
+            // No conflict - release transaction and delegate to regular drop
+            tx.commit().await?;
+            self.drop_table(table_id)
+        })
+    }
+
+    fn drop_schema_checked(&self, schema_id: i64, since_snapshot: i64) -> Result<i64> {
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+
+            // Check if this schema was already dropped since our snapshot
+            let drop_check = sqlx::query(
+                "SELECT COUNT(*) FROM ducklake_snapshot_changes
+                 WHERE snapshot_id > ? AND schema_id = ? AND change_type = 'DROP_SCHEMA'",
+            )
+            .bind(since_snapshot)
+            .bind(schema_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let drop_count: i64 = drop_check.try_get(0)?;
+
+            if drop_count > 0 {
+                return Err(crate::error::DuckLakeError::TransactionConflict(format!(
+                    "Transaction conflict: schema (id={}) was already dropped by another transaction since snapshot {}",
+                    schema_id, since_snapshot
+                )));
+            }
+
+            // No conflict - release transaction and delegate to regular drop
+            tx.commit().await?;
+            self.drop_schema(schema_id)
         })
     }
 
@@ -595,6 +811,64 @@ impl MetadataWriter for SqliteMetadataWriter {
                 table_id,
                 column_ids,
             })
+        })
+    }
+
+    fn create_view(
+        &self,
+        schema_id: i64,
+        view_name: &str,
+        sql: &str,
+    ) -> Result<(i64, i64)> {
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+
+            let row = sqlx::query(
+                "INSERT INTO ducklake_snapshot (snapshot_time) VALUES (CURRENT_TIMESTAMP) RETURNING snapshot_id",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            let snapshot_id: i64 = row.try_get(0)?;
+
+            let row = sqlx::query(
+                "INSERT INTO ducklake_view (schema_id, view_name, sql, begin_snapshot)
+                 VALUES (?, ?, ?, ?) RETURNING view_id",
+            )
+            .bind(schema_id)
+            .bind(view_name)
+            .bind(sql)
+            .bind(snapshot_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let view_id: i64 = row.try_get(0)?;
+
+            tx.commit().await?;
+            Ok((view_id, snapshot_id))
+        })
+    }
+
+    fn drop_view(&self, view_id: i64) -> Result<i64> {
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+
+            let row = sqlx::query(
+                "INSERT INTO ducklake_snapshot (snapshot_time) VALUES (CURRENT_TIMESTAMP) RETURNING snapshot_id",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            let snapshot_id: i64 = row.try_get(0)?;
+
+            sqlx::query(
+                "UPDATE ducklake_view SET end_snapshot = ?
+                 WHERE view_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(snapshot_id)
+            .bind(view_id)
+            .execute(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
+            Ok(snapshot_id)
         })
     }
 }

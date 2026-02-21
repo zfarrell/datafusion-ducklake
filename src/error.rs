@@ -67,6 +67,10 @@ pub enum DuckLakeError {
     #[error("Parquet error: {0}")]
     Parquet(#[from] parquet::errors::ParquetError),
 
+    /// Transaction conflict (concurrent write detected)
+    #[error("Transaction conflict: {0}")]
+    TransactionConflict(String),
+
     /// Generic error
     #[error("Internal error: {0}")]
     Internal(String),
