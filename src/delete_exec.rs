@@ -14,6 +14,7 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray, UInt64Array};
 use arrow::compute;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::common::DFSchema;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -21,7 +22,6 @@ use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning, create_physical_expr};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
-use datafusion::common::DFSchema;
 use futures::stream::{self, TryStreamExt};
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, PutPayload};
@@ -33,6 +33,7 @@ use crate::metadata_provider::DuckLakeTableFile;
 use crate::metadata_writer::{DeleteFileInfo, MetadataWriter};
 use crate::path_resolver::join_paths;
 use crate::table::delete_file_schema;
+use crate::table_writer::calculate_footer_size_from_bytes;
 
 /// Schema for the output of delete operations (count of rows deleted)
 fn make_delete_count_schema() -> SchemaRef {
@@ -128,7 +129,7 @@ impl DisplayAs for DuckLakeDeleteExec {
                     self.table_files.len(),
                     self.filters.len()
                 )
-            }
+            },
         }
     }
 }
@@ -199,9 +200,7 @@ impl ExecutionPlan for DuckLakeDeleteExec {
             let df_schema = DFSchema::try_from(table_schema.as_ref().clone())?;
             let physical_filters: Vec<_> = filters
                 .iter()
-                .map(|expr| {
-                    create_physical_expr(expr, &df_schema, &Default::default())
-                })
+                .map(|expr| create_physical_expr(expr, &df_schema, &Default::default()))
                 .collect::<DataFusionResult<Vec<_>>>()?;
 
             let mut total_deleted: u64 = 0;
@@ -231,10 +230,9 @@ impl ExecutionPlan for DuckLakeDeleteExec {
                     object_path,
                 );
 
-                let builder =
-                    parquet::arrow::ParquetRecordBatchStreamBuilder::new(reader)
-                        .await
-                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                let builder = parquet::arrow::ParquetRecordBatchStreamBuilder::new(reader)
+                    .await
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
                 let mut parquet_stream = builder
                     .build()
@@ -257,8 +255,7 @@ impl ExecutionPlan for DuckLakeDeleteExec {
                             arrow::array::BooleanArray::from(vec![true; num_rows]);
                         for filter in &physical_filters {
                             let result = filter.evaluate(&batch)?;
-                            let bool_arr = result
-                                .into_array(num_rows)?;
+                            let bool_arr = result.into_array(num_rows)?;
                             let filter_arr = bool_arr
                                 .as_any()
                                 .downcast_ref::<arrow::array::BooleanArray>()
@@ -267,9 +264,8 @@ impl ExecutionPlan for DuckLakeDeleteExec {
                                         "Filter did not return boolean array".to_string(),
                                     )
                                 })?;
-                            combined_mask =
-                                compute::and(&combined_mask, filter_arr)
-                                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+                            combined_mask = compute::and(&combined_mask, filter_arr)
+                                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
                         }
                         Some(combined_mask)
                     };
@@ -317,12 +313,10 @@ impl ExecutionPlan for DuckLakeDeleteExec {
                 }
 
                 // Write the delete file
-                let delete_file_name =
-                    format!("ducklake-{}-delete.parquet", Uuid::new_v4());
+                let delete_file_name = format!("ducklake-{}-delete.parquet", Uuid::new_v4());
                 // Use the table path structure for delete files
                 let schema_table_prefix = table_path.trim_start_matches('/');
-                let delete_object_key =
-                    join_paths(schema_table_prefix, &delete_file_name);
+                let delete_object_key = join_paths(schema_table_prefix, &delete_file_name);
                 let delete_object_path =
                     ObjectPath::from(delete_object_key.trim_start_matches('/'));
 
@@ -330,24 +324,17 @@ impl ExecutionPlan for DuckLakeDeleteExec {
                 let del_schema = delete_file_schema();
                 let file_path_values: Vec<&str> =
                     vec![&table_file.file.path; positions_to_delete.len()];
-                let file_path_array: ArrayRef =
-                    Arc::new(StringArray::from(file_path_values));
-                let pos_array: ArrayRef =
-                    Arc::new(Int64Array::from(positions_to_delete.clone()));
+                let file_path_array: ArrayRef = Arc::new(StringArray::from(file_path_values));
+                let pos_array: ArrayRef = Arc::new(Int64Array::from(positions_to_delete.clone()));
 
-                let delete_batch = RecordBatch::try_new(
-                    del_schema.clone(),
-                    vec![file_path_array, pos_array],
-                )?;
+                let delete_batch =
+                    RecordBatch::try_new(del_schema.clone(), vec![file_path_array, pos_array])?;
 
                 let props = WriterProperties::builder()
-                    .set_writer_version(
-                        parquet::file::properties::WriterVersion::PARQUET_2_0,
-                    )
+                    .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
                     .build();
-                let mut arrow_writer =
-                    ArrowWriter::try_new(Vec::new(), del_schema, Some(props))
-                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                let mut arrow_writer = ArrowWriter::try_new(Vec::new(), del_schema, Some(props))
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
                 arrow_writer
                     .write(&delete_batch)
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -356,7 +343,8 @@ impl ExecutionPlan for DuckLakeDeleteExec {
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
                 let file_size = buffer.len() as i64;
-                let footer_size = calculate_footer_size(&buffer)?;
+                let footer_size = calculate_footer_size_from_bytes(&buffer)
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
                 // Upload to object store
                 object_store
@@ -365,13 +353,9 @@ impl ExecutionPlan for DuckLakeDeleteExec {
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
                 // Register the delete file in metadata
-                let delete_file_info = DeleteFileInfo::new(
-                    data_file_id,
-                    &delete_file_name,
-                    file_size,
-                    delete_count,
-                )
-                .with_footer_size(footer_size);
+                let delete_file_info =
+                    DeleteFileInfo::new(data_file_id, &delete_file_name, file_size, delete_count)
+                        .with_footer_size(footer_size);
 
                 writer
                     .register_delete_file(table_id, snapshot_id, &delete_file_info)
@@ -385,26 +369,7 @@ impl ExecutionPlan for DuckLakeDeleteExec {
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             make_delete_count_schema(),
-            stream.map_err(|e: DataFusionError| e),
+            stream,
         )))
     }
-}
-
-/// Calculate Parquet footer size from file bytes
-fn calculate_footer_size(buffer: &[u8]) -> DataFusionResult<i64> {
-    if buffer.len() < 8 {
-        return Err(DataFusionError::Internal(
-            "Invalid Parquet file: too small".to_string(),
-        ));
-    }
-    let footer_bytes = &buffer[buffer.len() - 8..];
-    if &footer_bytes[4..8] != b"PAR1" {
-        return Err(DataFusionError::Internal(
-            "Invalid Parquet file: missing PAR1 magic".to_string(),
-        ));
-    }
-    let metadata_len =
-        i32::from_le_bytes([footer_bytes[0], footer_bytes[1], footer_bytes[2], footer_bytes[3]])
-            as i64;
-    Ok(metadata_len + 8)
 }

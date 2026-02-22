@@ -37,6 +37,7 @@ use crate::metadata_provider::DuckLakeTableFile;
 use crate::metadata_writer::{DataFileInfo, DeleteFileInfo, MetadataWriter};
 use crate::path_resolver::join_paths;
 use crate::table::delete_file_schema;
+use crate::table_writer::calculate_footer_size_from_bytes;
 
 /// Schema for the output of update operations (count of rows updated)
 fn make_update_count_schema() -> SchemaRef {
@@ -151,7 +152,7 @@ impl DisplayAs for DuckLakeUpdateExec {
                     self.filters.len(),
                     self.assignments.len()
                 )
-            }
+            },
         }
     }
 }
@@ -232,8 +233,7 @@ impl ExecutionPlan for DuckLakeUpdateExec {
             let physical_assignments: Vec<_> = assignments
                 .iter()
                 .map(|a| {
-                    let phys_expr =
-                        create_physical_expr(&a.expr, &df_schema, &Default::default())?;
+                    let phys_expr = create_physical_expr(&a.expr, &df_schema, &Default::default())?;
                     Ok((a.column_index, phys_expr))
                 })
                 .collect::<DataFusionResult<Vec<_>>>()?;
@@ -267,10 +267,9 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                     object_path,
                 );
 
-                let builder =
-                    parquet::arrow::ParquetRecordBatchStreamBuilder::new(reader)
-                        .await
-                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                let builder = parquet::arrow::ParquetRecordBatchStreamBuilder::new(reader)
+                    .await
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
                 let mut parquet_stream = builder
                     .build()
@@ -331,8 +330,7 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                     }
 
                     // Filter the batch to get only matching rows
-                    let effective_mask =
-                        arrow::array::BooleanArray::from(mask_values);
+                    let effective_mask = arrow::array::BooleanArray::from(mask_values);
                     if effective_mask.true_count() > 0 {
                         let filtered = compute::filter_record_batch(&batch, &effective_mask)
                             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
@@ -366,8 +364,7 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                         columns[*col_idx] = new_values;
                     }
 
-                    let updated_batch =
-                        RecordBatch::try_new(table_schema.clone(), columns)?;
+                    let updated_batch = RecordBatch::try_new(table_schema.clone(), columns)?;
                     updated_batches.push(updated_batch);
                 }
 
@@ -382,35 +379,25 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                 }
 
                 // Write the delete file
-                let delete_file_name =
-                    format!("ducklake-{}-delete.parquet", Uuid::new_v4());
+                let delete_file_name = format!("ducklake-{}-delete.parquet", Uuid::new_v4());
                 let schema_table_prefix = table_path.trim_start_matches('/');
-                let delete_object_key =
-                    join_paths(schema_table_prefix, &delete_file_name);
+                let delete_object_key = join_paths(schema_table_prefix, &delete_file_name);
                 let delete_object_path =
                     ObjectPath::from(delete_object_key.trim_start_matches('/'));
 
                 let del_schema = delete_file_schema();
-                let file_path_values: Vec<&str> =
-                    vec![&table_file.file.path; all_positions.len()];
-                let file_path_array: ArrayRef =
-                    Arc::new(StringArray::from(file_path_values));
-                let pos_array: ArrayRef =
-                    Arc::new(Int64Array::from(all_positions));
+                let file_path_values: Vec<&str> = vec![&table_file.file.path; all_positions.len()];
+                let file_path_array: ArrayRef = Arc::new(StringArray::from(file_path_values));
+                let pos_array: ArrayRef = Arc::new(Int64Array::from(all_positions));
 
-                let delete_batch = RecordBatch::try_new(
-                    del_schema.clone(),
-                    vec![file_path_array, pos_array],
-                )?;
+                let delete_batch =
+                    RecordBatch::try_new(del_schema.clone(), vec![file_path_array, pos_array])?;
 
                 let props = WriterProperties::builder()
-                    .set_writer_version(
-                        parquet::file::properties::WriterVersion::PARQUET_2_0,
-                    )
+                    .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
                     .build();
-                let mut arrow_writer =
-                    ArrowWriter::try_new(Vec::new(), del_schema, Some(props))
-                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                let mut arrow_writer = ArrowWriter::try_new(Vec::new(), del_schema, Some(props))
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
                 arrow_writer
                     .write(&delete_batch)
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -419,20 +406,17 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
                 let file_size = buffer.len() as i64;
-                let footer_size = calculate_footer_size(&buffer)?;
+                let footer_size = calculate_footer_size_from_bytes(&buffer)
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
                 object_store
                     .put(&delete_object_path, PutPayload::from(buffer))
                     .await
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-                let delete_file_info = DeleteFileInfo::new(
-                    data_file_id,
-                    &delete_file_name,
-                    file_size,
-                    update_count,
-                )
-                .with_footer_size(footer_size);
+                let delete_file_info =
+                    DeleteFileInfo::new(data_file_id, &delete_file_name, file_size, update_count)
+                        .with_footer_size(footer_size);
 
                 writer
                     .register_delete_file(table_id, snapshot_id, &delete_file_info)
@@ -451,26 +435,17 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                     crate::path_resolver::parse_object_store_url(&data_path_str)
                         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-                let table_key = join_paths(
-                    &join_paths(&base_key_path, &schema_name),
-                    &table_name,
-                );
+                let table_key = join_paths(&join_paths(&base_key_path, &schema_name), &table_name);
                 let object_key = join_paths(&table_key, &data_file_name);
-                let data_object_path =
-                    ObjectPath::from(object_key.trim_start_matches('/'));
+                let data_object_path = ObjectPath::from(object_key.trim_start_matches('/'));
 
                 // Write all updated rows to a single Parquet file
                 let props = WriterProperties::builder()
-                    .set_writer_version(
-                        parquet::file::properties::WriterVersion::PARQUET_2_0,
-                    )
+                    .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
                     .build();
-                let mut arrow_writer = ArrowWriter::try_new(
-                    Vec::new(),
-                    table_schema.clone(),
-                    Some(props),
-                )
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                let mut arrow_writer =
+                    ArrowWriter::try_new(Vec::new(), table_schema.clone(), Some(props))
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
                 let mut total_records: i64 = 0;
                 for batch in &updated_batches {
@@ -485,16 +460,16 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
                 let file_size = buffer.len() as i64;
-                let footer_size = calculate_footer_size(&buffer)?;
+                let footer_size = calculate_footer_size_from_bytes(&buffer)
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
                 object_store
                     .put(&data_object_path, PutPayload::from(buffer))
                     .await
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-                let data_file_info =
-                    DataFileInfo::new(&data_file_name, file_size, total_records)
-                        .with_footer_size(footer_size);
+                let data_file_info = DataFileInfo::new(&data_file_name, file_size, total_records)
+                    .with_footer_size(footer_size);
 
                 writer
                     .register_data_file(table_id, snapshot_id, &data_file_info)
@@ -508,26 +483,7 @@ impl ExecutionPlan for DuckLakeUpdateExec {
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             make_update_count_schema(),
-            stream.map_err(|e: DataFusionError| e),
+            stream,
         )))
     }
-}
-
-/// Calculate Parquet footer size from file bytes
-fn calculate_footer_size(buffer: &[u8]) -> DataFusionResult<i64> {
-    if buffer.len() < 8 {
-        return Err(DataFusionError::Internal(
-            "Invalid Parquet file: too small".to_string(),
-        ));
-    }
-    let footer_bytes = &buffer[buffer.len() - 8..];
-    if &footer_bytes[4..8] != b"PAR1" {
-        return Err(DataFusionError::Internal(
-            "Invalid Parquet file: missing PAR1 magic".to_string(),
-        ));
-    }
-    let metadata_len =
-        i32::from_le_bytes([footer_bytes[0], footer_bytes[1], footer_bytes[2], footer_bytes[3]])
-            as i64;
-    Ok(metadata_len + 8)
 }

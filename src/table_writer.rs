@@ -285,9 +285,9 @@ impl TableWriteSession {
         if !self.path_is_relative {
             file_info = file_info.with_absolute_path();
         }
-        let data_file_id = self
-            .metadata
-            .register_data_file(self.table_id, self.snapshot_id, &file_info)?;
+        let data_file_id =
+            self.metadata
+                .register_data_file(self.table_id, self.snapshot_id, &file_info)?;
 
         // Register column-level statistics
         if !column_stats.is_empty() {
@@ -380,7 +380,7 @@ fn extract_column_stats(
                             if should_replace_min(stats, bm, current) {
                                 min_values[col_idx] = Some(bm.clone());
                             }
-                        }
+                        },
                     }
                 }
 
@@ -391,7 +391,7 @@ fn extract_column_stats(
                             if should_replace_max(stats, bm, current) {
                                 max_values[col_idx] = Some(bm.clone());
                             }
-                        }
+                        },
                     }
                 }
             }
@@ -461,18 +461,10 @@ fn should_replace_min(
 ) -> bool {
     use parquet::file::statistics::Statistics;
     match stats {
-        Statistics::Int32(_) => {
-            new_val.parse::<i32>().ok() < current.parse::<i32>().ok()
-        }
-        Statistics::Int64(_) => {
-            new_val.parse::<i64>().ok() < current.parse::<i64>().ok()
-        }
-        Statistics::Float(_) => {
-            new_val.parse::<f32>().ok() < current.parse::<f32>().ok()
-        }
-        Statistics::Double(_) => {
-            new_val.parse::<f64>().ok() < current.parse::<f64>().ok()
-        }
+        Statistics::Int32(_) => new_val.parse::<i32>().ok() < current.parse::<i32>().ok(),
+        Statistics::Int64(_) => new_val.parse::<i64>().ok() < current.parse::<i64>().ok(),
+        Statistics::Float(_) => new_val.parse::<f32>().ok() < current.parse::<f32>().ok(),
+        Statistics::Double(_) => new_val.parse::<f64>().ok() < current.parse::<f64>().ok(),
         _ => new_val < current,
     }
 }
@@ -485,23 +477,15 @@ fn should_replace_max(
 ) -> bool {
     use parquet::file::statistics::Statistics;
     match stats {
-        Statistics::Int32(_) => {
-            new_val.parse::<i32>().ok() > current.parse::<i32>().ok()
-        }
-        Statistics::Int64(_) => {
-            new_val.parse::<i64>().ok() > current.parse::<i64>().ok()
-        }
-        Statistics::Float(_) => {
-            new_val.parse::<f32>().ok() > current.parse::<f32>().ok()
-        }
-        Statistics::Double(_) => {
-            new_val.parse::<f64>().ok() > current.parse::<f64>().ok()
-        }
+        Statistics::Int32(_) => new_val.parse::<i32>().ok() > current.parse::<i32>().ok(),
+        Statistics::Int64(_) => new_val.parse::<i64>().ok() > current.parse::<i64>().ok(),
+        Statistics::Float(_) => new_val.parse::<f32>().ok() > current.parse::<f32>().ok(),
+        Statistics::Double(_) => new_val.parse::<f64>().ok() > current.parse::<f64>().ok(),
         _ => new_val > current,
     }
 }
 
-fn calculate_footer_size_from_bytes(buffer: &[u8]) -> Result<i64> {
+pub(crate) fn calculate_footer_size_from_bytes(buffer: &[u8]) -> Result<i64> {
     if buffer.len() < 8 {
         return Err(crate::error::DuckLakeError::Internal(
             "Invalid Parquet file: too small".to_string(),

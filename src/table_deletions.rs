@@ -36,14 +36,7 @@ use futures::Stream;
 
 use crate::metadata_provider::{DeleteFileChange, MetadataProvider};
 use crate::path_resolver::resolve_path;
-
-/// Delete file schema: (file_path: VARCHAR, pos: INT64)
-fn delete_file_schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![
-        Field::new("file_path", DataType::Utf8, false),
-        Field::new("pos", DataType::Int64, false),
-    ]))
-}
+use crate::table::delete_file_schema;
 
 /// TableProvider that exposes deleted rows between snapshots
 ///
