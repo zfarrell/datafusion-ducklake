@@ -77,6 +77,9 @@ async fn init_schema(pool: &PgPool) -> anyhow::Result<()> {
             column_name VARCHAR NOT NULL,
             column_type VARCHAR NOT NULL,
             column_order INTEGER NOT NULL,
+            nulls_allowed BOOLEAN DEFAULT TRUE,
+            begin_snapshot BIGINT NOT NULL DEFAULT 1,
+            end_snapshot BIGINT,
             FOREIGN KEY (table_id) REFERENCES ducklake_table(table_id)
         )",
     )
@@ -91,6 +94,12 @@ async fn init_schema(pool: &PgPool) -> anyhow::Result<()> {
             path_is_relative BOOLEAN NOT NULL,
             file_size_bytes BIGINT NOT NULL,
             footer_size BIGINT,
+            encryption_key VARCHAR,
+            record_count BIGINT,
+            row_id_start BIGINT,
+            mapping_id BIGINT,
+            begin_snapshot BIGINT NOT NULL DEFAULT 1,
+            end_snapshot BIGINT,
             FOREIGN KEY (table_id) REFERENCES ducklake_table(table_id)
         )",
     )
@@ -106,6 +115,7 @@ async fn init_schema(pool: &PgPool) -> anyhow::Result<()> {
             path_is_relative BOOLEAN NOT NULL,
             file_size_bytes BIGINT NOT NULL,
             footer_size BIGINT,
+            encryption_key VARCHAR,
             delete_count BIGINT,
             begin_snapshot BIGINT NOT NULL,
             end_snapshot BIGINT,
@@ -448,14 +458,15 @@ async fn populate_from_duckdb_catalog(
 
             for (order, column) in columns.iter().enumerate() {
                 sqlx::query(
-                    "INSERT INTO ducklake_column (column_id, table_id, column_name, column_type, column_order)
-                     VALUES ($1, $2, $3, $4, $5)"
+                    "INSERT INTO ducklake_column (column_id, table_id, column_name, column_type, column_order, nulls_allowed)
+                     VALUES ($1, $2, $3, $4, $5, $6)"
                 )
                 .bind(column.column_id)
                 .bind(table.table_id)
                 .bind(&column.column_name)
                 .bind(&column.column_type)
                 .bind(order as i32)
+                .bind(column.is_nullable)
                 .execute(&mut *tx)
                 .await?;
             }
