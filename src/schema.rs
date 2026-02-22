@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::catalog::{SchemaProvider, TableProvider};
-use datafusion::datasource::object_store::ObjectStoreUrl;
 use datafusion::datasource::ViewTable;
+use datafusion::datasource::object_store::ObjectStoreUrl;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::prelude::{SessionConfig, SessionContext};
 
@@ -17,6 +17,8 @@ use crate::table::DuckLakeTable;
 
 #[cfg(feature = "write")]
 use crate::metadata_writer::{ColumnDef, MetadataWriter, WriteMode};
+#[cfg(feature = "write")]
+use crate::table_writer::DuckLakeTableWriter;
 #[cfg(feature = "write")]
 use datafusion::error::DataFusionError;
 
@@ -111,15 +113,15 @@ impl DuckLakeSchema {
         let mut config = SessionConfig::new();
         config.options_mut().catalog.default_catalog = "ducklake".to_string();
         config.options_mut().catalog.default_schema = self.schema_name.clone();
-        config.options_mut().catalog.create_default_catalog_and_schema = false;
+        config
+            .options_mut()
+            .catalog
+            .create_default_catalog_and_schema = false;
 
         let temp_ctx = SessionContext::new_with_config(config);
 
-        let temp_catalog = DuckLakeCatalog::with_snapshot(
-            self.provider.clone(),
-            self.snapshot_id,
-        )
-        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        let temp_catalog = DuckLakeCatalog::with_snapshot(self.provider.clone(), self.snapshot_id)
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
 
         temp_ctx.register_catalog("ducklake", Arc::new(temp_catalog));
 
@@ -205,7 +207,7 @@ impl SchemaProvider for DuckLakeSchema {
             Ok(Some(view_meta)) => {
                 let view_table = self.plan_view(&view_meta).await?;
                 Ok(Some(Arc::new(view_table) as Arc<dyn TableProvider>))
-            }
+            },
             Ok(None) => Ok(None),
             Err(e) => Err(datafusion::error::DataFusionError::External(Box::new(e))),
         }
@@ -271,14 +273,19 @@ impl SchemaProvider for DuckLakeSchema {
 
     /// Register a new table in this schema.
     ///
-    /// This is called by DataFusion for CREATE TABLE AS SELECT statements.
-    /// It creates the table metadata in the catalog and returns a writable table provider.
+    /// This is called by DataFusion for CREATE TABLE and CREATE TABLE AS SELECT (CTAS).
+    /// For CTAS, DataFusion collects the SELECT data into a MemTable and passes it here.
+    /// We extract the data, create table metadata, and write data to Parquet files.
     #[cfg(feature = "write")]
     fn register_table(
         &self,
         name: String,
         table: Arc<dyn TableProvider>,
     ) -> DataFusionResult<Option<Arc<dyn TableProvider>>> {
+        use crate::metadata_provider::block_on;
+        use datafusion::physical_plan::ExecutionPlanProperties;
+        use futures::TryStreamExt;
+
         // Validate table name to prevent path traversal attacks
         validate_table_name(&name)?;
 
@@ -289,38 +296,56 @@ impl SchemaProvider for DuckLakeSchema {
             )
         })?;
 
-        // Convert Arrow schema to ColumnDefs
-        let arrow_schema = table.schema();
-        let columns: Vec<ColumnDef> = arrow_schema
-            .fields()
-            .iter()
-            .map(|field| {
-                ColumnDef::from_arrow(field.name(), field.data_type(), field.is_nullable())
-                    .map_err(|e| DataFusionError::External(Box::new(e)))
-            })
-            .collect::<DataFusionResult<Vec<_>>>()?;
+        // Extract data batches from the input table (for CTAS, this is a MemTable with data).
+        // We scan all partitions using a temporary SessionContext to collect all rows.
+        let batches: Vec<arrow::record_batch::RecordBatch> = block_on(async {
+            let ctx = datafusion::prelude::SessionContext::new();
+            let plan = table.scan(&ctx.state(), None, &[], None).await?;
+            let task_ctx = ctx.task_ctx();
+            let num_partitions = plan.output_partitioning().partition_count();
+            let mut all_batches = Vec::new();
+            for partition in 0..num_partitions {
+                let stream = plan.execute(partition, Arc::clone(&task_ctx))?;
+                let partition_batches: Vec<arrow::record_batch::RecordBatch> =
+                    stream.try_collect().await?;
+                all_batches.extend(partition_batches);
+            }
+            Ok(all_batches) as DataFusionResult<Vec<_>>
+        })?;
 
-        // Create table in metadata (creates snapshot, table, columns in a transaction)
-        let setup = writer
-            .begin_write_transaction(&self.schema_name, &name, &columns, WriteMode::Replace)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
+            // Empty table (CREATE TABLE without AS SELECT, or empty SELECT).
+            // Just create metadata.
+            let arrow_schema = table.schema();
+            let columns: Vec<ColumnDef> = arrow_schema
+                .fields()
+                .iter()
+                .map(|field| {
+                    ColumnDef::from_arrow(field.name(), field.data_type(), field.is_nullable())
+                        .map_err(|e| DataFusionError::External(Box::new(e)))
+                })
+                .collect::<DataFusionResult<Vec<_>>>()?;
 
-        // Resolve table path
-        let table_path = resolve_path(&self.schema_path, &name, true);
+            writer
+                .begin_write_transaction(&self.schema_name, &name, &columns, WriteMode::Replace)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        } else {
+            // CTAS with data — write to Parquet and create metadata in one operation.
+            let object_store: Arc<dyn object_store::ObjectStore> =
+                Arc::new(object_store::local::LocalFileSystem::new());
+            let table_writer = DuckLakeTableWriter::new(Arc::clone(writer), object_store)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-        // Create writable DuckLakeTable
-        let writable_table = DuckLakeTable::new(
-            setup.table_id,
-            name,
-            self.provider.clone(),
-            setup.snapshot_id,
-            self.object_store_url.clone(),
-            table_path,
-        )
-        .map_err(|e| DataFusionError::External(Box::new(e)))?
-        .with_writer(self.schema_name.clone(), Arc::clone(writer));
+            // Filter out empty batches
+            let non_empty: Vec<_> = batches.into_iter().filter(|b| b.num_rows() > 0).collect();
 
-        Ok(Some(Arc::new(writable_table) as Arc<dyn TableProvider>))
+            block_on(table_writer.write_table(&self.schema_name, &name, &non_empty))
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        }
+
+        // Return None to indicate a newly created table.
+        // DataFusion uses this to distinguish new tables from replaced ones.
+        Ok(None)
     }
 }
 

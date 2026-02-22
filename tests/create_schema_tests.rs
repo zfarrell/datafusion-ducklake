@@ -127,7 +127,11 @@ async fn test_create_schema_if_not_exists_already_exists() {
         .collect()
         .await;
 
-    assert!(result.is_ok(), "IF NOT EXISTS should not error: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "IF NOT EXISTS should not error: {:?}",
+        result
+    );
 }
 
 /// CREATE SCHEMA without IF NOT EXISTS should fail when schema already exists.
@@ -174,8 +178,7 @@ async fn test_create_schema_then_create_table() {
         .await
         .unwrap();
 
-    // Create a table in the new schema using INSERT INTO
-    // First, set up test data as an in-memory table
+    // Create a table in the new schema using CTAS
     let ctx2 = create_writable_ctx(&temp_dir).await;
     ctx2.sql(
         "CREATE TABLE ducklake.myschema.users AS SELECT 1 as id, 'alice' as name UNION ALL SELECT 2, 'bob'",
@@ -186,10 +189,10 @@ async fn test_create_schema_then_create_table() {
     .await
     .unwrap();
 
-    // Query the table in the new schema
+    // Query the table in the new schema and verify the actual row count value
     let ctx3 = create_writable_ctx(&temp_dir).await;
     let results = ctx3
-        .sql("SELECT count(*) FROM ducklake.myschema.users")
+        .sql("SELECT count(*) as cnt FROM ducklake.myschema.users")
         .await
         .unwrap()
         .collect()
@@ -198,6 +201,13 @@ async fn test_create_schema_then_create_table() {
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].num_rows(), 1);
+    let count = results[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(count, 2, "CTAS in non-main schema should create 2 rows");
 }
 
 // ==================== Multiple schemas ====================
