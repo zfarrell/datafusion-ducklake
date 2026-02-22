@@ -71,7 +71,7 @@ impl QueryPlanner for DuckLakeQueryPlanner {
                 ..
             }) => {
                 let table = downcast_ducklake_table(target)?;
-                let (assignments, filters) = extract_update_info(input, &table)?;
+                let (assignments, filters) = extract_update_info(input, table)?;
                 table.update(session_state, assignments, &filters).await
             },
             _ => {

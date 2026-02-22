@@ -308,14 +308,14 @@ impl ExecutionPlan for DuckLakeUpdateExec {
 
                     // Build a mask that includes filter match AND excludes already-deleted rows
                     let mut mask_values = vec![false; num_rows];
-                    for i in 0..num_rows {
+                    for (i, mask_val) in mask_values.iter_mut().enumerate().take(num_rows) {
                         let global_pos = global_row_offset + i as i64;
 
                         // Skip if already deleted
-                        if let Some(existing) = existing_positions {
-                            if existing.contains(&global_pos) {
-                                continue;
-                            }
+                        if let Some(existing) = existing_positions
+                            && existing.contains(&global_pos)
+                        {
+                            continue;
                         }
 
                         let matches = match &matching_mask {
@@ -325,7 +325,7 @@ impl ExecutionPlan for DuckLakeUpdateExec {
 
                         if matches {
                             positions_to_delete.push(global_pos);
-                            mask_values[i] = true;
+                            *mask_val = true;
                         }
                     }
 

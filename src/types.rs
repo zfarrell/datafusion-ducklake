@@ -213,8 +213,7 @@ fn parse_complex_type(type_str: &str) -> Option<Result<DataType>> {
     let lower = type_str.to_lowercase();
 
     // Array suffix notation: TYPE[]
-    if type_str.ends_with("[]") {
-        let inner = &type_str[..type_str.len() - 2];
+    if let Some(inner) = type_str.strip_suffix("[]") {
         return Some(
             ducklake_to_arrow_type(inner)
                 .map(|dt| DataType::List(Arc::new(Field::new("item", dt, true)))),
@@ -222,35 +221,35 @@ fn parse_complex_type(type_str: &str) -> Option<Result<DataType>> {
     }
 
     // LIST or ARRAY type
-    if lower.starts_with("list") {
-        if let Some(inner) = extract_type_params(type_str, 4) {
-            return Some(
-                ducklake_to_arrow_type(inner.trim())
-                    .map(|dt| DataType::List(Arc::new(Field::new("item", dt, true)))),
-            );
-        }
+    if lower.starts_with("list")
+        && let Some(inner) = extract_type_params(type_str, 4)
+    {
+        return Some(
+            ducklake_to_arrow_type(inner.trim())
+                .map(|dt| DataType::List(Arc::new(Field::new("item", dt, true)))),
+        );
     }
-    if lower.starts_with("array") {
-        if let Some(inner) = extract_type_params(type_str, 5) {
-            return Some(
-                ducklake_to_arrow_type(inner.trim())
-                    .map(|dt| DataType::List(Arc::new(Field::new("item", dt, true)))),
-            );
-        }
+    if lower.starts_with("array")
+        && let Some(inner) = extract_type_params(type_str, 5)
+    {
+        return Some(
+            ducklake_to_arrow_type(inner.trim())
+                .map(|dt| DataType::List(Arc::new(Field::new("item", dt, true)))),
+        );
     }
 
     // STRUCT type
-    if lower.starts_with("struct") {
-        if let Some(inner) = extract_type_params(type_str, 6) {
-            return Some(parse_struct_fields(inner));
-        }
+    if lower.starts_with("struct")
+        && let Some(inner) = extract_type_params(type_str, 6)
+    {
+        return Some(parse_struct_fields(inner));
     }
 
     // MAP type
-    if lower.starts_with("map") {
-        if let Some(inner) = extract_type_params(type_str, 3) {
-            return Some(parse_map_type(inner));
-        }
+    if lower.starts_with("map")
+        && let Some(inner) = extract_type_params(type_str, 3)
+    {
+        return Some(parse_map_type(inner));
     }
 
     None

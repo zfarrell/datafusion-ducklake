@@ -91,6 +91,9 @@ pub use metadata_provider::MetadataProvider;
 pub use schema::DuckLakeSchema;
 pub use table::DuckLakeTable;
 pub use table_functions::register_ducklake_functions;
+pub use virtual_column_exec::{
+    VIRTUAL_COL_FILE_ROW_NUMBER, VIRTUAL_COL_FILENAME, VirtualColumnExec,
+};
 
 // Re-export metadata providers (feature-gated)
 #[cfg(feature = "metadata-duckdb")]

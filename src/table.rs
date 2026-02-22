@@ -705,35 +705,35 @@ impl TableProvider for DuckLakeTable {
             let data_type = self.schema.field(col_idx).data_type();
 
             // Update min
-            if let Some(ref min_str) = fs.min_value {
-                if let Some(sv) = parse_stat_value(min_str, data_type) {
-                    col_stats[col_idx].min_value = match &col_stats[col_idx].min_value {
-                        Precision::Absent => Precision::Inexact(sv),
-                        Precision::Inexact(current) | Precision::Exact(current) => {
-                            if sv < *current {
-                                Precision::Inexact(sv)
-                            } else {
-                                col_stats[col_idx].min_value.clone()
-                            }
-                        },
-                    };
-                }
+            if let Some(ref min_str) = fs.min_value
+                && let Some(sv) = parse_stat_value(min_str, data_type)
+            {
+                col_stats[col_idx].min_value = match &col_stats[col_idx].min_value {
+                    Precision::Absent => Precision::Inexact(sv),
+                    Precision::Inexact(current) | Precision::Exact(current) => {
+                        if sv < *current {
+                            Precision::Inexact(sv)
+                        } else {
+                            col_stats[col_idx].min_value.clone()
+                        }
+                    },
+                };
             }
 
             // Update max
-            if let Some(ref max_str) = fs.max_value {
-                if let Some(sv) = parse_stat_value(max_str, data_type) {
-                    col_stats[col_idx].max_value = match &col_stats[col_idx].max_value {
-                        Precision::Absent => Precision::Inexact(sv),
-                        Precision::Inexact(current) | Precision::Exact(current) => {
-                            if sv > *current {
-                                Precision::Inexact(sv)
-                            } else {
-                                col_stats[col_idx].max_value.clone()
-                            }
-                        },
-                    };
-                }
+            if let Some(ref max_str) = fs.max_value
+                && let Some(sv) = parse_stat_value(max_str, data_type)
+            {
+                col_stats[col_idx].max_value = match &col_stats[col_idx].max_value {
+                    Precision::Absent => Precision::Inexact(sv),
+                    Precision::Inexact(current) | Precision::Exact(current) => {
+                        if sv > *current {
+                            Precision::Inexact(sv)
+                        } else {
+                            col_stats[col_idx].max_value.clone()
+                        }
+                    },
+                };
             }
         }
 

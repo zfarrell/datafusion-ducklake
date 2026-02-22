@@ -275,10 +275,10 @@ impl ExecutionPlan for DuckLakeDeleteExec {
                         let global_pos = global_row_offset + i as i64;
 
                         // Skip if already deleted
-                        if let Some(existing) = existing_positions {
-                            if existing.contains(&global_pos) {
-                                continue;
-                            }
+                        if let Some(existing) = existing_positions
+                            && existing.contains(&global_pos)
+                        {
+                            continue;
                         }
 
                         // Check if row matches filter

@@ -193,7 +193,6 @@ impl RecordBatchStream for VirtualColumnStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::physical_plan::EmptyRecordBatchStream;
 
