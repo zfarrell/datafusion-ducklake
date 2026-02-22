@@ -9,7 +9,8 @@ use crate::metadata_writer::{
     WriteMode, WriteSetupResult,
 };
 use sqlx::Row;
-use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
+use std::str::FromStr;
 
 const DEFAULT_MAX_CONNECTIONS: u32 = 5;
 
@@ -127,9 +128,12 @@ impl SqliteMetadataWriter {
         connection_string: &str,
         max_connections: u32,
     ) -> Result<Self> {
+        let options = SqliteConnectOptions::from_str(connection_string)?
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(30));
         let pool = SqlitePoolOptions::new()
             .max_connections(max_connections)
-            .connect(connection_string)
+            .connect_with(options)
             .await?;
         Ok(Self {
             pool,
