@@ -223,7 +223,7 @@ impl ExecutionPlan for DuckLakeInsertExec {
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             make_insert_count_schema(),
-            stream.map_err(|e: DataFusionError| e),
+            stream,
         )))
     }
 }
