@@ -402,7 +402,7 @@ async fn test_insert_then_delete_via_sql() {
     ctx.register_batch("insert_source", insert_batch).unwrap();
 
     let df = ctx
-        .sql("INSERT INTO ducklake.main.test_table SELECT * FROM insert_source")
+        .sql("INSERT INTO ducklake.main.test_table (id, name) SELECT * FROM insert_source")
         .await
         .unwrap();
     let _ = df.collect().await.unwrap();

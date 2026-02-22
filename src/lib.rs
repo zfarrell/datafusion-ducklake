@@ -49,6 +49,7 @@ pub mod table_changes;
 pub mod table_deletions;
 pub mod table_functions;
 pub mod types;
+pub mod virtual_column_exec;
 
 // Metadata providers (feature-gated)
 #[cfg(feature = "metadata-duckdb")]

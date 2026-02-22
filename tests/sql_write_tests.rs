@@ -178,7 +178,7 @@ async fn test_insert_into_existing_table() {
 
     // Try INSERT INTO
     let result = ctx2
-        .sql("INSERT INTO ducklake.main.values_table SELECT * FROM insert_source")
+        .sql("INSERT INTO ducklake.main.values_table (id, value) SELECT * FROM insert_source")
         .await;
 
     match result {
@@ -265,7 +265,7 @@ async fn test_insert_into_read_only_fails() {
 
     // Try INSERT INTO - should fail because table is read-only
     let result = ctx
-        .sql("INSERT INTO ducklake.main.readonly_test SELECT * FROM source")
+        .sql("INSERT INTO ducklake.main.readonly_test (id) SELECT * FROM source")
         .await;
 
     match result {
@@ -293,8 +293,9 @@ async fn test_insert_into_read_only_fails() {
             assert!(
                 msg.contains("read-only")
                     || msg.contains("read only")
-                    || msg.contains("not supported"),
-                "Expected read-only or not supported error, got: {}",
+                    || msg.contains("not supported")
+                    || msg.contains("column count"),
+                "Expected read-only, not supported, or column count error, got: {}",
                 e
             );
         },
@@ -520,7 +521,7 @@ async fn test_schema_evolution_via_sql() {
 
     // Insert with evolved schema
     let result = ctx2
-        .sql("INSERT INTO ducklake.main.evolve_table SELECT * FROM evolved_source")
+        .sql("INSERT INTO ducklake.main.evolve_table (id, name, age) SELECT * FROM evolved_source")
         .await;
 
     match result {

@@ -776,7 +776,7 @@ async fn test_not_null_insert_with_null_fails() {
     ctx.register_batch("null_source", null_batch).unwrap();
 
     let result = ctx
-        .sql("INSERT INTO ducklake.main.strict_table SELECT * FROM null_source")
+        .sql("INSERT INTO ducklake.main.strict_table (id, name, email) SELECT * FROM null_source")
         .await;
 
     match result {
@@ -843,7 +843,7 @@ async fn test_not_null_insert_valid_succeeds() {
     ctx.register_batch("valid_source", valid_batch).unwrap();
 
     let result = ctx
-        .sql("INSERT INTO ducklake.main.valid_insert_table SELECT * FROM valid_source")
+        .sql("INSERT INTO ducklake.main.valid_insert_table (id, name) SELECT * FROM valid_source")
         .await
         .unwrap()
         .collect()
@@ -912,7 +912,7 @@ async fn test_not_null_nullable_column_accepts_null() {
     ctx.register_batch("null_email_source", null_batch).unwrap();
 
     let result = ctx
-        .sql("INSERT INTO ducklake.main.nullable_col_table SELECT * FROM null_email_source")
+        .sql("INSERT INTO ducklake.main.nullable_col_table (id, email) SELECT * FROM null_email_source")
         .await
         .unwrap()
         .collect()
@@ -990,7 +990,7 @@ async fn test_not_null_mixed_null_batch_fails() {
     ctx.register_batch("mixed_source", mixed_batch).unwrap();
 
     let result = ctx
-        .sql("INSERT INTO ducklake.main.mixed_null_table SELECT * FROM mixed_source")
+        .sql("INSERT INTO ducklake.main.mixed_null_table (id, value) SELECT * FROM mixed_source")
         .await;
 
     match result {
@@ -1060,7 +1060,7 @@ async fn test_not_null_error_mentions_column_name() {
     ctx.register_batch("named_source", null_batch).unwrap();
 
     let result = ctx
-        .sql("INSERT INTO ducklake.main.named_constraint_table SELECT * FROM named_source")
+        .sql("INSERT INTO ducklake.main.named_constraint_table (id, required_field) SELECT * FROM named_source")
         .await
         .unwrap()
         .collect()
@@ -1104,7 +1104,7 @@ async fn test_not_null_constraint_preserved_after_insert() {
     )
     .unwrap();
     ctx.register_batch("valid_insert", valid_batch).unwrap();
-    ctx.sql("INSERT INTO ducklake.main.status_table SELECT * FROM valid_insert")
+    ctx.sql("INSERT INTO ducklake.main.status_table (id, status) SELECT * FROM valid_insert")
         .await
         .unwrap()
         .collect()
@@ -1128,7 +1128,7 @@ async fn test_not_null_constraint_preserved_after_insert() {
     ctx2.register_batch("null_status", null_source).unwrap();
 
     let result = ctx2
-        .sql("INSERT INTO ducklake.main.status_table SELECT * FROM null_status")
+        .sql("INSERT INTO ducklake.main.status_table (id, status) SELECT * FROM null_status")
         .await;
 
     match result {

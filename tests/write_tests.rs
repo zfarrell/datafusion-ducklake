@@ -109,7 +109,8 @@ async fn test_write_and_read_basic_types() {
 
     assert_eq!(batches.len(), 1);
     assert_eq!(batches[0].num_rows(), 3);
-    assert_eq!(batches[0].num_columns(), 5);
+    // 5 real columns + 2 virtual columns (filename, file_row_number)
+    assert_eq!(batches[0].num_columns(), 7);
 
     // Verify data
     let ids = batches[0]

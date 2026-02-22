@@ -109,12 +109,21 @@ fn duckdb_value_to_string(v: &duckdb::types::Value) -> String {
 }
 
 /// Convert DataFusion RecordBatch results to Vec<Vec<String>> for comparison.
+/// Skips virtual columns (filename, file_row_number) that are not present in DuckDB output.
 fn batches_to_strings(batches: &[RecordBatch]) -> Vec<Vec<String>> {
     let mut rows = Vec::new();
     for batch in batches {
+        let schema = batch.schema();
+        // Determine which columns to include (skip virtual columns)
+        let col_indices: Vec<usize> = (0..batch.num_columns())
+            .filter(|&i| {
+                let name = schema.field(i).name();
+                name != "filename" && name != "file_row_number"
+            })
+            .collect();
         for row_idx in 0..batch.num_rows() {
             let mut row = Vec::new();
-            for col_idx in 0..batch.num_columns() {
+            for &col_idx in &col_indices {
                 let col = batch.column(col_idx);
                 if col.is_null(row_idx) {
                     row.push("NULL".to_string());

@@ -909,7 +909,12 @@ async fn test_query_real_parquet_files() {
     assert_eq!(batch.num_rows(), 4, "Should have 4 rows");
 
     // Verify schema
-    assert_eq!(batch.num_columns(), 3, "Should have 3 columns");
+    // 3 real columns + 2 virtual columns (filename, file_row_number)
+    assert_eq!(
+        batch.num_columns(),
+        5,
+        "Should have 5 columns (3 real + 2 virtual)"
+    );
     let schema = batch.schema();
     assert_eq!(schema.field(0).name(), "id");
     assert_eq!(schema.field(1).name(), "name");

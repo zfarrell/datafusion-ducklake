@@ -14,6 +14,9 @@ use crate::path_resolver::resolve_path;
 use crate::types::{
     build_arrow_schema, build_read_schema_with_field_id_mapping, extract_parquet_field_ids,
 };
+use crate::virtual_column_exec::{
+    VIRTUAL_COL_FILE_ROW_NUMBER, VIRTUAL_COL_FILENAME, VirtualColumnExec,
+};
 
 #[cfg(feature = "write")]
 use crate::delete_exec::DuckLakeDeleteExec;
@@ -37,7 +40,11 @@ use datafusion::execution::object_store::ObjectStoreUrl;
 #[cfg(feature = "write")]
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
+#[cfg(feature = "write")]
+use datafusion::physical_expr::expressions::Column as PhysicalColumn;
 use datafusion::physical_plan::ExecutionPlan;
+#[cfg(feature = "write")]
+use datafusion::physical_plan::projection::ProjectionExec;
 use futures::StreamExt;
 use object_store::path::Path as ObjectPath;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
@@ -80,8 +87,10 @@ pub struct DuckLakeTable {
     object_store_url: Arc<ObjectStoreUrl>,
     /// Table path for resolving relative file paths
     table_path: String,
-    /// Current schema with potentially renamed column names
+    /// Base schema without virtual columns
     schema: SchemaRef,
+    /// Full schema including virtual columns (filename, file_row_number)
+    full_schema: SchemaRef,
     /// Column metadata from DuckLake (needed for field_id mapping)
     columns: Vec<DuckLakeTableColumn>,
     /// Table files with paths as stored in metadata (resolved on-the-fly when needed)
@@ -125,6 +134,20 @@ impl DuckLakeTable {
         // Load ALL metadata with this snapshot_id
         let columns = provider.get_table_structure(table_id)?;
         let schema = Arc::new(build_arrow_schema(&columns)?);
+        let full_schema = {
+            let mut fields = schema.fields().to_vec();
+            fields.push(Arc::new(Field::new(
+                VIRTUAL_COL_FILENAME,
+                DataType::Utf8,
+                true,
+            )));
+            fields.push(Arc::new(Field::new(
+                VIRTUAL_COL_FILE_ROW_NUMBER,
+                DataType::Int64,
+                true,
+            )));
+            Arc::new(Schema::new(fields))
+        };
         let table_files = provider.get_table_files_for_select(table_id, snapshot_id)?;
 
         // Build encryption factory from file encryption keys (when encryption feature is enabled)
@@ -163,6 +186,7 @@ impl DuckLakeTable {
             object_store_url,
             table_path,
             schema,
+            full_schema,
             columns,
             table_files,
             #[cfg(feature = "encryption")]
@@ -503,6 +527,49 @@ impl DuckLakeTable {
         )))
     }
 
+    /// Build a Parquet scan for a single file (no delete filtering).
+    /// Used when virtual columns are requested (files must be scanned individually).
+    async fn build_exec_for_single_file(
+        &self,
+        state: &dyn Session,
+        table_file: &DuckLakeTableFile,
+        projection: Option<&Vec<usize>>,
+        limit: Option<usize>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let (read_schema, name_mapping) = self.get_schema_mapping(state).await?;
+        let resolved_path = self.resolve_file_path(&table_file.file);
+        let mut pf = PartitionedFile::new(&resolved_path, table_file.file.file_size_bytes as u64);
+        if let Some(footer_size) = table_file.file.footer_size {
+            pf = pf.with_metadata_size_hint(footer_size as usize);
+        }
+        let mut builder = FileScanConfigBuilder::new(
+            self.object_store_url.as_ref().clone(),
+            read_schema.clone(),
+            Arc::new(self.create_parquet_source()),
+        )
+        .with_limit(limit)
+        .with_file_group(FileGroup::new(vec![pf]));
+        if let Some(proj) = projection {
+            builder = builder.with_projection_indices(Some(proj.clone()));
+        }
+        let file_scan_config = builder.build();
+        let parquet_exec: Arc<dyn ExecutionPlan> =
+            DataSourceExec::from_data_source(file_scan_config);
+        if !name_mapping.is_empty() {
+            let output_schema = match projection {
+                Some(indices) => Arc::new(self.schema.project(indices)?),
+                None => self.schema.clone(),
+            };
+            Ok(Arc::new(ColumnRenameExec::new(
+                parquet_exec,
+                output_schema,
+                name_mapping.clone(),
+            )))
+        } else {
+            Ok(parquet_exec)
+        }
+    }
+
     /// Build an execution plan for a single file with delete filtering
     ///
     /// Creates a Parquet scan wrapped with a delete filter to exclude deleted rows.
@@ -586,7 +653,7 @@ impl TableProvider for DuckLakeTable {
     }
 
     fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
+        Arc::clone(&self.full_schema)
     }
 
     fn table_type(&self) -> TableType {
@@ -704,55 +771,177 @@ impl TableProvider for DuckLakeTable {
         &self,
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        // Filters are received here for informational purposes. DataFusion's optimizer
-        // automatically pushes them down to the Parquet scanner for row group pruning and
-        // page-level filtering since we declared support via supports_filters_pushdown().
-        // We mark them as Inexact, so DataFusion will reapply them after our scan.
         _filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        // Separate files into two groups: with deletes and without deletes
-        // This allows us to create a single efficient exec for files without deletes
-        let (files_with_deletes, files_without_deletes): (Vec<_>, Vec<_>) = self
-            .table_files
-            .iter()
-            .partition(|tf| tf.delete_file.is_some());
+        let base_field_count = self.schema.fields().len();
+        let filename_idx = base_field_count;
+        let row_number_idx = base_field_count + 1;
+
+        // Determine if any virtual columns are requested
+        let (needs_virtual, include_filename, include_row_number) = match projection {
+            Some(indices) => {
+                let has_filename = indices.contains(&filename_idx);
+                let has_row_number = indices.contains(&row_number_idx);
+                (has_filename || has_row_number, has_filename, has_row_number)
+            },
+            None => (true, true, true), // SELECT * includes virtual columns
+        };
+
+        if !needs_virtual {
+            // No virtual columns — use optimized grouped scan path
+            let (files_with_deletes, files_without_deletes): (Vec<_>, Vec<_>) = self
+                .table_files
+                .iter()
+                .partition(|tf| tf.delete_file.is_some());
+            let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
+            if !files_without_deletes.is_empty() {
+                execs.push(
+                    self.build_exec_for_files_without_deletes(
+                        state,
+                        &files_without_deletes,
+                        projection,
+                        limit,
+                    )
+                    .await?,
+                );
+            }
+            for table_file in files_with_deletes {
+                execs.push(
+                    self.build_exec_for_file_with_deletes(state, table_file, projection, limit)
+                        .await?,
+                );
+            }
+            if execs.is_empty() {
+                use datafusion::physical_plan::empty::EmptyExec;
+                let projected_schema = match projection {
+                    Some(indices) => Arc::new(self.schema.project(indices)?),
+                    None => self.schema.clone(),
+                };
+                return Ok(Arc::new(EmptyExec::new(projected_schema)));
+            }
+            return combine_execution_plans(execs);
+        }
+
+        // Virtual columns requested — scan files individually
+        // Build the "real" projection (base schema indices only)
+        let real_projection: Option<Vec<usize>> = projection.map(|indices| {
+            indices
+                .iter()
+                .filter(|&&idx| idx < base_field_count)
+                .copied()
+                .collect()
+        });
+
+        // Build VirtualColumnExec output schema: [real projected cols..., filename?, row_number?]
+        let real_output_schema = match &real_projection {
+            Some(indices) if !indices.is_empty() => Arc::new(self.schema.project(indices)?),
+            Some(_) => Arc::new(Schema::empty()),
+            None => self.schema.clone(),
+        };
+        let mut vc_fields = real_output_schema.fields().to_vec();
+        if include_filename {
+            vc_fields.push(Arc::new(Field::new(
+                VIRTUAL_COL_FILENAME,
+                DataType::Utf8,
+                true,
+            )));
+        }
+        if include_row_number {
+            vc_fields.push(Arc::new(Field::new(
+                VIRTUAL_COL_FILE_ROW_NUMBER,
+                DataType::Int64,
+                true,
+            )));
+        }
+        let vc_output_schema = Arc::new(Schema::new(vc_fields));
+        let real_proj_ref = real_projection.as_ref();
 
         let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
-
-        // Create single exec for all files without deletes (more efficient)
-        if !files_without_deletes.is_empty() {
-            let exec = self
-                .build_exec_for_files_without_deletes(
-                    state,
-                    &files_without_deletes,
-                    projection,
-                    limit,
-                )
-                .await?;
-            execs.push(exec);
+        for table_file in &self.table_files {
+            let resolved_path = self.resolve_file_path(&table_file.file);
+            let file_exec = if table_file.delete_file.is_some() {
+                self.build_exec_for_file_with_deletes(state, table_file, real_proj_ref, limit)
+                    .await?
+            } else {
+                self.build_exec_for_single_file(state, table_file, real_proj_ref, limit)
+                    .await?
+            };
+            execs.push(Arc::new(VirtualColumnExec::new(
+                file_exec,
+                resolved_path,
+                include_filename,
+                include_row_number,
+                Arc::clone(&vc_output_schema),
+            )));
         }
 
-        // Only create separate execs for files with deletes
-        for table_file in files_with_deletes {
-            let exec = self
-                .build_exec_for_file_with_deletes(state, table_file, projection, limit)
-                .await?;
-            execs.push(exec);
-        }
-
-        // Handle empty tables (no data files)
         if execs.is_empty() {
             use datafusion::physical_plan::empty::EmptyExec;
             let projected_schema = match projection {
-                Some(indices) => Arc::new(self.schema.project(indices)?),
-                None => self.schema.clone(),
+                Some(indices) => Arc::new(self.full_schema.project(indices)?),
+                None => self.full_schema.clone(),
             };
             return Ok(Arc::new(EmptyExec::new(projected_schema)));
         }
 
-        // Combine execution plans
-        combine_execution_plans(execs)
+        let combined = combine_execution_plans(execs)?;
+
+        // Check if we need to reorder columns (virtual cols not at the end of projection)
+        if let Some(indices) = projection {
+            // Build expected order: real indices first, then virtual
+            let mut expected: Vec<usize> = Vec::new();
+            for &idx in indices {
+                if idx < base_field_count {
+                    expected.push(idx);
+                }
+            }
+            if include_filename {
+                expected.push(filename_idx);
+            }
+            if include_row_number {
+                expected.push(row_number_idx);
+            }
+
+            if indices != expected.as_slice() {
+                // Need to reorder: map each requested index to its position in vc_output_schema
+                let mut real_col_pos = 0usize;
+                let mut index_to_vc_pos: HashMap<usize, usize> = HashMap::new();
+                for &idx in indices {
+                    if idx < base_field_count {
+                        index_to_vc_pos.insert(idx, real_col_pos);
+                        real_col_pos += 1;
+                    }
+                }
+                let mut vc_pos = real_col_pos;
+                if include_filename {
+                    index_to_vc_pos.insert(filename_idx, vc_pos);
+                    vc_pos += 1;
+                }
+                if include_row_number {
+                    index_to_vc_pos.insert(row_number_idx, vc_pos);
+                }
+
+                use datafusion::physical_expr::expressions::Column;
+                use datafusion::physical_plan::projection::ProjectionExec;
+                let proj_exprs: Vec<(Arc<dyn datafusion::physical_expr::PhysicalExpr>, String)> =
+                    indices
+                        .iter()
+                        .map(|&idx| {
+                            let vc_idx = index_to_vc_pos[&idx];
+                            let name = vc_output_schema.field(vc_idx).name().clone();
+                            (
+                                Arc::new(Column::new(&name, vc_idx))
+                                    as Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+                                name,
+                            )
+                        })
+                        .collect();
+                return Ok(Arc::new(ProjectionExec::try_new(proj_exprs, combined)?));
+            }
+        }
+
+        Ok(combined)
     }
 
     #[cfg(feature = "write")]
@@ -778,12 +967,32 @@ impl TableProvider for DuckLakeTable {
             InsertOp::Overwrite | InsertOp::Replace => WriteMode::Replace,
         };
 
+        // Strip virtual columns from input if present (DataFusion may include them
+        // because schema() returns full_schema with virtual columns)
+        let base_col_count = self.schema.fields().len();
+        let actual_input = if input.schema().fields().len() > base_col_count {
+            let exprs: Vec<(Arc<dyn datafusion::physical_expr::PhysicalExpr>, String)> = (0
+                ..base_col_count)
+                .map(|i| {
+                    let name = input.schema().field(i).name().to_string();
+                    (
+                        Arc::new(PhysicalColumn::new(&name, i))
+                            as Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+                        name,
+                    )
+                })
+                .collect();
+            Arc::new(ProjectionExec::try_new(exprs, input)?) as Arc<dyn ExecutionPlan>
+        } else {
+            input
+        };
+
         Ok(Arc::new(DuckLakeInsertExec::new(
-            input,
+            actual_input,
             Arc::clone(writer),
             schema_name.clone(),
             self.table_name.clone(),
-            self.schema(),
+            Arc::clone(&self.schema),
             write_mode,
             self.object_store_url.clone(),
         )))
