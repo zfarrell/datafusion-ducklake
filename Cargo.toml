@@ -67,4 +67,5 @@ encryption = ["parquet/encryption", "datafusion/parquet_encryption", "dep:base64
 # Write support
 write = ["dep:uuid"]
 write-sqlite = ["write", "metadata-sqlite"]
+write-mysql = ["write", "metadata-mysql"]
 write-postgres = ["write", "metadata-postgres"]
