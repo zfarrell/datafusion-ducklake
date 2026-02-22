@@ -259,6 +259,7 @@ impl MetadataProvider for PostgresMetadataProvider {
                     };
 
                     Ok(DuckLakeTableFile {
+                        data_file_id: row.try_get(0)?,
                         file: data_file,
                         delete_file,
                         row_id_start: None,
@@ -501,6 +502,7 @@ impl MetadataProvider for PostgresMetadataProvider {
                         schema_name: row.try_get(0)?,
                         table_name: row.try_get(1)?,
                         file: DuckLakeTableFile {
+                            data_file_id: row.try_get(2)?,
                             file: data_file,
                             delete_file,
                             row_id_start: None,

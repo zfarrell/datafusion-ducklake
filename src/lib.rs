@@ -62,7 +62,13 @@ pub mod metadata_provider_sqlite;
 
 // Write support (feature-gated)
 #[cfg(feature = "write")]
+pub mod delete_exec;
+#[cfg(feature = "write")]
 pub mod insert_exec;
+#[cfg(feature = "write")]
+pub mod query_planner;
+#[cfg(feature = "write")]
+pub mod update_exec;
 #[cfg(feature = "write")]
 pub mod metadata_writer;
 #[cfg(feature = "write-sqlite")]
@@ -93,12 +99,19 @@ pub use metadata_provider_sqlite::SqliteMetadataProvider;
 
 // Re-export write types (feature-gated)
 #[cfg(feature = "write")]
+pub use delete_exec::DuckLakeDeleteExec;
+#[cfg(feature = "write")]
 pub use insert_exec::DuckLakeInsertExec;
 #[cfg(feature = "write")]
 pub use metadata_writer::{
-    ColumnDef, DataFileInfo, MetadataWriter, WriteMode, WriteResult, WriteSetupResult,
+    ColumnDef, ColumnStatInfo, DataFileInfo, DeleteFileInfo, MetadataWriter, WriteMode,
+    WriteResult, WriteSetupResult,
 };
 #[cfg(feature = "write-sqlite")]
 pub use metadata_writer_sqlite::SqliteMetadataWriter;
 #[cfg(feature = "write")]
 pub use table_writer::{DuckLakeTableWriter, TableWriteSession};
+#[cfg(feature = "write")]
+pub use query_planner::DuckLakeQueryPlanner;
+#[cfg(feature = "write")]
+pub use update_exec::{DuckLakeUpdateExec, UpdateAssignment};

@@ -155,6 +155,22 @@ impl DataFileInfo {
     }
 }
 
+/// Per-column statistics for a data file.
+///
+/// Stores min/max values (as strings) and null count for a single column
+/// within a data file. Used for query optimization (file pruning).
+#[derive(Debug, Clone)]
+pub struct ColumnStatInfo {
+    /// Column ID in the catalog
+    pub column_id: i64,
+    /// Number of null values in this column for this file
+    pub null_count: Option<i64>,
+    /// Minimum value as a string (type-specific serialization)
+    pub min_value: Option<String>,
+    /// Maximum value as a string (type-specific serialization)
+    pub max_value: Option<String>,
+}
+
 /// Information about a delete file to register in the catalog.
 ///
 /// Delete files contain (file_path: VARCHAR, pos: INT64) records that
@@ -260,6 +276,21 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         columns: &[ColumnDef],
         snapshot_id: i64,
     ) -> Result<Vec<i64>>;
+
+    /// Register column-level statistics for a data file.
+    ///
+    /// Stores per-column min/max values and null counts, used for
+    /// file-level pruning during query planning.
+    ///
+    /// Default implementation is a no-op for backward compatibility.
+    fn register_column_stats(
+        &self,
+        _data_file_id: i64,
+        _table_id: i64,
+        _stats: &[ColumnStatInfo],
+    ) -> Result<()> {
+        Ok(())
+    }
 
     /// Register a new data file. Returns the assigned data_file_id.
     fn register_data_file(

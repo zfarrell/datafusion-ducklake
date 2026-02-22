@@ -12,7 +12,9 @@ use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
 
 use crate::Result;
-use crate::metadata_writer::{ColumnDef, DataFileInfo, MetadataWriter, WriteMode, WriteResult};
+use crate::metadata_writer::{
+    ColumnDef, ColumnStatInfo, DataFileInfo, MetadataWriter, WriteMode, WriteResult,
+};
 use crate::path_resolver::join_paths;
 use crate::types::arrow_to_ducklake_type;
 
@@ -260,9 +262,14 @@ impl TableWriteSession {
     }
 
     pub async fn finish(mut self) -> Result<WriteResult> {
-        let writer = self.writer.take().ok_or_else(|| {
+        let mut writer = self.writer.take().ok_or_else(|| {
             crate::error::DuckLakeError::Internal("Writer already closed".to_string())
         })?;
+
+        // Flush pending data so flushed_row_groups() has all row groups
+        writer.flush()?;
+        let column_stats = extract_column_stats(writer.flushed_row_groups(), &self.column_ids);
+
         let buffer = writer.into_inner()?;
 
         let file_size = buffer.len() as i64;
@@ -278,8 +285,15 @@ impl TableWriteSession {
         if !self.path_is_relative {
             file_info = file_info.with_absolute_path();
         }
-        self.metadata
+        let data_file_id = self
+            .metadata
             .register_data_file(self.table_id, self.snapshot_id, &file_info)?;
+
+        // Register column-level statistics
+        if !column_stats.is_empty() {
+            self.metadata
+                .register_column_stats(data_file_id, self.table_id, &column_stats)?;
+        }
 
         Ok(WriteResult {
             snapshot_id: self.snapshot_id,
@@ -322,6 +336,169 @@ fn build_schema_with_field_ids(schema: &Schema, column_ids: &[i64]) -> Schema {
         .collect();
 
     Schema::new_with_metadata(fields, schema.metadata().clone())
+}
+
+/// Extract column-level statistics from flushed Parquet row groups.
+///
+/// Merges statistics across multiple row groups by summing null counts
+/// and taking the overall min/max across all groups.
+fn extract_column_stats(
+    row_groups: &[parquet::file::metadata::RowGroupMetaData],
+    column_ids: &[i64],
+) -> Vec<ColumnStatInfo> {
+    if row_groups.is_empty() {
+        return Vec::new();
+    }
+
+    let num_columns = column_ids.len();
+
+    // Accumulators: (null_count, min_string, max_string)
+    let mut null_counts: Vec<i64> = vec![0; num_columns];
+    let mut min_values: Vec<Option<String>> = vec![None; num_columns];
+    let mut max_values: Vec<Option<String>> = vec![None; num_columns];
+    let mut has_stats: Vec<bool> = vec![false; num_columns];
+
+    for rg in row_groups {
+        for (col_idx, col_chunk) in rg.columns().iter().enumerate() {
+            if col_idx >= num_columns {
+                break;
+            }
+
+            if let Some(stats) = col_chunk.statistics() {
+                has_stats[col_idx] = true;
+
+                if let Some(nc) = stats.null_count_opt() {
+                    null_counts[col_idx] += nc as i64;
+                }
+
+                let (batch_min, batch_max) = parquet_stats_min_max(stats);
+
+                if let Some(ref bm) = batch_min {
+                    match &min_values[col_idx] {
+                        None => min_values[col_idx] = Some(bm.clone()),
+                        Some(current) => {
+                            if should_replace_min(stats, bm, current) {
+                                min_values[col_idx] = Some(bm.clone());
+                            }
+                        }
+                    }
+                }
+
+                if let Some(ref bm) = batch_max {
+                    match &max_values[col_idx] {
+                        None => max_values[col_idx] = Some(bm.clone()),
+                        Some(current) => {
+                            if should_replace_max(stats, bm, current) {
+                                max_values[col_idx] = Some(bm.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    (0..num_columns)
+        .filter(|&i| has_stats[i])
+        .map(|i| ColumnStatInfo {
+            column_id: column_ids[i],
+            null_count: Some(null_counts[i]),
+            min_value: min_values[i].clone(),
+            max_value: max_values[i].clone(),
+        })
+        .collect()
+}
+
+/// Extract min/max values from Parquet statistics as strings.
+fn parquet_stats_min_max(
+    stats: &parquet::file::statistics::Statistics,
+) -> (Option<String>, Option<String>) {
+    use parquet::file::statistics::Statistics;
+    match stats {
+        Statistics::Boolean(vs) => (
+            vs.min_opt().map(|v| v.to_string()),
+            vs.max_opt().map(|v| v.to_string()),
+        ),
+        Statistics::Int32(vs) => (
+            vs.min_opt().map(|v| v.to_string()),
+            vs.max_opt().map(|v| v.to_string()),
+        ),
+        Statistics::Int64(vs) => (
+            vs.min_opt().map(|v| v.to_string()),
+            vs.max_opt().map(|v| v.to_string()),
+        ),
+        Statistics::Float(vs) => (
+            vs.min_opt().map(|v| v.to_string()),
+            vs.max_opt().map(|v| v.to_string()),
+        ),
+        Statistics::Double(vs) => (
+            vs.min_opt().map(|v| v.to_string()),
+            vs.max_opt().map(|v| v.to_string()),
+        ),
+        Statistics::ByteArray(vs) => (
+            vs.min_opt()
+                .and_then(|v| String::from_utf8(v.data().to_vec()).ok()),
+            vs.max_opt()
+                .and_then(|v| String::from_utf8(v.data().to_vec()).ok()),
+        ),
+        Statistics::FixedLenByteArray(vs) => (
+            vs.min_opt()
+                .and_then(|v| String::from_utf8(v.data().to_vec()).ok()),
+            vs.max_opt()
+                .and_then(|v| String::from_utf8(v.data().to_vec()).ok()),
+        ),
+        Statistics::Int96(_) => (None, None),
+    }
+}
+
+/// Decide whether a new min value should replace the current one.
+///
+/// For numeric types, compares as numbers; for strings, compares lexicographically.
+fn should_replace_min(
+    stats: &parquet::file::statistics::Statistics,
+    new_val: &str,
+    current: &str,
+) -> bool {
+    use parquet::file::statistics::Statistics;
+    match stats {
+        Statistics::Int32(_) => {
+            new_val.parse::<i32>().ok() < current.parse::<i32>().ok()
+        }
+        Statistics::Int64(_) => {
+            new_val.parse::<i64>().ok() < current.parse::<i64>().ok()
+        }
+        Statistics::Float(_) => {
+            new_val.parse::<f32>().ok() < current.parse::<f32>().ok()
+        }
+        Statistics::Double(_) => {
+            new_val.parse::<f64>().ok() < current.parse::<f64>().ok()
+        }
+        _ => new_val < current,
+    }
+}
+
+/// Decide whether a new max value should replace the current one.
+fn should_replace_max(
+    stats: &parquet::file::statistics::Statistics,
+    new_val: &str,
+    current: &str,
+) -> bool {
+    use parquet::file::statistics::Statistics;
+    match stats {
+        Statistics::Int32(_) => {
+            new_val.parse::<i32>().ok() > current.parse::<i32>().ok()
+        }
+        Statistics::Int64(_) => {
+            new_val.parse::<i64>().ok() > current.parse::<i64>().ok()
+        }
+        Statistics::Float(_) => {
+            new_val.parse::<f32>().ok() > current.parse::<f32>().ok()
+        }
+        Statistics::Double(_) => {
+            new_val.parse::<f64>().ok() > current.parse::<f64>().ok()
+        }
+        _ => new_val > current,
+    }
 }
 
 fn calculate_footer_size_from_bytes(buffer: &[u8]) -> Result<i64> {

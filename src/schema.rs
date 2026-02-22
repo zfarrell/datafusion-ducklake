@@ -6,9 +6,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::catalog::{SchemaProvider, TableProvider};
 use datafusion::datasource::object_store::ObjectStoreUrl;
+use datafusion::datasource::ViewTable;
 use datafusion::error::Result as DataFusionResult;
+use datafusion::prelude::{SessionConfig, SessionContext};
 
-use crate::metadata_provider::MetadataProvider;
+use crate::catalog::DuckLakeCatalog;
+use crate::metadata_provider::{MetadataProvider, ViewMetadata};
 use crate::path_resolver::resolve_path;
 use crate::table::DuckLakeTable;
 
@@ -98,6 +101,32 @@ impl DuckLakeSchema {
         self.writer = Some(writer);
         self
     }
+
+    /// Plan a view's SQL definition and return a ViewTable.
+    ///
+    /// Creates a temporary SessionContext with a DuckLakeCatalog registered
+    /// under the default catalog name, so unqualified and schema-qualified
+    /// table references in the view SQL resolve correctly.
+    async fn plan_view(&self, view: &ViewMetadata) -> DataFusionResult<ViewTable> {
+        let mut config = SessionConfig::new();
+        config.options_mut().catalog.default_catalog = "ducklake".to_string();
+        config.options_mut().catalog.default_schema = self.schema_name.clone();
+        config.options_mut().catalog.create_default_catalog_and_schema = false;
+
+        let temp_ctx = SessionContext::new_with_config(config);
+
+        let temp_catalog = DuckLakeCatalog::with_snapshot(
+            self.provider.clone(),
+            self.snapshot_id,
+        )
+        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+
+        temp_ctx.register_catalog("ducklake", Arc::new(temp_catalog));
+
+        let plan = temp_ctx.state().create_logical_plan(&view.sql).await?;
+
+        Ok(ViewTable::new(plan, Some(view.sql.clone())))
+    }
 }
 
 #[async_trait]
@@ -108,7 +137,8 @@ impl SchemaProvider for DuckLakeSchema {
 
     fn table_names(&self) -> Vec<String> {
         // Use cached snapshot_id
-        self.provider
+        let mut names: Vec<String> = self
+            .provider
             .list_tables(self.schema_id, self.snapshot_id)
             .inspect_err(|e| {
                 tracing::error!(
@@ -122,11 +152,18 @@ impl SchemaProvider for DuckLakeSchema {
             .unwrap_or_default()
             .into_iter()
             .map(|t| t.table_name)
-            .collect()
+            .collect();
+
+        // Also include views
+        if let Ok(views) = self.provider.list_views(self.schema_id, self.snapshot_id) {
+            names.extend(views.into_iter().map(|v| v.view_name));
+        }
+
+        names
     }
 
     async fn table(&self, name: &str) -> DataFusionResult<Option<Arc<dyn TableProvider>>> {
-        // Use cached snapshot_id
+        // Use cached snapshot_id - check tables first
         match self
             .provider
             .get_table_by_name(self.schema_id, name, self.snapshot_id)
@@ -154,18 +191,35 @@ impl SchemaProvider for DuckLakeSchema {
                     table
                 };
 
-                Ok(Some(Arc::new(table) as Arc<dyn TableProvider>))
+                return Ok(Some(Arc::new(table) as Arc<dyn TableProvider>));
             },
+            Ok(None) => {},
+            Err(e) => return Err(datafusion::error::DataFusionError::External(Box::new(e))),
+        }
+
+        // Table not found — check for views
+        match self
+            .provider
+            .get_view_by_name(self.schema_id, name, self.snapshot_id)
+        {
+            Ok(Some(view_meta)) => {
+                let view_table = self.plan_view(&view_meta).await?;
+                Ok(Some(Arc::new(view_table) as Arc<dyn TableProvider>))
+            }
             Ok(None) => Ok(None),
             Err(e) => Err(datafusion::error::DataFusionError::External(Box::new(e))),
         }
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        // Use cached snapshot_id
+        // Use cached snapshot_id — check tables and views
         self.provider
             .table_exists(self.schema_id, name, self.snapshot_id)
             .unwrap_or(false)
+            || self
+                .provider
+                .view_exists(self.schema_id, name, self.snapshot_id)
+                .unwrap_or(false)
     }
 
     /// Deregister (drop) a table from this schema.

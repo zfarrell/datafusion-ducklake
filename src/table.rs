@@ -16,6 +16,8 @@ use crate::types::{
 };
 
 #[cfg(feature = "write")]
+use crate::delete_exec::DuckLakeDeleteExec;
+#[cfg(feature = "write")]
 use crate::insert_exec::DuckLakeInsertExec;
 #[cfg(feature = "write")]
 use crate::metadata_writer::{MetadataWriter, WriteMode};
@@ -69,11 +71,11 @@ type SchemaMappingCache = (SchemaRef, HashMap<String, String>);
 /// Represents a table within a DuckLake schema and provides access to data via Parquet files.
 /// Caches snapshot_id and uses it to load all metadata atomically.
 pub struct DuckLakeTable {
-    #[allow(dead_code)]
     table_id: i64,
     table_name: String,
-    #[allow(dead_code)]
     provider: Arc<dyn MetadataProvider>,
+    /// Snapshot ID this table is bound to
+    snapshot_id: i64,
     /// Object store URL for resolving file paths (e.g., s3://bucket/ or file:///)
     object_store_url: Arc<ObjectStoreUrl>,
     /// Table path for resolving relative file paths
@@ -157,6 +159,7 @@ impl DuckLakeTable {
             table_id,
             table_name: table_name.into(),
             provider,
+            snapshot_id,
             object_store_url,
             table_path,
             schema,
@@ -397,6 +400,109 @@ impl DuckLakeTable {
         self
     }
 
+    /// Create a DELETE execution plan for this table.
+    ///
+    /// Returns an execution plan that, when executed, will:
+    /// 1. Scan each data file and apply the filter
+    /// 2. Collect positions of matching (non-deleted) rows
+    /// 3. Write Parquet delete files
+    /// 4. Register them in catalog metadata
+    /// 5. Return the count of deleted rows
+    ///
+    /// If `filters` is empty, all rows are deleted.
+    #[cfg(feature = "write")]
+    pub async fn delete(
+        &self,
+        state: &dyn Session,
+        filters: &[Expr],
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let writer = self.writer.as_ref().ok_or_else(|| {
+            DataFusionError::Plan(
+                "Table is read-only. Use DuckLakeCatalog::with_writer() to enable writes."
+                    .to_string(),
+            )
+        })?;
+
+        // Pre-load existing delete positions for files that have delete files
+        let mut existing_deletes = HashMap::new();
+        for table_file in &self.table_files {
+            if let Some(ref delete_file) = table_file.delete_file {
+                let resolved_path = self.resolve_file_path(&table_file.file);
+                let positions = self.read_delete_file_positions(state, delete_file).await?;
+                existing_deletes.insert(resolved_path, positions);
+            }
+        }
+
+        Ok(Arc::new(DuckLakeDeleteExec::new(
+            self.table_id,
+            self.table_name.clone(),
+            self.schema.clone(),
+            self.table_files.clone(),
+            filters.to_vec(),
+            Arc::clone(writer),
+            self.object_store_url.clone(),
+            self.table_path.clone(),
+            existing_deletes,
+        )))
+    }
+
+    /// Create an UPDATE execution plan for this table.
+    ///
+    /// Returns an execution plan that, when executed, will:
+    /// 1. Scan each data file and apply the WHERE filter
+    /// 2. Collect matching rows' full data and positions
+    /// 3. Apply SET transformations to the matched rows
+    /// 4. Write delete files for old rows
+    /// 5. Write new data files with updated rows
+    /// 6. Register both in catalog metadata
+    /// 7. Return the count of updated rows
+    ///
+    /// If `filters` is empty, all rows are updated.
+    #[cfg(feature = "write")]
+    pub async fn update(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<crate::update_exec::UpdateAssignment>,
+        filters: &[Expr],
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        use crate::update_exec::DuckLakeUpdateExec;
+
+        let writer = self.writer.as_ref().ok_or_else(|| {
+            DataFusionError::Plan(
+                "Table is read-only. Use DuckLakeCatalog::with_writer() to enable writes."
+                    .to_string(),
+            )
+        })?;
+
+        let schema_name = self.schema_name.as_ref().ok_or_else(|| {
+            DataFusionError::Internal("Schema name not set for writable table".to_string())
+        })?;
+
+        // Pre-load existing delete positions for files that have delete files
+        let mut existing_deletes = HashMap::new();
+        for table_file in &self.table_files {
+            if let Some(ref delete_file) = table_file.delete_file {
+                let resolved_path = self.resolve_file_path(&table_file.file);
+                let positions = self.read_delete_file_positions(state, delete_file).await?;
+                existing_deletes.insert(resolved_path, positions);
+            }
+        }
+
+        Ok(Arc::new(DuckLakeUpdateExec::new(
+            self.table_id,
+            self.table_name.clone(),
+            schema_name.clone(),
+            self.schema.clone(),
+            self.table_files.clone(),
+            filters.to_vec(),
+            assignments,
+            Arc::clone(writer),
+            self.object_store_url.clone(),
+            self.table_path.clone(),
+            existing_deletes,
+        )))
+    }
+
     /// Build an execution plan for a single file with delete filtering
     ///
     /// Creates a Parquet scan wrapped with a delete filter to exclude deleted rows.
@@ -485,6 +591,98 @@ impl TableProvider for DuckLakeTable {
 
     fn table_type(&self) -> TableType {
         TableType::Base
+    }
+
+    fn statistics(&self) -> Option<datafusion::common::Statistics> {
+        use datafusion::common::stats::Precision;
+        use datafusion::common::{ColumnStatistics, Statistics};
+
+        let file_stats = self
+            .provider
+            .get_file_column_stats(self.table_id, self.snapshot_id)
+            .ok()?;
+
+        if file_stats.is_empty() {
+            return None;
+        }
+
+        // Build a map: column_name -> index in schema
+        let col_name_to_idx: HashMap<&str, usize> = self
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(idx, col)| (col.column_name.as_str(), idx))
+            .collect();
+
+        let num_cols = self.columns.len();
+        let mut col_stats: Vec<ColumnStatistics> =
+            vec![ColumnStatistics::new_unknown(); num_cols];
+
+        // Track per-column aggregated null_count and min/max across all files
+        let mut null_counts: Vec<i64> = vec![0; num_cols];
+        let mut has_null_count: Vec<bool> = vec![false; num_cols];
+
+        for fs in &file_stats {
+            let Some(&col_idx) = col_name_to_idx.get(fs.column_name.as_str()) else {
+                continue;
+            };
+            if col_idx >= num_cols {
+                continue;
+            }
+
+            // Accumulate null counts
+            if let Some(nc) = fs.null_count {
+                null_counts[col_idx] += nc;
+                has_null_count[col_idx] = true;
+            }
+
+            let data_type = self.schema.field(col_idx).data_type();
+
+            // Update min
+            if let Some(ref min_str) = fs.min_value {
+                if let Some(sv) = parse_stat_value(min_str, data_type) {
+                    col_stats[col_idx].min_value = match &col_stats[col_idx].min_value {
+                        Precision::Absent => Precision::Inexact(sv),
+                        Precision::Inexact(current) | Precision::Exact(current) => {
+                            if sv < *current {
+                                Precision::Inexact(sv)
+                            } else {
+                                col_stats[col_idx].min_value.clone()
+                            }
+                        }
+                    };
+                }
+            }
+
+            // Update max
+            if let Some(ref max_str) = fs.max_value {
+                if let Some(sv) = parse_stat_value(max_str, data_type) {
+                    col_stats[col_idx].max_value = match &col_stats[col_idx].max_value {
+                        Precision::Absent => Precision::Inexact(sv),
+                        Precision::Inexact(current) | Precision::Exact(current) => {
+                            if sv > *current {
+                                Precision::Inexact(sv)
+                            } else {
+                                col_stats[col_idx].max_value.clone()
+                            }
+                        }
+                    };
+                }
+            }
+        }
+
+        // Set null counts
+        for (i, cs) in col_stats.iter_mut().enumerate() {
+            if has_null_count[i] {
+                cs.null_count = Precision::Inexact(null_counts[i] as usize);
+            }
+        }
+
+        Some(Statistics {
+            num_rows: Precision::Absent,
+            total_byte_size: Precision::Absent,
+            column_statistics: col_stats,
+        })
     }
 
     fn supports_filters_pushdown(
@@ -590,6 +788,33 @@ impl TableProvider for DuckLakeTable {
             write_mode,
             self.object_store_url.clone(),
         )))
+    }
+}
+
+/// Parse a string-encoded statistic value into a DataFusion ScalarValue.
+///
+/// Supports common numeric, string, and boolean types. Returns None for
+/// unsupported types or parse failures.
+fn parse_stat_value(s: &str, data_type: &DataType) -> Option<datafusion::common::ScalarValue> {
+    use datafusion::common::ScalarValue;
+
+    match data_type {
+        DataType::Boolean => s.parse::<bool>().ok().map(|v| ScalarValue::Boolean(Some(v))),
+        DataType::Int8 => s.parse::<i8>().ok().map(|v| ScalarValue::Int8(Some(v))),
+        DataType::Int16 => s.parse::<i16>().ok().map(|v| ScalarValue::Int16(Some(v))),
+        DataType::Int32 => s.parse::<i32>().ok().map(|v| ScalarValue::Int32(Some(v))),
+        DataType::Int64 => s.parse::<i64>().ok().map(|v| ScalarValue::Int64(Some(v))),
+        DataType::UInt8 => s.parse::<u8>().ok().map(|v| ScalarValue::UInt8(Some(v))),
+        DataType::UInt16 => s.parse::<u16>().ok().map(|v| ScalarValue::UInt16(Some(v))),
+        DataType::UInt32 => s.parse::<u32>().ok().map(|v| ScalarValue::UInt32(Some(v))),
+        DataType::UInt64 => s.parse::<u64>().ok().map(|v| ScalarValue::UInt64(Some(v))),
+        DataType::Float32 => s.parse::<f32>().ok().map(|v| ScalarValue::Float32(Some(v))),
+        DataType::Float64 => s.parse::<f64>().ok().map(|v| ScalarValue::Float64(Some(v))),
+        DataType::Utf8 => Some(ScalarValue::Utf8(Some(s.to_string()))),
+        DataType::LargeUtf8 => Some(ScalarValue::LargeUtf8(Some(s.to_string()))),
+        DataType::Date32 => s.parse::<i32>().ok().map(|v| ScalarValue::Date32(Some(v))),
+        DataType::Date64 => s.parse::<i64>().ok().map(|v| ScalarValue::Date64(Some(v))),
+        _ => None,
     }
 }
 

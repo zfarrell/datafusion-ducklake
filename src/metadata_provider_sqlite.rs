@@ -3,8 +3,9 @@
 use crate::Result;
 use crate::metadata_provider::{
     ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileData, DuckLakeTableColumn,
-    DuckLakeTableFile, FileWithTable, MetadataProvider, SchemaMetadata, SnapshotMetadata,
-    TableMetadata, TableWithSchema, block_on,
+    DuckLakeTableFile, FileColumnStats, FileWithTable, MetadataProvider, SchemaMetadata,
+    SnapshotMetadata, TableMetadata, TableWithSchema, ViewMetadata, block_on,
+    SQL_GET_FILE_COLUMN_STATS, SQL_GET_VIEW_BY_NAME, SQL_LIST_VIEWS, SQL_VIEW_EXISTS,
 };
 use sqlx::Row;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
@@ -205,6 +206,7 @@ impl MetadataProvider for SqliteMetadataProvider {
 
             rows.into_iter()
                 .map(|row| {
+                    let data_file_id: Option<i64> = row.try_get(0)?;
                     let data_file = DuckLakeFileData {
                         path: row.try_get(1)?,
                         path_is_relative: row.try_get(2)?,
@@ -226,6 +228,7 @@ impl MetadataProvider for SqliteMetadataProvider {
                     };
 
                     Ok(DuckLakeTableFile {
+                        data_file_id,
                         file: data_file,
                         delete_file,
                         row_id_start: None,
@@ -467,6 +470,7 @@ impl MetadataProvider for SqliteMetadataProvider {
                         schema_name: row.try_get(0)?,
                         table_name: row.try_get(1)?,
                         file: DuckLakeTableFile {
+                            data_file_id: row.try_get(2)?,
                             file: data_file,
                             delete_file,
                             row_id_start: None,
@@ -674,6 +678,90 @@ WHERE data.table_id = ?
                     })
                 })
                 .collect()
+        })
+    }
+
+    fn get_file_column_stats(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+    ) -> Result<Vec<FileColumnStats>> {
+        block_on(async {
+            sqlx::query(SQL_GET_FILE_COLUMN_STATS)
+                .bind(table_id)
+                .bind(snapshot_id)
+                .bind(snapshot_id)
+                .fetch_all(&self.pool)
+                .await?
+                .into_iter()
+                .map(|row| {
+                    Ok(FileColumnStats {
+                        data_file_id: row.try_get(0)?,
+                        column_name: row.try_get(1)?,
+                        null_count: row.try_get(2)?,
+                        min_value: row.try_get(3)?,
+                        max_value: row.try_get(4)?,
+                    })
+                })
+                .collect()
+        })
+    }
+
+    fn list_views(&self, schema_id: i64, snapshot_id: i64) -> Result<Vec<ViewMetadata>> {
+        block_on(async {
+            sqlx::query(SQL_LIST_VIEWS)
+                .bind(schema_id)
+                .bind(snapshot_id)
+                .bind(snapshot_id)
+                .fetch_all(&self.pool)
+                .await?
+                .iter()
+                .map(|row| {
+                    Ok(ViewMetadata {
+                        view_id: row.try_get(0)?,
+                        view_name: row.try_get(1)?,
+                        sql: row.try_get(2)?,
+                    })
+                })
+                .collect()
+        })
+    }
+
+    fn get_view_by_name(
+        &self,
+        schema_id: i64,
+        name: &str,
+        snapshot_id: i64,
+    ) -> Result<Option<ViewMetadata>> {
+        block_on(async {
+            let row = sqlx::query(SQL_GET_VIEW_BY_NAME)
+                .bind(schema_id)
+                .bind(name)
+                .bind(snapshot_id)
+                .bind(snapshot_id)
+                .fetch_optional(&self.pool)
+                .await?;
+            match row {
+                Some(row) => Ok(Some(ViewMetadata {
+                    view_id: row.try_get(0)?,
+                    view_name: row.try_get(1)?,
+                    sql: row.try_get(2)?,
+                })),
+                None => Ok(None),
+            }
+        })
+    }
+
+    fn view_exists(&self, schema_id: i64, name: &str, snapshot_id: i64) -> Result<bool> {
+        block_on(async {
+            let row = sqlx::query(SQL_VIEW_EXISTS)
+                .bind(schema_id)
+                .bind(name)
+                .bind(snapshot_id)
+                .bind(snapshot_id)
+                .fetch_one(&self.pool)
+                .await?;
+            Ok(row.try_get::<bool, _>(0)?)
         })
     }
 }

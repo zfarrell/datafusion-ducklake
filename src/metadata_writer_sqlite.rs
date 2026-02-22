@@ -5,8 +5,8 @@
 use crate::Result;
 use crate::metadata_provider::block_on;
 use crate::metadata_writer::{
-    AlterTableOp, ColumnDef, DataFileInfo, DeleteFileInfo, MetadataWriter, WriteMode,
-    WriteSetupResult,
+    AlterTableOp, ColumnDef, ColumnStatInfo, DataFileInfo, DeleteFileInfo, MetadataWriter,
+    WriteMode, WriteSetupResult,
 };
 use sqlx::Row;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
@@ -90,6 +90,16 @@ CREATE TABLE IF NOT EXISTS ducklake_snapshot_changes (
     change_type TEXT NOT NULL,
     table_id INTEGER,
     schema_id INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS ducklake_file_column_stats (
+    data_file_id INTEGER NOT NULL,
+    table_id INTEGER NOT NULL,
+    column_id INTEGER NOT NULL,
+    null_count INTEGER,
+    min_value VARCHAR,
+    max_value VARCHAR,
+    PRIMARY KEY (data_file_id, column_id)
 );
 
 CREATE TABLE IF NOT EXISTS ducklake_view (
@@ -255,6 +265,35 @@ impl MetadataWriter for SqliteMetadataWriter {
 
             tx.commit().await?;
             Ok(column_ids)
+        })
+    }
+
+    fn register_column_stats(
+        &self,
+        data_file_id: i64,
+        table_id: i64,
+        stats: &[ColumnStatInfo],
+    ) -> Result<()> {
+        if stats.is_empty() {
+            return Ok(());
+        }
+        block_on(async {
+            for stat in stats {
+                sqlx::query(
+                    "INSERT OR REPLACE INTO ducklake_file_column_stats
+                     (data_file_id, table_id, column_id, null_count, min_value, max_value)
+                     VALUES (?, ?, ?, ?, ?, ?)",
+                )
+                .bind(data_file_id)
+                .bind(table_id)
+                .bind(stat.column_id)
+                .bind(stat.null_count)
+                .bind(&stat.min_value)
+                .bind(&stat.max_value)
+                .execute(&self.pool)
+                .await?;
+            }
+            Ok(())
         })
     }
 

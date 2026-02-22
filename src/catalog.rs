@@ -10,10 +10,11 @@ use crate::path_resolver::{parse_object_store_url, resolve_path};
 use crate::schema::DuckLakeSchema;
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
 use datafusion::datasource::object_store::ObjectStoreUrl;
-use datafusion::error::Result as DataFusionResult;
 
 #[cfg(feature = "write")]
 use crate::metadata_writer::MetadataWriter;
+#[cfg(feature = "write")]
+use datafusion::error::{DataFusionError, Result as DataFusionResult};
 
 /// Configuration for write operations (when write feature is enabled)
 #[cfg(feature = "write")]
@@ -150,8 +151,6 @@ impl CatalogProvider for DuckLakeCatalog {
         name: &str,
         cascade: bool,
     ) -> DataFusionResult<Option<Arc<dyn SchemaProvider>>> {
-        use datafusion::error::DataFusionError;
-
         let config = self.write_config.as_ref().ok_or_else(|| {
             DataFusionError::Plan(
                 "Catalog is read-only. Use DuckLakeCatalog::with_writer() to enable writes."
@@ -216,6 +215,57 @@ impl CatalogProvider for DuckLakeCatalog {
             self.object_store_url.clone(),
             schema_path,
         );
+
+        Ok(Some(Arc::new(schema) as Arc<dyn SchemaProvider>))
+    }
+
+    /// Register (create) a new schema in this catalog.
+    ///
+    /// Called by DataFusion for CREATE SCHEMA statements.
+    /// Creates the schema in DuckLake metadata via MetadataWriter.
+    /// The passed-in schema provider is ignored; a DuckLakeSchema is created instead.
+    #[cfg(feature = "write")]
+    fn register_schema(
+        &self,
+        name: &str,
+        _schema: Arc<dyn SchemaProvider>,
+    ) -> DataFusionResult<Option<Arc<dyn SchemaProvider>>> {
+        let config = self.write_config.as_ref().ok_or_else(|| {
+            DataFusionError::Plan(
+                "Catalog is read-only. Use DuckLakeCatalog::with_writer() to enable writes."
+                    .to_string(),
+            )
+        })?;
+
+        // Cannot create information_schema
+        if name == "information_schema" {
+            return Err(DataFusionError::Plan(
+                "Cannot create schema 'information_schema': reserved name".to_string(),
+            ));
+        }
+
+        // Create snapshot and schema in metadata
+        let snapshot_id = config
+            .writer
+            .create_snapshot()
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        let (schema_id, _was_created) = config
+            .writer
+            .get_or_create_schema(name, None, snapshot_id)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        // Build the schema provider
+        let schema_path = resolve_path(&self.catalog_path, name, true);
+        let schema = DuckLakeSchema::new(
+            schema_id,
+            name,
+            Arc::clone(&self.provider),
+            self.snapshot_id,
+            self.object_store_url.clone(),
+            schema_path,
+        )
+        .with_writer(Arc::clone(&config.writer));
 
         Ok(Some(Arc::new(schema) as Arc<dyn SchemaProvider>))
     }

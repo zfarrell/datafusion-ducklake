@@ -176,7 +176,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
                 [table_id, snapshot_id, snapshot_id, table_id, snapshot_id, snapshot_id],
                 |row| {
                     // Parse data file (columns 0-5)
-                    let _data_file_id: i64 = row.get(0)?;
+                    let data_file_id: i64 = row.get(0)?;
                     let data_file = DuckLakeFileData {
                         path: row.get(1)?,
                         path_is_relative: row.get(2)?,
@@ -201,11 +201,12 @@ impl MetadataProvider for DuckdbMetadataProvider {
                     let _delete_count: Option<i64> = row.get(12)?;
 
                     Ok(DuckLakeTableFile {
+                        data_file_id: Some(data_file_id),
                         file: data_file,
                         delete_file,
                         row_id_start: None,
                         snapshot_id: Some(snapshot_id),
-                        max_row_count: None, // Set to None until we have actual row count from data file metadata
+                        max_row_count: None,
                     })
                 },
             )?
@@ -352,7 +353,8 @@ impl MetadataProvider for DuckdbMetadataProvider {
                     let schema_name: String = row.get(0)?;
                     let table_name: String = row.get(1)?;
 
-                    // Parse data file (skip column 2: data_file_id, only used for JOIN)
+                    // Parse data file (column 2: data_file_id)
+                    let data_file_id: i64 = row.get(2)?;
                     let data_file = DuckLakeFileData {
                         path: row.get(3)?,
                         path_is_relative: row.get(4)?,
@@ -381,6 +383,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
                         schema_name,
                         table_name,
                         file: DuckLakeTableFile {
+                            data_file_id: Some(data_file_id),
                             file: data_file,
                             delete_file,
                             row_id_start: None,

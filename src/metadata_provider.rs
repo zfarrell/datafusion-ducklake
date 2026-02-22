@@ -71,6 +71,18 @@ pub const SQL_TABLE_EXISTS: &str = "SELECT EXISTS(
          AND (? < end_snapshot OR end_snapshot IS NULL)
      )";
 
+// Column-level statistics query
+// Joins through ducklake_column to get column_name so stats from different
+// column versions (which have different column_ids) can be aggregated correctly.
+pub const SQL_GET_FILE_COLUMN_STATS: &str = "
+    SELECT s.data_file_id, c.column_name, s.null_count, s.min_value, s.max_value
+    FROM ducklake_file_column_stats s
+    JOIN ducklake_data_file f ON s.data_file_id = f.data_file_id
+    JOIN ducklake_column c ON s.column_id = c.column_id
+    WHERE s.table_id = ?
+      AND ? >= f.begin_snapshot
+      AND (? < f.end_snapshot OR f.end_snapshot IS NULL)";
+
 // Queries for table_changes (CDC) - files added/removed between snapshots
 
 pub const SQL_GET_DATA_FILES_ADDED_BETWEEN_SNAPSHOTS: &str = "
@@ -261,6 +273,17 @@ pub const SQL_LIST_ALL_FILES: &str = "
       AND (? < data.end_snapshot OR data.end_snapshot IS NULL)
     ORDER BY s.schema_name, t.table_name, data.path";
 
+// View queries
+
+pub const SQL_LIST_VIEWS: &str =
+    "SELECT view_id, view_name, sql FROM ducklake_view WHERE schema_id = ? AND ? >= begin_snapshot AND (? < end_snapshot OR end_snapshot IS NULL)";
+
+pub const SQL_GET_VIEW_BY_NAME: &str =
+    "SELECT view_id, view_name, sql FROM ducklake_view WHERE schema_id = ? AND view_name = ? AND ? >= begin_snapshot AND (? < end_snapshot OR end_snapshot IS NULL)";
+
+pub const SQL_VIEW_EXISTS: &str = "SELECT EXISTS(
+    SELECT 1 FROM ducklake_view WHERE schema_id = ? AND view_name = ? AND ? >= begin_snapshot AND (? < end_snapshot OR end_snapshot IS NULL))";
+
 /// Metadata for a snapshot in the DuckLake catalog
 #[derive(Debug, Clone)]
 pub struct SnapshotMetadata {
@@ -294,6 +317,32 @@ pub struct TableMetadata {
     pub path: String,
     /// Whether the path is relative to the schema's path
     pub path_is_relative: bool,
+}
+
+/// Metadata for a view in the DuckLake catalog
+#[derive(Debug, Clone)]
+pub struct ViewMetadata {
+    /// Unique identifier for this view in the catalog
+    pub view_id: i64,
+    /// Name of the view as it appears in SQL queries
+    pub view_name: String,
+    /// SQL query that defines the view
+    pub sql: String,
+}
+
+/// Per-column statistics for a single data file
+#[derive(Debug, Clone)]
+pub struct FileColumnStats {
+    /// ID of the data file
+    pub data_file_id: i64,
+    /// Column name in the catalog
+    pub column_name: String,
+    /// Number of null values
+    pub null_count: Option<i64>,
+    /// Minimum value as a string
+    pub min_value: Option<String>,
+    /// Maximum value as a string
+    pub max_value: Option<String>,
 }
 
 /// Table metadata with its schema name (for bulk queries)
@@ -386,6 +435,8 @@ impl DuckLakeFileData {
 /// Represents a data file and its associated delete file (if any) for a DuckLake table
 #[derive(Debug, Clone)]
 pub struct DuckLakeTableFile {
+    /// ID of the data file in the catalog (needed for delete file registration)
+    pub data_file_id: Option<i64>,
     /// Metadata for the data file
     pub file: DuckLakeFileData,
     /// Optional associated delete file containing deleted row positions
@@ -401,6 +452,7 @@ pub struct DuckLakeTableFile {
 impl DuckLakeTableFile {
     pub fn new(file: DuckLakeFileData) -> Self {
         Self {
+            data_file_id: None,
             file,
             delete_file: None,
             row_id_start: None,
@@ -514,6 +566,42 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         start_snapshot: i64,
         end_snapshot: i64,
     ) -> Result<Vec<DataFileChange>>;
+
+    // Column statistics methods
+
+    /// Get per-file column statistics for a table at a given snapshot.
+    ///
+    /// Returns statistics only for active data files (those visible at this snapshot).
+    /// Default implementation returns empty (no stats available).
+    fn get_file_column_stats(
+        &self,
+        _table_id: i64,
+        _snapshot_id: i64,
+    ) -> Result<Vec<FileColumnStats>> {
+        Ok(Vec::new())
+    }
+
+    // View methods (with default implementations for backward compatibility)
+
+    /// List views for a specific schema and snapshot
+    fn list_views(&self, _schema_id: i64, _snapshot_id: i64) -> Result<Vec<ViewMetadata>> {
+        Ok(Vec::new())
+    }
+
+    /// Get a view by name for a specific schema and snapshot
+    fn get_view_by_name(
+        &self,
+        _schema_id: i64,
+        _name: &str,
+        _snapshot_id: i64,
+    ) -> Result<Option<ViewMetadata>> {
+        Ok(None)
+    }
+
+    /// Check if a view exists for a specific schema and snapshot
+    fn view_exists(&self, _schema_id: i64, _name: &str, _snapshot_id: i64) -> Result<bool> {
+        Ok(false)
+    }
 
     /// Get delete files added between two snapshots (exclusive start, inclusive end)
     /// Returns delete files where begin_snapshot > start_snapshot AND begin_snapshot <= end_snapshot
