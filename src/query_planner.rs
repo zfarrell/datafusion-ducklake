@@ -61,9 +61,9 @@ impl QueryPlanner for DuckLakeQueryPlanner {
                 ..
             }) => {
                 let table = downcast_ducklake_table(target)?;
-                let filters = extract_filters(input);
+                let filters = extract_filters(input)?;
                 table.delete(session_state, &filters).await
-            }
+            },
             LogicalPlan::Dml(DmlStatement {
                 target,
                 op: WriteOp::Update,
@@ -73,13 +73,13 @@ impl QueryPlanner for DuckLakeQueryPlanner {
                 let table = downcast_ducklake_table(target)?;
                 let (assignments, filters) = extract_update_info(input, &table)?;
                 table.update(session_state, assignments, &filters).await
-            }
+            },
             _ => {
                 let planner = DefaultPhysicalPlanner::default();
                 planner
                     .create_physical_plan(logical_plan, session_state)
                     .await
-            }
+            },
         }
     }
 }
@@ -118,16 +118,42 @@ fn downcast_ducklake_table(
 ///
 /// Column references are unnormalized (qualifiers stripped) so they match
 /// the unqualified column names in the table schema.
-fn extract_filters(plan: &LogicalPlan) -> Vec<Expr> {
+///
+/// Returns an error for unrecognized plan shapes (subqueries, JOINs, etc.)
+/// rather than silently returning empty filters, which would delete all rows.
+fn extract_filters(plan: &LogicalPlan) -> Result<Vec<Expr>> {
     match plan {
-        LogicalPlan::Filter(Filter { predicate, .. }) => {
-            datafusion::logical_expr::utils::split_conjunction(predicate)
-                .into_iter()
-                .cloned()
-                .map(unnormalize_col)
-                .collect()
-        }
-        _ => vec![],
+        LogicalPlan::Filter(Filter {
+            predicate,
+            input,
+            ..
+        }) => {
+            // Verify the filter's input is a TableScan — reject complex plans
+            // like SemiJoin (from IN subquery) or other join-based rewrites
+            match input.as_ref() {
+                LogicalPlan::TableScan(_) => {},
+                other => {
+                    return Err(DataFusionError::NotImplemented(format!(
+                        "DELETE/UPDATE with complex WHERE clause is not supported. \
+                         Expected TableScan under Filter, got: {}",
+                        other.display()
+                    )));
+                },
+            }
+            Ok(
+                datafusion::logical_expr::utils::split_conjunction(predicate)
+                    .into_iter()
+                    .cloned()
+                    .map(unnormalize_col)
+                    .collect(),
+            )
+        },
+        LogicalPlan::TableScan(_) => Ok(vec![]),
+        other => Err(DataFusionError::NotImplemented(format!(
+            "DELETE/UPDATE with complex WHERE clause is not supported. \
+             Expected Filter or TableScan, got: {}",
+            other.display()
+        ))),
     }
 }
 
@@ -148,16 +174,20 @@ fn extract_update_info(
 ) -> Result<(Vec<UpdateAssignment>, Vec<Expr>)> {
     // Walk the plan: expect Project(exprs, Filter(pred, Scan)) or Project(exprs, Scan)
     let (projection_exprs, filter_plan) = match plan {
-        LogicalPlan::Projection(Projection { expr, input, .. }) => (expr, input.as_ref()),
+        LogicalPlan::Projection(Projection {
+            expr,
+            input,
+            ..
+        }) => (expr, input.as_ref()),
         _ => {
             return Err(DataFusionError::Plan(
                 "UPDATE: expected Projection as top-level input node".to_string(),
             ));
-        }
+        },
     };
 
-    // Extract filter if present
-    let filters = extract_filters(filter_plan);
+    // Extract filter if present — returns error for complex plans (subqueries, JOINs)
+    let filters = extract_filters(filter_plan)?;
 
     // Build assignments by comparing projection exprs to original column references.
     // The SQL planner produces one expr per column, aliased to the column name.
@@ -198,47 +228,76 @@ fn extract_update_info(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::logical_expr::{col, lit};
+    use datafusion::logical_expr::{LogicalTableSource, col, lit};
 
     #[test]
-    fn test_extract_filters_empty_plan() {
-        // A TableScan (no filter) should return empty filters
-        // We can't easily construct a real TableScan in tests, but we can
-        // verify the function handles non-Filter plans
+    fn test_extract_filters_unrecognized_plan_returns_error() {
+        // An unrecognized plan shape (not TableScan or Filter) should error,
+        // NOT silently return empty filters (which would delete all rows)
         let plan = LogicalPlan::EmptyRelation(datafusion::logical_expr::EmptyRelation {
             produce_one_row: false,
             schema: Arc::new(datafusion::common::DFSchema::empty()),
         });
-        let filters = extract_filters(&plan);
-        assert!(filters.is_empty());
+        let result = extract_filters(&plan);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not supported"),
+            "Error should mention unsupported: {err_msg}"
+        );
+    }
+
+    fn make_test_scan(fields: Vec<arrow::datatypes::Field>) -> LogicalPlan {
+        let schema = Arc::new(arrow::datatypes::Schema::new(fields));
+        let source = Arc::new(LogicalTableSource::new(schema));
+        LogicalPlan::TableScan(
+            datafusion::logical_expr::TableScan::try_new("test", source, None, vec![], None)
+                .unwrap(),
+        )
     }
 
     #[test]
     fn test_extract_filters_single() {
+        // Filter over TableScan should extract the predicate
+        let scan = make_test_scan(vec![arrow::datatypes::Field::new(
+            "id",
+            arrow::datatypes::DataType::Int32,
+            false,
+        )]);
+        let predicate = col("id").eq(lit(1));
+        let filter = Filter::try_new(predicate.clone(), Arc::new(scan)).unwrap();
+        let plan = LogicalPlan::Filter(filter);
+
+        let filters = extract_filters(&plan).unwrap();
+        assert_eq!(filters.len(), 1);
+    }
+
+    #[test]
+    fn test_extract_filters_conjunction() {
+        let scan = make_test_scan(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int32, false),
+            arrow::datatypes::Field::new("name", arrow::datatypes::DataType::Utf8, true),
+        ]);
+        let predicate = col("id").gt(lit(1)).and(col("name").eq(lit("test")));
+        let filter = Filter::try_new(predicate, Arc::new(scan)).unwrap();
+        let plan = LogicalPlan::Filter(filter);
+
+        let filters = extract_filters(&plan).unwrap();
+        assert_eq!(filters.len(), 2);
+    }
+
+    #[test]
+    fn test_extract_filters_filter_over_non_scan_returns_error() {
+        // Filter over a non-TableScan (e.g., from a subquery rewrite) should error
         let inner = LogicalPlan::EmptyRelation(datafusion::logical_expr::EmptyRelation {
             produce_one_row: false,
             schema: Arc::new(datafusion::common::DFSchema::empty()),
         });
         let predicate = col("id").eq(lit(1));
-        let filter = Filter::try_new(predicate.clone(), Arc::new(inner)).unwrap();
-        let plan = LogicalPlan::Filter(filter);
-
-        let filters = extract_filters(&plan);
-        assert_eq!(filters.len(), 1);
-        assert_eq!(filters[0], predicate);
-    }
-
-    #[test]
-    fn test_extract_filters_conjunction() {
-        let inner = LogicalPlan::EmptyRelation(datafusion::logical_expr::EmptyRelation {
-            produce_one_row: false,
-            schema: Arc::new(datafusion::common::DFSchema::empty()),
-        });
-        let predicate = col("id").gt(lit(1)).and(col("name").eq(lit("test")));
         let filter = Filter::try_new(predicate, Arc::new(inner)).unwrap();
         let plan = LogicalPlan::Filter(filter);
 
-        let filters = extract_filters(&plan);
-        assert_eq!(filters.len(), 2);
+        let result = extract_filters(&plan);
+        assert!(result.is_err());
     }
 }
