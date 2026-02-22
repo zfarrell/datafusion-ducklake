@@ -68,6 +68,8 @@ pub mod delete_exec;
 pub mod insert_exec;
 #[cfg(feature = "write")]
 pub mod metadata_writer;
+#[cfg(feature = "write-postgres")]
+pub mod metadata_writer_postgres;
 #[cfg(feature = "write-sqlite")]
 pub mod metadata_writer_sqlite;
 #[cfg(feature = "write")]
@@ -108,6 +110,8 @@ pub use metadata_writer::{
     ColumnDef, ColumnStatInfo, DataFileInfo, DeleteFileInfo, MetadataWriter, WriteMode,
     WriteResult, WriteSetupResult,
 };
+#[cfg(feature = "write-postgres")]
+pub use metadata_writer_postgres::PostgresMetadataWriter;
 #[cfg(feature = "write-sqlite")]
 pub use metadata_writer_sqlite::SqliteMetadataWriter;
 #[cfg(feature = "write")]
