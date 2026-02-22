@@ -14,18 +14,18 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use datafusion::common::stats::Precision;
 use datafusion::common::ScalarValue;
+use datafusion::common::stats::Precision;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::*;
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 
-use datafusion_ducklake::{
-    DuckLakeCatalog, DuckLakeQueryPlanner, DuckLakeTableWriter, MetadataProvider,
-    MetadataWriter, SqliteMetadataProvider, SqliteMetadataWriter,
-};
 use datafusion_ducklake::metadata_writer::{AlterTableOp, ColumnDef};
+use datafusion_ducklake::{
+    DuckLakeCatalog, DuckLakeQueryPlanner, DuckLakeTableWriter, MetadataProvider, MetadataWriter,
+    SqliteMetadataProvider, SqliteMetadataWriter,
+};
 
 // ============================================================================
 // Common helpers
@@ -133,10 +133,7 @@ fn id_name_schema() -> Arc<Schema> {
 fn make_batch(ids: Vec<i32>, names: Vec<&str>) -> RecordBatch {
     RecordBatch::try_new(
         id_name_schema(),
-        vec![
-            Arc::new(Int32Array::from(ids)),
-            Arc::new(StringArray::from(names)),
-        ],
+        vec![Arc::new(Int32Array::from(ids)), Arc::new(StringArray::from(names))],
     )
     .unwrap()
 }
@@ -223,10 +220,7 @@ async fn test_empty_table_count_star() {
     write_table(writer.clone(), "main", "cnt_tbl", &[batch]).await;
 
     let ctx = create_dml_ctx(&temp_dir).await;
-    let df = ctx
-        .sql("DELETE FROM ducklake.main.cnt_tbl")
-        .await
-        .unwrap();
+    let df = ctx.sql("DELETE FROM ducklake.main.cnt_tbl").await.unwrap();
     collect_dml_count(df).await;
 
     let read_ctx = create_read_ctx(&temp_dir).await;
@@ -309,7 +303,9 @@ async fn test_all_null_column_count() {
     let read_ctx = create_read_ctx(&temp_dir).await;
     // COUNT(*) should count all rows
     let df = read_ctx
-        .sql("SELECT COUNT(*) as all_rows, COUNT(val) as non_null FROM ducklake.main.null_count_tbl")
+        .sql(
+            "SELECT COUNT(*) as all_rows, COUNT(val) as non_null FROM ducklake.main.null_count_tbl",
+        )
         .await
         .unwrap();
     let batches = df.collect().await.unwrap();
@@ -337,7 +333,10 @@ async fn test_all_null_column_count() {
 async fn test_unicode_emoji() {
     let (writer, temp_dir) = create_test_env().await;
 
-    let batch = make_batch(vec![1, 2, 3], vec!["\u{1F389}", "\u{1F680}", "\u{2764}\u{FE0F}"]);
+    let batch = make_batch(
+        vec![1, 2, 3],
+        vec!["\u{1F389}", "\u{1F680}", "\u{2764}\u{FE0F}"],
+    );
     write_table(writer.clone(), "main", "emoji_tbl", &[batch]).await;
 
     let read_ctx = create_read_ctx(&temp_dir).await;
@@ -377,7 +376,7 @@ async fn test_unicode_cjk() {
         .as_any()
         .downcast_ref::<StringArray>()
         .unwrap();
-    assert_eq!(names.value(0), "\u{4E2D}\u{6587}");       // 中文
+    assert_eq!(names.value(0), "\u{4E2D}\u{6587}"); // 中文
     assert_eq!(names.value(1), "\u{65E5}\u{672C}\u{8A9E}"); // 日本語
     assert_eq!(names.value(2), "\u{D55C}\u{AD6D}\u{C5B4}"); // 한국어
 }
@@ -416,16 +415,10 @@ async fn test_unicode_combining_and_zwj() {
 async fn test_large_int64_values() {
     let (writer, temp_dir) = create_test_env().await;
 
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("val", DataType::Int64, false),
-    ]));
+    let schema = Arc::new(Schema::new(vec![Field::new("val", DataType::Int64, false)]));
     let batch = RecordBatch::try_new(
         schema,
-        vec![Arc::new(Int64Array::from(vec![
-            i64::MAX,
-            i64::MIN,
-            0,
-        ]))],
+        vec![Arc::new(Int64Array::from(vec![i64::MAX, i64::MIN, 0]))],
     )
     .unwrap();
     write_table(writer.clone(), "main", "big_ints", &[batch]).await;
@@ -478,9 +471,11 @@ async fn test_very_long_varchar() {
 async fn test_high_precision_float() {
     let (writer, temp_dir) = create_test_env().await;
 
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("val", DataType::Float64, false),
-    ]));
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "val",
+        DataType::Float64,
+        false,
+    )]));
     let batch = RecordBatch::try_new(
         schema,
         vec![Arc::new(Float64Array::from(vec![
@@ -525,10 +520,7 @@ async fn test_delete_all_rows_no_where() {
     write_table(writer.clone(), "main", "del_all", &[batch]).await;
 
     let ctx = create_dml_ctx(&temp_dir).await;
-    let df = ctx
-        .sql("DELETE FROM ducklake.main.del_all")
-        .await
-        .unwrap();
+    let df = ctx.sql("DELETE FROM ducklake.main.del_all").await.unwrap();
     let count = collect_dml_count(df).await;
     assert_eq!(count, 5);
 
@@ -721,18 +713,20 @@ async fn test_complex_type_nested_list() {
 
     // LIST(LIST(INTEGER)) should parse correctly
     let result = ducklake_to_arrow_type("list(list(integer))");
-    assert!(result.is_ok(), "LIST(LIST(INTEGER)) should parse: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "LIST(LIST(INTEGER)) should parse: {:?}",
+        result
+    );
 
     let dt = result.unwrap();
     match &dt {
-        DataType::List(inner) => {
-            match inner.data_type() {
-                DataType::List(inner2) => {
-                    assert_eq!(*inner2.data_type(), DataType::Int32);
-                }
-                other => panic!("Expected inner List, got {:?}", other),
-            }
-        }
+        DataType::List(inner) => match inner.data_type() {
+            DataType::List(inner2) => {
+                assert_eq!(*inner2.data_type(), DataType::Int32);
+            },
+            other => panic!("Expected inner List, got {:?}", other),
+        },
         other => panic!("Expected List, got {:?}", other),
     }
 }
@@ -755,10 +749,10 @@ async fn test_complex_type_nested_struct() {
                     assert_eq!(inner_fields.len(), 1);
                     assert_eq!(inner_fields[0].name(), "b");
                     assert_eq!(*inner_fields[0].data_type(), DataType::Int32);
-                }
+                },
                 other => panic!("Expected inner Struct, got {:?}", other),
             }
-        }
+        },
         other => panic!("Expected Struct, got {:?}", other),
     }
 }
@@ -769,7 +763,11 @@ async fn test_complex_type_map_with_list_value() {
 
     // MAP(VARCHAR, LIST(INTEGER))
     let result = ducklake_to_arrow_type("map(varchar, list(integer))");
-    assert!(result.is_ok(), "MAP(VARCHAR, LIST(INTEGER)) should parse: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "MAP(VARCHAR, LIST(INTEGER)) should parse: {:?}",
+        result
+    );
 
     let dt = result.unwrap();
     match &dt {
@@ -780,13 +778,13 @@ async fn test_complex_type_map_with_list_value() {
                 match fields[1].data_type() {
                     DataType::List(inner) => {
                         assert_eq!(*inner.data_type(), DataType::Int32);
-                    }
+                    },
                     other => panic!("Expected List value type, got {:?}", other),
                 }
             } else {
                 panic!("Expected Struct inside Map");
             }
-        }
+        },
         other => panic!("Expected Map, got {:?}", other),
     }
 }
@@ -853,10 +851,11 @@ async fn test_schema_lifecycle() {
 
     // Querying the table should fail
     let ctx6 = create_read_ctx(&temp_dir).await;
-    let result = ctx6
-        .sql("SELECT * FROM ducklake.lifecycle.items")
-        .await;
-    assert!(result.is_err(), "Table should not be queryable after schema drop");
+    let result = ctx6.sql("SELECT * FROM ducklake.lifecycle.items").await;
+    assert!(
+        result.is_err(),
+        "Table should not be queryable after schema drop"
+    );
 }
 
 // ============================================================================
@@ -1007,7 +1006,11 @@ async fn test_alter_table_add_column_then_query() {
     let mut found_charlie_email = false;
     let mut null_email_count = 0;
     for batch in &batches {
-        let ids = batch.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
         let emails = batch.column(1);
         for i in 0..batch.num_rows() {
             if ids.value(i) == 3 {
@@ -1020,13 +1023,20 @@ async fn test_alter_table_add_column_then_query() {
                     found_charlie_email = true;
                 }
             } else {
-                assert!(emails.is_null(i), "Old row id={} should have NULL email", ids.value(i));
+                assert!(
+                    emails.is_null(i),
+                    "Old row id={} should have NULL email",
+                    ids.value(i)
+                );
                 null_email_count += 1;
             }
         }
     }
     assert!(found_charlie_email, "Should find charlie's email");
-    assert_eq!(null_email_count, 2, "Should have 2 old rows with NULL email");
+    assert_eq!(
+        null_email_count, 2,
+        "Should have 2 old rows with NULL email"
+    );
 }
 
 // ============================================================================
@@ -1116,8 +1126,8 @@ async fn test_stats_still_valid_after_delete() {
         match &id_stats2.min_value {
             Precision::Inexact(ScalarValue::Int32(Some(v))) => {
                 assert!(*v <= 1, "Min should be <= 1, got {}", v);
-            }
-            _ => {} // stats format may vary, just check it doesn't panic
+            },
+            _ => {}, // stats format may vary, just check it doesn't panic
         }
     }
 

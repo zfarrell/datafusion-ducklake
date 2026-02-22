@@ -99,10 +99,7 @@ fn test_schema() -> Schema {
 fn test_batch(ids: Vec<i32>, names: Vec<&str>) -> RecordBatch {
     RecordBatch::try_new(
         Arc::new(test_schema()),
-        vec![
-            Arc::new(Int32Array::from(ids)),
-            Arc::new(StringArray::from(names)),
-        ],
+        vec![Arc::new(Int32Array::from(ids)), Arc::new(StringArray::from(names))],
     )
     .unwrap()
 }
@@ -318,10 +315,10 @@ async fn test_drop_table_without_if_exists_nonexistent() {
                 exec.is_err(),
                 "DROP TABLE on non-existent table should fail"
             );
-        }
+        },
         Err(_) => {
             // Planning-time failure is also acceptable
-        }
+        },
     }
 }
 
@@ -454,13 +451,13 @@ async fn test_drop_schema_empty() {
                 "DROP SCHEMA on empty schema should succeed: {:?}",
                 exec.err()
             );
-        }
+        },
         Err(e) => {
             panic!(
                 "DROP SCHEMA on empty schema should not fail during planning: {}",
                 e
             );
-        }
+        },
     }
 
     // Verify schema is gone
@@ -498,9 +495,7 @@ async fn test_drop_schema_cascade() {
 
     // Drop schema with CASCADE
     let ctx = create_writable_ctx(&temp_dir).await;
-    let result = ctx
-        .sql("DROP SCHEMA ducklake.cascade_schema CASCADE")
-        .await;
+    let result = ctx.sql("DROP SCHEMA ducklake.cascade_schema CASCADE").await;
 
     match result {
         Ok(df) => {
@@ -510,10 +505,10 @@ async fn test_drop_schema_cascade() {
                 "DROP SCHEMA CASCADE should succeed: {:?}",
                 exec.err()
             );
-        }
+        },
         Err(e) => {
             panic!("DROP SCHEMA CASCADE should not fail: {}", e);
-        }
+        },
     }
 
     // Verify schema and tables are gone
@@ -559,7 +554,7 @@ async fn test_drop_schema_nonempty_without_cascade_fails() {
                 "Error should mention dependencies or CASCADE, got: {}",
                 err_msg
             );
-        }
+        },
         Err(e) => {
             // Planning-time failure is also acceptable
             let err_msg = e.to_string();
@@ -570,7 +565,7 @@ async fn test_drop_schema_nonempty_without_cascade_fails() {
                 "Error should mention dependencies or CASCADE, got: {}",
                 err_msg
             );
-        }
+        },
     }
 
     // Verify schema is still there
@@ -669,7 +664,7 @@ async fn test_drop_schema_information_schema_fails() {
                 "Error should mention information_schema, got: {}",
                 err_msg
             );
-        }
+        },
         Err(e) => {
             let err_msg = e.to_string();
             assert!(
@@ -677,7 +672,7 @@ async fn test_drop_schema_information_schema_fails() {
                 "Error should mention information_schema, got: {}",
                 err_msg
             );
-        }
+        },
     }
 }
 
@@ -742,8 +737,8 @@ async fn test_not_null_insert_with_null_fails() {
     // Create a table with NOT NULL columns using the writer API
     let schema = Schema::new(vec![
         Field::new("id", DataType::Int32, false),  // NOT NULL
-        Field::new("name", DataType::Utf8, false),  // NOT NULL
-        Field::new("email", DataType::Utf8, true),  // nullable
+        Field::new("name", DataType::Utf8, false), // NOT NULL
+        Field::new("email", DataType::Utf8, true), // nullable
     ]);
 
     let batch = RecordBatch::try_new(
@@ -797,7 +792,7 @@ async fn test_not_null_insert_with_null_fails() {
                 "Error should mention NOT NULL constraint, got: {}",
                 err_msg
             );
-        }
+        },
         Err(e) => {
             // Planning-time failure is also acceptable
             let err_msg = e.to_string();
@@ -806,7 +801,7 @@ async fn test_not_null_insert_with_null_fails() {
                 "Error should mention NOT NULL constraint, got: {}",
                 err_msg
             );
-        }
+        },
     }
 }
 
@@ -816,16 +811,13 @@ async fn test_not_null_insert_valid_succeeds() {
 
     // Create a table with NOT NULL columns
     let schema = Schema::new(vec![
-        Field::new("id", DataType::Int32, false),   // NOT NULL
-        Field::new("name", DataType::Utf8, false),   // NOT NULL
+        Field::new("id", DataType::Int32, false),  // NOT NULL
+        Field::new("name", DataType::Utf8, false), // NOT NULL
     ]);
 
     let batch = RecordBatch::try_new(
         Arc::new(schema.clone()),
-        vec![
-            Arc::new(Int32Array::from(vec![1])),
-            Arc::new(StringArray::from(vec!["Alice"])),
-        ],
+        vec![Arc::new(Int32Array::from(vec![1])), Arc::new(StringArray::from(vec!["Alice"]))],
     )
     .unwrap();
 
@@ -914,10 +906,7 @@ async fn test_not_null_nullable_column_accepts_null() {
     let ctx = create_writable_ctx(&temp_dir).await;
     let null_batch = RecordBatch::try_new(
         Arc::new(schema),
-        vec![
-            Arc::new(Int32Array::from(vec![2])),
-            Arc::new(StringArray::from(vec![None::<&str>])),
-        ],
+        vec![Arc::new(Int32Array::from(vec![2])), Arc::new(StringArray::from(vec![None::<&str>]))],
     )
     .unwrap();
     ctx.register_batch("null_email_source", null_batch).unwrap();
@@ -958,16 +947,13 @@ async fn test_not_null_mixed_null_batch_fails() {
 
     // Create a table with a NOT NULL column
     let schema = Schema::new(vec![
-        Field::new("id", DataType::Int32, false),    // NOT NULL
-        Field::new("value", DataType::Utf8, false),   // NOT NULL
+        Field::new("id", DataType::Int32, false),   // NOT NULL
+        Field::new("value", DataType::Utf8, false), // NOT NULL
     ]);
 
     let initial_batch = RecordBatch::try_new(
         Arc::new(schema.clone()),
-        vec![
-            Arc::new(Int32Array::from(vec![1])),
-            Arc::new(StringArray::from(vec!["init"])),
-        ],
+        vec![Arc::new(Int32Array::from(vec![1])), Arc::new(StringArray::from(vec!["init"]))],
     )
     .unwrap();
 
@@ -1020,7 +1006,7 @@ async fn test_not_null_mixed_null_batch_fails() {
                 "Error should mention NOT NULL constraint, got: {}",
                 err_msg
             );
-        }
+        },
         Err(e) => {
             let err_msg = e.to_string();
             assert!(
@@ -1028,7 +1014,7 @@ async fn test_not_null_mixed_null_batch_fails() {
                 "Error should mention NOT NULL constraint, got: {}",
                 err_msg
             );
-        }
+        },
     }
 }
 
@@ -1044,10 +1030,7 @@ async fn test_not_null_error_mentions_column_name() {
 
     let batch = RecordBatch::try_new(
         Arc::new(schema.clone()),
-        vec![
-            Arc::new(Int32Array::from(vec![1])),
-            Arc::new(StringArray::from(vec!["present"])),
-        ],
+        vec![Arc::new(Int32Array::from(vec![1])), Arc::new(StringArray::from(vec!["present"]))],
     )
     .unwrap();
 
@@ -1070,10 +1053,7 @@ async fn test_not_null_error_mentions_column_name() {
 
     let null_batch = RecordBatch::try_new(
         insert_schema,
-        vec![
-            Arc::new(Int32Array::from(vec![2])),
-            Arc::new(StringArray::from(vec![None::<&str>])),
-        ],
+        vec![Arc::new(Int32Array::from(vec![2])), Arc::new(StringArray::from(vec![None::<&str>]))],
     )
     .unwrap();
 
@@ -1102,7 +1082,7 @@ async fn test_not_null_constraint_preserved_after_insert() {
     // Create a table with NOT NULL columns using the writer API
     let schema = Schema::new(vec![
         Field::new("id", DataType::Int32, false),    // NOT NULL
-        Field::new("status", DataType::Utf8, false),  // NOT NULL
+        Field::new("status", DataType::Utf8, false), // NOT NULL
     ]);
 
     let batch = RecordBatch::try_new(
@@ -1114,23 +1094,13 @@ async fn test_not_null_constraint_preserved_after_insert() {
     )
     .unwrap();
 
-    create_table_with_data(
-        &temp_dir,
-        "main",
-        "status_table",
-        &schema,
-        vec![batch],
-    )
-    .await;
+    create_table_with_data(&temp_dir, "main", "status_table", &schema, vec![batch]).await;
 
     // First, do a valid INSERT to evolve the schema
     let ctx = create_writable_ctx(&temp_dir).await;
     let valid_batch = RecordBatch::try_new(
         Arc::new(schema.clone()),
-        vec![
-            Arc::new(Int32Array::from(vec![3])),
-            Arc::new(StringArray::from(vec!["pending"])),
-        ],
+        vec![Arc::new(Int32Array::from(vec![3])), Arc::new(StringArray::from(vec!["pending"]))],
     )
     .unwrap();
     ctx.register_batch("valid_insert", valid_batch).unwrap();
@@ -1151,10 +1121,7 @@ async fn test_not_null_constraint_preserved_after_insert() {
 
     let null_source = RecordBatch::try_new(
         null_source_schema,
-        vec![
-            Arc::new(Int32Array::from(vec![4])),
-            Arc::new(StringArray::from(vec![None::<&str>])),
-        ],
+        vec![Arc::new(Int32Array::from(vec![4])), Arc::new(StringArray::from(vec![None::<&str>]))],
     )
     .unwrap();
 
@@ -1171,10 +1138,10 @@ async fn test_not_null_constraint_preserved_after_insert() {
                 exec.is_err(),
                 "INSERT with NULL in NOT NULL column should fail even after prior inserts"
             );
-        }
+        },
         Err(_) => {
             // Planning-time failure is acceptable
-        }
+        },
     }
 }
 
@@ -1252,13 +1219,20 @@ async fn test_drop_table_data_files_preserved() {
     .await;
 
     // Find data files before drop
-    let data_dir = temp_dir.path().join("data").join("main").join("preserved_data");
+    let data_dir = temp_dir
+        .path()
+        .join("data")
+        .join("main")
+        .join("preserved_data");
     let files_before: Vec<_> = std::fs::read_dir(&data_dir)
         .unwrap()
         .filter_map(|e| e.ok())
         .filter(|e| e.path().extension().is_some_and(|ext| ext == "parquet"))
         .collect();
-    assert!(!files_before.is_empty(), "Should have data files before drop");
+    assert!(
+        !files_before.is_empty(),
+        "Should have data files before drop"
+    );
 
     // Drop the table
     let ctx = create_writable_ctx(&temp_dir).await;

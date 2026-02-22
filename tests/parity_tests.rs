@@ -42,11 +42,8 @@ fn duckdb_query(catalog_path: &str, sql: &str) -> Vec<Vec<String>> {
     conn.execute("INSTALL ducklake;", []).unwrap();
     conn.execute("LOAD ducklake;", []).unwrap();
     let ducklake_path = format!("ducklake:{catalog_path}");
-    conn.execute(
-        &format!("ATTACH '{ducklake_path}' AS dl (READ_ONLY);"),
-        [],
-    )
-    .unwrap();
+    conn.execute(&format!("ATTACH '{ducklake_path}' AS dl (READ_ONLY);"), [])
+        .unwrap();
 
     let mut stmt = conn.prepare(sql).unwrap();
     let mut duckdb_rows = stmt.query([]).unwrap();
@@ -81,18 +78,24 @@ fn duckdb_value_to_string(v: &duckdb::types::Value) -> String {
         duckdb::types::Value::Date32(days) => {
             let date = chrono::NaiveDate::from_num_days_from_ce_opt(days + 719_163).unwrap();
             date.format("%Y-%m-%d").to_string()
-        }
+        },
         duckdb::types::Value::Timestamp(unit, val) => {
             // DuckDB timestamps: convert to seconds + subsec based on unit
             let (secs, nsecs) = match unit {
                 duckdb::types::TimeUnit::Second => (*val, 0u32),
-                duckdb::types::TimeUnit::Millisecond => (val / 1000, ((val % 1000) * 1_000_000) as u32),
-                duckdb::types::TimeUnit::Microsecond => (val / 1_000_000, ((val % 1_000_000) * 1_000) as u32),
-                duckdb::types::TimeUnit::Nanosecond => (val / 1_000_000_000, (val % 1_000_000_000) as u32),
+                duckdb::types::TimeUnit::Millisecond => {
+                    (val / 1000, ((val % 1000) * 1_000_000) as u32)
+                },
+                duckdb::types::TimeUnit::Microsecond => {
+                    (val / 1_000_000, ((val % 1_000_000) * 1_000) as u32)
+                },
+                duckdb::types::TimeUnit::Nanosecond => {
+                    (val / 1_000_000_000, (val % 1_000_000_000) as u32)
+                },
             };
             let dt = chrono::DateTime::from_timestamp(secs, nsecs).unwrap();
             dt.format("%Y-%m-%d %H:%M:%S").to_string()
-        }
+        },
         _ => {
             // Fallback: use Debug format but try to extract the value
             let s = format!("{v:?}");
@@ -101,7 +104,7 @@ fn duckdb_value_to_string(v: &duckdb::types::Value) -> String {
                 return s[8..s.len() - 1].to_string();
             }
             s
-        }
+        },
     }
 }
 
@@ -130,46 +133,46 @@ fn arrow_value_to_string(array: &dyn Array, idx: usize) -> String {
         DataType::Boolean => {
             let a = array.as_any().downcast_ref::<BooleanArray>().unwrap();
             a.value(idx).to_string()
-        }
+        },
         DataType::Int8 => {
             let a = array.as_any().downcast_ref::<Int8Array>().unwrap();
             a.value(idx).to_string()
-        }
+        },
         DataType::Int16 => {
             let a = array.as_any().downcast_ref::<Int16Array>().unwrap();
             a.value(idx).to_string()
-        }
+        },
         DataType::Int32 => {
             let a = array.as_any().downcast_ref::<Int32Array>().unwrap();
             a.value(idx).to_string()
-        }
+        },
         DataType::Int64 => {
             let a = array.as_any().downcast_ref::<Int64Array>().unwrap();
             a.value(idx).to_string()
-        }
+        },
         DataType::Float32 => {
             let a = array.as_any().downcast_ref::<Float32Array>().unwrap();
             format!("{}", a.value(idx))
-        }
+        },
         DataType::Float64 => {
             let a = array.as_any().downcast_ref::<Float64Array>().unwrap();
             format!("{}", a.value(idx))
-        }
+        },
         DataType::Utf8 => {
             let a = array.as_any().downcast_ref::<StringArray>().unwrap();
             a.value(idx).to_string()
-        }
+        },
         DataType::LargeUtf8 => {
             let a = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
             a.value(idx).to_string()
-        }
+        },
         DataType::Date32 => {
             let a = array.as_any().downcast_ref::<Date32Array>().unwrap();
             // Date32 stores days since epoch
             let days = a.value(idx);
             let date = chrono::NaiveDate::from_num_days_from_ce_opt(days + 719_163).unwrap();
             date.format("%Y-%m-%d").to_string()
-        }
+        },
         DataType::Timestamp(unit, _) => {
             let s = match unit {
                 arrow::datatypes::TimeUnit::Microsecond => {
@@ -182,7 +185,7 @@ fn arrow_value_to_string(array: &dyn Array, idx: usize) -> String {
                     let subsec_us = (us % 1_000_000) as u32;
                     let dt = chrono::DateTime::from_timestamp(secs, subsec_us * 1000).unwrap();
                     dt.format("%Y-%m-%d %H:%M:%S").to_string()
-                }
+                },
                 arrow::datatypes::TimeUnit::Nanosecond => {
                     let a = array
                         .as_any()
@@ -193,7 +196,7 @@ fn arrow_value_to_string(array: &dyn Array, idx: usize) -> String {
                     let subsec_ns = (ns % 1_000_000_000) as u32;
                     let dt = chrono::DateTime::from_timestamp(secs, subsec_ns).unwrap();
                     dt.format("%Y-%m-%d %H:%M:%S").to_string()
-                }
+                },
                 arrow::datatypes::TimeUnit::Millisecond => {
                     let a = array
                         .as_any()
@@ -202,10 +205,9 @@ fn arrow_value_to_string(array: &dyn Array, idx: usize) -> String {
                     let ms = a.value(idx);
                     let secs = ms / 1_000;
                     let subsec_ms = (ms % 1_000) as u32;
-                    let dt =
-                        chrono::DateTime::from_timestamp(secs, subsec_ms * 1_000_000).unwrap();
+                    let dt = chrono::DateTime::from_timestamp(secs, subsec_ms * 1_000_000).unwrap();
                     dt.format("%Y-%m-%d %H:%M:%S").to_string()
-                }
+                },
                 arrow::datatypes::TimeUnit::Second => {
                     let a = array
                         .as_any()
@@ -214,10 +216,10 @@ fn arrow_value_to_string(array: &dyn Array, idx: usize) -> String {
                     let s = a.value(idx);
                     let dt = chrono::DateTime::from_timestamp(s, 0).unwrap();
                     dt.format("%Y-%m-%d %H:%M:%S").to_string()
-                }
+                },
             };
             s
-        }
+        },
         DataType::Decimal128(_, scale) => {
             let a = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
             let raw = a.value(idx);
@@ -226,17 +228,13 @@ fn arrow_value_to_string(array: &dyn Array, idx: usize) -> String {
             let whole = raw / divisor;
             let frac = (raw % divisor).unsigned_abs();
             format!("{whole}.{frac:0>width$}", width = scale as usize)
-        }
+        },
         other => format!("<unsupported:{other:?}>"),
     }
 }
 
 /// Assert two result sets are equal (after normalizing floats).
-fn assert_results_equal(
-    scenario: &str,
-    expected: &[Vec<String>],
-    actual: &[Vec<String>],
-) {
+fn assert_results_equal(scenario: &str, expected: &[Vec<String>], actual: &[Vec<String>]) {
     assert_eq!(
         expected.len(),
         actual.len(),
@@ -283,11 +281,8 @@ fn setup_ducklake_catalog(catalog_path: &std::path::Path, setup_sql: &str) {
     conn.execute("INSTALL ducklake;", []).unwrap();
     conn.execute("LOAD ducklake;", []).unwrap();
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
-    conn.execute(
-        &format!("ATTACH '{ducklake_path}' AS dl;"),
-        [],
-    )
-    .unwrap();
+    conn.execute(&format!("ATTACH '{ducklake_path}' AS dl;"), [])
+        .unwrap();
 
     // Execute each statement separately
     for stmt in setup_sql.split(';') {
@@ -475,10 +470,7 @@ async fn parity_null_count_semantics() -> DfResult<()> {
     );
 
     let path_str = catalog_path.to_string_lossy().to_string();
-    let expected = duckdb_query(
-        &path_str,
-        "SELECT COUNT(*), COUNT(val) FROM dl.main.nulls",
-    );
+    let expected = duckdb_query(&path_str, "SELECT COUNT(*), COUNT(val) FROM dl.main.nulls");
     assert_eq!(expected.len(), 1);
     assert_eq!(expected[0], vec!["3", "1"]);
 
@@ -506,10 +498,7 @@ async fn parity_alter_table_add_column() -> DfResult<()> {
     );
 
     let path_str = catalog_path.to_string_lossy().to_string();
-    let expected = duckdb_query(
-        &path_str,
-        "SELECT * FROM dl.main.alter_test ORDER BY id",
-    );
+    let expected = duckdb_query(&path_str, "SELECT * FROM dl.main.alter_test ORDER BY id");
     assert_eq!(expected.len(), 2);
 
     let ctx = create_df_session(&path_str)?;

@@ -11,8 +11,8 @@ use std::sync::Arc;
 use arrow::array::{Float64Array, Int32Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use datafusion::common::stats::Precision;
 use datafusion::common::ScalarValue;
+use datafusion::common::stats::Precision;
 use datafusion::prelude::*;
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
@@ -64,7 +64,11 @@ async fn test_stats_written_to_metadata() {
         schema,
         vec![
             Arc::new(Int32Array::from(vec![1, 2, 3])),
-            Arc::new(StringArray::from(vec![Some("alice"), None, Some("charlie")])),
+            Arc::new(StringArray::from(vec![
+                Some("alice"),
+                None,
+                Some("charlie"),
+            ])),
         ],
     )
     .unwrap();
@@ -202,11 +206,8 @@ async fn test_stats_with_multiple_appends() {
         .unwrap();
 
     // Second write (append): values 10, 20
-    let batch2 = RecordBatch::try_new(
-        schema,
-        vec![Arc::new(Int32Array::from(vec![10, 20]))],
-    )
-    .unwrap();
+    let batch2 =
+        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![10, 20]))]).unwrap();
 
     let table_writer2 = DuckLakeTableWriter::new(writer.clone(), object_store).unwrap();
     table_writer2
@@ -293,7 +294,14 @@ async fn test_no_stats_returns_none() {
     let (writer, temp_dir) = create_test_env().await;
 
     // Create a table via SQL that has no data files → no stats
-    writer.begin_write_transaction("main", "empty_table", &[], datafusion_ducklake::WriteMode::Replace).unwrap();
+    writer
+        .begin_write_transaction(
+            "main",
+            "empty_table",
+            &[],
+            datafusion_ducklake::WriteMode::Replace,
+        )
+        .unwrap();
 
     let ctx = create_read_context(&temp_dir).await;
     let table = ctx

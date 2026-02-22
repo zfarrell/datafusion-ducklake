@@ -3,9 +3,9 @@
 use crate::Result;
 use crate::metadata_provider::{
     ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileData, DuckLakeTableColumn,
-    DuckLakeTableFile, FileColumnStats, FileWithTable, MetadataProvider, SchemaMetadata,
-    SnapshotMetadata, TableMetadata, TableWithSchema, ViewMetadata, block_on,
-    SQL_GET_FILE_COLUMN_STATS, SQL_GET_VIEW_BY_NAME, SQL_LIST_VIEWS, SQL_VIEW_EXISTS,
+    DuckLakeTableFile, FileColumnStats, FileWithTable, MetadataProvider, SQL_GET_FILE_COLUMN_STATS,
+    SQL_GET_VIEW_BY_NAME, SQL_LIST_VIEWS, SQL_VIEW_EXISTS, SchemaMetadata, SnapshotMetadata,
+    TableMetadata, TableWithSchema, ViewMetadata, block_on,
 };
 use sqlx::Row;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};

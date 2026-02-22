@@ -66,15 +66,15 @@ pub mod delete_exec;
 #[cfg(feature = "write")]
 pub mod insert_exec;
 #[cfg(feature = "write")]
-pub mod query_planner;
-#[cfg(feature = "write")]
-pub mod update_exec;
-#[cfg(feature = "write")]
 pub mod metadata_writer;
 #[cfg(feature = "write-sqlite")]
 pub mod metadata_writer_sqlite;
 #[cfg(feature = "write")]
+pub mod query_planner;
+#[cfg(feature = "write")]
 pub mod table_writer;
+#[cfg(feature = "write")]
+pub mod update_exec;
 
 // Result type for DuckLake operations
 pub type Result<T> = std::result::Result<T, DuckLakeError>;
@@ -110,8 +110,8 @@ pub use metadata_writer::{
 #[cfg(feature = "write-sqlite")]
 pub use metadata_writer_sqlite::SqliteMetadataWriter;
 #[cfg(feature = "write")]
-pub use table_writer::{DuckLakeTableWriter, TableWriteSession};
-#[cfg(feature = "write")]
 pub use query_planner::DuckLakeQueryPlanner;
+#[cfg(feature = "write")]
+pub use table_writer::{DuckLakeTableWriter, TableWriteSession};
 #[cfg(feature = "write")]
 pub use update_exec::{DuckLakeUpdateExec, UpdateAssignment};

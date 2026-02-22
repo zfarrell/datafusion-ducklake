@@ -35,10 +35,7 @@ fn test_schema() -> Arc<Schema> {
 fn make_batch(ids: Vec<i32>, names: Vec<&str>) -> RecordBatch {
     RecordBatch::try_new(
         test_schema(),
-        vec![
-            Arc::new(Int32Array::from(ids)),
-            Arc::new(StringArray::from(names)),
-        ],
+        vec![Arc::new(Int32Array::from(ids)), Arc::new(StringArray::from(names))],
     )
     .unwrap()
 }
@@ -57,8 +54,7 @@ async fn setup_test_data(batches: &[RecordBatch]) -> TempDir {
     writer.set_data_path(data_path.to_str().unwrap()).unwrap();
 
     let object_store = create_object_store();
-    let table_writer =
-        DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
+    let table_writer = DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
     table_writer
         .write_table("main", "test_table", batches)
         .await
@@ -327,8 +323,7 @@ async fn test_sql_update_with_expression() {
     writer.set_data_path(data_path.to_str().unwrap()).unwrap();
 
     let object_store = create_object_store();
-    let table_writer =
-        DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
+    let table_writer = DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
     table_writer
         .write_table("main", "test_table", &[batch])
         .await
@@ -354,8 +349,16 @@ async fn test_sql_update_with_expression() {
 
     let mut results: Vec<(i32, i32)> = Vec::new();
     for batch in &batches {
-        let ids = batch.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-        let vals = batch.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let vals = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
         for i in 0..batch.num_rows() {
             results.push((ids.value(i), vals.value(i)));
         }

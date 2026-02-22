@@ -83,10 +83,7 @@ fn test_schema() -> Arc<Schema> {
 fn make_batch(ids: Vec<i32>, names: Vec<&str>) -> RecordBatch {
     RecordBatch::try_new(
         test_schema(),
-        vec![
-            Arc::new(Int32Array::from(ids)),
-            Arc::new(StringArray::from(names)),
-        ],
+        vec![Arc::new(Int32Array::from(ids)), Arc::new(StringArray::from(names))],
     )
     .unwrap()
 }
@@ -173,10 +170,7 @@ async fn query_rows(ctx: &SessionContext) -> Vec<(i32, String)> {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_update_with_literal_value() {
     let (writer, temp_dir) = create_test_env().await;
-    let batch = make_batch(
-        vec![1, 2, 3],
-        vec!["alice", "bob", "charlie"],
-    );
+    let batch = make_batch(vec![1, 2, 3], vec!["alice", "bob", "charlie"]);
     write_test_data(writer, &[batch]).await;
 
     // UPDATE test_table SET name = 'updated' WHERE id = 2
@@ -204,10 +198,7 @@ async fn test_update_with_literal_value() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_update_multiple_rows() {
     let (writer, temp_dir) = create_test_env().await;
-    let batch = make_batch(
-        vec![1, 2, 3, 4, 5],
-        vec!["a", "b", "c", "d", "e"],
-    );
+    let batch = make_batch(vec![1, 2, 3, 4, 5], vec!["a", "b", "c", "d", "e"]);
     write_test_data(writer, &[batch]).await;
 
     // UPDATE test_table SET name = 'X' WHERE id > 3
@@ -313,10 +304,7 @@ async fn test_update_preserves_row_count() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_update_with_existing_deletes() {
     let (writer, temp_dir) = create_test_env().await;
-    let batch = make_batch(
-        vec![1, 2, 3, 4, 5],
-        vec!["a", "b", "c", "d", "e"],
-    );
+    let batch = make_batch(vec![1, 2, 3, 4, 5], vec!["a", "b", "c", "d", "e"]);
     write_test_data(writer, &[batch]).await;
 
     // First: delete id=3
@@ -328,10 +316,7 @@ async fn test_update_with_existing_deletes() {
         let catalog = ctx.catalog("test").unwrap();
         let schema = catalog.schema("main").unwrap();
         let table = schema.table("test_table").await.unwrap().unwrap();
-        let ducklake_table = table
-            .as_any()
-            .downcast_ref::<DuckLakeTable>()
-            .unwrap();
+        let ducklake_table = table.as_any().downcast_ref::<DuckLakeTable>().unwrap();
         let state = ctx.state();
         let plan = ducklake_table
             .delete(&state, &[col("id").eq(lit(3))])
@@ -356,7 +341,10 @@ async fn test_update_with_existing_deletes() {
         &[col("id").gt_eq(lit(2))],
     )
     .await;
-    assert_eq!(updated, 3, "Should update ids 2, 4, 5 (not 3, which is deleted)");
+    assert_eq!(
+        updated, 3,
+        "Should update ids 2, 4, 5 (not 3, which is deleted)"
+    );
 
     // Verify
     let ctx = create_read_context(&temp_dir).await;

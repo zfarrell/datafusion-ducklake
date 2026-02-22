@@ -275,11 +275,9 @@ pub const SQL_LIST_ALL_FILES: &str = "
 
 // View queries
 
-pub const SQL_LIST_VIEWS: &str =
-    "SELECT view_id, view_name, sql FROM ducklake_view WHERE schema_id = ? AND ? >= begin_snapshot AND (? < end_snapshot OR end_snapshot IS NULL)";
+pub const SQL_LIST_VIEWS: &str = "SELECT view_id, view_name, sql FROM ducklake_view WHERE schema_id = ? AND ? >= begin_snapshot AND (? < end_snapshot OR end_snapshot IS NULL)";
 
-pub const SQL_GET_VIEW_BY_NAME: &str =
-    "SELECT view_id, view_name, sql FROM ducklake_view WHERE schema_id = ? AND view_name = ? AND ? >= begin_snapshot AND (? < end_snapshot OR end_snapshot IS NULL)";
+pub const SQL_GET_VIEW_BY_NAME: &str = "SELECT view_id, view_name, sql FROM ducklake_view WHERE schema_id = ? AND view_name = ? AND ? >= begin_snapshot AND (? < end_snapshot OR end_snapshot IS NULL)";
 
 pub const SQL_VIEW_EXISTS: &str = "SELECT EXISTS(
     SELECT 1 FROM ducklake_view WHERE schema_id = ? AND view_name = ? AND ? >= begin_snapshot AND (? < end_snapshot OR end_snapshot IS NULL))";

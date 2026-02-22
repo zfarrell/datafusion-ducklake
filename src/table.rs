@@ -615,8 +615,7 @@ impl TableProvider for DuckLakeTable {
             .collect();
 
         let num_cols = self.columns.len();
-        let mut col_stats: Vec<ColumnStatistics> =
-            vec![ColumnStatistics::new_unknown(); num_cols];
+        let mut col_stats: Vec<ColumnStatistics> = vec![ColumnStatistics::new_unknown(); num_cols];
 
         // Track per-column aggregated null_count and min/max across all files
         let mut null_counts: Vec<i64> = vec![0; num_cols];
@@ -649,7 +648,7 @@ impl TableProvider for DuckLakeTable {
                             } else {
                                 col_stats[col_idx].min_value.clone()
                             }
-                        }
+                        },
                     };
                 }
             }
@@ -665,7 +664,7 @@ impl TableProvider for DuckLakeTable {
                             } else {
                                 col_stats[col_idx].max_value.clone()
                             }
-                        }
+                        },
                     };
                 }
             }
@@ -799,7 +798,10 @@ fn parse_stat_value(s: &str, data_type: &DataType) -> Option<datafusion::common:
     use datafusion::common::ScalarValue;
 
     match data_type {
-        DataType::Boolean => s.parse::<bool>().ok().map(|v| ScalarValue::Boolean(Some(v))),
+        DataType::Boolean => s
+            .parse::<bool>()
+            .ok()
+            .map(|v| ScalarValue::Boolean(Some(v))),
         DataType::Int8 => s.parse::<i8>().ok().map(|v| ScalarValue::Int8(Some(v))),
         DataType::Int16 => s.parse::<i16>().ok().map(|v| ScalarValue::Int16(Some(v))),
         DataType::Int32 => s.parse::<i32>().ok().map(|v| ScalarValue::Int32(Some(v))),

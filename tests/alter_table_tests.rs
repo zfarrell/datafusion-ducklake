@@ -26,10 +26,7 @@ async fn create_test_writer() -> (SqliteMetadataWriter, TempDir) {
 }
 
 fn test_columns() -> Vec<ColumnDef> {
-    vec![
-        ColumnDef::new("id", "int32", false),
-        ColumnDef::new("name", "varchar", true),
-    ]
+    vec![ColumnDef::new("id", "int32", false), ColumnDef::new("name", "varchar", true)]
 }
 
 /// Helper: create a table and return (table_id, schema_id, snapshot_id)
@@ -206,8 +203,7 @@ async fn test_drop_last_column_fails() {
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(
-        err.to_string().contains("last column")
-            || err.to_string().contains("only has one column"),
+        err.to_string().contains("last column") || err.to_string().contains("only has one column"),
         "Error should mention last column: {err}"
     );
 }
@@ -308,10 +304,8 @@ async fn test_alter_column_type_widening() {
     let (writer, _temp) = create_test_writer().await;
 
     // Create table with int32 column
-    let columns = vec![
-        ColumnDef::new("id", "int32", false),
-        ColumnDef::new("value", "int32", true),
-    ];
+    let columns =
+        vec![ColumnDef::new("id", "int32", false), ColumnDef::new("value", "int32", true)];
     let setup = writer
         .begin_write_transaction("main", "data", &columns, WriteMode::Replace)
         .unwrap();

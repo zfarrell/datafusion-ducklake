@@ -24,10 +24,7 @@ async fn create_test_writer() -> (SqliteMetadataWriter, TempDir) {
 }
 
 fn test_columns() -> Vec<ColumnDef> {
-    vec![
-        ColumnDef::new("id", "int32", false),
-        ColumnDef::new("name", "varchar", true),
-    ]
+    vec![ColumnDef::new("id", "int32", false), ColumnDef::new("name", "varchar", true)]
 }
 
 // ==================== INSERT after DROP conflicts ====================
@@ -268,7 +265,10 @@ async fn test_no_conflict_concurrent_appends() {
         start_snapshot,
     );
 
-    assert!(result.is_ok(), "Concurrent appends should not conflict: {result:?}");
+    assert!(
+        result.is_ok(),
+        "Concurrent appends should not conflict: {result:?}"
+    );
 }
 
 // ==================== Error message quality ====================

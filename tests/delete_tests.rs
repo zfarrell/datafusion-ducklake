@@ -42,10 +42,7 @@ async fn create_test_env() -> (Arc<SqliteMetadataWriter>, TempDir) {
 }
 
 /// Write test data: a simple (id, name) table with the given rows.
-async fn write_test_data(
-    writer: Arc<SqliteMetadataWriter>,
-    batches: &[RecordBatch],
-) {
+async fn write_test_data(writer: Arc<SqliteMetadataWriter>, batches: &[RecordBatch]) {
     let object_store = create_object_store();
     let table_writer = DuckLakeTableWriter::new(writer, object_store).unwrap();
     table_writer
@@ -60,9 +57,7 @@ async fn create_writable_context(temp_dir: &TempDir) -> SessionContext {
     let conn_str = format!("sqlite:{}", db_path.display());
 
     let provider = Arc::new(SqliteMetadataProvider::new(&conn_str).await.unwrap());
-    let writer = Arc::new(
-        SqliteMetadataWriter::new(&conn_str).await.unwrap(),
-    );
+    let writer = Arc::new(SqliteMetadataWriter::new(&conn_str).await.unwrap());
     let catalog = DuckLakeCatalog::with_writer(provider, writer).unwrap();
 
     let ctx = SessionContext::new();
@@ -95,10 +90,7 @@ fn test_schema() -> Arc<Schema> {
 fn make_batch(ids: Vec<i32>, names: Vec<&str>) -> RecordBatch {
     RecordBatch::try_new(
         test_schema(),
-        vec![
-            Arc::new(Int32Array::from(ids)),
-            Arc::new(StringArray::from(names)),
-        ],
+        vec![Arc::new(Int32Array::from(ids)), Arc::new(StringArray::from(names))],
     )
     .unwrap()
 }
@@ -229,10 +221,7 @@ async fn test_delete_no_matching_rows() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_delete_then_select_reflects_deletion() {
     let (writer, temp_dir) = create_test_env().await;
-    let batch = make_batch(
-        vec![1, 2, 3, 4],
-        vec!["alice", "bob", "charlie", "diana"],
-    );
+    let batch = make_batch(vec![1, 2, 3, 4], vec!["alice", "bob", "charlie", "diana"]);
     write_test_data(writer, &[batch]).await;
 
     // Verify initial state
@@ -298,10 +287,7 @@ async fn test_delete_with_existing_deletes() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_delete_with_string_filter() {
     let (writer, temp_dir) = create_test_env().await;
-    let batch = make_batch(
-        vec![1, 2, 3],
-        vec!["keep", "remove", "keep"],
-    );
+    let batch = make_batch(vec![1, 2, 3], vec!["keep", "remove", "keep"]);
     write_test_data(writer, &[batch]).await;
 
     // Delete rows where name = 'remove'

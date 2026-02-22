@@ -15,8 +15,8 @@ use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 
 use datafusion_ducklake::{
-    DuckLakeCatalog, DuckLakeTableWriter, MetadataProvider, MetadataWriter,
-    SqliteMetadataProvider, SqliteMetadataWriter,
+    DuckLakeCatalog, DuckLakeTableWriter, MetadataProvider, MetadataWriter, SqliteMetadataProvider,
+    SqliteMetadataWriter,
 };
 
 fn create_object_store() -> Arc<dyn object_store::ObjectStore> {
@@ -69,10 +69,7 @@ fn test_schema() -> Arc<Schema> {
 fn make_batch(ids: Vec<i32>, names: Vec<&str>) -> RecordBatch {
     RecordBatch::try_new(
         test_schema(),
-        vec![
-            Arc::new(Int32Array::from(ids)),
-            Arc::new(StringArray::from(names)),
-        ],
+        vec![Arc::new(Int32Array::from(ids)), Arc::new(StringArray::from(names))],
     )
     .unwrap()
 }
@@ -118,8 +115,16 @@ async fn test_view_select_all() {
 
     let mut rows = Vec::new();
     for batch in &batches {
-        let ids = batch.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-        let names = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let names = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         for i in 0..batch.num_rows() {
             rows.push((ids.value(i), names.value(i).to_string()));
         }
@@ -153,8 +158,16 @@ async fn test_view_with_filter() {
 
     let mut rows = Vec::new();
     for batch in &batches {
-        let ids = batch.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-        let names = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let names = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         for i in 0..batch.num_rows() {
             rows.push((ids.value(i), names.value(i).to_string()));
         }
@@ -182,7 +195,11 @@ async fn test_view_with_projection() {
 
     let mut names = Vec::new();
     for batch in &batches {
-        let name_col = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        let name_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         for i in 0..batch.num_rows() {
             names.push(name_col.value(i).to_string());
         }

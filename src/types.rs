@@ -346,11 +346,7 @@ fn parse_map_type(inner: &str) -> Result<DataType> {
     let entries_field = Field::new(
         "entries",
         DataType::Struct(
-            vec![
-                Field::new("key", key_type, false),
-                Field::new("value", value_type, true),
-            ]
-            .into(),
+            vec![Field::new("key", key_type, false), Field::new("value", value_type, true)].into(),
         ),
         false,
     );
@@ -371,8 +367,8 @@ fn split_top_level(s: &str, sep: char) -> Vec<&str> {
             _ if c == sep && depth == 0 => {
                 result.push(&s[start..i]);
                 start = i + c.len_utf8();
-            }
-            _ => {}
+            },
+            _ => {},
         }
     }
     result.push(&s[start..]);
@@ -387,7 +383,7 @@ fn find_top_level_char(s: &str, target: char) -> Option<usize> {
             '(' | '<' | '[' => depth += 1,
             ')' | '>' | ']' => depth -= 1,
             _ if c == target && depth == 0 => return Some(i),
-            _ => {}
+            _ => {},
         }
     }
     None
@@ -741,11 +737,8 @@ mod tests {
     fn test_nested_struct_in_list() {
         let result = ducklake_to_arrow_type("list<struct<a:int32,b:varchar>>").unwrap();
         let inner_struct = DataType::Struct(
-            vec![
-                Field::new("a", DataType::Int32, true),
-                Field::new("b", DataType::Utf8, true),
-            ]
-            .into(),
+            vec![Field::new("a", DataType::Int32, true), Field::new("b", DataType::Utf8, true)]
+                .into(),
         );
         assert_eq!(
             result,
@@ -779,11 +772,8 @@ mod tests {
         // struct(a int32, b varchar)[]
         let result = ducklake_to_arrow_type("struct(a int32, b varchar)[]").unwrap();
         let inner_struct = DataType::Struct(
-            vec![
-                Field::new("a", DataType::Int32, true),
-                Field::new("b", DataType::Utf8, true),
-            ]
-            .into(),
+            vec![Field::new("a", DataType::Int32, true), Field::new("b", DataType::Utf8, true)]
+                .into(),
         );
         assert_eq!(
             result,
@@ -970,11 +960,8 @@ mod tests {
     #[test]
     fn test_arrow_to_ducklake_struct() {
         let struct_type = DataType::Struct(
-            vec![
-                Field::new("a", DataType::Int32, true),
-                Field::new("b", DataType::Utf8, true),
-            ]
-            .into(),
+            vec![Field::new("a", DataType::Int32, true), Field::new("b", DataType::Utf8, true)]
+                .into(),
         );
         assert_eq!(
             arrow_to_ducklake_type(&struct_type).unwrap(),

@@ -404,12 +404,7 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
 
     /// Create a view in the catalog.
     /// Creates a new snapshot, stores the view SQL definition, and returns (view_id, snapshot_id).
-    fn create_view(
-        &self,
-        schema_id: i64,
-        view_name: &str,
-        sql: &str,
-    ) -> Result<(i64, i64)>;
+    fn create_view(&self, schema_id: i64, view_name: &str, sql: &str) -> Result<(i64, i64)>;
 
     /// Drop a view by setting its end_snapshot.
     /// Creates a new snapshot and marks the view as dropped.
