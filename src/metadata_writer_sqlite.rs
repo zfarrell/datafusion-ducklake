@@ -145,6 +145,281 @@ impl SqliteMetadataWriter {
         writer.initialize_schema()?;
         Ok(writer)
     }
+
+    /// Inner write transaction logic, usable with an existing transaction.
+    /// Creates snapshot, schema, table, columns and commits.
+    async fn write_transaction_inner(
+        mut tx: sqlx::Transaction<'_, sqlx::Sqlite>,
+        schema_name: &str,
+        table_name: &str,
+        columns: &[ColumnDef],
+        mode: WriteMode,
+    ) -> Result<WriteSetupResult> {
+        let row = sqlx::query(
+            "INSERT INTO ducklake_snapshot (snapshot_time) VALUES (CURRENT_TIMESTAMP) RETURNING snapshot_id",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        let snapshot_id: i64 = row.try_get(0)?;
+
+        let schema_id: i64 = {
+            let existing = sqlx::query(
+                "SELECT schema_id FROM ducklake_schema
+                 WHERE schema_name = ? AND end_snapshot IS NULL",
+            )
+            .bind(schema_name)
+            .fetch_optional(&mut *tx)
+            .await?;
+
+            if let Some(row) = existing {
+                row.try_get(0)?
+            } else {
+                let row = sqlx::query(
+                    "INSERT INTO ducklake_schema (schema_name, path, path_is_relative, begin_snapshot)
+                     VALUES (?, ?, 1, ?) RETURNING schema_id",
+                )
+                .bind(schema_name)
+                .bind(schema_name)
+                .bind(snapshot_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                row.try_get(0)?
+            }
+        };
+
+        let table_id: i64 = {
+            let existing = sqlx::query(
+                "SELECT table_id FROM ducklake_table
+                 WHERE schema_id = ? AND table_name = ? AND end_snapshot IS NULL",
+            )
+            .bind(schema_id)
+            .bind(table_name)
+            .fetch_optional(&mut *tx)
+            .await?;
+
+            if let Some(row) = existing {
+                row.try_get(0)?
+            } else {
+                let row = sqlx::query(
+                    "INSERT INTO ducklake_table (schema_id, table_name, path, path_is_relative, begin_snapshot)
+                     VALUES (?, ?, ?, 1, ?) RETURNING table_id",
+                )
+                .bind(schema_id)
+                .bind(table_name)
+                .bind(table_name)
+                .bind(snapshot_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                row.try_get(0)?
+            }
+        };
+
+        // Get existing columns to check schema compatibility for appends
+        let rows = sqlx::query(
+            "SELECT column_name, column_type, nulls_allowed
+             FROM ducklake_column
+             WHERE table_id = ? AND end_snapshot IS NULL
+             ORDER BY column_order",
+        )
+        .bind(table_id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let mut existing_columns: Vec<(String, String, bool)> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let name: String = row.try_get(0)?;
+            let col_type: String = row.try_get(1)?;
+            let nullable: bool = row.try_get::<Option<bool>, _>(2)?.unwrap_or(true);
+            existing_columns.push((name, col_type, nullable));
+        }
+
+        // For append mode, validate schema compatibility with evolution rules:
+        // - Allowed: add nullable columns, remove columns, reorder columns
+        // - Disallowed: add non-nullable columns, type changes for existing columns
+        if mode == WriteMode::Append && !existing_columns.is_empty() {
+            use std::collections::HashMap;
+
+            // Build map of existing columns: name -> (type, nullable)
+            let existing_map: HashMap<&str, (&str, bool)> = existing_columns
+                .iter()
+                .map(|(name, col_type, nullable)| (name.as_str(), (col_type.as_str(), *nullable)))
+                .collect();
+
+            for new_col in columns.iter() {
+                if let Some((existing_type, _existing_nullable)) =
+                    existing_map.get(new_col.name.as_str())
+                {
+                    // Column exists - check type matches
+                    if *existing_type != new_col.ducklake_type {
+                        return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                            "Schema evolution error: column '{}' has type '{}' in existing table but '{}' in new schema. Type changes are not allowed.",
+                            new_col.name, existing_type, new_col.ducklake_type
+                        )));
+                    }
+                    // Note: We allow nullable changes (strict -> nullable is safe for reads)
+                } else {
+                    // New column - must be nullable
+                    if !new_col.is_nullable {
+                        return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                            "Schema evolution error: new column '{}' must be nullable. Adding non-nullable columns is not allowed.",
+                            new_col.name
+                        )));
+                    }
+                }
+            }
+            // Columns in existing but not in new schema are implicitly removed - this is allowed
+        }
+
+        sqlx::query(
+            "UPDATE ducklake_column SET end_snapshot = ?
+             WHERE table_id = ? AND end_snapshot IS NULL",
+        )
+        .bind(snapshot_id)
+        .bind(table_id)
+        .execute(&mut *tx)
+        .await?;
+
+        let mut column_ids = Vec::with_capacity(columns.len());
+        for (order, col) in columns.iter().enumerate() {
+            let row = sqlx::query(
+                "INSERT INTO ducklake_column (table_id, column_name, column_type, column_order, nulls_allowed, begin_snapshot)
+                 VALUES (?, ?, ?, ?, ?, ?) RETURNING column_id",
+            )
+            .bind(table_id)
+            .bind(&col.name)
+            .bind(&col.ducklake_type)
+            .bind(order as i64)
+            .bind(col.is_nullable)
+            .bind(snapshot_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            column_ids.push(row.try_get(0)?);
+        }
+
+        if mode == WriteMode::Replace {
+            sqlx::query(
+                "UPDATE ducklake_data_file SET end_snapshot = ?
+                 WHERE table_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(snapshot_id)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+
+        Ok(WriteSetupResult {
+            snapshot_id,
+            schema_id,
+            table_id,
+            column_ids,
+        })
+    }
+
+    /// Inner drop table logic, usable with an existing transaction.
+    async fn drop_table_inner(
+        mut tx: sqlx::Transaction<'_, sqlx::Sqlite>,
+        table_id: i64,
+    ) -> Result<i64> {
+        // Create a new snapshot for the drop
+        let row = sqlx::query(
+            "INSERT INTO ducklake_snapshot (snapshot_time) VALUES (CURRENT_TIMESTAMP) RETURNING snapshot_id",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        let snapshot_id: i64 = row.try_get(0)?;
+
+        // Mark the table as dropped by setting end_snapshot
+        sqlx::query(
+            "UPDATE ducklake_table SET end_snapshot = ?
+             WHERE table_id = ? AND end_snapshot IS NULL",
+        )
+        .bind(snapshot_id)
+        .bind(table_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // End all active columns for this table
+        sqlx::query(
+            "UPDATE ducklake_column SET end_snapshot = ?
+             WHERE table_id = ? AND end_snapshot IS NULL",
+        )
+        .bind(snapshot_id)
+        .bind(table_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // End all active data files for this table (metadata only, files remain)
+        sqlx::query(
+            "UPDATE ducklake_data_file SET end_snapshot = ?
+             WHERE table_id = ? AND end_snapshot IS NULL",
+        )
+        .bind(snapshot_id)
+        .bind(table_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // End all active delete files for this table
+        sqlx::query(
+            "UPDATE ducklake_delete_file SET end_snapshot = ?
+             WHERE table_id = ? AND end_snapshot IS NULL",
+        )
+        .bind(snapshot_id)
+        .bind(table_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // Record the change for conflict detection
+        sqlx::query(
+            "INSERT INTO ducklake_snapshot_changes (snapshot_id, change_type, table_id)
+             VALUES (?, 'DROP_TABLE', ?)",
+        )
+        .bind(snapshot_id)
+        .bind(table_id)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(snapshot_id)
+    }
+
+    /// Inner drop schema logic, usable with an existing transaction.
+    async fn drop_schema_inner(
+        mut tx: sqlx::Transaction<'_, sqlx::Sqlite>,
+        schema_id: i64,
+    ) -> Result<i64> {
+        // Create a new snapshot for the drop
+        let row = sqlx::query(
+            "INSERT INTO ducklake_snapshot (snapshot_time) VALUES (CURRENT_TIMESTAMP) RETURNING snapshot_id",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        let snapshot_id: i64 = row.try_get(0)?;
+
+        // Mark the schema as dropped
+        sqlx::query(
+            "UPDATE ducklake_schema SET end_snapshot = ?
+             WHERE schema_id = ? AND end_snapshot IS NULL",
+        )
+        .bind(snapshot_id)
+        .bind(schema_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // Record the change for conflict detection
+        sqlx::query(
+            "INSERT INTO ducklake_snapshot_changes (snapshot_id, change_type, schema_id)
+             VALUES (?, 'DROP_SCHEMA', ?)",
+        )
+        .bind(snapshot_id)
+        .bind(schema_id)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(snapshot_id)
+    }
 }
 
 impl MetadataWriter for SqliteMetadataWriter {
@@ -425,105 +700,15 @@ impl MetadataWriter for SqliteMetadataWriter {
 
     fn drop_table(&self, table_id: i64) -> Result<i64> {
         block_on(async {
-            let mut tx = self.pool.begin().await?;
-
-            // Create a new snapshot for the drop
-            let row = sqlx::query(
-                "INSERT INTO ducklake_snapshot (snapshot_time) VALUES (CURRENT_TIMESTAMP) RETURNING snapshot_id",
-            )
-            .fetch_one(&mut *tx)
-            .await?;
-            let snapshot_id: i64 = row.try_get(0)?;
-
-            // Mark the table as dropped by setting end_snapshot
-            sqlx::query(
-                "UPDATE ducklake_table SET end_snapshot = ?
-                 WHERE table_id = ? AND end_snapshot IS NULL",
-            )
-            .bind(snapshot_id)
-            .bind(table_id)
-            .execute(&mut *tx)
-            .await?;
-
-            // End all active columns for this table
-            sqlx::query(
-                "UPDATE ducklake_column SET end_snapshot = ?
-                 WHERE table_id = ? AND end_snapshot IS NULL",
-            )
-            .bind(snapshot_id)
-            .bind(table_id)
-            .execute(&mut *tx)
-            .await?;
-
-            // End all active data files for this table (metadata only, files remain)
-            sqlx::query(
-                "UPDATE ducklake_data_file SET end_snapshot = ?
-                 WHERE table_id = ? AND end_snapshot IS NULL",
-            )
-            .bind(snapshot_id)
-            .bind(table_id)
-            .execute(&mut *tx)
-            .await?;
-
-            // End all active delete files for this table
-            sqlx::query(
-                "UPDATE ducklake_delete_file SET end_snapshot = ?
-                 WHERE table_id = ? AND end_snapshot IS NULL",
-            )
-            .bind(snapshot_id)
-            .bind(table_id)
-            .execute(&mut *tx)
-            .await?;
-
-            // Record the change for conflict detection
-            sqlx::query(
-                "INSERT INTO ducklake_snapshot_changes (snapshot_id, change_type, table_id)
-                 VALUES (?, 'DROP_TABLE', ?)",
-            )
-            .bind(snapshot_id)
-            .bind(table_id)
-            .execute(&mut *tx)
-            .await?;
-
-            tx.commit().await?;
-            Ok(snapshot_id)
+            let tx = self.pool.begin().await?;
+            Self::drop_table_inner(tx, table_id).await
         })
     }
 
     fn drop_schema(&self, schema_id: i64) -> Result<i64> {
         block_on(async {
-            let mut tx = self.pool.begin().await?;
-
-            // Create a new snapshot for the drop
-            let row = sqlx::query(
-                "INSERT INTO ducklake_snapshot (snapshot_time) VALUES (CURRENT_TIMESTAMP) RETURNING snapshot_id",
-            )
-            .fetch_one(&mut *tx)
-            .await?;
-            let snapshot_id: i64 = row.try_get(0)?;
-
-            // Mark the schema as dropped
-            sqlx::query(
-                "UPDATE ducklake_schema SET end_snapshot = ?
-                 WHERE schema_id = ? AND end_snapshot IS NULL",
-            )
-            .bind(snapshot_id)
-            .bind(schema_id)
-            .execute(&mut *tx)
-            .await?;
-
-            // Record the change for conflict detection
-            sqlx::query(
-                "INSERT INTO ducklake_snapshot_changes (snapshot_id, change_type, schema_id)
-                 VALUES (?, 'DROP_SCHEMA', ?)",
-            )
-            .bind(snapshot_id)
-            .bind(schema_id)
-            .execute(&mut *tx)
-            .await?;
-
-            tx.commit().await?;
-            Ok(snapshot_id)
+            let tx = self.pool.begin().await?;
+            Self::drop_schema_inner(tx, schema_id).await
         })
     }
 
@@ -556,10 +741,8 @@ impl MetadataWriter for SqliteMetadataWriter {
         block_on(async {
             let mut tx = self.pool.begin().await?;
 
-            // Check for table drops: look up the table_id by name to see if it
-            // existed previously but was dropped since our snapshot.
-            // We check the snapshot_changes table for DROP_TABLE entries affecting
-            // any table with this name in this schema.
+            // Conflict check: look for DROP operations since our snapshot.
+            // This runs in the SAME transaction as the write to prevent TOCTOU races.
             let schema_row = sqlx::query(
                 "SELECT schema_id FROM ducklake_schema
                  WHERE schema_name = ?
@@ -572,7 +755,6 @@ impl MetadataWriter for SqliteMetadataWriter {
             if let Some(schema_row) = schema_row {
                 let schema_id: i64 = schema_row.try_get(0)?;
 
-                // Check if the schema was dropped since our snapshot
                 let schema_drop = sqlx::query(
                     "SELECT COUNT(*) FROM ducklake_snapshot_changes
                      WHERE snapshot_id > ? AND schema_id = ? AND change_type = 'DROP_SCHEMA'",
@@ -581,15 +763,13 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .bind(schema_id)
                 .fetch_one(&mut *tx)
                 .await?;
-                let schema_drop_count: i64 = schema_drop.try_get(0)?;
-                if schema_drop_count > 0 {
+                if schema_drop.try_get::<i64, _>(0)? > 0 {
                     return Err(crate::error::DuckLakeError::TransactionConflict(format!(
                         "Transaction conflict: schema '{}' was dropped by another transaction since snapshot {}",
                         schema_name, since_snapshot
                     )));
                 }
 
-                // Check if any table with this name in this schema was dropped
                 let table_row = sqlx::query(
                     "SELECT table_id FROM ducklake_table
                      WHERE schema_id = ? AND table_name = ?
@@ -602,7 +782,6 @@ impl MetadataWriter for SqliteMetadataWriter {
 
                 if let Some(table_row) = table_row {
                     let table_id: i64 = table_row.try_get(0)?;
-
                     let table_drop = sqlx::query(
                         "SELECT COUNT(*) FROM ducklake_snapshot_changes
                          WHERE snapshot_id > ? AND table_id = ? AND change_type = 'DROP_TABLE'",
@@ -611,8 +790,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .bind(table_id)
                     .fetch_one(&mut *tx)
                     .await?;
-                    let table_drop_count: i64 = table_drop.try_get(0)?;
-                    if table_drop_count > 0 {
+                    if table_drop.try_get::<i64, _>(0)? > 0 {
                         return Err(crate::error::DuckLakeError::TransactionConflict(format!(
                             "Transaction conflict: table '{}.{}' was dropped by another transaction since snapshot {}",
                             schema_name, table_name, since_snapshot
@@ -621,9 +799,8 @@ impl MetadataWriter for SqliteMetadataWriter {
                 }
             }
 
-            // No conflict detected - release the transaction and delegate
-            tx.commit().await?;
-            self.begin_write_transaction(schema_name, table_name, columns, mode)
+            // No conflict — proceed with write in the same transaction.
+            Self::write_transaction_inner(tx, schema_name, table_name, columns, mode).await
         })
     }
 
@@ -631,7 +808,6 @@ impl MetadataWriter for SqliteMetadataWriter {
         block_on(async {
             let mut tx = self.pool.begin().await?;
 
-            // Check if this table was already dropped since our snapshot
             let drop_check = sqlx::query(
                 "SELECT COUNT(*) FROM ducklake_snapshot_changes
                  WHERE snapshot_id > ? AND table_id = ? AND change_type = 'DROP_TABLE'",
@@ -640,18 +816,15 @@ impl MetadataWriter for SqliteMetadataWriter {
             .bind(table_id)
             .fetch_one(&mut *tx)
             .await?;
-            let drop_count: i64 = drop_check.try_get(0)?;
-
-            if drop_count > 0 {
+            if drop_check.try_get::<i64, _>(0)? > 0 {
                 return Err(crate::error::DuckLakeError::TransactionConflict(format!(
                     "Transaction conflict: table (id={}) was already dropped by another transaction since snapshot {}",
                     table_id, since_snapshot
                 )));
             }
 
-            // No conflict - release transaction and delegate to regular drop
-            tx.commit().await?;
-            self.drop_table(table_id)
+            // No conflict — perform drop in the same transaction.
+            Self::drop_table_inner(tx, table_id).await
         })
     }
 
@@ -659,7 +832,6 @@ impl MetadataWriter for SqliteMetadataWriter {
         block_on(async {
             let mut tx = self.pool.begin().await?;
 
-            // Check if this schema was already dropped since our snapshot
             let drop_check = sqlx::query(
                 "SELECT COUNT(*) FROM ducklake_snapshot_changes
                  WHERE snapshot_id > ? AND schema_id = ? AND change_type = 'DROP_SCHEMA'",
@@ -668,18 +840,15 @@ impl MetadataWriter for SqliteMetadataWriter {
             .bind(schema_id)
             .fetch_one(&mut *tx)
             .await?;
-            let drop_count: i64 = drop_check.try_get(0)?;
-
-            if drop_count > 0 {
+            if drop_check.try_get::<i64, _>(0)? > 0 {
                 return Err(crate::error::DuckLakeError::TransactionConflict(format!(
                     "Transaction conflict: schema (id={}) was already dropped by another transaction since snapshot {}",
                     schema_id, since_snapshot
                 )));
             }
 
-            // No conflict - release transaction and delegate to regular drop
-            tx.commit().await?;
-            self.drop_schema(schema_id)
+            // No conflict — perform drop in the same transaction.
+            Self::drop_schema_inner(tx, schema_id).await
         })
     }
 
@@ -691,179 +860,12 @@ impl MetadataWriter for SqliteMetadataWriter {
         mode: WriteMode,
     ) -> Result<WriteSetupResult> {
         block_on(async {
-            let mut tx = self.pool.begin().await?;
-
-            let row = sqlx::query(
-                "INSERT INTO ducklake_snapshot (snapshot_time) VALUES (CURRENT_TIMESTAMP) RETURNING snapshot_id",
-            )
-            .fetch_one(&mut *tx)
-            .await?;
-            let snapshot_id: i64 = row.try_get(0)?;
-
-            let schema_id: i64 = {
-                let existing = sqlx::query(
-                    "SELECT schema_id FROM ducklake_schema
-                     WHERE schema_name = ? AND end_snapshot IS NULL",
-                )
-                .bind(schema_name)
-                .fetch_optional(&mut *tx)
-                .await?;
-
-                if let Some(row) = existing {
-                    row.try_get(0)?
-                } else {
-                    let row = sqlx::query(
-                        "INSERT INTO ducklake_schema (schema_name, path, path_is_relative, begin_snapshot)
-                         VALUES (?, ?, 1, ?) RETURNING schema_id",
-                    )
-                    .bind(schema_name)
-                    .bind(schema_name)
-                    .bind(snapshot_id)
-                    .fetch_one(&mut *tx)
-                    .await?;
-                    row.try_get(0)?
-                }
-            };
-
-            let table_id: i64 = {
-                let existing = sqlx::query(
-                    "SELECT table_id FROM ducklake_table
-                     WHERE schema_id = ? AND table_name = ? AND end_snapshot IS NULL",
-                )
-                .bind(schema_id)
-                .bind(table_name)
-                .fetch_optional(&mut *tx)
-                .await?;
-
-                if let Some(row) = existing {
-                    row.try_get(0)?
-                } else {
-                    let row = sqlx::query(
-                        "INSERT INTO ducklake_table (schema_id, table_name, path, path_is_relative, begin_snapshot)
-                         VALUES (?, ?, ?, 1, ?) RETURNING table_id",
-                    )
-                    .bind(schema_id)
-                    .bind(table_name)
-                    .bind(table_name)
-                    .bind(snapshot_id)
-                    .fetch_one(&mut *tx)
-                    .await?;
-                    row.try_get(0)?
-                }
-            };
-
-            // Get existing columns to check schema compatibility for appends
-            let rows = sqlx::query(
-                "SELECT column_name, column_type, nulls_allowed
-                 FROM ducklake_column
-                 WHERE table_id = ? AND end_snapshot IS NULL
-                 ORDER BY column_order",
-            )
-            .bind(table_id)
-            .fetch_all(&mut *tx)
-            .await?;
-
-            let mut existing_columns: Vec<(String, String, bool)> = Vec::with_capacity(rows.len());
-            for row in rows {
-                let name: String = row.try_get(0)?;
-                let col_type: String = row.try_get(1)?;
-                let nullable: bool = row.try_get::<Option<bool>, _>(2)?.unwrap_or(true);
-                existing_columns.push((name, col_type, nullable));
-            }
-
-            // For append mode, validate schema compatibility with evolution rules:
-            // - Allowed: add nullable columns, remove columns, reorder columns
-            // - Disallowed: add non-nullable columns, type changes for existing columns
-            if mode == WriteMode::Append && !existing_columns.is_empty() {
-                use std::collections::HashMap;
-
-                // Build map of existing columns: name -> (type, nullable)
-                let existing_map: HashMap<&str, (&str, bool)> = existing_columns
-                    .iter()
-                    .map(|(name, col_type, nullable)| {
-                        (name.as_str(), (col_type.as_str(), *nullable))
-                    })
-                    .collect();
-
-                for new_col in columns.iter() {
-                    if let Some((existing_type, _existing_nullable)) =
-                        existing_map.get(new_col.name.as_str())
-                    {
-                        // Column exists - check type matches
-                        if *existing_type != new_col.ducklake_type {
-                            return Err(crate::error::DuckLakeError::InvalidConfig(format!(
-                                "Schema evolution error: column '{}' has type '{}' in existing table but '{}' in new schema. Type changes are not allowed.",
-                                new_col.name, existing_type, new_col.ducklake_type
-                            )));
-                        }
-                        // Note: We allow nullable changes (strict -> nullable is safe for reads)
-                    } else {
-                        // New column - must be nullable
-                        if !new_col.is_nullable {
-                            return Err(crate::error::DuckLakeError::InvalidConfig(format!(
-                                "Schema evolution error: new column '{}' must be nullable. Adding non-nullable columns is not allowed.",
-                                new_col.name
-                            )));
-                        }
-                    }
-                }
-                // Columns in existing but not in new schema are implicitly removed - this is allowed
-            }
-
-            sqlx::query(
-                "UPDATE ducklake_column SET end_snapshot = ?
-                 WHERE table_id = ? AND end_snapshot IS NULL",
-            )
-            .bind(snapshot_id)
-            .bind(table_id)
-            .execute(&mut *tx)
-            .await?;
-
-            let mut column_ids = Vec::with_capacity(columns.len());
-            for (order, col) in columns.iter().enumerate() {
-                let row = sqlx::query(
-                    "INSERT INTO ducklake_column (table_id, column_name, column_type, column_order, nulls_allowed, begin_snapshot)
-                     VALUES (?, ?, ?, ?, ?, ?) RETURNING column_id",
-                )
-                .bind(table_id)
-                .bind(&col.name)
-                .bind(&col.ducklake_type)
-                .bind(order as i64)
-                .bind(col.is_nullable)
-                .bind(snapshot_id)
-                .fetch_one(&mut *tx)
-                .await?;
-                column_ids.push(row.try_get(0)?);
-            }
-
-            if mode == WriteMode::Replace {
-                sqlx::query(
-                    "UPDATE ducklake_data_file SET end_snapshot = ?
-                     WHERE table_id = ? AND end_snapshot IS NULL",
-                )
-                .bind(snapshot_id)
-                .bind(table_id)
-                .execute(&mut *tx)
-                .await?;
-            }
-
-            tx.commit().await?;
-
-            Ok(WriteSetupResult {
-                snapshot_id,
-                schema_id,
-                table_id,
-                column_ids,
-            })
+            let tx = self.pool.begin().await?;
+            Self::write_transaction_inner(tx, schema_name, table_name, columns, mode).await
         })
     }
 
-    fn create_view(
-        &self,
-        schema_id: i64,
-        view_name: &str,
-        sql: &str,
-    ) -> Result<(i64, i64)> {
+    fn create_view(&self, schema_id: i64, view_name: &str, sql: &str) -> Result<(i64, i64)> {
         block_on(async {
             let mut tx = self.pool.begin().await?;
 
@@ -935,7 +937,8 @@ impl MetadataWriter for SqliteMetadataWriter {
 
             if col_rows.is_empty() {
                 return Err(crate::error::DuckLakeError::Internal(
-                    "Cannot alter table: no active columns found (table may be dropped)".to_string(),
+                    "Cannot alter table: no active columns found (table may be dropped)"
+                        .to_string(),
                 ));
             }
 
@@ -948,24 +951,25 @@ impl MetadataWriter for SqliteMetadataWriter {
             let snapshot_id: i64 = row.try_get(0)?;
 
             match op {
-                AlterTableOp::AddColumn { column } => {
+                AlterTableOp::AddColumn {
+                    column,
+                } => {
                     // Validate: must be nullable
                     if !column.is_nullable {
-                        return Err(crate::error::DuckLakeError::InvalidConfig(
-                            format!(
-                                "Cannot add non-nullable column '{}': new columns must be nullable since existing rows have no value",
-                                column.name
-                            ),
-                        ));
+                        return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                            "Cannot add non-nullable column '{}': new columns must be nullable since existing rows have no value",
+                            column.name
+                        )));
                     }
 
                     // Validate: no duplicate name
                     for row in &col_rows {
                         let name: String = row.try_get(1)?;
                         if name == column.name {
-                            return Err(crate::error::DuckLakeError::InvalidConfig(
-                                format!("Column '{}' already exists in table", column.name),
-                            ));
+                            return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                                "Column '{}' already exists in table",
+                                column.name
+                            )));
                         }
                     }
 
@@ -988,9 +992,11 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .bind(snapshot_id)
                     .execute(&mut *tx)
                     .await?;
-                }
+                },
 
-                AlterTableOp::DropColumn { column_name } => {
+                AlterTableOp::DropColumn {
+                    column_name,
+                } => {
                     // Validate: cannot drop last column
                     if col_rows.len() == 1 {
                         return Err(crate::error::DuckLakeError::InvalidConfig(
@@ -999,14 +1005,15 @@ impl MetadataWriter for SqliteMetadataWriter {
                     }
 
                     // Find the column
-                    let target = col_rows.iter().find(|r| {
-                        r.try_get::<String, _>(1).unwrap_or_default() == *column_name
-                    });
+                    let target = col_rows
+                        .iter()
+                        .find(|r| r.try_get::<String, _>(1).unwrap_or_default() == *column_name);
 
                     let Some(target_row) = target else {
-                        return Err(crate::error::DuckLakeError::InvalidConfig(
-                            format!("Column '{}' not found in table", column_name),
-                        ));
+                        return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                            "Column '{}' not found in table",
+                            column_name
+                        )));
                     };
 
                     let column_id: i64 = target_row.try_get(0)?;
@@ -1020,27 +1027,32 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .bind(column_id)
                     .execute(&mut *tx)
                     .await?;
-                }
+                },
 
-                AlterTableOp::RenameColumn { old_name, new_name } => {
+                AlterTableOp::RenameColumn {
+                    old_name,
+                    new_name,
+                } => {
                     // Find the column to rename
-                    let target = col_rows.iter().find(|r| {
-                        r.try_get::<String, _>(1).unwrap_or_default() == *old_name
-                    });
+                    let target = col_rows
+                        .iter()
+                        .find(|r| r.try_get::<String, _>(1).unwrap_or_default() == *old_name);
 
                     let Some(target_row) = target else {
-                        return Err(crate::error::DuckLakeError::InvalidConfig(
-                            format!("Column '{}' not found in table", old_name),
-                        ));
+                        return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                            "Column '{}' not found in table",
+                            old_name
+                        )));
                     };
 
                     // Validate: new name doesn't conflict
                     for row in &col_rows {
                         let name: String = row.try_get(1)?;
                         if name == *new_name {
-                            return Err(crate::error::DuckLakeError::InvalidConfig(
-                                format!("Column '{}' already exists in table", new_name),
-                            ));
+                            return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                                "Column '{}' already exists in table",
+                                new_name
+                            )));
                         }
                     }
 
@@ -1071,7 +1083,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .bind(snapshot_id)
                     .execute(&mut *tx)
                     .await?;
-                }
+                },
 
                 AlterTableOp::AlterColumnType(alter_type) => {
                     // Find the column
@@ -1080,9 +1092,10 @@ impl MetadataWriter for SqliteMetadataWriter {
                     });
 
                     let Some(target_row) = target else {
-                        return Err(crate::error::DuckLakeError::InvalidConfig(
-                            format!("Column '{}' not found in table", alter_type.column_name),
-                        ));
+                        return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                            "Column '{}' not found in table",
+                            alter_type.column_name
+                        )));
                     };
 
                     let column_id: i64 = target_row.try_get(0)?;
@@ -1092,12 +1105,10 @@ impl MetadataWriter for SqliteMetadataWriter {
 
                     // Validate type promotion
                     if !is_type_promotion_allowed(&current_type, &alter_type.new_type) {
-                        return Err(crate::error::DuckLakeError::InvalidConfig(
-                            format!(
-                                "Cannot change type of column '{}' from '{}' to '{}': only widening type promotions are allowed",
-                                alter_type.column_name, current_type, alter_type.new_type
-                            ),
-                        ));
+                        return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                            "Cannot change type of column '{}' from '{}' to '{}': only widening type promotions are allowed",
+                            alter_type.column_name, current_type, alter_type.new_type
+                        )));
                     }
 
                     // End old column, create new with new type
@@ -1122,7 +1133,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .bind(snapshot_id)
                     .execute(&mut *tx)
                     .await?;
-                }
+                },
             }
 
             // Record change for conflict detection
