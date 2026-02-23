@@ -75,6 +75,8 @@ pub mod metadata_writer_postgres;
 #[cfg(feature = "write-sqlite")]
 pub mod metadata_writer_sqlite;
 #[cfg(feature = "write")]
+pub(crate) mod metadata_writer_validation;
+#[cfg(feature = "write")]
 pub mod query_planner;
 #[cfg(feature = "write")]
 pub mod table_writer;

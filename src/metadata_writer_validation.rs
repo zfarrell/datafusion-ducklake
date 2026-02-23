@@ -1,0 +1,547 @@
+//! Shared validation logic for MetadataWriter implementations.
+//!
+//! Extracts duplicated validation code from SQLite, Postgres, and MySQL writers
+//! into a single source of truth. Backend-specific SQL execution remains in each writer.
+
+use crate::Result;
+use crate::error::DuckLakeError;
+use crate::metadata_writer::{AlterTableOp, ColumnDef, WriteMode, is_type_promotion_allowed};
+
+/// DB-independent parsed column row for validation.
+#[derive(Debug, Clone)]
+pub(crate) struct ActiveColumnInfo {
+    pub column_id: i64,
+    pub column_name: String,
+    pub column_type: String,
+    pub column_order: i64,
+    pub is_nullable: bool,
+    pub initial_default: Option<String>,
+    pub default_value: Option<String>,
+    pub parent_column: Option<i64>,
+    pub default_value_type: Option<String>,
+    pub default_value_dialect: Option<String>,
+}
+
+/// Validation result telling the caller what SQL to execute after validation.
+#[derive(Debug)]
+#[allow(clippy::enum_variant_names)]
+pub(crate) enum AlterTableAction {
+    /// Insert a new column at the given order.
+    InsertColumn {
+        column_name: String,
+        column_type: String,
+        column_order: i64,
+        is_nullable: bool,
+    },
+    /// End (soft-delete) an existing column.
+    EndColumn {
+        column_id: i64,
+    },
+    /// End an existing column and replace it with new values.
+    ReplaceColumn {
+        end_column_id: i64,
+        column_name: String,
+        column_type: String,
+        column_order: i64,
+        is_nullable: bool,
+        initial_default: Option<String>,
+        default_value: Option<String>,
+        parent_column: Option<i64>,
+        default_value_type: Option<String>,
+        default_value_dialect: Option<String>,
+    },
+}
+
+/// Validate that column names are unique within the provided column list.
+///
+/// Returns an error if any two columns share the same name (case-sensitive).
+/// Should be called before inserting columns into the catalog.
+pub(crate) fn validate_no_duplicate_columns(columns: &[ColumnDef]) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for col in columns {
+        if !seen.insert(&col.name) {
+            return Err(DuckLakeError::InvalidConfig(format!(
+                "Duplicate column name '{}' in table definition",
+                col.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validate schema evolution rules for append mode.
+///
+/// Checks that:
+/// - Existing columns have matching types in the new schema
+/// - New columns (not in existing schema) are nullable
+/// - Columns removed from the new schema are allowed (implicit removal)
+pub(crate) fn validate_schema_evolution(
+    existing: &[(String, String, bool)],
+    new: &[ColumnDef],
+    mode: WriteMode,
+) -> Result<()> {
+    if mode != WriteMode::Append || existing.is_empty() {
+        return Ok(());
+    }
+
+    use std::collections::HashMap;
+
+    let existing_map: HashMap<&str, (&str, bool)> = existing
+        .iter()
+        .map(|(name, col_type, nullable)| (name.as_str(), (col_type.as_str(), *nullable)))
+        .collect();
+
+    for new_col in new.iter() {
+        if let Some((existing_type, _existing_nullable)) = existing_map.get(new_col.name.as_str()) {
+            if *existing_type != new_col.ducklake_type {
+                return Err(DuckLakeError::InvalidConfig(format!(
+                    "Schema evolution error: column '{}' has type '{}' in existing table but '{}' in new schema. Type changes are not allowed.",
+                    new_col.name, existing_type, new_col.ducklake_type
+                )));
+            }
+        } else if !new_col.is_nullable {
+            return Err(DuckLakeError::InvalidConfig(format!(
+                "Schema evolution error: new column '{}' must be nullable. Adding non-nullable columns is not allowed.",
+                new_col.name
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate that a table has at least one active column.
+pub(crate) fn validate_table_has_columns(columns: &[ActiveColumnInfo]) -> Result<()> {
+    if columns.is_empty() {
+        return Err(DuckLakeError::Internal(
+            "Cannot alter table: no active columns found (table may be dropped)".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate an ALTER TABLE operation and return the action to execute.
+pub(crate) fn validate_alter_table(
+    columns: &[ActiveColumnInfo],
+    op: &AlterTableOp,
+) -> Result<AlterTableAction> {
+    match op {
+        AlterTableOp::AddColumn {
+            column,
+        } => validate_add_column(columns, column),
+        AlterTableOp::DropColumn {
+            column_name,
+        } => validate_drop_column(columns, column_name),
+        AlterTableOp::RenameColumn {
+            old_name,
+            new_name,
+        } => validate_rename_column(columns, old_name, new_name),
+        AlterTableOp::AlterColumnType(alter_type) => {
+            validate_alter_column_type(columns, &alter_type.column_name, &alter_type.new_type)
+        },
+    }
+}
+
+fn validate_add_column(
+    columns: &[ActiveColumnInfo],
+    column: &ColumnDef,
+) -> Result<AlterTableAction> {
+    if !column.is_nullable {
+        return Err(DuckLakeError::InvalidConfig(format!(
+            "Cannot add non-nullable column '{}': new columns must be nullable since existing rows have no value",
+            column.name
+        )));
+    }
+
+    for col in columns {
+        if col.column_name == column.name {
+            return Err(DuckLakeError::InvalidConfig(format!(
+                "Column '{}' already exists in table",
+                column.name
+            )));
+        }
+    }
+
+    let max_order = columns.iter().map(|c| c.column_order).max().unwrap_or(-1);
+
+    Ok(AlterTableAction::InsertColumn {
+        column_name: column.name.clone(),
+        column_type: column.ducklake_type.clone(),
+        column_order: max_order + 1,
+        is_nullable: column.is_nullable,
+    })
+}
+
+fn validate_drop_column(
+    columns: &[ActiveColumnInfo],
+    column_name: &str,
+) -> Result<AlterTableAction> {
+    if columns.len() == 1 {
+        return Err(DuckLakeError::InvalidConfig(
+            "Cannot drop column: table only has one column remaining".to_string(),
+        ));
+    }
+
+    let target = columns.iter().find(|c| c.column_name == column_name);
+
+    let Some(target_col) = target else {
+        return Err(DuckLakeError::InvalidConfig(format!(
+            "Column '{}' not found in table",
+            column_name
+        )));
+    };
+
+    Ok(AlterTableAction::EndColumn {
+        column_id: target_col.column_id,
+    })
+}
+
+fn validate_rename_column(
+    columns: &[ActiveColumnInfo],
+    old_name: &str,
+    new_name: &str,
+) -> Result<AlterTableAction> {
+    let target = columns.iter().find(|c| c.column_name == old_name);
+
+    let Some(target_col) = target else {
+        return Err(DuckLakeError::InvalidConfig(format!(
+            "Column '{}' not found in table",
+            old_name
+        )));
+    };
+
+    for col in columns {
+        if col.column_name == new_name {
+            return Err(DuckLakeError::InvalidConfig(format!(
+                "Column '{}' already exists in table",
+                new_name
+            )));
+        }
+    }
+
+    Ok(AlterTableAction::ReplaceColumn {
+        end_column_id: target_col.column_id,
+        column_name: new_name.to_string(),
+        column_type: target_col.column_type.clone(),
+        column_order: target_col.column_order,
+        is_nullable: target_col.is_nullable,
+        initial_default: target_col.initial_default.clone(),
+        default_value: target_col.default_value.clone(),
+        parent_column: target_col.parent_column,
+        default_value_type: target_col.default_value_type.clone(),
+        default_value_dialect: target_col.default_value_dialect.clone(),
+    })
+}
+
+fn validate_alter_column_type(
+    columns: &[ActiveColumnInfo],
+    column_name: &str,
+    new_type: &str,
+) -> Result<AlterTableAction> {
+    let target = columns.iter().find(|c| c.column_name == column_name);
+
+    let Some(target_col) = target else {
+        return Err(DuckLakeError::InvalidConfig(format!(
+            "Column '{}' not found in table",
+            column_name
+        )));
+    };
+
+    if !is_type_promotion_allowed(&target_col.column_type, new_type) {
+        return Err(DuckLakeError::InvalidConfig(format!(
+            "Cannot change type of column '{}' from '{}' to '{}': only widening type promotions are allowed",
+            column_name, target_col.column_type, new_type
+        )));
+    }
+
+    Ok(AlterTableAction::ReplaceColumn {
+        end_column_id: target_col.column_id,
+        column_name: column_name.to_string(),
+        column_type: new_type.to_string(),
+        column_order: target_col.column_order,
+        is_nullable: target_col.is_nullable,
+        initial_default: target_col.initial_default.clone(),
+        default_value: target_col.default_value.clone(),
+        parent_column: target_col.parent_column,
+        default_value_type: target_col.default_value_type.clone(),
+        default_value_dialect: target_col.default_value_dialect.clone(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_columns(cols: &[(&str, &str, i64, bool)]) -> Vec<ActiveColumnInfo> {
+        cols.iter()
+            .enumerate()
+            .map(|(i, (name, typ, order, nullable))| ActiveColumnInfo {
+                column_id: i as i64 + 1,
+                column_name: name.to_string(),
+                column_type: typ.to_string(),
+                column_order: *order,
+                is_nullable: *nullable,
+                initial_default: None,
+                default_value: None,
+                parent_column: None,
+                default_value_type: None,
+                default_value_dialect: None,
+            })
+            .collect()
+    }
+
+    // --- validate_schema_evolution tests ---
+
+    #[test]
+    fn test_schema_evolution_replace_mode_skips_validation() {
+        let existing = vec![("id".into(), "int64".into(), false)];
+        let new = vec![ColumnDef::new("id", "varchar", false)]; // type mismatch
+        assert!(validate_schema_evolution(&existing, &new, WriteMode::Replace).is_ok());
+    }
+
+    #[test]
+    fn test_schema_evolution_empty_existing_skips_validation() {
+        let existing: Vec<(String, String, bool)> = vec![];
+        let new = vec![ColumnDef::new("id", "int64", false)];
+        assert!(validate_schema_evolution(&existing, &new, WriteMode::Append).is_ok());
+    }
+
+    #[test]
+    fn test_schema_evolution_matching_types_ok() {
+        let existing = vec![("id".into(), "int64".into(), false)];
+        let new = vec![ColumnDef::new("id", "int64", false)];
+        assert!(validate_schema_evolution(&existing, &new, WriteMode::Append).is_ok());
+    }
+
+    #[test]
+    fn test_schema_evolution_type_mismatch_fails() {
+        let existing = vec![("id".into(), "int64".into(), false)];
+        let new = vec![ColumnDef::new("id", "varchar", false)];
+        let err = validate_schema_evolution(&existing, &new, WriteMode::Append).unwrap_err();
+        assert!(err.to_string().contains("Type changes are not allowed"));
+    }
+
+    #[test]
+    fn test_schema_evolution_new_nullable_column_ok() {
+        let existing = vec![("id".into(), "int64".into(), false)];
+        let new =
+            vec![ColumnDef::new("id", "int64", false), ColumnDef::new("name", "varchar", true)];
+        assert!(validate_schema_evolution(&existing, &new, WriteMode::Append).is_ok());
+    }
+
+    #[test]
+    fn test_schema_evolution_new_non_nullable_column_fails() {
+        let existing = vec![("id".into(), "int64".into(), false)];
+        let new =
+            vec![ColumnDef::new("id", "int64", false), ColumnDef::new("name", "varchar", false)];
+        let err = validate_schema_evolution(&existing, &new, WriteMode::Append).unwrap_err();
+        assert!(err.to_string().contains("must be nullable"));
+    }
+
+    // --- validate_table_has_columns tests ---
+
+    #[test]
+    fn test_table_has_columns_ok() {
+        let columns = make_columns(&[("id", "int64", 0, false)]);
+        assert!(validate_table_has_columns(&columns).is_ok());
+    }
+
+    #[test]
+    fn test_table_has_no_columns_fails() {
+        assert!(validate_table_has_columns(&[]).is_err());
+    }
+
+    // --- validate_add_column tests ---
+
+    #[test]
+    fn test_add_nullable_column_ok() {
+        let columns = make_columns(&[("id", "int64", 0, false)]);
+        let op = AlterTableOp::AddColumn {
+            column: ColumnDef::new("name", "varchar", true),
+        };
+        let action = validate_alter_table(&columns, &op).unwrap();
+        match action {
+            AlterTableAction::InsertColumn {
+                column_order,
+                ..
+            } => assert_eq!(column_order, 1),
+            _ => panic!("Expected InsertColumn"),
+        }
+    }
+
+    #[test]
+    fn test_add_non_nullable_column_fails() {
+        let columns = make_columns(&[("id", "int64", 0, false)]);
+        let op = AlterTableOp::AddColumn {
+            column: ColumnDef::new("name", "varchar", false),
+        };
+        assert!(validate_alter_table(&columns, &op).is_err());
+    }
+
+    #[test]
+    fn test_add_duplicate_column_fails() {
+        let columns = make_columns(&[("id", "int64", 0, false)]);
+        let op = AlterTableOp::AddColumn {
+            column: ColumnDef::new("id", "varchar", true),
+        };
+        let err = validate_alter_table(&columns, &op).unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+    }
+
+    // --- validate_drop_column tests ---
+
+    #[test]
+    fn test_drop_column_ok() {
+        let columns = make_columns(&[("id", "int64", 0, false), ("name", "varchar", 1, true)]);
+        let op = AlterTableOp::DropColumn {
+            column_name: "name".into(),
+        };
+        let action = validate_alter_table(&columns, &op).unwrap();
+        match action {
+            AlterTableAction::EndColumn {
+                column_id,
+            } => assert_eq!(column_id, 2),
+            _ => panic!("Expected EndColumn"),
+        }
+    }
+
+    #[test]
+    fn test_drop_last_column_fails() {
+        let columns = make_columns(&[("id", "int64", 0, false)]);
+        let op = AlterTableOp::DropColumn {
+            column_name: "id".into(),
+        };
+        let err = validate_alter_table(&columns, &op).unwrap_err();
+        assert!(err.to_string().contains("one column remaining"));
+    }
+
+    #[test]
+    fn test_drop_nonexistent_column_fails() {
+        let columns = make_columns(&[("id", "int64", 0, false), ("name", "varchar", 1, true)]);
+        let op = AlterTableOp::DropColumn {
+            column_name: "missing".into(),
+        };
+        assert!(validate_alter_table(&columns, &op).is_err());
+    }
+
+    // --- validate_rename_column tests ---
+
+    #[test]
+    fn test_rename_column_ok() {
+        let columns = make_columns(&[("id", "int64", 0, false), ("name", "varchar", 1, true)]);
+        let op = AlterTableOp::RenameColumn {
+            old_name: "name".into(),
+            new_name: "full_name".into(),
+        };
+        let action = validate_alter_table(&columns, &op).unwrap();
+        match action {
+            AlterTableAction::ReplaceColumn {
+                end_column_id,
+                column_name,
+                column_type,
+                column_order,
+                is_nullable,
+                ..
+            } => {
+                assert_eq!(end_column_id, 2);
+                assert_eq!(column_name, "full_name");
+                assert_eq!(column_type, "varchar");
+                assert_eq!(column_order, 1);
+                assert!(is_nullable);
+            },
+            _ => panic!("Expected ReplaceColumn"),
+        }
+    }
+
+    #[test]
+    fn test_rename_to_existing_name_fails() {
+        let columns = make_columns(&[("id", "int64", 0, false), ("name", "varchar", 1, true)]);
+        let op = AlterTableOp::RenameColumn {
+            old_name: "name".into(),
+            new_name: "id".into(),
+        };
+        let err = validate_alter_table(&columns, &op).unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+    }
+
+    #[test]
+    fn test_rename_nonexistent_column_fails() {
+        let columns = make_columns(&[("id", "int64", 0, false)]);
+        let op = AlterTableOp::RenameColumn {
+            old_name: "missing".into(),
+            new_name: "new_name".into(),
+        };
+        assert!(validate_alter_table(&columns, &op).is_err());
+    }
+
+    // --- validate_alter_column_type tests ---
+
+    #[test]
+    fn test_alter_column_type_widening_ok() {
+        let columns = make_columns(&[("id", "int32", 0, false)]);
+        let op = AlterTableOp::AlterColumnType(crate::metadata_writer::AlterColumnTypeOp {
+            column_name: "id".into(),
+            new_type: "int64".into(),
+        });
+        let action = validate_alter_table(&columns, &op).unwrap();
+        match action {
+            AlterTableAction::ReplaceColumn {
+                column_type,
+                ..
+            } => assert_eq!(column_type, "int64"),
+            _ => panic!("Expected ReplaceColumn"),
+        }
+    }
+
+    #[test]
+    fn test_alter_column_type_narrowing_fails() {
+        let columns = make_columns(&[("id", "int64", 0, false)]);
+        let op = AlterTableOp::AlterColumnType(crate::metadata_writer::AlterColumnTypeOp {
+            column_name: "id".into(),
+            new_type: "int32".into(),
+        });
+        let err = validate_alter_table(&columns, &op).unwrap_err();
+        assert!(err.to_string().contains("widening type promotions"));
+    }
+
+    #[test]
+    fn test_alter_nonexistent_column_type_fails() {
+        let columns = make_columns(&[("id", "int64", 0, false)]);
+        let op = AlterTableOp::AlterColumnType(crate::metadata_writer::AlterColumnTypeOp {
+            column_name: "missing".into(),
+            new_type: "int64".into(),
+        });
+        assert!(validate_alter_table(&columns, &op).is_err());
+    }
+
+    // --- validate_no_duplicate_columns tests ---
+
+    #[test]
+    fn test_no_duplicate_columns_ok() {
+        let columns = vec![
+            ColumnDef::new("id", "int64", false),
+            ColumnDef::new("name", "varchar", true),
+        ];
+        assert!(validate_no_duplicate_columns(&columns).is_ok());
+    }
+
+    #[test]
+    fn test_duplicate_columns_fails() {
+        let columns = vec![
+            ColumnDef::new("id", "int64", false),
+            ColumnDef::new("id", "int64", false),
+        ];
+        let err = validate_no_duplicate_columns(&columns).unwrap_err();
+        assert!(err.to_string().contains("Duplicate column name"));
+    }
+
+    #[test]
+    fn test_duplicate_columns_different_types_fails() {
+        let columns = vec![
+            ColumnDef::new("x", "int64", false),
+            ColumnDef::new("x", "varchar", true),
+        ];
+        let err = validate_no_duplicate_columns(&columns).unwrap_err();
+        assert!(err.to_string().contains("Duplicate column name 'x'"));
+    }
+}

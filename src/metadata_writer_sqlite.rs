@@ -8,6 +8,10 @@ use crate::metadata_writer::{
     AlterTableOp, ColumnDef, ColumnStatInfo, DataFileInfo, DeleteFileInfo, MetadataWriter,
     WriteMode, WriteSetupResult,
 };
+use crate::metadata_writer_validation::{
+    ActiveColumnInfo, AlterTableAction, validate_alter_table, validate_no_duplicate_columns,
+    validate_schema_evolution, validate_table_has_columns,
+};
 use sqlx::Row;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
 use std::str::FromStr;
@@ -18,16 +22,21 @@ const SQL_CREATE_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS ducklake_metadata (
     key VARCHAR NOT NULL,
     value VARCHAR NOT NULL,
-    scope VARCHAR
+    scope VARCHAR,
+    scope_id INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS ducklake_snapshot (
     snapshot_id INTEGER PRIMARY KEY,
-    snapshot_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    snapshot_time TEXT DEFAULT CURRENT_TIMESTAMP,
+    schema_version INTEGER DEFAULT 1,
+    next_catalog_id INTEGER DEFAULT 0,
+    next_file_id INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS ducklake_schema (
     schema_id INTEGER PRIMARY KEY,
+    schema_uuid VARCHAR,
     schema_name VARCHAR NOT NULL,
     path VARCHAR NOT NULL DEFAULT '',
     path_is_relative BOOLEAN NOT NULL DEFAULT 1,
@@ -36,7 +45,8 @@ CREATE TABLE IF NOT EXISTS ducklake_schema (
 );
 
 CREATE TABLE IF NOT EXISTS ducklake_table (
-    table_id INTEGER PRIMARY KEY,
+    table_id INTEGER NOT NULL,
+    table_uuid VARCHAR,
     schema_id INTEGER NOT NULL,
     table_name VARCHAR NOT NULL,
     path VARCHAR NOT NULL DEFAULT '',
@@ -46,12 +56,17 @@ CREATE TABLE IF NOT EXISTS ducklake_table (
 );
 
 CREATE TABLE IF NOT EXISTS ducklake_column (
-    column_id INTEGER PRIMARY KEY,
+    column_id INTEGER NOT NULL,
     table_id INTEGER NOT NULL,
     column_name VARCHAR NOT NULL,
     column_type VARCHAR NOT NULL,
     column_order INTEGER NOT NULL,
     nulls_allowed BOOLEAN DEFAULT 1,
+    initial_default VARCHAR,
+    default_value VARCHAR,
+    parent_column INTEGER,
+    default_value_type VARCHAR,
+    default_value_dialect VARCHAR,
     begin_snapshot INTEGER NOT NULL,
     end_snapshot INTEGER
 );
@@ -67,6 +82,11 @@ CREATE TABLE IF NOT EXISTS ducklake_data_file (
     record_count INTEGER,
     row_id_start INTEGER,
     mapping_id INTEGER,
+    file_order INTEGER,
+    file_format VARCHAR DEFAULT 'PARQUET',
+    partition_id INTEGER,
+    partial_max INTEGER,
+    partial_file_info VARCHAR,
     begin_snapshot INTEGER NOT NULL,
     end_snapshot INTEGER
 );
@@ -81,11 +101,21 @@ CREATE TABLE IF NOT EXISTS ducklake_delete_file (
     footer_size INTEGER,
     encryption_key VARCHAR,
     delete_count INTEGER,
+    format VARCHAR DEFAULT 'POSITION_DELETES',
+    partial_max INTEGER,
     begin_snapshot INTEGER NOT NULL,
     end_snapshot INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS ducklake_snapshot_changes (
+    snapshot_id INTEGER PRIMARY KEY,
+    changes_made VARCHAR,
+    author VARCHAR,
+    commit_message VARCHAR,
+    commit_extra_info VARCHAR
+);
+
+CREATE TABLE IF NOT EXISTS _df_change_tracking (
     id INTEGER PRIMARY KEY,
     snapshot_id INTEGER NOT NULL,
     change_type TEXT NOT NULL,
@@ -97,23 +127,183 @@ CREATE TABLE IF NOT EXISTS ducklake_file_column_stats (
     data_file_id INTEGER NOT NULL,
     table_id INTEGER NOT NULL,
     column_id INTEGER NOT NULL,
+    column_size_bytes INTEGER,
+    value_count INTEGER,
     null_count INTEGER,
     min_value VARCHAR,
     max_value VARCHAR,
-    PRIMARY KEY (data_file_id, column_id)
+    contains_nan BOOLEAN,
+    extra_stats VARCHAR
 );
 
 CREATE TABLE IF NOT EXISTS ducklake_view (
-    view_id INTEGER PRIMARY KEY,
+    view_id INTEGER NOT NULL,
+    view_uuid VARCHAR,
     schema_id INTEGER NOT NULL,
     view_name VARCHAR NOT NULL,
+    dialect VARCHAR,
     sql VARCHAR NOT NULL,
+    column_aliases VARCHAR,
     begin_snapshot INTEGER NOT NULL,
     end_snapshot INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS ducklake_tag (
+    object_id INTEGER,
+    begin_snapshot INTEGER,
+    end_snapshot INTEGER,
+    key VARCHAR,
+    value VARCHAR
+);
+
+CREATE TABLE IF NOT EXISTS ducklake_column_tag (
+    table_id INTEGER,
+    column_id INTEGER,
+    begin_snapshot INTEGER,
+    end_snapshot INTEGER,
+    key VARCHAR,
+    value VARCHAR
+);
+
+CREATE TABLE IF NOT EXISTS ducklake_table_stats (
+    table_id INTEGER,
+    record_count INTEGER,
+    next_row_id INTEGER,
+    file_size_bytes INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS ducklake_table_column_stats (
+    table_id INTEGER,
+    column_id INTEGER,
+    contains_null BOOLEAN,
+    contains_nan BOOLEAN,
+    min_value VARCHAR,
+    max_value VARCHAR,
+    extra_stats VARCHAR
+);
+
+CREATE TABLE IF NOT EXISTS ducklake_partition_info (
+    partition_id INTEGER,
+    table_id INTEGER,
+    begin_snapshot INTEGER,
+    end_snapshot INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS ducklake_partition_column (
+    partition_id INTEGER,
+    table_id INTEGER,
+    partition_key_index INTEGER,
+    column_id INTEGER,
+    transform VARCHAR
+);
+
+CREATE TABLE IF NOT EXISTS ducklake_file_partition_value (
+    data_file_id INTEGER,
+    table_id INTEGER,
+    partition_key_index INTEGER,
+    partition_value VARCHAR
+);
+
+CREATE TABLE IF NOT EXISTS ducklake_files_scheduled_for_deletion (
+    data_file_id INTEGER,
+    path VARCHAR,
+    path_is_relative BOOLEAN,
+    schedule_start TEXT
+);
+
+CREATE TABLE IF NOT EXISTS ducklake_inlined_data_tables (
+    table_id INTEGER,
+    table_name VARCHAR,
+    schema_version INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS ducklake_column_mapping (
+    mapping_id INTEGER,
+    table_id INTEGER,
+    type VARCHAR
+);
+
+CREATE TABLE IF NOT EXISTS ducklake_name_mapping (
+    mapping_id INTEGER,
+    column_id INTEGER,
+    source_name VARCHAR,
+    target_field_id INTEGER,
+    parent_column INTEGER,
+    is_partition BOOLEAN
+);
+
+CREATE TABLE IF NOT EXISTS ducklake_schema_versions (
+    begin_snapshot INTEGER,
+    schema_version INTEGER,
+    table_id INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS ducklake_macro (
+    schema_id INTEGER,
+    macro_id INTEGER,
+    macro_name VARCHAR,
+    begin_snapshot INTEGER,
+    end_snapshot INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS ducklake_macro_impl (
+    macro_id INTEGER,
+    impl_id INTEGER,
+    dialect VARCHAR,
+    sql VARCHAR,
+    type VARCHAR
+);
+
+CREATE TABLE IF NOT EXISTS ducklake_macro_parameters (
+    macro_id INTEGER,
+    impl_id INTEGER,
+    column_id INTEGER,
+    parameter_name VARCHAR,
+    parameter_type VARCHAR,
+    default_value VARCHAR,
+    default_value_type VARCHAR
+);
+
+CREATE TABLE IF NOT EXISTS ducklake_sort_info (
+    sort_id INTEGER,
+    table_id INTEGER,
+    begin_snapshot INTEGER,
+    end_snapshot INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS ducklake_sort_expression (
+    sort_id INTEGER,
+    table_id INTEGER,
+    sort_key_index INTEGER,
+    expression VARCHAR,
+    dialect VARCHAR,
+    sort_direction VARCHAR,
+    null_order VARCHAR
+);
+
+CREATE TABLE IF NOT EXISTS ducklake_file_variant_stats (
+    data_file_id INTEGER,
+    table_id INTEGER,
+    column_id INTEGER,
+    variant_path VARCHAR,
+    shredded_type VARCHAR,
+    column_size_bytes INTEGER,
+    value_count INTEGER,
+    null_count INTEGER,
+    min_value VARCHAR,
+    max_value VARCHAR,
+    contains_nan BOOLEAN,
+    extra_stats VARCHAR
 );
 "#;
 
 /// SQLite-based metadata writer for DuckLake catalogs.
+///
+/// **Concurrency note:** SQLite uses a single-writer model (WAL mode allows
+/// concurrent readers but only one writer at a time). All MAX+1 ID queries
+/// run inside transactions, which is safe because SQLite serializes writes.
+/// Concurrent writers to the same SQLite database file from separate processes
+/// are NOT supported and may produce duplicate IDs or lock errors.
 #[derive(Debug, Clone)]
 pub struct SqliteMetadataWriter {
     pool: SqlitePool,
@@ -174,12 +364,13 @@ impl SqliteMetadataWriter {
             if let Some(row) = existing {
                 row.try_get(0)?
             } else {
+                let schema_path = format!("{}/", schema_name);
                 let row = sqlx::query(
                     "INSERT INTO ducklake_schema (schema_name, path, path_is_relative, begin_snapshot)
                      VALUES (?, ?, 1, ?) RETURNING schema_id",
                 )
                 .bind(schema_name)
-                .bind(schema_name)
+                .bind(&schema_path)
                 .bind(snapshot_id)
                 .fetch_one(&mut *tx)
                 .await?;
@@ -200,17 +391,25 @@ impl SqliteMetadataWriter {
             if let Some(row) = existing {
                 row.try_get(0)?
             } else {
-                let row = sqlx::query(
-                    "INSERT INTO ducklake_table (schema_id, table_name, path, path_is_relative, begin_snapshot)
-                     VALUES (?, ?, ?, 1, ?) RETURNING table_id",
+                let next_tid_row =
+                    sqlx::query("SELECT COALESCE(MAX(table_id), 0) + 1 FROM ducklake_table")
+                        .fetch_one(&mut *tx)
+                        .await?;
+                let next_table_id: i64 = next_tid_row.try_get(0)?;
+
+                let table_path = format!("{}/", table_name);
+                sqlx::query(
+                    "INSERT INTO ducklake_table (table_id, schema_id, table_name, path, path_is_relative, begin_snapshot)
+                     VALUES (?, ?, ?, ?, 1, ?)",
                 )
+                .bind(next_table_id)
                 .bind(schema_id)
                 .bind(table_name)
-                .bind(table_name)
+                .bind(&table_path)
                 .bind(snapshot_id)
-                .fetch_one(&mut *tx)
+                .execute(&mut *tx)
                 .await?;
-                row.try_get(0)?
+                next_table_id
             }
         };
 
@@ -233,42 +432,8 @@ impl SqliteMetadataWriter {
             existing_columns.push((name, col_type, nullable));
         }
 
-        // For append mode, validate schema compatibility with evolution rules:
-        // - Allowed: add nullable columns, remove columns, reorder columns
-        // - Disallowed: add non-nullable columns, type changes for existing columns
-        if mode == WriteMode::Append && !existing_columns.is_empty() {
-            use std::collections::HashMap;
-
-            // Build map of existing columns: name -> (type, nullable)
-            let existing_map: HashMap<&str, (&str, bool)> = existing_columns
-                .iter()
-                .map(|(name, col_type, nullable)| (name.as_str(), (col_type.as_str(), *nullable)))
-                .collect();
-
-            for new_col in columns.iter() {
-                if let Some((existing_type, _existing_nullable)) =
-                    existing_map.get(new_col.name.as_str())
-                {
-                    // Column exists - check type matches
-                    if *existing_type != new_col.ducklake_type {
-                        return Err(crate::error::DuckLakeError::InvalidConfig(format!(
-                            "Schema evolution error: column '{}' has type '{}' in existing table but '{}' in new schema. Type changes are not allowed.",
-                            new_col.name, existing_type, new_col.ducklake_type
-                        )));
-                    }
-                    // Note: We allow nullable changes (strict -> nullable is safe for reads)
-                } else {
-                    // New column - must be nullable
-                    if !new_col.is_nullable {
-                        return Err(crate::error::DuckLakeError::InvalidConfig(format!(
-                            "Schema evolution error: new column '{}' must be nullable. Adding non-nullable columns is not allowed.",
-                            new_col.name
-                        )));
-                    }
-                }
-            }
-            // Columns in existing but not in new schema are implicitly removed - this is allowed
-        }
+        validate_no_duplicate_columns(columns)?;
+        validate_schema_evolution(&existing_columns, columns, mode)?;
 
         sqlx::query(
             "UPDATE ducklake_column SET end_snapshot = ?
@@ -279,21 +444,36 @@ impl SqliteMetadataWriter {
         .execute(&mut *tx)
         .await?;
 
+        let next_cid_row = sqlx::query(
+            "SELECT COALESCE(MAX(column_id), 0) + 1 FROM ducklake_column WHERE table_id = ?",
+        )
+        .bind(table_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let next_column_id: i64 = next_cid_row.try_get(0)?;
+
         let mut column_ids = Vec::with_capacity(columns.len());
         for (order, col) in columns.iter().enumerate() {
-            let row = sqlx::query(
-                "INSERT INTO ducklake_column (table_id, column_name, column_type, column_order, nulls_allowed, begin_snapshot)
-                 VALUES (?, ?, ?, ?, ?, ?) RETURNING column_id",
+            let column_id = next_column_id + order as i64;
+            sqlx::query(
+                "INSERT INTO ducklake_column (column_id, table_id, column_name, column_type, column_order, nulls_allowed, initial_default, default_value, parent_column, default_value_type, default_value_dialect, begin_snapshot)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
+            .bind(column_id)
             .bind(table_id)
             .bind(&col.name)
             .bind(&col.ducklake_type)
-            .bind(order as i64)
+            .bind((order + 1) as i64)
             .bind(col.is_nullable)
+            .bind(&col.initial_default)
+            .bind(&col.default_value)
+            .bind(col.parent_column)
+            .bind(&col.default_value_type)
+            .bind(&col.default_value_dialect)
             .bind(snapshot_id)
-            .fetch_one(&mut *tx)
+            .execute(&mut *tx)
             .await?;
-            column_ids.push(row.try_get(0)?);
+            column_ids.push(column_id);
         }
 
         if mode == WriteMode::Replace {
@@ -372,11 +552,21 @@ impl SqliteMetadataWriter {
 
         // Record the change for conflict detection
         sqlx::query(
-            "INSERT INTO ducklake_snapshot_changes (snapshot_id, change_type, table_id)
+            "INSERT INTO _df_change_tracking (snapshot_id, change_type, table_id)
              VALUES (?, 'DROP_TABLE', ?)",
         )
         .bind(snapshot_id)
         .bind(table_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // Record in spec-compliant snapshot changes
+        sqlx::query(
+            "INSERT OR REPLACE INTO ducklake_snapshot_changes (snapshot_id, changes_made)
+             VALUES (?, ?)",
+        )
+        .bind(snapshot_id)
+        .bind(format!("Dropped table (id={})", table_id))
         .execute(&mut *tx)
         .await?;
 
@@ -409,11 +599,21 @@ impl SqliteMetadataWriter {
 
         // Record the change for conflict detection
         sqlx::query(
-            "INSERT INTO ducklake_snapshot_changes (snapshot_id, change_type, schema_id)
+            "INSERT INTO _df_change_tracking (snapshot_id, change_type, schema_id)
              VALUES (?, 'DROP_SCHEMA', ?)",
         )
         .bind(snapshot_id)
         .bind(schema_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // Record in spec-compliant snapshot changes
+        sqlx::query(
+            "INSERT OR REPLACE INTO ducklake_snapshot_changes (snapshot_id, changes_made)
+             VALUES (?, ?)",
+        )
+        .bind(snapshot_id)
+        .bind(format!("Dropped schema (id={})", schema_id))
         .execute(&mut *tx)
         .await?;
 
@@ -453,13 +653,18 @@ impl MetadataWriter for SqliteMetadataWriter {
                 return Ok((row.try_get(0)?, false));
             }
 
-            let schema_path = path.unwrap_or(name);
+            let base_path = path.unwrap_or(name);
+            let schema_path = if base_path.ends_with('/') {
+                base_path.to_string()
+            } else {
+                format!("{}/", base_path)
+            };
             let row = sqlx::query(
                 "INSERT INTO ducklake_schema (schema_name, path, path_is_relative, begin_snapshot)
                  VALUES (?, ?, 1, ?) RETURNING schema_id",
             )
             .bind(name)
-            .bind(schema_path)
+            .bind(&schema_path)
             .bind(snapshot_id)
             .fetch_one(&self.pool)
             .await?;
@@ -476,32 +681,48 @@ impl MetadataWriter for SqliteMetadataWriter {
         snapshot_id: i64,
     ) -> Result<(i64, bool)> {
         block_on(async {
+            let mut tx = self.pool.begin().await?;
+
             let existing = sqlx::query(
                 "SELECT table_id FROM ducklake_table
                  WHERE schema_id = ? AND table_name = ? AND end_snapshot IS NULL",
             )
             .bind(schema_id)
             .bind(name)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?;
 
             if let Some(row) = existing {
+                tx.commit().await?;
                 return Ok((row.try_get(0)?, false));
             }
 
-            let table_path = path.unwrap_or(name);
-            let row = sqlx::query(
-                "INSERT INTO ducklake_table (schema_id, table_name, path, path_is_relative, begin_snapshot)
-                 VALUES (?, ?, ?, 1, ?) RETURNING table_id",
+            let base_path = path.unwrap_or(name);
+            let table_path = if base_path.ends_with('/') {
+                base_path.to_string()
+            } else {
+                format!("{}/", base_path)
+            };
+            let next_tid_row =
+                sqlx::query("SELECT COALESCE(MAX(table_id), 0) + 1 FROM ducklake_table")
+                    .fetch_one(&mut *tx)
+                    .await?;
+            let next_table_id: i64 = next_tid_row.try_get(0)?;
+
+            sqlx::query(
+                "INSERT INTO ducklake_table (table_id, schema_id, table_name, path, path_is_relative, begin_snapshot)
+                 VALUES (?, ?, ?, ?, 1, ?)",
             )
+            .bind(next_table_id)
             .bind(schema_id)
             .bind(name)
-            .bind(table_path)
+            .bind(&table_path)
             .bind(snapshot_id)
-            .fetch_one(&self.pool)
+            .execute(&mut *tx)
             .await?;
 
-            Ok((row.try_get(0)?, true))
+            tx.commit().await?;
+            Ok((next_table_id, true))
         })
     }
 
@@ -511,6 +732,7 @@ impl MetadataWriter for SqliteMetadataWriter {
         columns: &[ColumnDef],
         snapshot_id: i64,
     ) -> Result<Vec<i64>> {
+        validate_no_duplicate_columns(columns)?;
         block_on(async {
             // Use a transaction to ensure atomicity: if column insertion fails,
             // we don't leave existing columns marked as ended
@@ -525,21 +747,36 @@ impl MetadataWriter for SqliteMetadataWriter {
             .execute(&mut *tx)
             .await?;
 
+            let next_cid_row = sqlx::query(
+                "SELECT COALESCE(MAX(column_id), 0) + 1 FROM ducklake_column WHERE table_id = ?",
+            )
+            .bind(table_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let next_column_id: i64 = next_cid_row.try_get(0)?;
+
             let mut column_ids = Vec::with_capacity(columns.len());
             for (order, col) in columns.iter().enumerate() {
-                let row = sqlx::query(
-                    "INSERT INTO ducklake_column (table_id, column_name, column_type, column_order, nulls_allowed, begin_snapshot)
-                     VALUES (?, ?, ?, ?, ?, ?) RETURNING column_id",
+                let column_id = next_column_id + order as i64;
+                sqlx::query(
+                    "INSERT INTO ducklake_column (column_id, table_id, column_name, column_type, column_order, nulls_allowed, initial_default, default_value, parent_column, default_value_type, default_value_dialect, begin_snapshot)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
+                .bind(column_id)
                 .bind(table_id)
                 .bind(&col.name)
                 .bind(&col.ducklake_type)
-                .bind(order as i64)
+                .bind((order + 1) as i64)
                 .bind(col.is_nullable)
+                .bind(&col.initial_default)
+                .bind(&col.default_value)
+                .bind(col.parent_column)
+                .bind(&col.default_value_type)
+                .bind(&col.default_value_dialect)
                 .bind(snapshot_id)
-                .fetch_one(&mut *tx)
+                .execute(&mut *tx)
                 .await?;
-                column_ids.push(row.try_get(0)?);
+                column_ids.push(column_id);
             }
 
             tx.commit().await?;
@@ -559,7 +796,7 @@ impl MetadataWriter for SqliteMetadataWriter {
         block_on(async {
             for stat in stats {
                 sqlx::query(
-                    "INSERT OR REPLACE INTO ducklake_file_column_stats
+                    "INSERT INTO ducklake_file_column_stats
                      (data_file_id, table_id, column_id, null_count, min_value, max_value)
                      VALUES (?, ?, ?, ?, ?, ?)",
                 )
@@ -653,6 +890,32 @@ impl MetadataWriter for SqliteMetadataWriter {
     fn initialize_schema(&self) -> Result<()> {
         block_on(async {
             sqlx::query(SQL_CREATE_SCHEMA).execute(&self.pool).await?;
+
+            // Insert DuckLake version metadata if not already present.
+            // DuckLake uses this for migration checks; v0.3 is compatible with DuckDB v1.4.x.
+            sqlx::query(
+                "INSERT INTO ducklake_metadata (key, value)
+                 SELECT 'version', '0.3'
+                 WHERE NOT EXISTS (SELECT 1 FROM ducklake_metadata WHERE key = 'version' AND scope IS NULL)",
+            )
+            .execute(&self.pool)
+            .await?;
+            sqlx::query(
+                "INSERT INTO ducklake_metadata (key, value)
+                 SELECT 'created_by', 'DataFusion-DuckLake'
+                 WHERE NOT EXISTS (SELECT 1 FROM ducklake_metadata WHERE key = 'created_by' AND scope IS NULL)",
+            )
+            .execute(&self.pool)
+            .await?;
+
+            // Insert initial snapshot 0 (DuckDB expects this as the "empty catalog" snapshot)
+            sqlx::query(
+                "INSERT OR IGNORE INTO ducklake_snapshot (snapshot_id, snapshot_time, schema_version, next_catalog_id, next_file_id)
+                 VALUES (0, CURRENT_TIMESTAMP, 0, 0, 0)",
+            )
+            .execute(&self.pool)
+            .await?;
+
             Ok(())
         })
     }
@@ -756,7 +1019,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 let schema_id: i64 = schema_row.try_get(0)?;
 
                 let schema_drop = sqlx::query(
-                    "SELECT COUNT(*) FROM ducklake_snapshot_changes
+                    "SELECT COUNT(*) FROM _df_change_tracking
                      WHERE snapshot_id > ? AND schema_id = ? AND change_type = 'DROP_SCHEMA'",
                 )
                 .bind(since_snapshot)
@@ -783,7 +1046,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 if let Some(table_row) = table_row {
                     let table_id: i64 = table_row.try_get(0)?;
                     let table_drop = sqlx::query(
-                        "SELECT COUNT(*) FROM ducklake_snapshot_changes
+                        "SELECT COUNT(*) FROM _df_change_tracking
                          WHERE snapshot_id > ? AND table_id = ? AND change_type = 'DROP_TABLE'",
                     )
                     .bind(since_snapshot)
@@ -809,7 +1072,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             let mut tx = self.pool.begin().await?;
 
             let drop_check = sqlx::query(
-                "SELECT COUNT(*) FROM ducklake_snapshot_changes
+                "SELECT COUNT(*) FROM _df_change_tracking
                  WHERE snapshot_id > ? AND table_id = ? AND change_type = 'DROP_TABLE'",
             )
             .bind(since_snapshot)
@@ -833,7 +1096,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             let mut tx = self.pool.begin().await?;
 
             let drop_check = sqlx::query(
-                "SELECT COUNT(*) FROM ducklake_snapshot_changes
+                "SELECT COUNT(*) FROM _df_change_tracking
                  WHERE snapshot_id > ? AND schema_id = ? AND change_type = 'DROP_SCHEMA'",
             )
             .bind(since_snapshot)
@@ -876,17 +1139,22 @@ impl MetadataWriter for SqliteMetadataWriter {
             .await?;
             let snapshot_id: i64 = row.try_get(0)?;
 
-            let row = sqlx::query(
-                "INSERT INTO ducklake_view (schema_id, view_name, sql, begin_snapshot)
-                 VALUES (?, ?, ?, ?) RETURNING view_id",
+            let vid_row = sqlx::query("SELECT COALESCE(MAX(view_id), 0) + 1 FROM ducklake_view")
+                .fetch_one(&mut *tx)
+                .await?;
+            let view_id: i64 = vid_row.try_get(0)?;
+
+            sqlx::query(
+                "INSERT INTO ducklake_view (view_id, schema_id, view_name, sql, begin_snapshot)
+                 VALUES (?, ?, ?, ?, ?)",
             )
+            .bind(view_id)
             .bind(schema_id)
             .bind(view_name)
             .bind(sql)
             .bind(snapshot_id)
-            .fetch_one(&mut *tx)
+            .execute(&mut *tx)
             .await?;
-            let view_id: i64 = row.try_get(0)?;
 
             tx.commit().await?;
             Ok((view_id, snapshot_id))
@@ -919,14 +1187,13 @@ impl MetadataWriter for SqliteMetadataWriter {
     }
 
     fn alter_table(&self, table_id: i64, op: &AlterTableOp) -> Result<i64> {
-        use crate::metadata_writer::is_type_promotion_allowed;
-
         block_on(async {
             let mut tx = self.pool.begin().await?;
 
-            // Get active columns for validation
+            // Get active columns for validation (including default value fields)
             let col_rows = sqlx::query(
-                "SELECT column_id, column_name, column_type, column_order, nulls_allowed
+                "SELECT column_id, column_name, column_type, column_order, nulls_allowed,
+                        initial_default, default_value, parent_column, default_value_type, default_value_dialect
                  FROM ducklake_column
                  WHERE table_id = ? AND end_snapshot IS NULL
                  ORDER BY column_order",
@@ -935,12 +1202,26 @@ impl MetadataWriter for SqliteMetadataWriter {
             .fetch_all(&mut *tx)
             .await?;
 
-            if col_rows.is_empty() {
-                return Err(crate::error::DuckLakeError::Internal(
-                    "Cannot alter table: no active columns found (table may be dropped)"
-                        .to_string(),
-                ));
-            }
+            let columns: Vec<ActiveColumnInfo> = col_rows
+                .iter()
+                .map(|r| {
+                    Ok(ActiveColumnInfo {
+                        column_id: r.try_get(0)?,
+                        column_name: r.try_get(1)?,
+                        column_type: r.try_get(2)?,
+                        column_order: r.try_get(3)?,
+                        is_nullable: r.try_get::<Option<bool>, _>(4)?.unwrap_or(true),
+                        initial_default: r.try_get(5)?,
+                        default_value: r.try_get(6)?,
+                        parent_column: r.try_get(7)?,
+                        default_value_type: r.try_get(8)?,
+                        default_value_dialect: r.try_get(9)?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            validate_table_has_columns(&columns)?;
+            let action = validate_alter_table(&columns, op)?;
 
             // Create a new snapshot
             let row = sqlx::query(
@@ -950,186 +1231,123 @@ impl MetadataWriter for SqliteMetadataWriter {
             .await?;
             let snapshot_id: i64 = row.try_get(0)?;
 
-            match op {
-                AlterTableOp::AddColumn {
-                    column,
-                } => {
-                    // Validate: must be nullable
-                    if !column.is_nullable {
-                        return Err(crate::error::DuckLakeError::InvalidConfig(format!(
-                            "Cannot add non-nullable column '{}': new columns must be nullable since existing rows have no value",
-                            column.name
-                        )));
-                    }
-
-                    // Validate: no duplicate name
-                    for row in &col_rows {
-                        let name: String = row.try_get(1)?;
-                        if name == column.name {
-                            return Err(crate::error::DuckLakeError::InvalidConfig(format!(
-                                "Column '{}' already exists in table",
-                                column.name
-                            )));
-                        }
-                    }
-
-                    // Determine next column_order
-                    let max_order: i64 = col_rows
-                        .iter()
-                        .map(|r| r.try_get::<i64, _>(3).unwrap_or(0))
-                        .max()
-                        .unwrap_or(-1);
-
-                    sqlx::query(
-                        "INSERT INTO ducklake_column (table_id, column_name, column_type, column_order, nulls_allowed, begin_snapshot)
-                         VALUES (?, ?, ?, ?, ?, ?)",
-                    )
-                    .bind(table_id)
-                    .bind(&column.name)
-                    .bind(&column.ducklake_type)
-                    .bind(max_order + 1)
-                    .bind(column.is_nullable)
-                    .bind(snapshot_id)
-                    .execute(&mut *tx)
-                    .await?;
-                },
-
-                AlterTableOp::DropColumn {
+            match action {
+                AlterTableAction::InsertColumn {
                     column_name,
+                    column_type,
+                    column_order,
+                    is_nullable,
                 } => {
-                    // Validate: cannot drop last column
-                    if col_rows.len() == 1 {
-                        return Err(crate::error::DuckLakeError::InvalidConfig(
-                            "Cannot drop column: table only has one column remaining".to_string(),
-                        ));
-                    }
+                    // Compute next column_id explicitly
+                    let next_cid_row = sqlx::query(
+                        "SELECT COALESCE(MAX(column_id), 0) + 1 FROM ducklake_column WHERE table_id = ?",
+                    )
+                    .bind(table_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    let next_column_id: i64 = next_cid_row.try_get(0)?;
 
-                    // Find the column
-                    let target = col_rows
-                        .iter()
-                        .find(|r| r.try_get::<String, _>(1).unwrap_or_default() == *column_name);
-
-                    let Some(target_row) = target else {
-                        return Err(crate::error::DuckLakeError::InvalidConfig(format!(
-                            "Column '{}' not found in table",
-                            column_name
-                        )));
+                    // For AddColumn, bind ColumnDef fields from the op
+                    let (
+                        initial_default,
+                        default_value,
+                        parent_column,
+                        default_value_type,
+                        default_value_dialect,
+                    ) = if let AlterTableOp::AddColumn {
+                        column,
+                    } = op
+                    {
+                        (
+                            &column.initial_default,
+                            &column.default_value,
+                            column.parent_column,
+                            &column.default_value_type,
+                            &column.default_value_dialect,
+                        )
+                    } else {
+                        (&None, &None, None, &None, &None)
                     };
+                    sqlx::query(
+                        "INSERT INTO ducklake_column (column_id, table_id, column_name, column_type, column_order, nulls_allowed, initial_default, default_value, parent_column, default_value_type, default_value_dialect, begin_snapshot)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    )
+                    .bind(next_column_id)
+                    .bind(table_id)
+                    .bind(&column_name)
+                    .bind(&column_type)
+                    .bind(column_order)
+                    .bind(is_nullable)
+                    .bind(initial_default)
+                    .bind(default_value)
+                    .bind(parent_column)
+                    .bind(default_value_type)
+                    .bind(default_value_dialect)
+                    .bind(snapshot_id)
+                    .execute(&mut *tx)
+                    .await?;
 
-                    let column_id: i64 = target_row.try_get(0)?;
-
-                    // Soft delete: set end_snapshot
+                    // Initialize table-level column stats for the new column (upstream bug #625)
+                    sqlx::query(
+                        "INSERT INTO ducklake_table_column_stats (table_id, column_id, contains_null, contains_nan)
+                         VALUES (?, ?, NULL, NULL)",
+                    )
+                    .bind(table_id)
+                    .bind(next_column_id)
+                    .execute(&mut *tx)
+                    .await?;
+                },
+                AlterTableAction::EndColumn {
+                    column_id,
+                } => {
                     sqlx::query(
                         "UPDATE ducklake_column SET end_snapshot = ?
-                         WHERE column_id = ?",
+                         WHERE column_id = ? AND end_snapshot IS NULL",
                     )
                     .bind(snapshot_id)
                     .bind(column_id)
                     .execute(&mut *tx)
                     .await?;
                 },
-
-                AlterTableOp::RenameColumn {
-                    old_name,
-                    new_name,
+                AlterTableAction::ReplaceColumn {
+                    end_column_id,
+                    column_name,
+                    column_type,
+                    column_order,
+                    is_nullable,
+                    initial_default,
+                    default_value,
+                    parent_column,
+                    default_value_type,
+                    default_value_dialect,
                 } => {
-                    // Find the column to rename
-                    let target = col_rows
-                        .iter()
-                        .find(|r| r.try_get::<String, _>(1).unwrap_or_default() == *old_name);
-
-                    let Some(target_row) = target else {
-                        return Err(crate::error::DuckLakeError::InvalidConfig(format!(
-                            "Column '{}' not found in table",
-                            old_name
-                        )));
-                    };
-
-                    // Validate: new name doesn't conflict
-                    for row in &col_rows {
-                        let name: String = row.try_get(1)?;
-                        if name == *new_name {
-                            return Err(crate::error::DuckLakeError::InvalidConfig(format!(
-                                "Column '{}' already exists in table",
-                                new_name
-                            )));
-                        }
-                    }
-
-                    let column_id: i64 = target_row.try_get(0)?;
-                    let col_type: String = target_row.try_get(2)?;
-                    let col_order: i64 = target_row.try_get(3)?;
-                    let nullable: bool = target_row.try_get::<Option<bool>, _>(4)?.unwrap_or(true);
-
-                    // End old column, create new with same type/order/nullable
+                    // End the existing column row
                     sqlx::query(
                         "UPDATE ducklake_column SET end_snapshot = ?
-                         WHERE column_id = ?",
+                         WHERE column_id = ? AND end_snapshot IS NULL",
                     )
                     .bind(snapshot_id)
-                    .bind(column_id)
+                    .bind(end_column_id)
                     .execute(&mut *tx)
                     .await?;
 
+                    // Reuse the same column_id for the replacement row
+                    // (critical for Parquet field_id mapping)
                     sqlx::query(
-                        "INSERT INTO ducklake_column (table_id, column_name, column_type, column_order, nulls_allowed, begin_snapshot)
-                         VALUES (?, ?, ?, ?, ?, ?)",
+                        "INSERT INTO ducklake_column (column_id, table_id, column_name, column_type, column_order, nulls_allowed, initial_default, default_value, parent_column, default_value_type, default_value_dialect, begin_snapshot)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     )
+                    .bind(end_column_id)
                     .bind(table_id)
-                    .bind(new_name)
-                    .bind(&col_type)
-                    .bind(col_order)
-                    .bind(nullable)
-                    .bind(snapshot_id)
-                    .execute(&mut *tx)
-                    .await?;
-                },
-
-                AlterTableOp::AlterColumnType(alter_type) => {
-                    // Find the column
-                    let target = col_rows.iter().find(|r| {
-                        r.try_get::<String, _>(1).unwrap_or_default() == alter_type.column_name
-                    });
-
-                    let Some(target_row) = target else {
-                        return Err(crate::error::DuckLakeError::InvalidConfig(format!(
-                            "Column '{}' not found in table",
-                            alter_type.column_name
-                        )));
-                    };
-
-                    let column_id: i64 = target_row.try_get(0)?;
-                    let current_type: String = target_row.try_get(2)?;
-                    let col_order: i64 = target_row.try_get(3)?;
-                    let nullable: bool = target_row.try_get::<Option<bool>, _>(4)?.unwrap_or(true);
-
-                    // Validate type promotion
-                    if !is_type_promotion_allowed(&current_type, &alter_type.new_type) {
-                        return Err(crate::error::DuckLakeError::InvalidConfig(format!(
-                            "Cannot change type of column '{}' from '{}' to '{}': only widening type promotions are allowed",
-                            alter_type.column_name, current_type, alter_type.new_type
-                        )));
-                    }
-
-                    // End old column, create new with new type
-                    sqlx::query(
-                        "UPDATE ducklake_column SET end_snapshot = ?
-                         WHERE column_id = ?",
-                    )
-                    .bind(snapshot_id)
-                    .bind(column_id)
-                    .execute(&mut *tx)
-                    .await?;
-
-                    sqlx::query(
-                        "INSERT INTO ducklake_column (table_id, column_name, column_type, column_order, nulls_allowed, begin_snapshot)
-                         VALUES (?, ?, ?, ?, ?, ?)",
-                    )
-                    .bind(table_id)
-                    .bind(&alter_type.column_name)
-                    .bind(&alter_type.new_type)
-                    .bind(col_order)
-                    .bind(nullable)
+                    .bind(&column_name)
+                    .bind(&column_type)
+                    .bind(column_order)
+                    .bind(is_nullable)
+                    .bind(&initial_default)
+                    .bind(&default_value)
+                    .bind(parent_column)
+                    .bind(&default_value_type)
+                    .bind(&default_value_dialect)
                     .bind(snapshot_id)
                     .execute(&mut *tx)
                     .await?;
@@ -1138,11 +1356,21 @@ impl MetadataWriter for SqliteMetadataWriter {
 
             // Record change for conflict detection
             sqlx::query(
-                "INSERT INTO ducklake_snapshot_changes (snapshot_id, change_type, table_id)
+                "INSERT INTO _df_change_tracking (snapshot_id, change_type, table_id)
                  VALUES (?, 'ALTER_TABLE', ?)",
             )
             .bind(snapshot_id)
             .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // Record in spec-compliant snapshot changes
+            sqlx::query(
+                "INSERT OR REPLACE INTO ducklake_snapshot_changes (snapshot_id, changes_made)
+                 VALUES (?, ?)",
+            )
+            .bind(snapshot_id)
+            .bind(format!("Altered table (id={})", table_id))
             .execute(&mut *tx)
             .await?;
 
@@ -1325,5 +1553,363 @@ mod tests {
         writer.set_data_path("/new/path").unwrap();
         let path2 = writer.get_data_path().unwrap();
         assert_eq!(path2, "/new/path");
+    }
+
+    /// Verifies that column_id is stable (reused) after a rename operation.
+    /// This is critical for Parquet field_id mapping (types.rs maps column_id → field_id).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_column_id_stable_after_rename() {
+        let (writer, _temp) = create_test_writer().await;
+        let snapshot_id = writer.create_snapshot().unwrap();
+        let (schema_id, _) = writer
+            .get_or_create_schema("main", None, snapshot_id)
+            .unwrap();
+        let (table_id, _) = writer
+            .get_or_create_table(schema_id, "users", None, snapshot_id)
+            .unwrap();
+
+        // Create columns: id (column_id=1), name (column_id=2)
+        let columns =
+            vec![ColumnDef::new("id", "int64", false), ColumnDef::new("name", "varchar", true)];
+        let column_ids = writer.set_columns(table_id, &columns, snapshot_id).unwrap();
+        assert_eq!(column_ids, vec![1, 2]);
+
+        // Rename "name" to "full_name"
+        let op = AlterTableOp::RenameColumn {
+            old_name: "name".to_string(),
+            new_name: "full_name".to_string(),
+        };
+        writer.alter_table(table_id, &op).unwrap();
+
+        // Verify the renamed column still has the same column_id (2)
+        let rows = block_on(async {
+            sqlx::query(
+                "SELECT column_id, column_name FROM ducklake_column
+                 WHERE table_id = ? AND end_snapshot IS NULL
+                 ORDER BY column_order",
+            )
+            .bind(table_id)
+            .fetch_all(&writer.pool)
+            .await
+            .unwrap()
+        });
+
+        assert_eq!(rows.len(), 2);
+        // "id" column should still have column_id = 1
+        let col0_id: i64 = rows[0].try_get(0).unwrap();
+        let col0_name: String = rows[0].try_get(1).unwrap();
+        assert_eq!(col0_id, 1);
+        assert_eq!(col0_name, "id");
+        // "full_name" column should still have column_id = 2 (reused from "name")
+        let col1_id: i64 = rows[1].try_get(0).unwrap();
+        let col1_name: String = rows[1].try_get(1).unwrap();
+        assert_eq!(col1_id, 2);
+        assert_eq!(col1_name, "full_name");
+
+        // Also verify there are ended rows with the same column_ids
+        let all_rows = block_on(async {
+            sqlx::query(
+                "SELECT column_id, column_name, end_snapshot FROM ducklake_column
+                 WHERE table_id = ?
+                 ORDER BY column_id, end_snapshot IS NULL",
+            )
+            .bind(table_id)
+            .fetch_all(&writer.pool)
+            .await
+            .unwrap()
+        });
+
+        // Should have 3 rows: id(active), name(ended), full_name(active)
+        assert_eq!(all_rows.len(), 3);
+
+        // Verify column_id=2 appears twice (once ended, once active)
+        let col2_rows: Vec<_> = all_rows
+            .iter()
+            .filter(|r| r.try_get::<i64, _>(0).unwrap() == 2)
+            .collect();
+        assert_eq!(col2_rows.len(), 2);
+        // One should be ended (name), one active (full_name)
+        let ended: String = col2_rows[0].try_get(1).unwrap();
+        let active: String = col2_rows[1].try_get(1).unwrap();
+        assert_eq!(ended, "name");
+        assert_eq!(active, "full_name");
+    }
+
+    /// Verifies that adding a new column gets the next sequential column_id,
+    /// not conflicting with existing or ended column_ids.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_add_column_gets_next_id() {
+        let (writer, _temp) = create_test_writer().await;
+        let snapshot_id = writer.create_snapshot().unwrap();
+        let (schema_id, _) = writer
+            .get_or_create_schema("main", None, snapshot_id)
+            .unwrap();
+        let (table_id, _) = writer
+            .get_or_create_table(schema_id, "users", None, snapshot_id)
+            .unwrap();
+
+        // Create columns: id (1), name (2)
+        let columns =
+            vec![ColumnDef::new("id", "int64", false), ColumnDef::new("name", "varchar", true)];
+        writer.set_columns(table_id, &columns, snapshot_id).unwrap();
+
+        // Add a new column
+        let op = AlterTableOp::AddColumn {
+            column: ColumnDef::new("email", "varchar", true),
+        };
+        writer.alter_table(table_id, &op).unwrap();
+
+        // Verify new column got column_id = 3
+        let rows = block_on(async {
+            sqlx::query(
+                "SELECT column_id, column_name FROM ducklake_column
+                 WHERE table_id = ? AND end_snapshot IS NULL
+                 ORDER BY column_order",
+            )
+            .bind(table_id)
+            .fetch_all(&writer.pool)
+            .await
+            .unwrap()
+        });
+
+        assert_eq!(rows.len(), 3);
+        let email_id: i64 = rows[2].try_get(0).unwrap();
+        let email_name: String = rows[2].try_get(1).unwrap();
+        assert_eq!(email_id, 3);
+        assert_eq!(email_name, "email");
+    }
+
+    /// Verifies that default values are preserved after a rename operation.
+    /// This tests the M4 fix: ReplaceColumn must carry forward all default-related fields.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_defaults_preserved_after_rename() {
+        let (writer, _temp) = create_test_writer().await;
+        let snapshot_id = writer.create_snapshot().unwrap();
+        let (schema_id, _) = writer
+            .get_or_create_schema("main", None, snapshot_id)
+            .unwrap();
+        let (table_id, _) = writer
+            .get_or_create_table(schema_id, "users", None, snapshot_id)
+            .unwrap();
+
+        // Create a column with default values set
+        let mut col = ColumnDef::new("status", "varchar", true);
+        col.initial_default = Some("active".to_string());
+        col.default_value = Some("active".to_string());
+        col.default_value_type = Some("VARCHAR".to_string());
+        col.default_value_dialect = Some("SQL".to_string());
+        let columns = vec![ColumnDef::new("id", "int64", false), col];
+        writer.set_columns(table_id, &columns, snapshot_id).unwrap();
+
+        // Rename "status" to "user_status"
+        let op = AlterTableOp::RenameColumn {
+            old_name: "status".to_string(),
+            new_name: "user_status".to_string(),
+        };
+        writer.alter_table(table_id, &op).unwrap();
+
+        // Verify defaults are preserved on the renamed column
+        let rows = block_on(async {
+            sqlx::query(
+                "SELECT column_name, initial_default, default_value, default_value_type, default_value_dialect
+                 FROM ducklake_column
+                 WHERE table_id = ? AND end_snapshot IS NULL AND column_name = 'user_status'",
+            )
+            .bind(table_id)
+            .fetch_all(&writer.pool)
+            .await
+            .unwrap()
+        });
+
+        assert_eq!(rows.len(), 1);
+        let name: String = rows[0].try_get(0).unwrap();
+        let init_def: Option<String> = rows[0].try_get(1).unwrap();
+        let def_val: Option<String> = rows[0].try_get(2).unwrap();
+        let def_type: Option<String> = rows[0].try_get(3).unwrap();
+        let def_dialect: Option<String> = rows[0].try_get(4).unwrap();
+        assert_eq!(name, "user_status");
+        assert_eq!(init_def.as_deref(), Some("active"));
+        assert_eq!(def_val.as_deref(), Some("active"));
+        assert_eq!(def_type.as_deref(), Some("VARCHAR"));
+        assert_eq!(def_dialect.as_deref(), Some("SQL"));
+    }
+
+    /// P2-5: Duplicate column names in write_transaction_inner should be rejected.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_duplicate_column_names_rejected() {
+        let (writer, _temp) = create_test_writer().await;
+
+        let columns = vec![
+            ColumnDef::new("id", "int64", false),
+            ColumnDef::new("id", "int64", false), // duplicate
+        ];
+
+        let result =
+            writer.begin_write_transaction("main", "dup_test", &columns, WriteMode::Replace);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("Duplicate column name"),
+            "Expected duplicate column error, got: {err}"
+        );
+    }
+
+    /// P2-5: Duplicate columns in set_columns should also be rejected.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_set_columns_duplicate_rejected() {
+        let (writer, _temp) = create_test_writer().await;
+        let snapshot_id = writer.create_snapshot().unwrap();
+        let (schema_id, _) = writer
+            .get_or_create_schema("main", None, snapshot_id)
+            .unwrap();
+        let (table_id, _) = writer
+            .get_or_create_table(schema_id, "users", None, snapshot_id)
+            .unwrap();
+
+        let columns = vec![
+            ColumnDef::new("x", "int64", false),
+            ColumnDef::new("x", "varchar", true),
+        ];
+
+        let result = writer.set_columns(table_id, &columns, snapshot_id);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Duplicate column name"));
+    }
+
+    /// P1-3: Column stats row should be initialized after ALTER TABLE AddColumn.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_add_column_initializes_table_column_stats() {
+        let (writer, _temp) = create_test_writer().await;
+        let snapshot_id = writer.create_snapshot().unwrap();
+        let (schema_id, _) = writer
+            .get_or_create_schema("main", None, snapshot_id)
+            .unwrap();
+        let (table_id, _) = writer
+            .get_or_create_table(schema_id, "users", None, snapshot_id)
+            .unwrap();
+
+        let columns =
+            vec![ColumnDef::new("id", "int64", false), ColumnDef::new("name", "varchar", true)];
+        writer.set_columns(table_id, &columns, snapshot_id).unwrap();
+
+        // Add a new column
+        let op = AlterTableOp::AddColumn {
+            column: ColumnDef::new("email", "varchar", true),
+        };
+        writer.alter_table(table_id, &op).unwrap();
+
+        // Verify that ducklake_table_column_stats has a row for the new column
+        let stats_rows = block_on(async {
+            sqlx::query(
+                "SELECT table_id, column_id FROM ducklake_table_column_stats
+                 WHERE table_id = ?
+                 ORDER BY column_id",
+            )
+            .bind(table_id)
+            .fetch_all(&writer.pool)
+            .await
+            .unwrap()
+        });
+
+        // Should have at least the new column's stats row
+        assert!(
+            !stats_rows.is_empty(),
+            "Expected ducklake_table_column_stats to have a row for the new column"
+        );
+
+        // Find the row for the email column (column_id = 3)
+        let new_col_stat = stats_rows
+            .iter()
+            .find(|r| r.try_get::<i64, _>(1).unwrap() == 3);
+        assert!(
+            new_col_stat.is_some(),
+            "Expected a stats row for the newly added column (column_id=3)"
+        );
+    }
+
+    /// P1-4: Compound ALTER TABLE operations (ADD then RENAME) should not corrupt metadata.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_compound_alter_add_then_rename() {
+        let (writer, _temp) = create_test_writer().await;
+        let snapshot_id = writer.create_snapshot().unwrap();
+        let (schema_id, _) = writer
+            .get_or_create_schema("main", None, snapshot_id)
+            .unwrap();
+        let (table_id, _) = writer
+            .get_or_create_table(schema_id, "users", None, snapshot_id)
+            .unwrap();
+
+        let columns =
+            vec![ColumnDef::new("id", "int64", false), ColumnDef::new("name", "varchar", true)];
+        let col_ids = writer.set_columns(table_id, &columns, snapshot_id).unwrap();
+        assert_eq!(col_ids, vec![1, 2]);
+
+        // Step 1: ADD COLUMN email
+        let snap1 = writer
+            .alter_table(
+                table_id,
+                &AlterTableOp::AddColumn {
+                    column: ColumnDef::new("email", "varchar", true),
+                },
+            )
+            .unwrap();
+
+        // Step 2: RENAME the newly added column
+        let snap2 = writer
+            .alter_table(
+                table_id,
+                &AlterTableOp::RenameColumn {
+                    old_name: "email".to_string(),
+                    new_name: "contact_email".to_string(),
+                },
+            )
+            .unwrap();
+
+        assert!(snap2 > snap1, "Each alter should create a new snapshot");
+
+        // Verify final column state
+        let columns = writer.get_active_columns(table_id).unwrap();
+        assert_eq!(columns.len(), 3);
+        assert_eq!(columns[0].0, "id");
+        assert_eq!(columns[1].0, "name");
+        assert_eq!(columns[2].0, "contact_email");
+        assert_eq!(columns[2].1, "varchar");
+        assert!(columns[2].2); // nullable
+
+        // Verify no duplicate active column names
+        let active_rows = block_on(async {
+            sqlx::query(
+                "SELECT column_name FROM ducklake_column
+                 WHERE table_id = ? AND end_snapshot IS NULL
+                 ORDER BY column_order",
+            )
+            .bind(table_id)
+            .fetch_all(&writer.pool)
+            .await
+            .unwrap()
+        });
+        let names: Vec<String> = active_rows
+            .iter()
+            .map(|r| r.try_get(0).unwrap())
+            .collect();
+        assert_eq!(names, vec!["id", "name", "contact_email"]);
+
+        // Verify column_id stability: email was added as id=3, renamed column should reuse id=3
+        let id_rows = block_on(async {
+            sqlx::query(
+                "SELECT column_id, column_name FROM ducklake_column
+                 WHERE table_id = ? AND end_snapshot IS NULL
+                 ORDER BY column_order",
+            )
+            .bind(table_id)
+            .fetch_all(&writer.pool)
+            .await
+            .unwrap()
+        });
+        let renamed_col_id: i64 = id_rows[2].try_get(0).unwrap();
+        let renamed_col_name: String = id_rows[2].try_get(1).unwrap();
+        assert_eq!(renamed_col_name, "contact_email");
+        // The rename reuses the same column_id
+        assert_eq!(renamed_col_id, 3);
     }
 }

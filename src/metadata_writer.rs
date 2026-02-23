@@ -69,6 +69,8 @@ pub fn is_type_promotion_allowed(source: &str, target: &str) -> bool {
             | ("uint32", "int64")
             // Float widening
             | ("float", "double")
+            // Timestamp widening
+            | ("timestamp", "timestamptz")
     )
 }
 
@@ -84,6 +86,16 @@ pub struct ColumnDef {
     pub ducklake_type: String,
     /// Whether this column allows NULL values
     pub is_nullable: bool,
+    /// Initial default value expression (DuckLake forward compatibility)
+    pub initial_default: Option<String>,
+    /// Default value expression (DuckLake forward compatibility)
+    pub default_value: Option<String>,
+    /// Parent column ID for nested columns (DuckLake forward compatibility)
+    pub parent_column: Option<i64>,
+    /// Type of the default value (DuckLake forward compatibility)
+    pub default_value_type: Option<String>,
+    /// SQL dialect for the default value (DuckLake forward compatibility)
+    pub default_value_dialect: Option<String>,
 }
 
 impl ColumnDef {
@@ -97,6 +109,11 @@ impl ColumnDef {
             name: name.into(),
             ducklake_type: ducklake_type.into(),
             is_nullable,
+            initial_default: None,
+            default_value: None,
+            parent_column: None,
+            default_value_type: None,
+            default_value_dialect: None,
         }
     }
 
