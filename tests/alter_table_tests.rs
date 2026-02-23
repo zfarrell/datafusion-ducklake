@@ -580,3 +580,124 @@ async fn test_alter_on_dropped_table_fails() {
         "Error should indicate table issue: {err}"
     );
 }
+
+// ==================== Compound ALTER TABLE ====================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_compound_alter_add_then_rename() {
+    let (writer, _temp) = create_test_writer().await;
+    let (table_id, _, _) = setup_table(&writer);
+
+    // Step 1: Add a column
+    writer
+        .alter_table(
+            table_id,
+            &AlterTableOp::AddColumn {
+                column: ColumnDef::new("email", "varchar", true),
+            },
+        )
+        .unwrap();
+
+    // Step 2: Rename the newly added column
+    writer
+        .alter_table(
+            table_id,
+            &AlterTableOp::RenameColumn {
+                old_name: "email".to_string(),
+                new_name: "contact_email".to_string(),
+            },
+        )
+        .unwrap();
+
+    let columns = writer.get_active_columns(table_id).unwrap();
+    assert_eq!(columns.len(), 3);
+    assert_eq!(columns[0].0, "id");
+    assert_eq!(columns[1].0, "name");
+    assert_eq!(columns[2].0, "contact_email");
+    assert_eq!(columns[2].1, "varchar");
+    assert!(columns[2].2); // nullable
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_compound_alter_add_rename_drop() {
+    let (writer, _temp) = create_test_writer().await;
+    let (table_id, _, _) = setup_table(&writer);
+
+    // Add two columns
+    writer
+        .alter_table(
+            table_id,
+            &AlterTableOp::AddColumn {
+                column: ColumnDef::new("email", "varchar", true),
+            },
+        )
+        .unwrap();
+    writer
+        .alter_table(
+            table_id,
+            &AlterTableOp::AddColumn {
+                column: ColumnDef::new("age", "int32", true),
+            },
+        )
+        .unwrap();
+
+    // Rename one
+    writer
+        .alter_table(
+            table_id,
+            &AlterTableOp::RenameColumn {
+                old_name: "name".to_string(),
+                new_name: "full_name".to_string(),
+            },
+        )
+        .unwrap();
+
+    // Drop one
+    writer
+        .alter_table(
+            table_id,
+            &AlterTableOp::DropColumn {
+                column_name: "age".to_string(),
+            },
+        )
+        .unwrap();
+
+    // Widen type
+    writer
+        .alter_table(
+            table_id,
+            &AlterTableOp::AlterColumnType(AlterColumnTypeOp {
+                column_name: "id".to_string(),
+                new_type: "int64".to_string(),
+            }),
+        )
+        .unwrap();
+
+    let columns = writer.get_active_columns(table_id).unwrap();
+    assert_eq!(columns.len(), 3, "Expected 3 columns after compound ALTER: {columns:?}");
+    assert_eq!(columns[0].0, "id");
+    assert_eq!(columns[0].1, "int64"); // widened
+    assert_eq!(columns[1].0, "full_name"); // renamed
+    assert_eq!(columns[2].0, "email");
+}
+
+// ==================== Duplicate column validation ====================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_write_with_duplicate_columns_fails() {
+    let (writer, _temp) = create_test_writer().await;
+
+    let dup_columns = vec![
+        ColumnDef::new("id", "int32", false),
+        ColumnDef::new("name", "varchar", true),
+        ColumnDef::new("id", "int32", false), // duplicate
+    ];
+
+    let result = writer.begin_write_transaction("main", "bad_table", &dup_columns, WriteMode::Replace);
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(
+        err.to_string().contains("Duplicate column name"),
+        "Error should mention duplicate column: {err}"
+    );
+}
