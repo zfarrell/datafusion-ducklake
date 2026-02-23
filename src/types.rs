@@ -19,6 +19,18 @@ pub fn ducklake_to_arrow_type(ducklake_type: &str) -> Result<DataType> {
         return Ok(decimal_params);
     }
 
+    // Handle parameterized string types: VARCHAR(N), CHAR(N), CHARACTER VARYING(N)
+    if normalized.starts_with("varchar(")
+        || normalized.starts_with("character varying(")
+        || normalized.starts_with("char(")
+        || normalized.starts_with("character(")
+        || normalized.starts_with("nchar(")
+        || normalized.starts_with("nvarchar(")
+        || normalized.starts_with("text(")
+    {
+        return Ok(DataType::Utf8);
+    }
+
     // Handle basic types
     match normalized.as_str() {
         // Boolean
@@ -294,6 +306,7 @@ fn extract_type_params(type_str: &str, prefix_len: usize) -> Option<&str> {
 
 /// Parse struct field definitions.
 /// Handles both `name type` (parentheses notation) and `name:type` (angle bracket notation).
+/// Supports double-quoted field names: `"my field" VARCHAR`.
 fn parse_struct_fields(inner: &str) -> Result<DataType> {
     let parts = split_top_level(inner, ',');
     let mut fields = Vec::new();
@@ -304,8 +317,23 @@ fn parse_struct_fields(inner: &str) -> Result<DataType> {
             continue;
         }
 
-        // Try colon separator first (angle bracket notation), then space
-        let (name, type_str) = if let Some(pos) = find_top_level_char(part, ':') {
+        // Check for double-quoted field name
+        let (name, type_str) = if part.starts_with('"') {
+            // Find closing quote
+            if let Some(close_quote) = part[1..].find('"') {
+                let name = &part[1..close_quote + 1];
+                let rest = part[close_quote + 2..].trim();
+                // Rest should start with ':' or ' ' then the type
+                let type_str = rest.strip_prefix(':').unwrap_or(rest).trim();
+                (name, type_str)
+            } else {
+                return Err(DuckLakeError::UnsupportedType(format!(
+                    "Unterminated quoted field name in struct: '{}'",
+                    part
+                )));
+            }
+        } else if let Some(pos) = find_top_level_char(part, ':') {
+            // Try colon separator first (angle bracket notation), then space
             (&part[..pos], &part[pos + 1..])
         } else if let Some(pos) = find_top_level_char(part, ' ') {
             (&part[..pos], &part[pos + 1..])
@@ -778,6 +806,87 @@ mod tests {
             result,
             DataType::List(Arc::new(Field::new("item", inner_struct, true)))
         );
+    }
+
+    // ==================== VARCHAR(N) / CHAR(N) tests ====================
+
+    #[test]
+    fn test_varchar_with_length() {
+        assert_eq!(ducklake_to_arrow_type("varchar(255)").unwrap(), DataType::Utf8);
+        assert_eq!(ducklake_to_arrow_type("VARCHAR(100)").unwrap(), DataType::Utf8);
+        assert_eq!(ducklake_to_arrow_type("varchar(1)").unwrap(), DataType::Utf8);
+    }
+
+    #[test]
+    fn test_char_with_length() {
+        assert_eq!(ducklake_to_arrow_type("char(10)").unwrap(), DataType::Utf8);
+        assert_eq!(ducklake_to_arrow_type("CHAR(1)").unwrap(), DataType::Utf8);
+        assert_eq!(ducklake_to_arrow_type("character(50)").unwrap(), DataType::Utf8);
+    }
+
+    #[test]
+    fn test_character_varying_with_length() {
+        assert_eq!(
+            ducklake_to_arrow_type("character varying(255)").unwrap(),
+            DataType::Utf8
+        );
+        assert_eq!(
+            ducklake_to_arrow_type("CHARACTER VARYING(100)").unwrap(),
+            DataType::Utf8
+        );
+    }
+
+    #[test]
+    fn test_nvarchar_with_length() {
+        assert_eq!(ducklake_to_arrow_type("nvarchar(255)").unwrap(), DataType::Utf8);
+        assert_eq!(ducklake_to_arrow_type("nchar(10)").unwrap(), DataType::Utf8);
+    }
+
+    // ==================== Struct quoted field names tests ====================
+
+    #[test]
+    fn test_struct_quoted_field_names() {
+        let result =
+            ducklake_to_arrow_type(r#"STRUCT("my field" VARCHAR, "other field" INTEGER)"#).unwrap();
+        if let DataType::Struct(fields) = &result {
+            assert_eq!(fields.len(), 2);
+            assert_eq!(fields[0].name(), "my field");
+            assert_eq!(fields[0].data_type(), &DataType::Utf8);
+            assert_eq!(fields[1].name(), "other field");
+            assert_eq!(fields[1].data_type(), &DataType::Int32);
+        } else {
+            panic!("Expected Struct type");
+        }
+    }
+
+    #[test]
+    fn test_struct_mixed_quoted_and_unquoted() {
+        let result =
+            ducklake_to_arrow_type(r#"STRUCT("my field" VARCHAR, name VARCHAR)"#).unwrap();
+        if let DataType::Struct(fields) = &result {
+            assert_eq!(fields.len(), 2);
+            assert_eq!(fields[0].name(), "my field");
+            assert_eq!(fields[1].name(), "name");
+        } else {
+            panic!("Expected Struct type");
+        }
+    }
+
+    #[test]
+    fn test_struct_quoted_field_with_colon_notation() {
+        let result = ducklake_to_arrow_type(r#"struct<"my field":int32>"#).unwrap();
+        if let DataType::Struct(fields) = &result {
+            assert_eq!(fields[0].name(), "my field");
+            assert_eq!(fields[0].data_type(), &DataType::Int32);
+        } else {
+            panic!("Expected Struct type");
+        }
+    }
+
+    #[test]
+    fn test_struct_unterminated_quote_error() {
+        let result = ducklake_to_arrow_type(r#"STRUCT("my field VARCHAR)"#);
+        assert!(result.is_err());
     }
 
     #[test]
