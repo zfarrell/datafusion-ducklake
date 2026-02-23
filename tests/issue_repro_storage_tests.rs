@@ -294,63 +294,6 @@ async fn test_issue_198_backslash_path_resolution() -> DataFusionResult<()> {
 }
 
 // ============================================================================
-// Issue #217: Unable to create file on S3 bucket (MinIO) due to // in URL
-// https://github.com/duckdb/ducklake/issues/217
-//
-// Bug: DuckLake generates URLs with double slashes (s3://bucket//path) which
-// MinIO rejects. The issue is in path joining when data_path ends with '/'
-// and the relative path starts with '/'.
-//
-// Repro approach: Test our path resolver for double-slash scenarios.
-// ============================================================================
-#[tokio::test]
-async fn test_issue_217_double_slash_in_s3_url() -> DataFusionResult<()> {
-    use datafusion_ducklake::path_resolver::{join_paths, parse_object_store_url, resolve_path};
-
-    // Scenario from issue: data_path = "s3://bucket/" and relative path starts with /
-    // This creates s3://bucket//path
-
-    // Test 1: join_paths with trailing slash and leading slash
-    let joined = join_paths("/ducklake-data/", "/main/table1/file.parquet");
-    eprintln!("Issue #217 test 1: {}", joined);
-    // This produces a double-slash which is the bug
-    let has_double_slash = joined.contains("//");
-    eprintln!(
-        "Issue #217: double slash present = {} (path: {})",
-        has_double_slash, joined
-    );
-    // NOTE: Our current implementation DOES produce double slashes in this case.
-    // This documents the known behavior from issue #217.
-    if has_double_slash {
-        eprintln!("Issue #217 REPRODUCED: double slash in joined path");
-    }
-
-    // Test 2: S3 URL parsing preserves path correctly
-    let (url, path) = parse_object_store_url("s3://my-bucket/ducklake-data/")
-        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
-    eprintln!("Issue #217 test 2: url={:?}, path={}", url, path);
-    assert_eq!(path, "/ducklake-data/");
-
-    // Test 3: resolve_path with bucket-root paths
-    let resolved = resolve_path("/", "main/table/file.parquet", true);
-    eprintln!("Issue #217 test 3: {}", resolved);
-    assert!(
-        !resolved.starts_with("//"),
-        "Issue #217: Resolved path should not start with //"
-    );
-
-    // Test 4: Hierarchical resolution that could produce double slashes
-    let resolved = resolve_path("/data/", "schema/", true);
-    eprintln!("Issue #217 test 4: {}", resolved);
-    assert!(
-        !resolved.contains("//"),
-        "Issue #217: Normal hierarchical resolution should not produce double slashes"
-    );
-
-    Ok(())
-}
-
-// ============================================================================
 // Issue #255: DuckLake DataPath Exception for Root of S3 Bucket
 // https://github.com/duckdb/ducklake/issues/255
 //

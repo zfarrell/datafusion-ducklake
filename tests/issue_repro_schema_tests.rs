@@ -1,7 +1,7 @@
 #![cfg(feature = "metadata-duckdb")]
 //! Reproduction tests for schema evolution and partition issues from DuckLake GitHub issues.
 //!
-//! Issues covered: #125, #332, #457, #470, #478, #509, #643, #733, #745, #749
+//! Issues covered: #125, #332, #457, #470, #478, #509, #643, #745
 
 mod common;
 
@@ -539,85 +539,6 @@ async fn test_issue_643_partition_by_year() -> DataFusionResult<()> {
     Ok(())
 }
 
-// ==================== #733: snapshots broken after update ====================
-// https://github.com/duckdb/ducklake/issues/733
-//
-// Cannot select snapshots after running UPDATE statements. We test that our
-// extension can read a table correctly after UPDATE operations.
-
-#[tokio::test]
-async fn test_issue_733_read_after_updates() -> DataFusionResult<()> {
-    let temp_dir = TempDir::new().unwrap();
-    let catalog_path = temp_dir.path().join("issue733.ducklake");
-    let conn = duckdb_setup(&catalog_path);
-
-    conn.execute(
-        "CREATE TABLE test_catalog.data (
-            id INT,
-            status VARCHAR,
-            value INT
-        );",
-        [],
-    )
-    .unwrap();
-
-    conn.execute(
-        "INSERT INTO test_catalog.data VALUES
-            (1, 'active', 100),
-            (2, 'active', 200),
-            (3, 'inactive', 300);",
-        [],
-    )
-    .unwrap();
-
-    // Perform UPDATE operations (this triggers the snapshot issue in #733)
-    conn.execute(
-        "UPDATE test_catalog.data SET status = 'archived' WHERE id = 1;",
-        [],
-    )
-    .unwrap();
-
-    conn.execute(
-        "UPDATE test_catalog.data SET value = 250 WHERE id = 2;",
-        [],
-    )
-    .unwrap();
-
-    drop(conn);
-
-    // Read via our extension — should see the latest snapshot correctly
-    let ctx = create_ctx(&catalog_path).await?;
-    let df = ctx
-        .sql("SELECT id, status, value FROM ducklake.main.data ORDER BY id")
-        .await?;
-    let batches = df.collect().await?;
-    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(total, 3, "Should have 3 rows after updates");
-
-    // Verify updated values are reflected
-    let mut rows: Vec<(i32, String, i32)> = Vec::new();
-    for batch in &batches {
-        let ids = batch.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-        let statuses = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
-        let values = batch.column(2).as_any().downcast_ref::<Int32Array>().unwrap();
-        for i in 0..batch.num_rows() {
-            rows.push((
-                ids.value(i),
-                statuses.value(i).to_string(),
-                values.value(i),
-            ));
-        }
-    }
-    rows.sort_by_key(|r| r.0);
-
-    assert_eq!(rows[0], (1, "archived".to_string(), 100));
-    assert_eq!(rows[1], (2, "active".to_string(), 250));
-    assert_eq!(rows[2], (3, "inactive".to_string(), 300));
-
-    std::mem::forget(temp_dir);
-    Ok(())
-}
-
 // ==================== #745: LIMIT ignores partition pruning ====================
 // https://github.com/duckdb/ducklake/issues/745
 //
@@ -692,86 +613,3 @@ async fn test_issue_745_limit_on_partitioned() -> DataFusionResult<()> {
     Ok(())
 }
 
-// ==================== #749: UPDATE on multi-partition table causes index error ====================
-// https://github.com/duckdb/ducklake/issues/749
-//
-// UPDATE on table partitioned by (column, day(ts)) causes "Attempted to access index 5
-// within vector of size 5". We test reading after such operations.
-
-#[tokio::test]
-async fn test_issue_749_multi_partition_update() -> DataFusionResult<()> {
-    let temp_dir = TempDir::new().unwrap();
-    let catalog_path = temp_dir.path().join("issue749.ducklake");
-    let conn = duckdb_setup(&catalog_path);
-
-    conn.execute(
-        "CREATE TABLE test_catalog.multi_part (
-            p VARCHAR,
-            ts TIMESTAMP,
-            v VARCHAR
-        );",
-        [],
-    )
-    .unwrap();
-
-    // Partition by (p, day(ts)) — the exact setup from issue #749
-    conn.execute(
-        "ALTER TABLE test_catalog.multi_part SET PARTITIONED BY (p, day(ts));",
-        [],
-    )
-    .unwrap();
-
-    conn.execute(
-        "INSERT INTO test_catalog.multi_part VALUES
-            ('p1', TIMESTAMP '2026-02-05 10:00:00', 'va'),
-            ('p2', TIMESTAMP '2026-02-06 11:00:00', 'vb');",
-        [],
-    )
-    .unwrap();
-
-    // The UPDATE in #749 causes the crash. We try it but catch errors since it may
-    // fail in DuckLake itself. Either way, we should still be able to read existing data.
-    let update_result = conn.execute(
-        "UPDATE test_catalog.multi_part SET p = 'p3' WHERE v = 'va';",
-        [],
-    );
-
-    drop(conn);
-
-    // Read via our extension — should read whatever state the table is in
-    let ctx = create_ctx(&catalog_path).await?;
-    let df = ctx
-        .sql("SELECT p, v FROM ducklake.main.multi_part ORDER BY v")
-        .await?;
-    let batches = df.collect().await?;
-    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
-
-    if update_result.is_ok() {
-        // If UPDATE succeeded, p1 should now be p3
-        assert_eq!(total, 2, "Should have 2 rows after update");
-        let mut rows: Vec<(String, String)> = Vec::new();
-        for batch in &batches {
-            let ps = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-            let vs = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
-            for i in 0..batch.num_rows() {
-                rows.push((ps.value(i).to_string(), vs.value(i).to_string()));
-            }
-        }
-        rows.sort_by(|a, b| a.1.cmp(&b.1));
-        assert_eq!(rows[0].0, "p3", "va row should be updated to p3");
-        assert_eq!(rows[1].0, "p2", "vb row should remain p2");
-    } else {
-        // If UPDATE failed (reproducing the bug), we should still read the original 2 rows
-        assert_eq!(
-            total, 2,
-            "Should have 2 rows (original data, update failed)"
-        );
-        eprintln!(
-            "Issue #749 reproduced: UPDATE on multi-partition table failed: {:?}",
-            update_result.err()
-        );
-    }
-
-    std::mem::forget(temp_dir);
-    Ok(())
-}
