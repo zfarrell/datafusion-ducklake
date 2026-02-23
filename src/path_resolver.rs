@@ -145,11 +145,12 @@ pub fn resolve_path(base_path: &str, path: &str, is_relative: bool) -> String {
 /// # use datafusion_ducklake::path_resolver::join_paths;
 /// assert_eq!(join_paths("/data/", "table/file.parquet"), "/data/table/file.parquet");
 /// assert_eq!(join_paths("/data", "table/file.parquet"), "/data/table/file.parquet");
-/// assert_eq!(join_paths("/data/", "/absolute"), "/data//absolute"); // preserves if relative starts with /
+/// assert_eq!(join_paths("/data/", "/absolute"), "/data/absolute"); // strips leading slash to avoid double slash
 /// ```
 pub fn join_paths(base_path: &str, relative_path: &str) -> String {
     if base_path.ends_with('/') || base_path.ends_with('\\') {
-        format!("{}{}", base_path, relative_path)
+        let trimmed = relative_path.trim_start_matches('/').trim_start_matches('\\');
+        format!("{}{}", base_path, trimmed)
     } else {
         format!("{}/{}", base_path, relative_path)
     }
@@ -471,8 +472,8 @@ mod tests {
 
     #[test]
     fn test_join_paths_double_slash_in_relative() {
-        // If relative path starts with /, we preserve it (though it's unusual)
-        assert_eq!(join_paths("/data/", "/absolute"), "/data//absolute");
+        // Leading slash on relative path is stripped to prevent double slashes
+        assert_eq!(join_paths("/data/", "/absolute"), "/data/absolute");
     }
 
     #[test]

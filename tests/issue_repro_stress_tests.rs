@@ -57,65 +57,51 @@ fn attach_ducklake(conn: &duckdb::Connection, catalog_path: &str, alias: &str) {
 /// Evidence: The existing test at path_resolver.rs:473-476 documents this:
 ///   assert_eq!(join_paths("/data/", "/absolute"), "/data//absolute");
 ///
-/// This is a real bug because DuckLake stores paths that may or may not have
-/// leading slashes, and joining them should never produce double slashes.
+/// Verify that join_paths strips leading slashes from relative_path when
+/// base_path already ends with a separator, preventing double slashes in S3 URLs.
 #[test]
 fn test_issue_217_double_slash_in_paths() {
     use datafusion_ducklake::path_resolver::{join_paths, resolve_path, PathResolver};
     use datafusion::datasource::object_store::ObjectStoreUrl;
 
-    // Case 1: Base with trailing slash + relative with leading slash -> DOUBLE SLASH BUG
+    // Case 1: Base with trailing slash + relative with leading slash -> no double slash
     let result = join_paths("/data/", "/subdir/file.parquet");
-    let has_double_slash = result.contains("//");
-    eprintln!("join_paths(\"/data/\", \"/subdir/file.parquet\") = \"{}\"", result);
-    eprintln!("Contains double slash: {}", has_double_slash);
-    // This IS a bug. join_paths should handle this case.
-    assert!(has_double_slash, "BUG CONFIRMED: join_paths produces // when base ends with / and relative starts with /");
+    assert_eq!(result, "/data/subdir/file.parquet");
+    assert!(!result.contains("//"), "join_paths must not produce double slashes");
 
-    // Case 2: S3-like path hierarchy that triggers the bug
-    let s3_base = "/warehouse/prod/";
-    let relative_with_leading_slash = "/data/file.parquet";
-    let result = join_paths(s3_base, relative_with_leading_slash);
-    eprintln!("join_paths(\"{}\", \"{}\") = \"{}\"", s3_base, relative_with_leading_slash, result);
-    assert!(result.contains("//"), "BUG CONFIRMED: S3 path has double slash");
+    // Case 2: S3-like path hierarchy
+    let result = join_paths("/warehouse/prod/", "/data/file.parquet");
+    assert_eq!(result, "/warehouse/prod/data/file.parquet");
+    assert!(!result.contains("//"), "S3 path must not have double slashes");
 
-    // Case 3: resolve_path with is_relative=true also triggers the bug
+    // Case 3: resolve_path with is_relative=true
     let result = resolve_path("/bucket/prefix/", "/schema/table/file.parquet", true);
-    eprintln!("resolve_path with is_relative=true: \"{}\"", result);
-    assert!(result.contains("//"), "BUG CONFIRMED: resolve_path produces // with is_relative=true");
+    assert_eq!(result, "/bucket/prefix/schema/table/file.parquet");
+    assert!(!result.contains("//"), "resolve_path must not produce double slashes");
 
-    // Case 4: PathResolver child_resolver can produce double slashes
+    // Case 4: PathResolver child_resolver
     let resolver = PathResolver::new(
         Arc::new(ObjectStoreUrl::parse("s3://bucket/").unwrap()),
         "/data/".to_string(),
     );
-    // If a schema path is marked as relative but starts with /, we get //
     let child = resolver.child_resolver("/subpath/", true);
-    eprintln!("PathResolver child_resolver base_path: \"{}\"", child.base_path());
-    assert!(child.base_path().contains("//"), "BUG CONFIRMED: PathResolver produces //");
+    assert_eq!(child.base_path(), "/data/subpath/");
+    assert!(!child.base_path().contains("//"), "PathResolver must not produce double slashes");
 
-    // Case 5: Multiple levels of nesting can accumulate double slashes
+    // Case 5: Multiple levels of nesting
     let base = "/s3/bucket/warehouse/";
-    let paths_that_trigger_bug = vec![
-        "/schema/",
-        "/table/",
-        "/partition=1/",
-    ];
-    for p in &paths_that_trigger_bug {
+    for p in &["/schema/", "/table/", "/partition=1/"] {
         let result = join_paths(base, p);
-        assert!(result.contains("//"),
-            "BUG CONFIRMED: join_paths({}, {}) = {} has //", base, p, result);
+        assert!(!result.contains("//"),
+            "join_paths({}, {}) = {} must not have //", base, p, result);
     }
 
-    // Case 6: Verify the bug does NOT occur in normal cases (no leading slash on relative)
+    // Case 6: Normal cases still work
     let ok_result = join_paths("/data/", "subdir/file.parquet");
-    assert!(!ok_result.contains("//"), "Normal case should not have //");
+    assert_eq!(ok_result, "/data/subdir/file.parquet");
 
     let ok_result2 = join_paths("/data", "subdir/file.parquet");
-    assert!(!ok_result2.contains("//"), "Normal case without trailing slash should not have //");
-
-    eprintln!("\n✗ Issue #217 CONFIRMED: join_paths produces double slashes in 5 edge cases");
-    eprintln!("  This is a real bug in our path_resolver.rs that would break S3 URLs");
+    assert_eq!(ok_result2, "/data/subdir/file.parquet");
 }
 
 // =============================================================================
