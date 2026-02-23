@@ -985,20 +985,23 @@ impl MetadataWriter for MySqlMetadataWriter {
             // Insert initial snapshot 0 (DuckDB expects this as the "empty catalog" snapshot).
             // MySQL treats INSERT of 0 into AUTO_INCREMENT as a new auto-value unless
             // NO_AUTO_VALUE_ON_ZERO is set, so we temporarily enable that mode.
+            // We must use a single connection for session variable save/restore,
+            // since pool connections don't share user variables.
+            let mut conn = self.pool.acquire().await?;
             sqlx::query("SET @old_sql_mode = @@SESSION.sql_mode")
-                .execute(&self.pool)
+                .execute(&mut *conn)
                 .await?;
             sqlx::query("SET SESSION sql_mode = CONCAT(@@SESSION.sql_mode, ',NO_AUTO_VALUE_ON_ZERO')")
-                .execute(&self.pool)
+                .execute(&mut *conn)
                 .await?;
             sqlx::query(
                 "INSERT IGNORE INTO ducklake_snapshot (snapshot_id, snapshot_time, schema_version, next_catalog_id, next_file_id)
                  VALUES (0, NOW(6), 0, 0, 0)",
             )
-            .execute(&self.pool)
+            .execute(&mut *conn)
             .await?;
             sqlx::query("SET SESSION sql_mode = @old_sql_mode")
-                .execute(&self.pool)
+                .execute(&mut *conn)
                 .await?;
 
             Ok(())
