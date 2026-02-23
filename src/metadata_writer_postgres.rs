@@ -1179,7 +1179,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                         column_id: r.try_get(0)?,
                         column_name: r.try_get(1)?,
                         column_type: r.try_get(2)?,
-                        column_order: r.try_get(3)?,
+                        column_order: r.try_get::<i32, _>(3)? as i64,
                         is_nullable: r.try_get::<Option<bool>, _>(4)?.unwrap_or(true),
                         initial_default: r.try_get(5)?,
                         default_value: r.try_get(6)?,
