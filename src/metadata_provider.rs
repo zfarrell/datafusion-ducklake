@@ -83,6 +83,44 @@ pub const SQL_GET_FILE_COLUMN_STATS: &str = "
       AND ? >= f.begin_snapshot
       AND (? < f.end_snapshot OR f.end_snapshot IS NULL)";
 
+// Row count query: returns exact row count when all files have record_count metadata
+pub const SQL_GET_TABLE_ROW_COUNT: &str = "
+    SELECT
+        CASE WHEN COUNT(*) = COUNT(data.record_count)
+            THEN COALESCE(SUM(data.record_count), 0) - COALESCE(SUM(del.delete_count), 0)
+            ELSE NULL
+        END as row_count
+    FROM ducklake_data_file data
+    LEFT JOIN ducklake_delete_file del
+        ON data.data_file_id = del.data_file_id
+        AND del.table_id = ?
+        AND ? >= del.begin_snapshot
+        AND (? < del.end_snapshot OR del.end_snapshot IS NULL)
+    WHERE data.table_id = ?
+      AND ? >= data.begin_snapshot
+      AND (? < data.end_snapshot OR data.end_snapshot IS NULL)";
+
+// Partition column query: returns partition key columns for a table
+pub const SQL_GET_PARTITION_COLUMNS: &str = "
+    SELECT pc.partition_key_index, c.column_name, pc.transform
+    FROM ducklake_partition_info pi
+    JOIN ducklake_partition_column pc
+        ON pi.partition_id = pc.partition_id AND pi.table_id = pc.table_id
+    JOIN ducklake_column c ON pc.column_id = c.column_id
+    WHERE pi.table_id = ?
+      AND ? >= pi.begin_snapshot
+      AND (? < pi.end_snapshot OR pi.end_snapshot IS NULL)
+    ORDER BY pc.partition_key_index";
+
+// File partition values: returns partition values for each data file
+pub const SQL_GET_FILE_PARTITION_VALUES: &str = "
+    SELECT fpv.data_file_id, fpv.partition_key_index, fpv.partition_value
+    FROM ducklake_file_partition_value fpv
+    JOIN ducklake_data_file df ON fpv.data_file_id = df.data_file_id
+    WHERE fpv.table_id = ?
+      AND ? >= df.begin_snapshot
+      AND (? < df.end_snapshot OR df.end_snapshot IS NULL)";
+
 // Queries for table_changes (CDC) - files added/removed between snapshots
 
 pub const SQL_GET_DATA_FILES_ADDED_BETWEEN_SNAPSHOTS: &str = "
@@ -374,6 +412,28 @@ pub struct FileWithTable {
     pub file: DuckLakeTableFile,
 }
 
+/// Partition column definition for a DuckLake table
+#[derive(Debug, Clone)]
+pub struct PartitionColumn {
+    /// Index of this partition key (0-based ordering)
+    pub partition_key_index: i32,
+    /// Name of the column used for partitioning
+    pub column_name: String,
+    /// Transform applied to the column (e.g., "identity", "year", "month")
+    pub transform: Option<String>,
+}
+
+/// Partition value for a specific data file
+#[derive(Debug, Clone)]
+pub struct FilePartitionValue {
+    /// ID of the data file
+    pub data_file_id: i64,
+    /// Index of the partition key
+    pub partition_key_index: i32,
+    /// Partition value as a string
+    pub partition_value: Option<String>,
+}
+
 /// Column definition for a DuckLake table
 #[derive(Debug, Clone)]
 pub struct DuckLakeTableColumn {
@@ -576,6 +636,43 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         _table_id: i64,
         _snapshot_id: i64,
     ) -> Result<Vec<FileColumnStats>> {
+        Ok(Vec::new())
+    }
+
+    // Row count optimization
+
+    /// Get exact row count for a table at a given snapshot.
+    ///
+    /// Returns Some(count) if all data files have record_count metadata.
+    /// Returns None if any file is missing record_count (cannot compute exact count).
+    /// The count accounts for deleted rows via delete_count in delete files.
+    fn get_table_row_count(&self, _table_id: i64, _snapshot_id: i64) -> Result<Option<i64>> {
+        Ok(None)
+    }
+
+    // Partition pruning methods
+
+    /// Get partition columns for a table at a given snapshot.
+    ///
+    /// Returns the list of columns used for partitioning, ordered by partition_key_index.
+    /// Returns empty vec if the table is not partitioned.
+    fn get_partition_columns(
+        &self,
+        _table_id: i64,
+        _snapshot_id: i64,
+    ) -> Result<Vec<PartitionColumn>> {
+        Ok(Vec::new())
+    }
+
+    /// Get partition values for all data files in a table at a given snapshot.
+    ///
+    /// Returns partition values for each (data_file_id, partition_key_index) pair.
+    /// Only includes values for files that are active at the given snapshot.
+    fn get_file_partition_values(
+        &self,
+        _table_id: i64,
+        _snapshot_id: i64,
+    ) -> Result<Vec<FilePartitionValue>> {
         Ok(Vec::new())
     }
 

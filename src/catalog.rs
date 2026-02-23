@@ -2,6 +2,7 @@
 
 use std::any::Any;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use crate::Result;
 use crate::information_schema::InformationSchemaProvider;
@@ -33,8 +34,10 @@ struct WriteConfig {
 pub struct DuckLakeCatalog {
     /// Metadata provider for querying catalog
     provider: Arc<dyn MetadataProvider>,
-    /// Snapshot ID this catalog is bound to (for query consistency)
-    snapshot_id: i64,
+    /// Snapshot ID this catalog is bound to.
+    /// Uses AtomicI64 so write operations (register_schema, deregister_schema, etc.)
+    /// can update it after creating new snapshots.
+    snapshot_id: Arc<AtomicI64>,
     /// Object store URL for resolving file paths (e.g., s3://bucket/ or file:///)
     object_store_url: Arc<ObjectStoreUrl>,
     /// Catalog base path component for resolving relative schema paths (e.g., /prefix/)
@@ -57,7 +60,7 @@ impl DuckLakeCatalog {
 
         Ok(Self {
             provider,
-            snapshot_id,
+            snapshot_id: Arc::new(AtomicI64::new(snapshot_id)),
             object_store_url: Arc::new(object_store_url),
             catalog_path,
             #[cfg(feature = "write")]
@@ -76,7 +79,7 @@ impl DuckLakeCatalog {
 
         Ok(Self {
             provider,
-            snapshot_id,
+            snapshot_id: Arc::new(AtomicI64::new(snapshot_id)),
             object_store_url: Arc::new(object_store_url),
             catalog_path,
             #[cfg(feature = "write")]
@@ -118,7 +121,7 @@ impl DuckLakeCatalog {
 
         Ok(Self {
             provider,
-            snapshot_id,
+            snapshot_id: Arc::new(AtomicI64::new(snapshot_id)),
             object_store_url: Arc::new(object_store_url),
             catalog_path,
             write_config: Some(WriteConfig {
@@ -166,9 +169,10 @@ impl CatalogProvider for DuckLakeCatalog {
         }
 
         // Look up the schema
+        let current_snapshot = self.snapshot_id.load(Ordering::Acquire);
         let schema_meta = self
             .provider
-            .get_schema_by_name(name, self.snapshot_id)
+            .get_schema_by_name(name, current_snapshot)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
         let Some(meta) = schema_meta else {
@@ -200,10 +204,13 @@ impl CatalogProvider for DuckLakeCatalog {
         }
 
         // Drop the schema itself
-        config
+        let new_snapshot = config
             .writer
             .drop_schema(meta.schema_id)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        // Update snapshot so subsequent lookups see the change
+        self.snapshot_id.store(new_snapshot, Ordering::Release);
 
         // Return the schema provider that was dropped
         let schema_path = resolve_path(&self.catalog_path, &meta.path, meta.path_is_relative);
@@ -211,7 +218,7 @@ impl CatalogProvider for DuckLakeCatalog {
             meta.schema_id,
             meta.schema_name,
             Arc::clone(&self.provider),
-            self.snapshot_id,
+            new_snapshot,
             self.object_store_url.clone(),
             schema_path,
         );
@@ -245,15 +252,18 @@ impl CatalogProvider for DuckLakeCatalog {
         }
 
         // Create snapshot and schema in metadata
-        let snapshot_id = config
+        let new_snapshot = config
             .writer
             .create_snapshot()
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
         let (schema_id, _was_created) = config
             .writer
-            .get_or_create_schema(name, None, snapshot_id)
+            .get_or_create_schema(name, None, new_snapshot)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        // Update snapshot so subsequent lookups see the new schema
+        self.snapshot_id.store(new_snapshot, Ordering::Release);
 
         // Build the schema provider
         let schema_path = resolve_path(&self.catalog_path, name, true);
@@ -261,7 +271,7 @@ impl CatalogProvider for DuckLakeCatalog {
             schema_id,
             name,
             Arc::clone(&self.provider),
-            self.snapshot_id,
+            new_snapshot,
             self.object_store_url.clone(),
             schema_path,
         )
@@ -274,14 +284,16 @@ impl CatalogProvider for DuckLakeCatalog {
         // Start with information_schema
         let mut names = vec!["information_schema".to_string()];
 
-        // Add data schemas from catalog using the pinned snapshot_id
+        let snapshot_id = self.snapshot_id.load(Ordering::Acquire);
+
+        // Add data schemas from catalog using the current snapshot_id
         let data_schemas = self
             .provider
-            .list_schemas(self.snapshot_id)
+            .list_schemas(snapshot_id)
             .inspect_err(|e| {
                 tracing::error!(
                     error = %e,
-                    snapshot_id = %self.snapshot_id,
+                    snapshot_id = %snapshot_id,
                     "Failed to list schemas from catalog"
                 )
             })
@@ -306,19 +318,21 @@ impl CatalogProvider for DuckLakeCatalog {
             ))));
         }
 
-        // Query database with the pinned snapshot_id for data schemas
-        match self.provider.get_schema_by_name(name, self.snapshot_id) {
+        let snapshot_id = self.snapshot_id.load(Ordering::Acquire);
+
+        // Query database with the current snapshot_id for data schemas
+        match self.provider.get_schema_by_name(name, snapshot_id) {
             Ok(Some(meta)) => {
                 // Resolve schema path hierarchically using path_resolver utility
                 let schema_path =
                     resolve_path(&self.catalog_path, &meta.path, meta.path_is_relative);
 
-                // Pass the pinned snapshot_id to schema
+                // Pass the current snapshot_id to schema
                 let schema = DuckLakeSchema::new(
                     meta.schema_id,
                     meta.schema_name,
                     Arc::clone(&self.provider),
-                    self.snapshot_id, // Propagate pinned snapshot_id
+                    snapshot_id,
                     self.object_store_url.clone(),
                     schema_path,
                 );

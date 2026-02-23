@@ -503,7 +503,7 @@ pub(crate) fn calculate_footer_size_from_bytes(buffer: &[u8]) -> Result<i64> {
     let metadata_len =
         i32::from_le_bytes([footer_bytes[0], footer_bytes[1], footer_bytes[2], footer_bytes[3]])
             as i64;
-    Ok(metadata_len + 8)
+    Ok(metadata_len)
 }
 
 #[cfg(test)]
@@ -612,8 +612,8 @@ mod tests {
 
         let footer_size = calculate_footer_size_from_bytes(&buffer).unwrap();
 
-        // Footer should be reasonable size (metadata + 8 bytes)
-        assert!(footer_size >= 8);
+        // Footer should be the raw Thrift metadata size (without PAR1 magic + length field)
+        assert!(footer_size > 0);
         assert!(footer_size < 10000);
     }
 }

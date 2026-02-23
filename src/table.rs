@@ -8,7 +8,7 @@ use crate::Result;
 use crate::column_rename::ColumnRenameExec;
 use crate::delete_filter::DeleteFilterExec;
 use crate::metadata_provider::{
-    DuckLakeFileData, DuckLakeTableColumn, DuckLakeTableFile, MetadataProvider,
+    DuckLakeFileData, DuckLakeTableColumn, DuckLakeTableFile, MetadataProvider, PartitionColumn,
 };
 use crate::path_resolver::resolve_path;
 use crate::types::{
@@ -95,6 +95,12 @@ pub struct DuckLakeTable {
     columns: Vec<DuckLakeTableColumn>,
     /// Table files with paths as stored in metadata (resolved on-the-fly when needed)
     table_files: Vec<DuckLakeTableFile>,
+    /// Cached exact row count from metadata (None if not available)
+    cached_row_count: Option<i64>,
+    /// Partition columns for this table (empty if not partitioned)
+    partition_columns: Vec<PartitionColumn>,
+    /// Partition values per file: data_file_id -> [(partition_key_index, value)]
+    file_partition_values: HashMap<i64, Vec<(i32, Option<String>)>>,
     /// Cached schema mapping (read_schema, name_mapping) - computed once on first scan
     schema_mapping_cache: OnceCell<SchemaMappingCache>,
     /// Encryption factory for decrypting encrypted Parquet files (when encryption feature is enabled)
@@ -150,6 +156,28 @@ impl DuckLakeTable {
         };
         let table_files = provider.get_table_files_for_select(table_id, snapshot_id)?;
 
+        // Load row count from metadata for COUNT(*) optimization
+        let cached_row_count = provider.get_table_row_count(table_id, snapshot_id).ok().flatten();
+
+        // Load partition metadata for partition pruning
+        let partition_columns = provider
+            .get_partition_columns(table_id, snapshot_id)
+            .unwrap_or_default();
+        let file_partition_values = if !partition_columns.is_empty() {
+            let raw_values = provider
+                .get_file_partition_values(table_id, snapshot_id)
+                .unwrap_or_default();
+            let mut map: HashMap<i64, Vec<(i32, Option<String>)>> = HashMap::new();
+            for v in raw_values {
+                map.entry(v.data_file_id)
+                    .or_default()
+                    .push((v.partition_key_index, v.partition_value));
+            }
+            map
+        } else {
+            HashMap::new()
+        };
+
         // Build encryption factory from file encryption keys (when encryption feature is enabled)
         #[cfg(feature = "encryption")]
         let encryption_factory = {
@@ -189,6 +217,9 @@ impl DuckLakeTable {
             full_schema,
             columns,
             table_files,
+            cached_row_count,
+            partition_columns,
+            file_partition_values,
             #[cfg(feature = "encryption")]
             encryption_factory,
             schema_mapping_cache: OnceCell::new(),
@@ -646,6 +677,140 @@ impl DuckLakeTable {
     }
 }
 
+impl DuckLakeTable {
+    /// Filter table files based on partition pruning.
+    ///
+    /// Extracts simple equality filters (column = literal) that reference partition columns
+    /// and prunes files whose partition values don't match.
+    /// Only applies to tables with partition metadata and identity transforms.
+    fn prune_files_by_partition<'a>(
+        &'a self,
+        files: &'a [DuckLakeTableFile],
+        filters: &[Expr],
+    ) -> Vec<&'a DuckLakeTableFile> {
+        if self.partition_columns.is_empty() || self.file_partition_values.is_empty() {
+            return files.iter().collect();
+        }
+
+        // Extract equality constraints on partition columns from filters
+        let partition_filters = extract_partition_equality_filters(filters, &self.partition_columns);
+        if partition_filters.is_empty() {
+            return files.iter().collect();
+        }
+
+        files
+            .iter()
+            .filter(|tf| {
+                let Some(file_id) = tf.data_file_id else {
+                    // No file_id means we can't check partition values — include the file
+                    return true;
+                };
+                let Some(values) = self.file_partition_values.get(&file_id) else {
+                    // No partition values recorded for this file — include it to be safe
+                    return true;
+                };
+
+                // Check all partition filter constraints
+                for (key_index, expected_value) in &partition_filters {
+                    let file_value = values.iter().find(|(ki, _)| ki == key_index);
+                    match file_value {
+                        Some((_, actual_value)) => {
+                            if actual_value.as_deref() != Some(expected_value.as_str()) {
+                                return false; // Partition value doesn't match
+                            }
+                        },
+                        None => {
+                            // No partition value for this key — can't prune, include the file
+                        },
+                    }
+                }
+                true
+            })
+            .collect()
+    }
+}
+
+/// Extract equality filters on partition columns from filter expressions.
+///
+/// Returns a list of (partition_key_index, string_value) pairs for simple
+/// `column = literal` or `literal = column` equality expressions where:
+/// - The column matches a partition column name
+/// - The partition column uses an identity transform (or no transform)
+/// - The literal value can be converted to a string for comparison
+fn extract_partition_equality_filters(
+    filters: &[Expr],
+    partition_columns: &[PartitionColumn],
+) -> Vec<(i32, String)> {
+    use datafusion::logical_expr::Operator;
+
+    let mut result = Vec::new();
+
+    for filter in filters {
+        if let Expr::BinaryExpr(binary) = filter {
+            if binary.op != Operator::Eq {
+                continue;
+            }
+
+            // Try both orderings: column = literal and literal = column
+            let (col_name, lit_value) = match (binary.left.as_ref(), binary.right.as_ref()) {
+                (Expr::Column(col), Expr::Literal(scalar, _)) => {
+                    (&col.name, scalar)
+                },
+                (Expr::Literal(scalar, _), Expr::Column(col)) => {
+                    (&col.name, scalar)
+                },
+                _ => continue,
+            };
+
+            // Check if this column is a partition column with identity transform
+            if let Some(pc) = partition_columns.iter().find(|pc| &pc.column_name == col_name) {
+                let is_identity = pc.transform.is_none()
+                    || pc
+                        .transform
+                        .as_deref()
+                        .is_some_and(|t| t.is_empty() || t.eq_ignore_ascii_case("identity"));
+                if !is_identity {
+                    continue; // Non-identity transforms require special handling
+                }
+
+                // Convert ScalarValue to string for comparison with partition_value
+                if let Some(val_str) = scalar_value_to_partition_string(lit_value) {
+                    result.push((pc.partition_key_index, val_str));
+                }
+            }
+        }
+    }
+
+    result
+}
+
+/// Convert a DataFusion ScalarValue to a string for partition value comparison.
+///
+/// Returns None for null values or unsupported types.
+fn scalar_value_to_partition_string(
+    value: &datafusion::common::ScalarValue,
+) -> Option<String> {
+    use datafusion::common::ScalarValue;
+
+    match value {
+        ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => Some(s.clone()),
+        ScalarValue::Int8(Some(v)) => Some(v.to_string()),
+        ScalarValue::Int16(Some(v)) => Some(v.to_string()),
+        ScalarValue::Int32(Some(v)) => Some(v.to_string()),
+        ScalarValue::Int64(Some(v)) => Some(v.to_string()),
+        ScalarValue::UInt8(Some(v)) => Some(v.to_string()),
+        ScalarValue::UInt16(Some(v)) => Some(v.to_string()),
+        ScalarValue::UInt32(Some(v)) => Some(v.to_string()),
+        ScalarValue::UInt64(Some(v)) => Some(v.to_string()),
+        ScalarValue::Float32(Some(v)) => Some(v.to_string()),
+        ScalarValue::Float64(Some(v)) => Some(v.to_string()),
+        ScalarValue::Boolean(Some(v)) => Some(v.to_string()),
+        ScalarValue::Date32(Some(v)) => Some(v.to_string()),
+        ScalarValue::Date64(Some(v)) => Some(v.to_string()),
+        _ => None,
+    }
+}
+
 #[async_trait]
 impl TableProvider for DuckLakeTable {
     fn as_any(&self) -> &dyn Any {
@@ -744,8 +909,13 @@ impl TableProvider for DuckLakeTable {
             }
         }
 
+        let num_rows = match self.cached_row_count {
+            Some(count) if count >= 0 => Precision::Exact(count as usize),
+            _ => Precision::Absent,
+        };
+
         Some(Statistics {
-            num_rows: Precision::Absent,
+            num_rows,
             total_byte_size: Precision::Absent,
             column_statistics: col_stats,
         })
@@ -771,12 +941,15 @@ impl TableProvider for DuckLakeTable {
         &self,
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let base_field_count = self.schema.fields().len();
         let filename_idx = base_field_count;
         let row_number_idx = base_field_count + 1;
+
+        // Apply partition pruning to filter out files that don't match partition filters
+        let active_files = self.prune_files_by_partition(&self.table_files, filters);
 
         // Determine if any virtual columns are requested
         let (needs_virtual, include_filename, include_row_number) = match projection {
@@ -790,9 +963,9 @@ impl TableProvider for DuckLakeTable {
 
         if !needs_virtual {
             // No virtual columns — use optimized grouped scan path
-            let (files_with_deletes, files_without_deletes): (Vec<_>, Vec<_>) = self
-                .table_files
+            let (files_with_deletes, files_without_deletes): (Vec<&DuckLakeTableFile>, Vec<&DuckLakeTableFile>) = active_files
                 .iter()
+                .copied()
                 .partition(|tf| tf.delete_file.is_some());
             let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
             if !files_without_deletes.is_empty() {
@@ -858,7 +1031,7 @@ impl TableProvider for DuckLakeTable {
         let real_proj_ref = real_projection.as_ref();
 
         let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
-        for table_file in &self.table_files {
+        for table_file in &active_files {
             let resolved_path = self.resolve_file_path(&table_file.file);
             let file_exec = if table_file.delete_file.is_some() {
                 self.build_exec_for_file_with_deletes(state, table_file, real_proj_ref, limit)

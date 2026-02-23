@@ -1,12 +1,14 @@
 use crate::DuckLakeError;
 use crate::metadata_provider::{
     ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileData, DuckLakeTableColumn,
-    DuckLakeTableFile, FileWithTable, MetadataProvider, SQL_GET_DATA_FILES,
-    SQL_GET_DATA_FILES_ADDED_BETWEEN_SNAPSHOTS, SQL_GET_DATA_PATH,
-    SQL_GET_DELETE_FILES_ADDED_BETWEEN_SNAPSHOTS, SQL_GET_LATEST_SNAPSHOT, SQL_GET_SCHEMA_BY_NAME,
-    SQL_GET_TABLE_BY_NAME, SQL_GET_TABLE_COLUMNS, SQL_LIST_ALL_COLUMNS, SQL_LIST_ALL_FILES,
-    SQL_LIST_ALL_TABLES, SQL_LIST_SCHEMAS, SQL_LIST_SNAPSHOTS, SQL_LIST_TABLES, SQL_TABLE_EXISTS,
-    SchemaMetadata, SnapshotMetadata, TableMetadata, TableWithSchema,
+    DuckLakeTableFile, FilePartitionValue, FileWithTable, MetadataProvider, PartitionColumn,
+    SQL_GET_DATA_FILES, SQL_GET_DATA_FILES_ADDED_BETWEEN_SNAPSHOTS, SQL_GET_DATA_PATH,
+    SQL_GET_DELETE_FILES_ADDED_BETWEEN_SNAPSHOTS, SQL_GET_FILE_PARTITION_VALUES,
+    SQL_GET_LATEST_SNAPSHOT, SQL_GET_PARTITION_COLUMNS, SQL_GET_SCHEMA_BY_NAME,
+    SQL_GET_TABLE_BY_NAME, SQL_GET_TABLE_COLUMNS, SQL_GET_TABLE_ROW_COUNT,
+    SQL_LIST_ALL_COLUMNS, SQL_LIST_ALL_FILES, SQL_LIST_ALL_TABLES, SQL_LIST_SCHEMAS,
+    SQL_LIST_SNAPSHOTS, SQL_LIST_TABLES, SQL_TABLE_EXISTS, SchemaMetadata, SnapshotMetadata,
+    TableMetadata, TableWithSchema,
 };
 use duckdb::AccessMode::ReadOnly;
 use duckdb::{Config, Connection, params};
@@ -421,6 +423,64 @@ impl MetadataProvider for DuckdbMetadataProvider {
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(files)
+    }
+
+    fn get_table_row_count(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+    ) -> crate::Result<Option<i64>> {
+        let conn = self.connection();
+        let row_count: Option<i64> = conn.query_row(
+            SQL_GET_TABLE_ROW_COUNT,
+            params![
+                table_id, snapshot_id, snapshot_id, table_id, snapshot_id, snapshot_id
+            ],
+            |row| row.get(0),
+        )?;
+        Ok(row_count)
+    }
+
+    fn get_partition_columns(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+    ) -> crate::Result<Vec<PartitionColumn>> {
+        let conn = self.connection();
+        let mut stmt = conn.prepare(SQL_GET_PARTITION_COLUMNS)?;
+
+        let columns = stmt
+            .query_map(params![table_id, snapshot_id, snapshot_id], |row| {
+                Ok(PartitionColumn {
+                    partition_key_index: row.get(0)?,
+                    column_name: row.get(1)?,
+                    transform: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(columns)
+    }
+
+    fn get_file_partition_values(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+    ) -> crate::Result<Vec<FilePartitionValue>> {
+        let conn = self.connection();
+        let mut stmt = conn.prepare(SQL_GET_FILE_PARTITION_VALUES)?;
+
+        let values = stmt
+            .query_map(params![table_id, snapshot_id, snapshot_id], |row| {
+                Ok(FilePartitionValue {
+                    data_file_id: row.get(0)?,
+                    partition_key_index: row.get(1)?,
+                    partition_value: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(values)
     }
 
     fn get_delete_files_added_between_snapshots(
