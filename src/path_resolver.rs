@@ -27,14 +27,23 @@ fn validate_no_null_bytes(path: &str) -> Result<()> {
 /// Validates that a path does not contain path traversal (`..`) components.
 ///
 /// Rejects any path where `..` appears as a standalone directory component
-/// (separated by `/` or `\`). This prevents attackers from injecting paths
-/// like `../../etc/passwd` into catalog metadata to escape the data directory.
+/// (separated by `/` or `\`). Also rejects URL-encoded variants (`%2e%2e`,
+/// case-insensitive) as a defense-in-depth measure — some storage backends
+/// (e.g., S3) may decode percent-encoded paths.
 ///
 /// Single dots (`.`) and dots within names (e.g., `schema.v2`) are allowed.
 ///
 /// # Errors
-/// Returns `DuckLakeError::InvalidConfig` if the path contains `..` as a component.
+/// Returns `DuckLakeError::InvalidConfig` if the path contains `..` or `%2e%2e` as a component.
 fn validate_no_path_traversal(path: &str) -> Result<()> {
+    // Check for URL-encoded traversal (%2e%2e = ..) before splitting.
+    // Case-insensitive to catch %2E%2e, %2e%2E, %2E%2E, etc.
+    if path.to_ascii_lowercase().contains("%2e%2e") {
+        return Err(DuckLakeError::InvalidConfig(format!(
+            "Path traversal detected: path contains URL-encoded '..' (%2e%2e): {}",
+            path
+        )));
+    }
     for component in path.split(|c: char| c == '/' || c == '\\') {
         if component == ".." {
             return Err(DuckLakeError::InvalidConfig(format!(
@@ -907,6 +916,28 @@ mod tests {
         let result = join_paths("/data/", "file\0.parquet");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("null byte"));
+    }
+
+    #[test]
+    fn test_url_encoded_traversal_rejected() {
+        // %2e%2e = .. (URL-encoded) — must be rejected as defense-in-depth
+        let result = join_paths("/data/", "%2e%2e/etc/passwd");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Path traversal"));
+    }
+
+    #[test]
+    fn test_url_encoded_traversal_uppercase_rejected() {
+        let result = resolve_path("/data/", "%2E%2E/secret", true);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Path traversal"));
+    }
+
+    #[test]
+    fn test_url_encoded_traversal_mixed_case_rejected() {
+        let result = join_paths("/data/", "%2e%2E/%2E%2e/etc/shadow");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Path traversal"));
     }
 
     #[test]

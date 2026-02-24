@@ -277,17 +277,37 @@ fn test_path_null_byte_injection() {
     assert!(resolved.is_err(), "join_paths should reject paths containing null bytes");
 }
 
-/// VULN-001: URL-encoded path traversal.
+/// VULN-001: URL-encoded path traversal — must be rejected.
+/// S3 and other backends may decode %2e%2e to "..", so we reject it at validation time.
 #[test]
 fn test_path_traversal_url_encoded() {
     let base = "/data/warehouse/";
     // %2e%2e = ..  (URL-encoded)
     let malicious = "%2e%2e/%2e%2e/etc/passwd";
 
-    let resolved = join_paths(base, malicious).unwrap();
-    // Not decoded, so passes through as literal - safer for filesystem
-    // but S3 might decode these
-    assert_eq!(resolved, "/data/warehouse/%2e%2e/%2e%2e/etc/passwd");
+    let result = join_paths(base, malicious);
+    assert!(result.is_err(), "join_paths should reject URL-encoded path traversal (%2e%2e)");
+    assert!(result.unwrap_err().to_string().contains("Path traversal"));
+}
+
+/// VULN-001: URL-encoded traversal with uppercase hex digits (%2E%2E).
+#[test]
+fn test_path_traversal_url_encoded_uppercase() {
+    let result = join_paths("/data/", "%2E%2E/etc/passwd");
+    assert!(result.is_err(), "should reject %2E%2E (uppercase)");
+    assert!(result.unwrap_err().to_string().contains("Path traversal"));
+}
+
+/// VULN-001: URL-encoded traversal with mixed-case hex digits (%2e%2E, %2E%2e).
+#[test]
+fn test_path_traversal_url_encoded_mixed_case() {
+    let result = join_paths("/data/", "%2e%2E/etc/passwd");
+    assert!(result.is_err(), "should reject %2e%2E (mixed case)");
+    assert!(result.unwrap_err().to_string().contains("Path traversal"));
+
+    let result = join_paths("/data/", "%2E%2e/secret");
+    assert!(result.is_err(), "should reject %2E%2e (mixed case)");
+    assert!(result.unwrap_err().to_string().contains("Path traversal"));
 }
 
 /// VULN-001: End-to-end path traversal through schema creation and read.
