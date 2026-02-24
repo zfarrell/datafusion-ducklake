@@ -172,7 +172,8 @@ impl SchemaProvider for DuckLakeSchema {
         {
             Ok(Some(meta)) => {
                 // Resolve table path hierarchically using path_resolver utility
-                let table_path = resolve_path(&self.schema_path, &meta.path, meta.path_is_relative);
+                let table_path = resolve_path(&self.schema_path, &meta.path, meta.path_is_relative)
+                    .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
 
                 // Pass snapshot_id to table
                 let table = DuckLakeTable::new(
@@ -251,7 +252,8 @@ impl SchemaProvider for DuckLakeSchema {
         };
 
         // Resolve table path for constructing the table provider to return
-        let table_path = resolve_path(&self.schema_path, &meta.path, meta.path_is_relative);
+        let table_path = resolve_path(&self.schema_path, &meta.path, meta.path_is_relative)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
         let table = DuckLakeTable::new(
             meta.table_id,

@@ -213,7 +213,8 @@ impl CatalogProvider for DuckLakeCatalog {
         self.snapshot_id.store(new_snapshot, Ordering::Release);
 
         // Return the schema provider that was dropped
-        let schema_path = resolve_path(&self.catalog_path, &meta.path, meta.path_is_relative);
+        let schema_path = resolve_path(&self.catalog_path, &meta.path, meta.path_is_relative)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
         let schema = DuckLakeSchema::new(
             meta.schema_id,
             meta.schema_name,
@@ -266,7 +267,8 @@ impl CatalogProvider for DuckLakeCatalog {
         self.snapshot_id.store(new_snapshot, Ordering::Release);
 
         // Build the schema provider
-        let schema_path = resolve_path(&self.catalog_path, name, true);
+        let schema_path = resolve_path(&self.catalog_path, name, true)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
         let schema = DuckLakeSchema::new(
             schema_id,
             name,
@@ -324,8 +326,13 @@ impl CatalogProvider for DuckLakeCatalog {
         match self.provider.get_schema_by_name(name, snapshot_id) {
             Ok(Some(meta)) => {
                 // Resolve schema path hierarchically using path_resolver utility
-                let schema_path =
-                    resolve_path(&self.catalog_path, &meta.path, meta.path_is_relative);
+                let schema_path = match resolve_path(&self.catalog_path, &meta.path, meta.path_is_relative) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::error!(error = %e, "Failed to resolve schema path");
+                        return None;
+                    }
+                };
 
                 // Pass the current snapshot_id to schema
                 let schema = DuckLakeSchema::new(

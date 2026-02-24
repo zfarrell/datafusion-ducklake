@@ -65,17 +65,17 @@ fn test_issue_217_double_slash_in_paths() {
     use datafusion::datasource::object_store::ObjectStoreUrl;
 
     // Case 1: Base with trailing slash + relative with leading slash -> no double slash
-    let result = join_paths("/data/", "/subdir/file.parquet");
+    let result = join_paths("/data/", "/subdir/file.parquet").unwrap();
     assert_eq!(result, "/data/subdir/file.parquet");
     assert!(!result.contains("//"), "join_paths must not produce double slashes");
 
     // Case 2: S3-like path hierarchy
-    let result = join_paths("/warehouse/prod/", "/data/file.parquet");
+    let result = join_paths("/warehouse/prod/", "/data/file.parquet").unwrap();
     assert_eq!(result, "/warehouse/prod/data/file.parquet");
     assert!(!result.contains("//"), "S3 path must not have double slashes");
 
     // Case 3: resolve_path with is_relative=true
-    let result = resolve_path("/bucket/prefix/", "/schema/table/file.parquet", true);
+    let result = resolve_path("/bucket/prefix/", "/schema/table/file.parquet", true).unwrap();
     assert_eq!(result, "/bucket/prefix/schema/table/file.parquet");
     assert!(!result.contains("//"), "resolve_path must not produce double slashes");
 
@@ -84,23 +84,23 @@ fn test_issue_217_double_slash_in_paths() {
         Arc::new(ObjectStoreUrl::parse("s3://bucket/").unwrap()),
         "/data/".to_string(),
     );
-    let child = resolver.child_resolver("/subpath/", true);
+    let child = resolver.child_resolver("/subpath/", true).unwrap();
     assert_eq!(child.base_path(), "/data/subpath/");
     assert!(!child.base_path().contains("//"), "PathResolver must not produce double slashes");
 
     // Case 5: Multiple levels of nesting
     let base = "/s3/bucket/warehouse/";
     for p in &["/schema/", "/table/", "/partition=1/"] {
-        let result = join_paths(base, p);
+        let result = join_paths(base, p).unwrap();
         assert!(!result.contains("//"),
             "join_paths({}, {}) = {} must not have //", base, p, result);
     }
 
     // Case 6: Normal cases still work
-    let ok_result = join_paths("/data/", "subdir/file.parquet");
+    let ok_result = join_paths("/data/", "subdir/file.parquet").unwrap();
     assert_eq!(ok_result, "/data/subdir/file.parquet");
 
-    let ok_result2 = join_paths("/data", "subdir/file.parquet");
+    let ok_result2 = join_paths("/data", "subdir/file.parquet").unwrap();
     assert_eq!(ok_result2, "/data/subdir/file.parquet");
 }
 

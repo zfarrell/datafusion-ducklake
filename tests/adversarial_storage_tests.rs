@@ -60,48 +60,51 @@ fn collect_int_values(results: &[RecordBatch], col_idx: usize) -> Vec<i32> {
 
 #[test]
 fn test_path_traversal_dot_dot() {
-    // BUG REPORT: join_paths does NOT sanitize "../" traversal.
-    // An attacker who controls a file path in the catalog can escape
-    // the table directory.
+    // Path traversal via ".." is now rejected by join_paths.
     let result = join_paths("/data/schema/table/", "../../etc/passwd");
-    // This produces "/data/schema/table/../../etc/passwd" — a valid traversal path!
-    assert_eq!(result, "/data/schema/table/../../etc/passwd");
-    // Expected: Should either reject or normalize this path.
-    // FINDING: Path traversal NOT prevented. Catalog-controlled file paths
-    // can escape the data directory.
+    assert!(
+        result.is_err(),
+        "join_paths should reject path traversal with '..' components"
+    );
+    // FINDING: Path traversal is now correctly prevented.
 }
 
 #[test]
 fn test_path_traversal_via_resolve_path() {
-    // Testing resolve_path with relative "../" traversal
+    // resolve_path now rejects ".." path traversal components.
     let result = resolve_path("/data/warehouse/", "../../../etc/shadow", true);
-    assert_eq!(result, "/data/warehouse/../../../etc/shadow");
-    // FINDING: resolve_path passes through traversal sequences unfiltered.
+    assert!(
+        result.is_err(),
+        "resolve_path should reject path traversal with '..' components"
+    );
+    // FINDING: resolve_path now correctly rejects traversal sequences.
 }
 
 #[test]
 fn test_empty_path_components() {
     // Empty base path with relative resolution
-    let result = join_paths("", "file.parquet");
+    let result = join_paths("", "file.parquet").unwrap();
     assert_eq!(result, "/file.parquet");
     // This adds a leading slash to a supposedly relative path.
 
-    let result2 = join_paths("", "");
+    let result2 = join_paths("", "").unwrap();
     assert_eq!(result2, "/");
     // Empty + empty = just a slash
 
-    let result3 = resolve_path("", "", true);
+    let result3 = resolve_path("", "", true).unwrap();
     assert_eq!(result3, "/");
     // FINDING: Empty paths produce "/" which may confuse downstream consumers.
 }
 
 #[test]
 fn test_path_with_null_bytes() {
-    // Null bytes in paths can truncate C-string processing
+    // Null bytes in paths are now rejected.
     let result = join_paths("/data/", "file\0.parquet");
-    assert_eq!(result, "/data/file\0.parquet");
-    // FINDING: Null bytes pass through unchecked. If this path is passed
-    // to C libraries or OS syscalls, it may be truncated at the null byte.
+    assert!(
+        result.is_err(),
+        "join_paths should reject paths containing null bytes"
+    );
+    // FINDING: Null bytes are now correctly rejected.
 }
 
 #[test]
@@ -109,7 +112,7 @@ fn test_path_with_unicode_special_chars() {
     // Unicode RTL override character can disguise file extensions
     let rtl_override = "\u{202E}"; // Right-to-Left Override
     let path = format!("{}teuqrap.elif", rtl_override);
-    let result = join_paths("/data/", &path);
+    let result = join_paths("/data/", &path).unwrap();
     // The path visually renders as "file.parquet" but is actually reversed
     assert!(result.contains(rtl_override));
     // FINDING: Unicode control characters pass through unchecked.
@@ -118,7 +121,7 @@ fn test_path_with_unicode_special_chars() {
 #[test]
 fn test_path_with_url_encoding() {
     // URL-encoded sequences in local paths
-    let result = join_paths("/data/", "file%2F..%2F..%2Fetc%2Fpasswd");
+    let result = join_paths("/data/", "file%2F..%2F..%2Fetc%2Fpasswd").unwrap();
     assert_eq!(result, "/data/file%2F..%2F..%2Fetc%2Fpasswd");
     // FINDING: URL-encoded path components are not decoded/validated.
     // If a downstream system decodes these, traversal could occur.
@@ -126,7 +129,7 @@ fn test_path_with_url_encoding() {
 
 #[test]
 fn test_path_with_spaces_and_special_chars() {
-    let result = join_paths("/data/", "my table/file name (1).parquet");
+    let result = join_paths("/data/", "my table/file name (1).parquet").unwrap();
     assert_eq!(result, "/data/my table/file name (1).parquet");
     // This is valid behavior, but worth documenting.
 }
@@ -134,7 +137,7 @@ fn test_path_with_spaces_and_special_chars() {
 #[test]
 fn test_extremely_long_path() {
     let long_component = "a".repeat(10000);
-    let result = join_paths("/data/", &long_component);
+    let result = join_paths("/data/", &long_component).unwrap();
     assert_eq!(result.len(), 6 + 10000); // "/data/" + 10000 chars
     // FINDING: No length limit on paths. Could cause memory issues with
     // extremely long paths (e.g., 2^31 characters).
@@ -142,11 +145,13 @@ fn test_extremely_long_path() {
 
 #[test]
 fn test_path_with_windows_backslash_traversal() {
-    // Windows-style traversal
+    // Windows-style traversal is now rejected (splits on both / and \).
     let result = join_paths("/data/", "..\\..\\etc\\passwd");
-    assert_eq!(result, "/data/..\\..\\etc\\passwd");
-    // FINDING: Backslash traversal is not normalized on Unix.
-    // On Windows, this would be a valid traversal.
+    assert!(
+        result.is_err(),
+        "join_paths should reject Windows-style path traversal with '..' components"
+    );
+    // FINDING: Backslash traversal is now correctly rejected.
 }
 
 #[test]
@@ -155,17 +160,17 @@ fn test_double_slash_in_various_positions() {
     // Let's verify all edge cases.
 
     // Base with trailing slash + relative with leading slash (the fixed case)
-    assert_eq!(join_paths("/data/", "/file.parquet"), "/data/file.parquet");
+    assert_eq!(join_paths("/data/", "/file.parquet").unwrap(), "/data/file.parquet");
 
     // Multiple leading slashes on relative path
     assert_eq!(
-        join_paths("/data/", "///file.parquet"),
+        join_paths("/data/", "///file.parquet").unwrap(),
         "/data/file.parquet"
     );
 
     // Multiple slashes in the middle of relative path (NOT cleaned)
     assert_eq!(
-        join_paths("/data/", "schema///table///file.parquet"),
+        join_paths("/data/", "schema///table///file.parquet").unwrap(),
         "/data/schema///table///file.parquet"
     );
     // FINDING: Internal multiple slashes are preserved. While the
@@ -173,7 +178,7 @@ fn test_double_slash_in_various_positions() {
     // pass through uncleaned.
 
     // Base without trailing slash (adds one via format!)
-    assert_eq!(join_paths("/data", "/file.parquet"), "/data//file.parquet");
+    assert_eq!(join_paths("/data", "/file.parquet").unwrap(), "/data//file.parquet");
     // FINDING: When base has NO trailing slash but relative has leading slash,
     // we get a double slash! The fix only covers the case where base ends with '/'.
 }
@@ -238,7 +243,7 @@ fn test_parse_relative_path_outside_cwd() {
 #[test]
 fn test_path_with_protocol_injection() {
     // Try injecting a different protocol via relative path
-    let result = join_paths("/data/", "s3://evil-bucket/stolen-data");
+    let result = join_paths("/data/", "s3://evil-bucket/stolen-data").unwrap();
     assert_eq!(result, "/data/s3://evil-bucket/stolen-data");
     // This becomes a local path, not an S3 path. OK behavior.
 }

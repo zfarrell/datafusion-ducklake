@@ -101,7 +101,7 @@ impl TableDeletionsTable {
             &self.table_path,
             &delete_file.data_file_path,
             delete_file.data_file_path_is_relative,
-        );
+        )?;
 
         // Create scan for current delete file (if exists - None means full file delete)
         let current_delete_exec = if let Some(ref current_path) = delete_file.current_delete_path {
@@ -152,7 +152,7 @@ impl TableDeletionsTable {
         size_bytes: i64,
         footer_size: i64,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let resolved_path = resolve_path(&self.table_path, path, is_relative);
+        let resolved_path = resolve_path(&self.table_path, path, is_relative)?;
 
         let mut pf = PartitionedFile::new(&resolved_path, size_bytes as u64);
         if footer_size > 0 {

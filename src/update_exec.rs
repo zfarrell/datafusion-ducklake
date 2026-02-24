@@ -255,7 +255,7 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                     &table_path,
                     &table_file.file.path,
                     table_file.file.path_is_relative,
-                );
+                )?;
 
                 // Get existing deleted positions for this file
                 let existing_positions = existing_deletes.get(&resolved_path);
@@ -381,7 +381,7 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                 // Write the delete file
                 let delete_file_name = format!("ducklake-{}-delete.parquet", Uuid::new_v4());
                 let schema_table_prefix = table_path.trim_start_matches('/');
-                let delete_object_key = join_paths(schema_table_prefix, &delete_file_name);
+                let delete_object_key = join_paths(schema_table_prefix, &delete_file_name)?;
                 let delete_object_path =
                     ObjectPath::from(delete_object_key.trim_start_matches('/'));
 
@@ -435,8 +435,8 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                     crate::path_resolver::parse_object_store_url(&data_path_str)
                         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-                let table_key = join_paths(&join_paths(&base_key_path, &schema_name), &table_name);
-                let object_key = join_paths(&table_key, &data_file_name);
+                let table_key = join_paths(&join_paths(&base_key_path, &schema_name)?, &table_name)?;
+                let object_key = join_paths(&table_key, &data_file_name)?;
                 let data_object_path = ObjectPath::from(object_key.trim_start_matches('/'));
 
                 // Write all updated rows to a single Parquet file

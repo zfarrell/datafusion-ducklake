@@ -238,7 +238,7 @@ async fn test_issue_198_backslash_path_resolution() -> DataFusionResult<()> {
     // This simulates what happens when DuckLake stores Windows-style paths
 
     // Case 1: base path with backslash, relative path with forward slash
-    let resolved = resolve_path("C:\\data\\schema1\\", "table1/file.parquet", true);
+    let resolved = resolve_path("C:\\data\\schema1\\", "table1/file.parquet", true).unwrap();
     eprintln!("Issue #198 case 1: {}", resolved);
     // The path should be usable (even if mixed slashes)
     assert!(
@@ -247,7 +247,7 @@ async fn test_issue_198_backslash_path_resolution() -> DataFusionResult<()> {
     );
 
     // Case 2: paths with backslashes throughout
-    let resolved = join_paths("main\\", "table1\\data.parquet");
+    let resolved = join_paths("main\\", "table1\\data.parquet").unwrap();
     eprintln!("Issue #198 case 2: {}", resolved);
     assert!(
         resolved.contains("table1") && resolved.contains("data.parquet"),
@@ -255,7 +255,7 @@ async fn test_issue_198_backslash_path_resolution() -> DataFusionResult<()> {
     );
 
     // Case 3: Mixed slashes in hierarchical resolution
-    let resolved = resolve_path("/data/", "schema1\\table1\\", true);
+    let resolved = resolve_path("/data/", "schema1\\table1\\", true).unwrap();
     eprintln!("Issue #198 case 3: {}", resolved);
     assert!(
         resolved.contains("schema1"),
@@ -326,7 +326,7 @@ async fn test_issue_255_s3_bucket_root_data_path() -> DataFusionResult<()> {
     // Test 3: PathResolver should work with bucket-root paths
     let resolver = PathResolver::new(Arc::new(url), path);
 
-    let schema_path = resolver.resolve("main/", true);
+    let schema_path = resolver.resolve("main/", true).unwrap();
     eprintln!("Issue #255 test 3 schema_path: {}", schema_path);
     // Should produce a valid path like "/main/" or "main/"
     assert!(
@@ -335,9 +335,9 @@ async fn test_issue_255_s3_bucket_root_data_path() -> DataFusionResult<()> {
     );
 
     // Test 4: Full hierarchy from bucket root
-    let schema_resolver = resolver.child_resolver("main/", true);
-    let table_resolver = schema_resolver.child_resolver("my_table/", true);
-    let file_path = table_resolver.resolve("data.parquet", true);
+    let schema_resolver = resolver.child_resolver("main/", true).unwrap();
+    let table_resolver = schema_resolver.child_resolver("my_table/", true).unwrap();
+    let file_path = table_resolver.resolve("data.parquet", true).unwrap();
     eprintln!("Issue #255 test 4 file_path: {}", file_path);
     assert!(
         file_path.contains("main") && file_path.contains("my_table") && file_path.contains("data.parquet"),
@@ -701,11 +701,11 @@ async fn test_path_resolver_edge_cases_for_storage_issues() -> DataFusionResult<
     }
 
     // Edge case from #217: Empty relative path
-    let resolved = resolve_path("/data/", "", true);
+    let resolved = resolve_path("/data/", "", true).unwrap();
     assert_eq!(resolved, "/data/", "Empty relative path should return base path");
 
     // Edge case from #255: Resolve with empty base path
-    let resolved = resolve_path("", "schema/table/file.parquet", true);
+    let resolved = resolve_path("", "schema/table/file.parquet", true).unwrap();
     eprintln!("Empty base + relative: {}", resolved);
     assert!(
         resolved.contains("schema"),
@@ -718,9 +718,9 @@ async fn test_path_resolver_edge_cases_for_storage_issues() -> DataFusionResult<
     let resolver = PathResolver::new(Arc::new(url), path);
 
     // Build a full hierarchy from bucket root
-    let schema_resolver = resolver.child_resolver("main/", true);
-    let table_resolver = schema_resolver.child_resolver("users/", true);
-    let file_path = table_resolver.resolve("00001.parquet", true);
+    let schema_resolver = resolver.child_resolver("main/", true).unwrap();
+    let table_resolver = schema_resolver.child_resolver("users/", true).unwrap();
+    let file_path = table_resolver.resolve("00001.parquet", true).unwrap();
     eprintln!("Full path from bucket root: {}", file_path);
     assert!(
         file_path.ends_with("00001.parquet"),

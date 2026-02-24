@@ -218,7 +218,7 @@ impl ExecutionPlan for DuckLakeDeleteExec {
                     &table_path,
                     &table_file.file.path,
                     table_file.file.path_is_relative,
-                );
+                )?;
 
                 // Get existing deleted positions for this file
                 let existing_positions = existing_deletes.get(&resolved_path);
@@ -316,7 +316,7 @@ impl ExecutionPlan for DuckLakeDeleteExec {
                 let delete_file_name = format!("ducklake-{}-delete.parquet", Uuid::new_v4());
                 // Use the table path structure for delete files
                 let schema_table_prefix = table_path.trim_start_matches('/');
-                let delete_object_key = join_paths(schema_table_prefix, &delete_file_name);
+                let delete_object_key = join_paths(schema_table_prefix, &delete_file_name)?;
                 let delete_object_path =
                     ObjectPath::from(delete_object_key.trim_start_matches('/'));
 

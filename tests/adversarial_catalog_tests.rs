@@ -227,13 +227,12 @@ fn test_path_traversal_schema_name_dotdot() {
     let malicious_schema = "../../etc";
 
     let resolved = join_paths(base, &format!("{}/", malicious_schema));
-    // VULNERABILITY: This resolves to "/data/warehouse/../../etc/"
-    // which is effectively "/etc/" on the filesystem
-    assert_eq!(resolved, "/data/warehouse/../../etc/");
+    // Path traversal is now correctly rejected
+    assert!(resolved.is_err(), "join_paths should reject path traversal with '..' components");
 
     // In a child_resolver chain, this escapes the data directory
     let schema_path = resolve_path(base, &format!("{}/", malicious_schema), true);
-    assert_eq!(schema_path, "/data/warehouse/../../etc/");
+    assert!(schema_path.is_err(), "resolve_path should reject path traversal with '..' components");
 }
 
 /// VULN-001: Path traversal via table name.
@@ -243,7 +242,7 @@ fn test_path_traversal_table_name_dotdot() {
     let malicious_table = "../../../tmp/evil";
 
     let resolved = join_paths(schema_base, &format!("{}/", malicious_table));
-    assert_eq!(resolved, "/data/warehouse/main/../../../tmp/evil/");
+    assert!(resolved.is_err(), "join_paths should reject path traversal with '..' components");
 }
 
 /// VULN-001: Path traversal with backslashes (Windows-style).
@@ -253,8 +252,8 @@ fn test_path_traversal_backslash() {
     let malicious = "..\\..\\etc\\passwd";
 
     let resolved = join_paths(base, malicious);
-    // join_paths strips leading backslash but doesn't sanitize internal ..
-    assert_eq!(resolved, "/data/warehouse/..\\..\\etc\\passwd");
+    // join_paths now rejects paths with '..' traversal components (splits on both / and \)
+    assert!(resolved.is_err(), "join_paths should reject Windows-style path traversal with '..' components");
 }
 
 /// VULN-001: Path traversal via file path in data file registration.
@@ -264,10 +263,7 @@ fn test_path_traversal_file_path() {
     let malicious_file = "../../../../etc/shadow";
 
     let resolved = resolve_path(table_base, malicious_file, true);
-    assert_eq!(
-        resolved,
-        "/data/warehouse/main/users/../../../../etc/shadow"
-    );
+    assert!(resolved.is_err(), "resolve_path should reject path traversal with '..' components");
 }
 
 /// VULN-001: Null bytes in paths could truncate path on some OS layers.
@@ -277,8 +273,8 @@ fn test_path_null_byte_injection() {
     let malicious = "schema\0/../../etc/passwd";
 
     let resolved = join_paths(base, malicious);
-    // Null byte passes through - could truncate at OS level
-    assert!(resolved.contains('\0'));
+    // Null bytes are now correctly rejected
+    assert!(resolved.is_err(), "join_paths should reject paths containing null bytes");
 }
 
 /// VULN-001: URL-encoded path traversal.
@@ -288,7 +284,7 @@ fn test_path_traversal_url_encoded() {
     // %2e%2e = ..  (URL-encoded)
     let malicious = "%2e%2e/%2e%2e/etc/passwd";
 
-    let resolved = join_paths(base, malicious);
+    let resolved = join_paths(base, malicious).unwrap();
     // Not decoded, so passes through as literal - safer for filesystem
     // but S3 might decode these
     assert_eq!(resolved, "/data/warehouse/%2e%2e/%2e%2e/etc/passwd");

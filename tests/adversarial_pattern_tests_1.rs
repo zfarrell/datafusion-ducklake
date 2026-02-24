@@ -321,7 +321,7 @@ mod path_patterns {
     #[test]
     fn test_pattern_217_double_slash_in_paths() {
         // join_paths with base ending in / and relative starting with /
-        let result = join_paths("/data/", "/subdir/file.parquet");
+        let result = join_paths("/data/", "/subdir/file.parquet").unwrap();
         assert!(!result.contains("//") || result.starts_with("//"),
             "Double slash should be prevented: '{}'", result);
 
@@ -330,7 +330,7 @@ mod path_patterns {
             Arc::new(ObjectStoreUrl::parse("s3://bucket/").unwrap()),
             "/data/".to_string(),
         );
-        let child = resolver.child_resolver("/", true);
+        let child = resolver.child_resolver("/", true).unwrap();
         // When base ends with / and child is just /, we get /data/ which is fine
         assert!(child.base_path() == "/data/" || !child.base_path().contains("//"),
             "Double slash in child resolver: '{}'", child.base_path());
@@ -346,9 +346,9 @@ mod path_patterns {
             "/prefix/".to_string(),
         );
 
-        let schema = resolver.child_resolver("schema/", true);
-        let table = schema.child_resolver("table/", true);
-        let file = table.resolve("data.parquet", true);
+        let schema = resolver.child_resolver("schema/", true).unwrap();
+        let table = schema.child_resolver("table/", true).unwrap();
+        let file = table.resolve("data.parquet", true).unwrap();
 
         assert_eq!(file, "/prefix/schema/table/data.parquet");
         // Check no double slashes
@@ -361,12 +361,12 @@ mod path_patterns {
     #[test]
     fn test_pattern_198_backslash_in_paths() {
         // If metadata contains backslash paths (Windows-created catalogs)
-        let result = resolve_path("/data/", "schema\\table\\file.parquet", true);
+        let result = resolve_path("/data/", "schema\\table\\file.parquet", true).unwrap();
         // At minimum, should not crash. The path will contain backslashes since we don't normalize.
         assert!(!result.is_empty(), "Path resolution with backslash should not produce empty result");
 
         // join_paths with backslash base
-        let result = join_paths("C:\\data\\", "table\\file.parquet");
+        let result = join_paths("C:\\data\\", "table\\file.parquet").unwrap();
         assert!(!result.is_empty(), "Backslash join should not crash");
     }
 
@@ -391,7 +391,7 @@ mod path_patterns {
             Arc::new(ObjectStoreUrl::parse("s3://bucket/").unwrap()),
             path.clone(),
         );
-        let resolved = resolver.resolve("schema/table/file.parquet", true);
+        let resolved = resolver.resolve("schema/table/file.parquet", true).unwrap();
         assert!(!resolved.is_empty(), "Resolution from bucket root should work");
     }
 
@@ -411,16 +411,16 @@ mod path_patterns {
     #[test]
     fn test_pattern_217_empty_path_components() {
         // Empty base path
-        let result = resolve_path("", "file.parquet", true);
+        let result = resolve_path("", "file.parquet", true).unwrap();
         assert!(!result.is_empty(), "Empty base with relative should still produce a path");
 
         // Empty relative path
-        let result = resolve_path("/data/", "", true);
+        let result = resolve_path("/data/", "", true).unwrap();
         assert!(result == "/data/" || result == "/data",
             "Empty relative path should return base: '{}'", result);
 
         // Both empty
-        let result = resolve_path("", "", true);
+        let result = resolve_path("", "", true).unwrap();
         assert!(result == "/" || result.is_empty(),
             "Both empty should produce root or empty: '{}'", result);
     }
@@ -430,14 +430,13 @@ mod path_patterns {
     // ANALOGOUS CODE: join_paths does NOT normalize ".." — is this a security issue?
     #[test]
     fn test_pattern_198_path_traversal_in_metadata() {
-        // If catalog metadata contains ".." paths, we pass them through
+        // Path traversal with ".." is now rejected as a security measure
         let result = join_paths("/data/schema/", "../../etc/passwd");
-        // We should document that we don't normalize these
-        assert!(result.contains(".."),
-            "join_paths should not silently normalize '..' references: '{}'", result);
+        assert!(result.is_err(),
+            "join_paths should reject paths containing '..' traversal");
 
         // resolve_path with absolute path (should be returned as-is even if sketchy)
-        let result = resolve_path("/data/", "/etc/passwd", false);
+        let result = resolve_path("/data/", "/etc/passwd", false).unwrap();
         assert_eq!(result, "/etc/passwd");
     }
 
@@ -470,11 +469,11 @@ mod path_patterns {
             "/data".to_string(),  // No trailing slash!
         );
 
-        let child = resolver.child_resolver("schema/", true);
+        let child = resolver.child_resolver("schema/", true).unwrap();
         assert_eq!(child.base_path(), "/data/schema/",
             "Should insert / between base and child");
 
-        let resolved = resolver.resolve("file.parquet", true);
+        let resolved = resolver.resolve("file.parquet", true).unwrap();
         assert_eq!(resolved, "/data/file.parquet",
             "Should insert / before file name");
     }
@@ -816,11 +815,11 @@ mod catalog_patterns {
     #[test]
     fn test_pattern_69_empty_paths_after_drop() {
         // If a table's path is "" after being dropped/corrupted
-        let result = resolve_path("/data/schema/", "", true);
+        let result = resolve_path("/data/schema/", "", true).unwrap();
         assert!(result == "/data/schema/" || result == "/data/schema",
             "Empty table path should resolve to schema path: '{}'", result);
 
-        let result = resolve_path("", "", false);
+        let result = resolve_path("", "", false).unwrap();
         assert!(result.is_empty(),
             "Empty absolute path should be empty: '{}'", result);
     }
@@ -837,7 +836,7 @@ mod catalog_patterns {
         // With snapshot_id=0 and begin_snapshot=1, "0 >= 1" is FALSE — correct!
 
         // Verify path resolution works with snapshot_id=0 context
-        let result = resolve_path("/catalog/", "schema/table/", true);
+        let result = resolve_path("/catalog/", "schema/table/", true).unwrap();
         assert_eq!(result, "/catalog/schema/table/");
     }
 
@@ -1134,15 +1133,15 @@ mod edge_case_patterns {
     // ANALOGOUS CODE: join_paths with null bytes.
     #[test]
     fn test_pattern_198_control_chars_in_paths() {
-        // Null byte in path
+        // Null byte in path is now rejected as a security measure
         let result = join_paths("/data/", "file\0.parquet");
-        assert!(!result.is_empty(), "Null byte in path should not crash");
+        assert!(result.is_err(), "Null byte in path should be rejected");
 
-        // Tab and newline
-        let result = join_paths("/data/", "file\t.parquet");
+        // Tab and newline are still allowed (not a security risk like null bytes)
+        let result = join_paths("/data/", "file\t.parquet").unwrap();
         assert!(!result.is_empty(), "Tab in path should not crash");
 
-        let result = join_paths("/data/", "file\n.parquet");
+        let result = join_paths("/data/", "file\n.parquet").unwrap();
         assert!(!result.is_empty(), "Newline in path should not crash");
     }
 
@@ -1158,7 +1157,7 @@ mod edge_case_patterns {
 
         // Very long path
         let long_path = "/".to_string() + &"a/".repeat(1000) + "file.parquet";
-        let result = join_paths("/data/", &long_path);
+        let result = join_paths("/data/", &long_path).unwrap();
         assert!(!result.is_empty(), "Very long path should not crash");
     }
 
@@ -1219,7 +1218,7 @@ mod edge_case_patterns {
         assert!(result.is_err(), "Empty type string should error");
 
         // Empty path components
-        let result = join_paths("", "");
+        let result = join_paths("", "").unwrap();
         assert!(result == "/" || result.is_empty(),
             "Both empty should not crash: '{}'", result);
     }

@@ -439,7 +439,7 @@ impl TableChangesTable {
             &self.table_path,
             &data_file.path,
             data_file.path_is_relative,
-        );
+        )?;
 
         // Create PartitionedFile with footer size hint if available
         let mut pf = PartitionedFile::new(&resolved_path, data_file.file_size_bytes as u64);
@@ -556,7 +556,8 @@ impl TableProvider for TableChangesTable {
                     &self.table_path,
                     &data_file.path,
                     data_file.path_is_relative,
-                );
+                )
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
                 builder.add_file(&resolved_path, data_file.encryption_key.as_deref());
             }
             let factory = builder.build();

@@ -7,6 +7,52 @@ use crate::{DuckLakeError, Result};
 use datafusion::datasource::object_store::ObjectStoreUrl;
 use std::sync::Arc;
 
+/// Validates that a path does not contain null bytes.
+///
+/// Null bytes in paths are a security vulnerability: OS syscalls truncate at \0,
+/// so the catalog may see one path while the OS accesses another.
+///
+/// # Errors
+/// Returns `DuckLakeError::InvalidConfig` if the path contains a null byte.
+fn validate_no_null_bytes(path: &str) -> Result<()> {
+    if path.contains('\0') {
+        return Err(DuckLakeError::InvalidConfig(
+            "Path contains null byte: paths with null bytes are not allowed (security risk)"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validates that a path does not contain path traversal (`..`) components.
+///
+/// Rejects any path where `..` appears as a standalone directory component
+/// (separated by `/` or `\`). This prevents attackers from injecting paths
+/// like `../../etc/passwd` into catalog metadata to escape the data directory.
+///
+/// Single dots (`.`) and dots within names (e.g., `schema.v2`) are allowed.
+///
+/// # Errors
+/// Returns `DuckLakeError::InvalidConfig` if the path contains `..` as a component.
+fn validate_no_path_traversal(path: &str) -> Result<()> {
+    for component in path.split(|c: char| c == '/' || c == '\\') {
+        if component == ".." {
+            return Err(DuckLakeError::InvalidConfig(format!(
+                "Path traversal detected: path contains '..' component: {}",
+                path
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validates a path for all security checks (null bytes and path traversal).
+fn validate_path(path: &str) -> Result<()> {
+    validate_no_null_bytes(path)?;
+    validate_no_path_traversal(path)?;
+    Ok(())
+}
+
 /// Parses a data path into an ObjectStoreUrl and key path
 ///
 /// Supports three formats:
@@ -27,6 +73,7 @@ use std::sync::Arc;
 /// - URL parsing fails
 /// - S3 URL is missing bucket name
 /// - Local path cannot be canonicalized (doesn't exist or permission denied)
+/// - Path contains null bytes or path traversal components
 ///
 /// # Example
 /// ```no_run
@@ -37,6 +84,7 @@ use std::sync::Arc;
 /// # Ok::<(), datafusion_ducklake::DuckLakeError>(())
 /// ```
 pub fn parse_object_store_url(data_path: &str) -> Result<(ObjectStoreUrl, String)> {
+    validate_path(data_path)?;
     if data_path.starts_with("s3://") {
         parse_s3_url(data_path)
     } else if data_path.starts_with("file://") {
@@ -112,20 +160,25 @@ fn parse_local_path(data_path: &str) -> Result<(ObjectStoreUrl, String)> {
 /// # Returns
 /// The resolved absolute path
 ///
+/// # Errors
+/// Returns error if any path contains null bytes or path traversal (`..`) components.
+///
 /// # Example
 /// ```
 /// # use datafusion_ducklake::path_resolver::resolve_path;
-/// let resolved = resolve_path("/data/schema1/", "table1/data.parquet", true);
+/// let resolved = resolve_path("/data/schema1/", "table1/data.parquet", true).unwrap();
 /// assert_eq!(resolved, "/data/schema1/table1/data.parquet");
 ///
-/// let absolute = resolve_path("/data/schema1/", "/other/path/data.parquet", false);
+/// let absolute = resolve_path("/data/schema1/", "/other/path/data.parquet", false).unwrap();
 /// assert_eq!(absolute, "/other/path/data.parquet");
 /// ```
-pub fn resolve_path(base_path: &str, path: &str, is_relative: bool) -> String {
+pub fn resolve_path(base_path: &str, path: &str, is_relative: bool) -> Result<String> {
+    validate_path(base_path)?;
+    validate_path(path)?;
     if is_relative {
         join_paths(base_path, path)
     } else {
-        path.to_string()
+        Ok(path.to_string())
     }
 }
 
@@ -140,19 +193,24 @@ pub fn resolve_path(base_path: &str, path: &str, is_relative: bool) -> String {
 /// # Returns
 /// The joined path with proper separators
 ///
+/// # Errors
+/// Returns error if any path contains null bytes or path traversal (`..`) components.
+///
 /// # Example
 /// ```
 /// # use datafusion_ducklake::path_resolver::join_paths;
-/// assert_eq!(join_paths("/data/", "table/file.parquet"), "/data/table/file.parquet");
-/// assert_eq!(join_paths("/data", "table/file.parquet"), "/data/table/file.parquet");
-/// assert_eq!(join_paths("/data/", "/absolute"), "/data/absolute"); // strips leading slash to avoid double slash
+/// assert_eq!(join_paths("/data/", "table/file.parquet").unwrap(), "/data/table/file.parquet");
+/// assert_eq!(join_paths("/data", "table/file.parquet").unwrap(), "/data/table/file.parquet");
+/// assert_eq!(join_paths("/data/", "/absolute").unwrap(), "/data/absolute"); // strips leading slash to avoid double slash
 /// ```
-pub fn join_paths(base_path: &str, relative_path: &str) -> String {
+pub fn join_paths(base_path: &str, relative_path: &str) -> Result<String> {
+    validate_path(base_path)?;
+    validate_path(relative_path)?;
     if base_path.ends_with('/') || base_path.ends_with('\\') {
         let trimmed = relative_path.trim_start_matches('/').trim_start_matches('\\');
-        format!("{}{}", base_path, trimmed)
+        Ok(format!("{}{}", base_path, trimmed))
     } else {
-        format!("{}/{}", base_path, relative_path)
+        Ok(format!("{}/{}", base_path, relative_path))
     }
 }
 
@@ -199,7 +257,10 @@ impl PathResolver {
     ///
     /// # Returns
     /// The resolved absolute path
-    pub fn resolve(&self, path: &str, is_relative: bool) -> String {
+    ///
+    /// # Errors
+    /// Returns error if any path contains null bytes or path traversal (`..`) components.
+    pub fn resolve(&self, path: &str, is_relative: bool) -> Result<String> {
         resolve_path(&self.base_path, path, is_relative)
     }
 
@@ -215,6 +276,9 @@ impl PathResolver {
     /// # Returns
     /// A new PathResolver with the resolved path as its base path
     ///
+    /// # Errors
+    /// Returns error if any path contains null bytes or path traversal (`..`) components.
+    ///
     /// # Example
     /// ```no_run
     /// # use datafusion_ducklake::path_resolver::PathResolver;
@@ -224,13 +288,13 @@ impl PathResolver {
     ///     Arc::new(ObjectStoreUrl::parse("s3://bucket/")?),
     ///     "/data/".to_string()
     /// );
-    /// let schema_resolver = catalog_resolver.child_resolver("schema1/", true);
+    /// let schema_resolver = catalog_resolver.child_resolver("schema1/", true)?;
     /// // schema_resolver now has base_path = "/data/schema1/"
-    /// # Ok::<(), datafusion::error::DataFusionError>(())
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn child_resolver(&self, path: &str, is_relative: bool) -> Self {
-        let resolved = self.resolve(path, is_relative);
-        Self::new(self.base_url.clone(), resolved)
+    pub fn child_resolver(&self, path: &str, is_relative: bool) -> Result<Self> {
+        let resolved = self.resolve(path, is_relative)?;
+        Ok(Self::new(self.base_url.clone(), resolved))
     }
 
     /// Returns the base object store URL
@@ -297,26 +361,26 @@ mod tests {
 
     #[test]
     fn test_resolve_path_relative() {
-        let resolved = resolve_path("/data/schema1/", "table1/", true);
+        let resolved = resolve_path("/data/schema1/", "table1/", true).unwrap();
         assert_eq!(resolved, "/data/schema1/table1/");
     }
 
     #[test]
     fn test_resolve_path_relative_no_trailing_slash() {
-        let resolved = resolve_path("/data/schema1", "table1/", true);
+        let resolved = resolve_path("/data/schema1", "table1/", true).unwrap();
         assert_eq!(resolved, "/data/schema1/table1/");
     }
 
     #[test]
     fn test_resolve_path_absolute() {
-        let resolved = resolve_path("/data/schema1/", "/other/path/", false);
+        let resolved = resolve_path("/data/schema1/", "/other/path/", false).unwrap();
         assert_eq!(resolved, "/other/path/");
     }
 
     #[test]
     fn test_join_paths_with_trailing_slash() {
         assert_eq!(
-            join_paths("/data/", "table/file.parquet"),
+            join_paths("/data/", "table/file.parquet").unwrap(),
             "/data/table/file.parquet"
         );
     }
@@ -324,7 +388,7 @@ mod tests {
     #[test]
     fn test_join_paths_without_trailing_slash() {
         assert_eq!(
-            join_paths("/data", "table/file.parquet"),
+            join_paths("/data", "table/file.parquet").unwrap(),
             "/data/table/file.parquet"
         );
     }
@@ -332,7 +396,7 @@ mod tests {
     #[test]
     fn test_join_paths_with_backslash() {
         assert_eq!(
-            join_paths("C:\\data\\", "table\\file.parquet"),
+            join_paths("C:\\data\\", "table\\file.parquet").unwrap(),
             "C:\\data\\table\\file.parquet"
         );
     }
@@ -344,10 +408,10 @@ mod tests {
             "/data/schema1/".to_string(),
         );
 
-        let resolved = resolver.resolve("table1/", true);
+        let resolved = resolver.resolve("table1/", true).unwrap();
         assert_eq!(resolved, "/data/schema1/table1/");
 
-        let absolute = resolver.resolve("/other/path/", false);
+        let absolute = resolver.resolve("/other/path/", false).unwrap();
         assert_eq!(absolute, "/other/path/");
     }
 
@@ -358,14 +422,14 @@ mod tests {
             "/data/".to_string(),
         );
 
-        let schema_resolver = catalog_resolver.child_resolver("schema1/", true);
+        let schema_resolver = catalog_resolver.child_resolver("schema1/", true).unwrap();
         assert_eq!(schema_resolver.base_path(), "/data/schema1/");
         assert_eq!(
             *schema_resolver.base_url(),
             Arc::new(ObjectStoreUrl::parse("s3://bucket/").unwrap())
         );
 
-        let table_resolver = schema_resolver.child_resolver("table1/", true);
+        let table_resolver = schema_resolver.child_resolver("table1/", true).unwrap();
         assert_eq!(table_resolver.base_path(), "/data/schema1/table1/");
     }
 
@@ -376,7 +440,9 @@ mod tests {
             "/data/".to_string(),
         );
 
-        let schema_resolver = catalog_resolver.child_resolver("/other/schema/", false);
+        let schema_resolver = catalog_resolver
+            .child_resolver("/other/schema/", false)
+            .unwrap();
         assert_eq!(schema_resolver.base_path(), "/other/schema/");
     }
 
@@ -437,7 +503,7 @@ mod tests {
     #[test]
     fn test_join_paths_nested_relative() {
         assert_eq!(
-            join_paths("/data/", "schema1/table1/file.parquet"),
+            join_paths("/data/", "schema1/table1/file.parquet").unwrap(),
             "/data/schema1/table1/file.parquet"
         );
     }
@@ -445,7 +511,7 @@ mod tests {
     #[test]
     fn test_join_paths_windows_style() {
         assert_eq!(
-            join_paths("C:\\data", "schema1\\table1"),
+            join_paths("C:\\data", "schema1\\table1").unwrap(),
             "C:\\data/schema1\\table1"
         );
     }
@@ -457,23 +523,23 @@ mod tests {
             "/data/".to_string(),
         );
 
-        let schema_resolver = catalog_resolver.child_resolver("schema1/", true);
-        let table_resolver = schema_resolver.child_resolver("table1/", true);
-        let file_path = table_resolver.resolve("file.parquet", true);
+        let schema_resolver = catalog_resolver.child_resolver("schema1/", true).unwrap();
+        let table_resolver = schema_resolver.child_resolver("table1/", true).unwrap();
+        let file_path = table_resolver.resolve("file.parquet", true).unwrap();
 
         assert_eq!(file_path, "/data/schema1/table1/file.parquet");
     }
 
     #[test]
     fn test_resolve_path_with_special_chars() {
-        let resolved = resolve_path("/data/", "table-123_test.v2/", true);
+        let resolved = resolve_path("/data/", "table-123_test.v2/", true).unwrap();
         assert_eq!(resolved, "/data/table-123_test.v2/");
     }
 
     #[test]
     fn test_join_paths_double_slash_in_relative() {
         // Leading slash on relative path is stripped to prevent double slashes
-        assert_eq!(join_paths("/data/", "/absolute"), "/data/absolute");
+        assert_eq!(join_paths("/data/", "/absolute").unwrap(), "/data/absolute");
     }
 
     #[test]
@@ -484,21 +550,22 @@ mod tests {
         );
 
         // First child is relative
-        let schema_resolver = catalog_resolver.child_resolver("schema1/", true);
+        let schema_resolver = catalog_resolver.child_resolver("schema1/", true).unwrap();
         assert_eq!(schema_resolver.base_path(), "/catalog/schema1/");
 
         // Second child is absolute (overrides)
-        let table_resolver = schema_resolver.child_resolver("/absolute/table/", false);
+        let table_resolver = schema_resolver
+            .child_resolver("/absolute/table/", false)
+            .unwrap();
         assert_eq!(table_resolver.base_path(), "/absolute/table/");
 
         // Third child is relative to the absolute path
-        let file_resolver = table_resolver.child_resolver("subdir/", true);
+        let file_resolver = table_resolver.child_resolver("subdir/", true).unwrap();
         assert_eq!(file_resolver.base_path(), "/absolute/table/subdir/");
     }
 
     #[test]
     fn test_s3_url_bucket_with_region() {
-        // Test S3 URL with region-specific bucket format
         let (url, path) = parse_object_store_url("s3://my-bucket/data/warehouse").unwrap();
         assert_eq!(url, ObjectStoreUrl::parse("s3://my-bucket/").unwrap());
         assert_eq!(path, "/data/warehouse");
@@ -506,7 +573,6 @@ mod tests {
 
     #[test]
     fn test_s3_url_with_encoded_characters() {
-        // S3 paths can contain URL-encoded characters
         let (url, path) = parse_object_store_url("s3://bucket/path%20with%20spaces/data").unwrap();
         assert_eq!(url, ObjectStoreUrl::parse("s3://bucket/").unwrap());
         assert_eq!(path, "/path%20with%20spaces/data");
@@ -523,49 +589,50 @@ mod tests {
 
     #[test]
     fn test_mixed_s3_and_local_hierarchy() {
-        // Simulate a scenario where catalog uses S3 but we need to track paths
         let s3_resolver = PathResolver::new(
             Arc::new(ObjectStoreUrl::parse("s3://data-lake/").unwrap()),
             "/prod/".to_string(),
         );
 
-        let schema_resolver = s3_resolver.child_resolver("sales/", true);
+        let schema_resolver = s3_resolver.child_resolver("sales/", true).unwrap();
         assert_eq!(schema_resolver.base_path(), "/prod/sales/");
         assert_eq!(
             *schema_resolver.base_url(),
             Arc::new(ObjectStoreUrl::parse("s3://data-lake/").unwrap())
         );
 
-        let table_resolver = schema_resolver.child_resolver("transactions/", true);
+        let table_resolver = schema_resolver
+            .child_resolver("transactions/", true)
+            .unwrap();
         assert_eq!(table_resolver.base_path(), "/prod/sales/transactions/");
 
-        let file_path = table_resolver.resolve("2024/01/data.parquet", true);
+        let file_path = table_resolver
+            .resolve("2024/01/data.parquet", true)
+            .unwrap();
         assert_eq!(file_path, "/prod/sales/transactions/2024/01/data.parquet");
     }
 
     #[test]
     fn test_hierarchical_path_with_absolute_override_s3() {
-        // Schema is relative to catalog, but table uses absolute path
         let catalog_resolver = PathResolver::new(
             Arc::new(ObjectStoreUrl::parse("s3://bucket/").unwrap()),
             "/warehouse/".to_string(),
         );
 
-        let schema_resolver = catalog_resolver.child_resolver("prod/", true);
+        let schema_resolver = catalog_resolver.child_resolver("prod/", true).unwrap();
         assert_eq!(schema_resolver.base_path(), "/warehouse/prod/");
 
-        // Table overrides with absolute path
-        let table_resolver = schema_resolver.child_resolver("/external/data/", false);
+        let table_resolver = schema_resolver
+            .child_resolver("/external/data/", false)
+            .unwrap();
         assert_eq!(table_resolver.base_path(), "/external/data/");
 
-        // File is relative to the absolute table path
-        let file_path = table_resolver.resolve("file.parquet", true);
+        let file_path = table_resolver.resolve("file.parquet", true).unwrap();
         assert_eq!(file_path, "/external/data/file.parquet");
     }
 
     #[test]
     fn test_parse_s3_url_minimal_bucket() {
-        // Shortest valid S3 URL (just bucket, no trailing slash)
         let (url, path) = parse_object_store_url("s3://b").unwrap();
         assert_eq!(url, ObjectStoreUrl::parse("s3://b/").unwrap());
         assert_eq!(path, "");
@@ -573,8 +640,6 @@ mod tests {
 
     #[test]
     fn test_parse_s3_url_with_query_params() {
-        // S3 URLs generally don't have query params, but URL parser should handle it
-        // Note: url::Url will parse query params but they won't be in the path
         let (url, path) = parse_object_store_url("s3://bucket/path/data").unwrap();
         assert_eq!(url, ObjectStoreUrl::parse("s3://bucket/").unwrap());
         assert_eq!(path, "/path/data");
@@ -582,7 +647,6 @@ mod tests {
 
     #[test]
     fn test_file_url_windows_style_path() {
-        // file:// URLs with Windows paths (C:/)
         let (url, path) = parse_object_store_url("file:///C:/Users/data").unwrap();
         assert_eq!(url, ObjectStoreUrl::parse("file:///").unwrap());
         assert_eq!(path, "/C:/Users/data");
@@ -590,38 +654,31 @@ mod tests {
 
     #[test]
     fn test_path_resolution_with_dots() {
-        // Paths with dots (version numbers, file extensions, etc.)
-        let resolved = resolve_path("/data/", "schema.v2/table.prod/", true);
+        // Paths with dots (version numbers, file extensions, etc.) - NOT traversal
+        let resolved = resolve_path("/data/", "schema.v2/table.prod/", true).unwrap();
         assert_eq!(resolved, "/data/schema.v2/table.prod/");
     }
 
     #[test]
     fn test_path_resolution_with_underscores() {
-        let resolved = resolve_path("/data/", "my_schema/my_table/", true);
+        let resolved = resolve_path("/data/", "my_schema/my_table/", true).unwrap();
         assert_eq!(resolved, "/data/my_schema/my_table/");
     }
 
     #[test]
     fn test_join_paths_with_multiple_slashes_in_relative() {
-        // Relative path with multiple directory levels
-        let result = join_paths("/base/", "a/b/c/d/file.parquet");
+        let result = join_paths("/base/", "a/b/c/d/file.parquet").unwrap();
         assert_eq!(result, "/base/a/b/c/d/file.parquet");
     }
 
     #[test]
     fn test_join_paths_preserves_trailing_slash() {
-        let result = join_paths("/base/", "subdir/");
+        let result = join_paths("/base/", "subdir/").unwrap();
         assert_eq!(result, "/base/subdir/");
     }
 
     #[test]
     fn test_real_world_s3_scenario() {
-        // Real-world scenario: DuckLake catalog on S3 with hierarchical structure
-        // Catalog: s3://data-lake/warehouse/
-        // Schema: prod/ (relative)
-        // Table: sales/transactions/ (relative)
-        // Files: 2024-01-01.parquet (relative)
-
         let (catalog_url, catalog_path) =
             parse_object_store_url("s3://data-lake/warehouse/").unwrap();
 
@@ -633,16 +690,20 @@ mod tests {
 
         let catalog_resolver = PathResolver::new(Arc::new(catalog_url), catalog_path);
 
-        let schema_resolver = catalog_resolver.child_resolver("prod/", true);
+        let schema_resolver = catalog_resolver.child_resolver("prod/", true).unwrap();
         assert_eq!(schema_resolver.base_path(), "/warehouse/prod/");
 
-        let table_resolver = schema_resolver.child_resolver("sales/transactions/", true);
+        let table_resolver = schema_resolver
+            .child_resolver("sales/transactions/", true)
+            .unwrap();
         assert_eq!(
             table_resolver.base_path(),
             "/warehouse/prod/sales/transactions/"
         );
 
-        let file_path = table_resolver.resolve("2024-01-01.parquet", true);
+        let file_path = table_resolver
+            .resolve("2024-01-01.parquet", true)
+            .unwrap();
         assert_eq!(
             file_path,
             "/warehouse/prod/sales/transactions/2024-01-01.parquet"
@@ -651,35 +712,26 @@ mod tests {
 
     #[test]
     fn test_real_world_mixed_absolute_paths() {
-        // Real-world scenario: Schema stored in different bucket than catalog
-        // Catalog: s3://catalog-db/metadata/
-        // Schema: /schemas/prod/ (absolute, could be different storage)
-        // Table: customers/ (relative to schema)
-
         let catalog_resolver = PathResolver::new(
             Arc::new(ObjectStoreUrl::parse("s3://catalog-db/").unwrap()),
             "/metadata/".to_string(),
         );
 
-        // Schema uses absolute path (maybe it's in a different location)
-        let schema_resolver = catalog_resolver.child_resolver("/schemas/prod/", false);
+        let schema_resolver = catalog_resolver
+            .child_resolver("/schemas/prod/", false)
+            .unwrap();
         assert_eq!(schema_resolver.base_path(), "/schemas/prod/");
 
-        // Table is relative to schema
-        let table_resolver = schema_resolver.child_resolver("customers/", true);
+        let table_resolver = schema_resolver.child_resolver("customers/", true).unwrap();
         assert_eq!(table_resolver.base_path(), "/schemas/prod/customers/");
 
-        let file_path = table_resolver.resolve("data.parquet", true);
+        let file_path = table_resolver.resolve("data.parquet", true).unwrap();
         assert_eq!(file_path, "/schemas/prod/customers/data.parquet");
     }
 
     #[test]
     fn test_s3_url_uppercase_scheme() {
-        // URL schemes are case-insensitive per RFC 3986
-        // The url::Url crate normalizes to lowercase
         let result = parse_object_store_url("S3://bucket/path");
-        // This will fail because our code checks for lowercase "s3://"
-        // This documents current behavior - we expect lowercase
         assert!(result.is_err());
     }
 
@@ -690,7 +742,7 @@ mod tests {
             "".to_string(),
         );
 
-        let resolved = resolver.resolve("path/to/file", true);
+        let resolved = resolver.resolve("path/to/file", true).unwrap();
         assert_eq!(resolved, "/path/to/file");
     }
 
@@ -701,79 +753,166 @@ mod tests {
             "/".to_string(),
         );
 
-        let resolved = resolver.resolve("file.parquet", true);
+        let resolved = resolver.resolve("file.parquet", true).unwrap();
         assert_eq!(resolved, "/file.parquet");
     }
 
     #[test]
     fn test_path_with_consecutive_slashes() {
-        // Test that we don't normalize consecutive slashes (preserve as-is)
-        let resolved = resolve_path("/data/", "schema//table/", true);
+        let resolved = resolve_path("/data/", "schema//table/", true).unwrap();
         assert_eq!(resolved, "/data/schema//table/");
     }
 
     #[test]
     fn test_s3_bucket_naming_conventions() {
-        // Test various valid S3 bucket naming patterns
-
-        // Bucket with numbers
         let (url, _) = parse_object_store_url("s3://bucket123/data").unwrap();
         assert_eq!(url, ObjectStoreUrl::parse("s3://bucket123/").unwrap());
 
-        // Bucket with hyphens
         let (url, _) = parse_object_store_url("s3://my-bucket-name/data").unwrap();
         assert_eq!(url, ObjectStoreUrl::parse("s3://my-bucket-name/").unwrap());
 
-        // Bucket with dots (periods)
         let (url, _) = parse_object_store_url("s3://my.bucket.name/data").unwrap();
         assert_eq!(url, ObjectStoreUrl::parse("s3://my.bucket.name/").unwrap());
     }
 
     #[test]
     fn test_file_url_relative_path_not_supported() {
-        // file:// URLs should have absolute paths
-        // file://relative/path is technically malformed
         let result = parse_object_store_url("file://relative/path");
-        // This will actually parse (url crate is permissive)
-        // but documents behavior
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_complex_hierarchical_scenario() {
-        // Complex real-world scenario with multiple levels and mixed absolute/relative
         let catalog_resolver = PathResolver::new(
             Arc::new(ObjectStoreUrl::parse("s3://prod-data-lake/").unwrap()),
             "/".to_string(),
         );
 
-        // Level 1: Schema is relative
-        let schema1 = catalog_resolver.child_resolver("warehouse/", true);
+        let schema1 = catalog_resolver.child_resolver("warehouse/", true).unwrap();
         assert_eq!(schema1.base_path(), "/warehouse/");
 
-        // Level 2: Table is relative to schema
-        let table1 = schema1.child_resolver("sales/", true);
+        let table1 = schema1.child_resolver("sales/", true).unwrap();
         assert_eq!(table1.base_path(), "/warehouse/sales/");
 
-        // Level 3: Partition subdirectory
-        let partition1 = table1.child_resolver("year=2024/", true);
+        let partition1 = table1.child_resolver("year=2024/", true).unwrap();
         assert_eq!(partition1.base_path(), "/warehouse/sales/year=2024/");
 
-        // Level 4: Month partition
-        let partition2 = partition1.child_resolver("month=01/", true);
+        let partition2 = partition1.child_resolver("month=01/", true).unwrap();
         assert_eq!(
             partition2.base_path(),
             "/warehouse/sales/year=2024/month=01/"
         );
 
-        // Final file path
-        let file = partition2.resolve("data.parquet", true);
+        let file = partition2.resolve("data.parquet", true).unwrap();
         assert_eq!(file, "/warehouse/sales/year=2024/month=01/data.parquet");
 
-        // Verify URL is preserved through all levels
         assert_eq!(
             *partition2.base_url(),
             Arc::new(ObjectStoreUrl::parse("s3://prod-data-lake/").unwrap())
         );
+    }
+
+    // ---- Path traversal rejection tests (issue #54) ----
+
+    #[test]
+    fn test_join_paths_rejects_dotdot_relative() {
+        let result = join_paths("/data/schema/", "../../etc/passwd");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Path traversal"));
+    }
+
+    #[test]
+    fn test_join_paths_rejects_dotdot_in_middle() {
+        let result = join_paths("/data/", "schema/../../../etc/passwd");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Path traversal"));
+    }
+
+    #[test]
+    fn test_join_paths_rejects_dotdot_standalone() {
+        let result = join_paths("/data/", "..");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Path traversal"));
+    }
+
+    #[test]
+    fn test_join_paths_rejects_dotdot_in_base() {
+        let result = join_paths("/data/../etc/", "file.parquet");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Path traversal"));
+    }
+
+    #[test]
+    fn test_join_paths_rejects_windows_backslash_traversal() {
+        let result = join_paths("C:\\data\\", "..\\..\\etc\\passwd");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Path traversal"));
+    }
+
+    #[test]
+    fn test_resolve_path_rejects_relative_traversal() {
+        let result = resolve_path("/data/warehouse/", "../../../etc/shadow", true);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Path traversal"));
+    }
+
+    #[test]
+    fn test_resolve_path_rejects_absolute_traversal() {
+        let result = resolve_path("/data/", "/etc/../../../shadow", false);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Path traversal"));
+    }
+
+    #[test]
+    fn test_path_resolver_rejects_traversal() {
+        let resolver = PathResolver::new(
+            Arc::new(ObjectStoreUrl::parse("s3://bucket/").unwrap()),
+            "/data/".to_string(),
+        );
+
+        let result = resolver.resolve("../../etc/passwd", true);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Path traversal"));
+    }
+
+    #[test]
+    fn test_child_resolver_rejects_traversal() {
+        let resolver = PathResolver::new(
+            Arc::new(ObjectStoreUrl::parse("s3://bucket/").unwrap()),
+            "/data/".to_string(),
+        );
+
+        let result = resolver.child_resolver("../escape/", true);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Path traversal"));
+    }
+
+    #[test]
+    fn test_dots_in_names_are_allowed() {
+        // Dots within filenames/directory names are fine - only standalone ".." is rejected
+        assert!(join_paths("/data/", "schema.v2/table.prod/file.parquet").is_ok());
+        assert!(resolve_path("/data/", "table..name/file.parquet", true).is_ok());
+        assert!(join_paths("/data/", "...hidden/file.parquet").is_ok());
+        assert!(join_paths("/data/", "file..parquet").is_ok());
+    }
+
+    #[test]
+    fn test_single_dot_is_allowed() {
+        assert!(join_paths("/data/", "./file.parquet").is_ok());
+        assert!(resolve_path("/data/", ".", true).is_ok());
+    }
+
+    #[test]
+    fn test_null_bytes_still_rejected() {
+        let result = join_paths("/data/", "file\0.parquet");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("null byte"));
+    }
+
+    #[test]
+    fn test_parse_object_store_url_rejects_traversal() {
+        let result = parse_object_store_url("s3://bucket/../../../etc/passwd");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Path traversal"));
     }
 }

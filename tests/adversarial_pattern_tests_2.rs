@@ -1095,27 +1095,32 @@ fn test_path_resolution_pathological_cases() {
         result2
     );
 
-    // Path with .. components (potential traversal)
+    // Path with .. components (potential traversal) — now rejected
     let result3 = resolve_path("/data/schema/", "../other/file.parquet", true);
     eprintln!(
         "[#606 path edge] resolve_path with .. = {:?}",
         result3
     );
-    // Note: resolve_path does NOT canonicalize, so .. is preserved
+    // resolve_path now rejects paths containing '..' as a standalone component
     assert!(
-        result3.contains(".."),
-        "resolve_path should preserve .. (no canonicalization)"
+        result3.is_err(),
+        "resolve_path should reject paths with '..' traversal component"
     );
 
-    // Backslash handling (Windows paths in Linux context)
+    // Backslash handling (Windows paths in Linux context) — now rejected due to ..
     let result4 = join_paths("C:\\data\\", "..\\..\\etc\\passwd");
     eprintln!(
         "[#606 path edge] join_paths with Windows traversal = {:?}",
         result4
     );
+    // join_paths now rejects paths containing '..' as a standalone component
+    assert!(
+        result4.is_err(),
+        "join_paths should reject paths with '..' traversal component"
+    );
 
     // Unicode in paths
-    let result5 = resolve_path("/data/日本語/", "テーブル/file.parquet", true);
+    let result5 = resolve_path("/data/日本語/", "テーブル/file.parquet", true).unwrap();
     eprintln!(
         "[#606 path edge] Unicode path resolution = {:?}",
         result5
@@ -1966,7 +1971,7 @@ fn test_zero_size_file_metadata() {
     };
 
     // This should not panic
-    let resolved = resolve_path("/data/table/", &table_file.file.path, table_file.file.path_is_relative);
+    let resolved = resolve_path("/data/table/", &table_file.file.path, table_file.file.path_is_relative).unwrap();
     eprintln!(
         "[#609 zero-size file] Resolved path: {} (file_size=0)",
         resolved
@@ -2168,18 +2173,18 @@ fn test_path_resolver_deep_hive_partition_hierarchy() {
         "/warehouse/".to_string(),
     );
 
-    let schema_resolver = catalog_resolver.child_resolver("prod/", true);
-    let table_resolver = schema_resolver.child_resolver("events/", true);
+    let schema_resolver = catalog_resolver.child_resolver("prod/", true).unwrap();
+    let table_resolver = schema_resolver.child_resolver("events/", true).unwrap();
 
     // Deep hive partition path
     let partition_resolver =
-        table_resolver.child_resolver("year=2024/month=01/day=15/hour=10/", true);
+        table_resolver.child_resolver("year=2024/month=01/day=15/hour=10/", true).unwrap();
     assert_eq!(
         partition_resolver.base_path(),
         "/warehouse/prod/events/year=2024/month=01/day=15/hour=10/"
     );
 
-    let file = partition_resolver.resolve("data.parquet", true);
+    let file = partition_resolver.resolve("data.parquet", true).unwrap();
     assert_eq!(
         file,
         "/warehouse/prod/events/year=2024/month=01/day=15/hour=10/data.parquet"
