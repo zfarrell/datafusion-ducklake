@@ -462,7 +462,12 @@ pub fn build_read_schema_with_field_id_mapping(
         .iter()
         .map(|col| {
             let data_type = ducklake_to_arrow_type(&col.column_type)?;
-            let field_id = col.column_id as i32;
+            let field_id = i32::try_from(col.column_id).map_err(|_| {
+                DuckLakeError::Internal(format!(
+                    "column_id {} for column '{}' exceeds i32 range for Parquet field_id",
+                    col.column_id, col.column_name
+                ))
+            })?;
 
             let (read_name, needs_rename) =
                 if let Some(parquet_name) = parquet_field_ids.get(&field_id) {
@@ -562,6 +567,68 @@ mod tests {
         // Falls back to current column name
         assert_eq!(read_schema.field(0).name(), "id");
         assert!(name_mapping.is_empty());
+    }
+
+    #[test]
+    fn test_build_read_schema_column_id_exceeds_i32() {
+        // column_id > i32::MAX should return an error, not silently wrap
+        let current_columns = vec![DuckLakeTableColumn {
+            column_id: i64::from(i32::MAX) + 1, // 2147483648
+            column_name: "big_id_col".to_string(),
+            column_type: "int32".to_string(),
+            is_nullable: true,
+        }];
+
+        let parquet_field_ids = HashMap::new();
+
+        let result =
+            build_read_schema_with_field_id_mapping(&current_columns, &parquet_field_ids);
+        assert!(result.is_err(), "should reject column_id > i32::MAX");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("2147483648"),
+            "error should mention the out-of-range value: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("big_id_col"),
+            "error should mention the column name: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_build_read_schema_negative_column_id_rejected() {
+        // Negative column_id should also be rejected (cannot fit in Parquet's non-negative field_id space)
+        let current_columns = vec![DuckLakeTableColumn {
+            column_id: -1,
+            column_name: "neg_col".to_string(),
+            column_type: "varchar".to_string(),
+            is_nullable: true,
+        }];
+
+        let parquet_field_ids = HashMap::new();
+
+        // Negative i64 values fit in i32 range (down to i32::MIN), so -1 should succeed
+        let result =
+            build_read_schema_with_field_id_mapping(&current_columns, &parquet_field_ids);
+        assert!(result.is_ok(), "negative i64 within i32 range should succeed");
+    }
+
+    #[test]
+    fn test_build_read_schema_column_id_at_i32_max() {
+        // column_id == i32::MAX should succeed (boundary)
+        let current_columns = vec![DuckLakeTableColumn {
+            column_id: i64::from(i32::MAX), // 2147483647
+            column_name: "max_col".to_string(),
+            column_type: "int32".to_string(),
+            is_nullable: true,
+        }];
+
+        let mut parquet_field_ids = HashMap::new();
+        parquet_field_ids.insert(i32::MAX, "max_col".to_string());
+
+        let result =
+            build_read_schema_with_field_id_mapping(&current_columns, &parquet_field_ids);
+        assert!(result.is_ok(), "column_id == i32::MAX should succeed");
     }
 
     #[test]
