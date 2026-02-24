@@ -517,7 +517,10 @@ mod integration_tests {
             .await?;
         let result = df.collect().await;
 
-        assert!(result.is_err(), "Query should fail when delete file is missing");
+        assert!(
+            result.is_err(),
+            "Query should fail when delete file is missing"
+        );
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("missing from storage"),

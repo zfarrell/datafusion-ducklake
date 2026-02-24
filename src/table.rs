@@ -287,21 +287,23 @@ impl DuckLakeTable {
             .object_store(self.object_store_url.as_ref())?;
         let delete_object_path = ObjectPath::from(resolved_delete_path.as_str());
         match object_store.head(&delete_object_path).await {
-            Ok(_) => {} // file exists
-            Err(object_store::Error::NotFound { .. }) => {
+            Ok(_) => {}, // file exists
+            Err(object_store::Error::NotFound {
+                ..
+            }) => {
                 return Err(DataFusionError::Execution(format!(
                     "Delete file referenced in catalog metadata is missing from storage: '{}'. \
                      This indicates data corruption — deleted rows cannot be filtered out.",
                     delete_file.path
                 )));
-            }
+            },
             Err(e) => {
                 return Err(DataFusionError::Execution(format!(
                     "Failed to access delete file '{}': {}. \
                      Without this file, deleted rows cannot be filtered.",
                     delete_file.path, e
                 )));
-            }
+            },
         }
 
         // Create PartitionedFile with footer size hint if available
