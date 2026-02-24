@@ -21,6 +21,15 @@ fn validate_no_null_bytes(path: &str) -> Result<()> {
                 .to_string(),
         ));
     }
+    // Also reject URL-encoded null bytes (%00) as defense-in-depth.
+    // Case-insensitive to catch %00, %00, etc. (though %00 has no case variants,
+    // this is consistent with the %2e%2e check in validate_no_path_traversal).
+    if path.to_ascii_lowercase().contains("%00") {
+        return Err(DuckLakeError::InvalidConfig(format!(
+            "Path contains URL-encoded null byte (%00): {}",
+            path
+        )));
+    }
     Ok(())
 }
 
@@ -1046,5 +1055,73 @@ mod tests {
         let result = parse_object_store_url("s3://bucket/../../../etc/passwd");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Path traversal"));
+    }
+
+    // ===== URL-encoded null byte (%00) rejection tests (issue #55 follow-up) =====
+
+    #[test]
+    fn test_url_encoded_null_byte_in_relative_path() {
+        let result = join_paths("/data/", "file%00.parquet");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("%00"));
+    }
+
+    #[test]
+    fn test_url_encoded_null_byte_in_base_path() {
+        let result = join_paths("/data/%00evil/", "file.parquet");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("%00"));
+    }
+
+    #[test]
+    fn test_url_encoded_null_byte_at_start() {
+        let result = resolve_path("/data/", "%00file.parquet", true);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("%00"));
+    }
+
+    #[test]
+    fn test_url_encoded_null_byte_at_end() {
+        let result = resolve_path("/data/", "file.parquet%00", true);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("%00"));
+    }
+
+    #[test]
+    fn test_url_encoded_null_byte_uppercase() {
+        // %00 has no alphabetic characters to vary case, but verify
+        // the to_ascii_lowercase path works consistently
+        let result = join_paths("/data/", "path%00name");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("%00"));
+    }
+
+    #[test]
+    fn test_url_encoded_null_byte_in_s3_url() {
+        let result = parse_object_store_url("s3://bucket/path%00evil");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("%00"));
+    }
+
+    #[test]
+    fn test_url_encoded_null_byte_in_resolver() {
+        let resolver = PathResolver::new(
+            Arc::new(ObjectStoreUrl::parse("s3://bucket/").unwrap()),
+            "/data/".to_string(),
+        );
+        let result = resolver.resolve("table%00evil/", true);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("%00"));
+    }
+
+    #[test]
+    fn test_url_encoded_null_byte_child_resolver() {
+        let resolver = PathResolver::new(
+            Arc::new(ObjectStoreUrl::parse("s3://bucket/").unwrap()),
+            "/data/".to_string(),
+        );
+        let result = resolver.child_resolver("schema%00/", true);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("%00"));
     }
 }
