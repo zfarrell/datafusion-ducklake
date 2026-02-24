@@ -911,9 +911,110 @@ mod tests {
         assert!(resolve_path("/data/", ".", true).is_ok());
     }
 
+    // ===== Null byte rejection tests (issue #55) =====
+
     #[test]
-    fn test_null_bytes_still_rejected() {
+    fn test_join_paths_rejects_null_byte_in_relative() {
         let result = join_paths("/data/", "file\0.parquet");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("null byte"));
+    }
+
+    #[test]
+    fn test_join_paths_rejects_null_byte_in_base() {
+        let result = join_paths("/data/\0evil/", "file.parquet");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("null byte"));
+    }
+
+    #[test]
+    fn test_join_paths_rejects_null_byte_at_start() {
+        let result = join_paths("/data/", "\0file.parquet");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("null byte"));
+    }
+
+    #[test]
+    fn test_join_paths_rejects_null_byte_at_end() {
+        let result = join_paths("/data/", "file.parquet\0");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("null byte"));
+    }
+
+    #[test]
+    fn test_join_paths_rejects_multiple_null_bytes() {
+        let result = join_paths("/data/", "file\0name\0.parquet");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("null byte"));
+    }
+
+    #[test]
+    fn test_resolve_path_rejects_null_byte_in_base() {
+        let result = resolve_path("/data/\0path/", "table/", true);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("null byte"));
+    }
+
+    #[test]
+    fn test_resolve_path_rejects_null_byte_in_path() {
+        let result = resolve_path("/data/", "table\0/", true);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("null byte"));
+    }
+
+    #[test]
+    fn test_resolve_path_rejects_null_byte_absolute_path() {
+        let result = resolve_path("/data/", "/other/\0path/", false);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("null byte"));
+    }
+
+    #[test]
+    fn test_parse_object_store_url_rejects_null_byte_s3() {
+        let result = parse_object_store_url("s3://bucket/path\0evil");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("null byte"));
+    }
+
+    #[test]
+    fn test_parse_object_store_url_rejects_null_byte_file() {
+        let result = parse_object_store_url("file:///tmp/\0data");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("null byte"));
+    }
+
+    #[test]
+    fn test_parse_object_store_url_rejects_null_byte_local() {
+        let result = parse_object_store_url("/tmp/\0data");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("null byte"));
+    }
+
+    #[test]
+    fn test_path_resolver_resolve_rejects_null_byte() {
+        let resolver = PathResolver::new(
+            Arc::new(ObjectStoreUrl::parse("s3://bucket/").unwrap()),
+            "/data/".to_string(),
+        );
+        let result = resolver.resolve("table\0evil/", true);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("null byte"));
+    }
+
+    #[test]
+    fn test_path_resolver_child_resolver_rejects_null_byte() {
+        let resolver = PathResolver::new(
+            Arc::new(ObjectStoreUrl::parse("s3://bucket/").unwrap()),
+            "/data/".to_string(),
+        );
+        let result = resolver.child_resolver("schema\0/", true);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("null byte"));
+    }
+
+    #[test]
+    fn test_null_byte_only_path() {
+        let result = join_paths("/data/", "\0");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("null byte"));
     }
