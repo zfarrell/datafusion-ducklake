@@ -268,6 +268,11 @@ impl DuckLakeTable {
     /// The delete file is already associated with a specific data file via metadata.
     /// We only need to extract the "pos" column - the "file_path" column is
     /// metadata/documentation only (for Iceberg compatibility).
+    ///
+    /// # Errors
+    /// Returns an error if the delete file is missing from storage. A missing delete
+    /// file indicates data corruption — without it, deleted rows would silently
+    /// reappear in query results.
     async fn read_delete_file_positions(
         &self,
         state: &dyn Session,
@@ -278,6 +283,37 @@ impl DuckLakeTable {
 
         // Resolve the delete file path
         let resolved_delete_path = self.resolve_file_path(delete_file);
+
+        // Verify the delete file exists before attempting to read it.
+        // A missing delete file is a data integrity issue: the catalog metadata
+        // references a file that should contain deleted row positions. Without it,
+        // we cannot filter deleted rows and would silently return corrupted data.
+        //
+        // TODO: This head() call adds an extra HTTP request per delete file on S3.
+        // A more targeted fix would be to ensure the Parquet reader's file-not-found
+        // error is properly propagated instead of being silently swallowed.
+        let object_store = state
+            .runtime_env()
+            .object_store(self.object_store_url.as_ref())?;
+        let delete_object_path = ObjectPath::from(resolved_delete_path.as_str());
+        match object_store.head(&delete_object_path).await {
+            Ok(_) => {} // file exists, proceed
+            Err(object_store::Error::NotFound { .. }) => {
+                return Err(DataFusionError::Execution(format!(
+                    "Delete file referenced in catalog metadata is missing from storage: '{}'. \
+                     This indicates data corruption — the catalog expects a delete file that \
+                     does not exist. Without this file, deleted rows cannot be filtered out.",
+                    resolved_delete_path
+                )));
+            }
+            Err(e) => {
+                return Err(DataFusionError::Execution(format!(
+                    "Failed to access delete file '{}': {}. \
+                     Cannot proceed without verifying delete file integrity.",
+                    resolved_delete_path, e
+                )));
+            }
+        }
 
         // Create PartitionedFile with footer size hint if available
         let mut pf =
