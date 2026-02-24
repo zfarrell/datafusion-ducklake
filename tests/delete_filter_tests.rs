@@ -464,4 +464,105 @@ mod integration_tests {
 
         Ok(())
     }
+
+    /// Helper to find and remove all delete files from a DuckLake data directory.
+    ///
+    /// DuckLake stores delete files as `*-delete.parquet` in the data directory
+    /// hierarchy. This function finds and removes them to simulate missing delete files.
+    fn remove_delete_files(data_dir: &std::path::Path) -> DataFusionResult<usize> {
+        let mut removed = 0;
+        fn walk_and_remove(dir: &std::path::Path, removed: &mut usize) -> std::io::Result<()> {
+            for entry in std::fs::read_dir(dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.is_dir() {
+                    walk_and_remove(&path, removed)?;
+                } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.ends_with("-delete.parquet") {
+                        std::fs::remove_file(&path)?;
+                        *removed += 1;
+                    }
+                }
+            }
+            Ok(())
+        }
+        walk_and_remove(data_dir, &mut removed)
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        assert!(removed > 0, "Expected at least one delete file to remove");
+        Ok(removed)
+    }
+
+    /// Test that querying a table with a missing delete file returns an error
+    /// instead of silently returning all rows (including deleted ones).
+    #[tokio::test]
+    async fn test_missing_delete_file_returns_error() -> DataFusionResult<()> {
+        let temp_dir = TempDir::new()
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        let catalog_path = temp_dir.path().join("missing_delete.ducklake");
+
+        // Generate test data with deletes
+        common::create_catalog_with_deletes(&catalog_path).map_err(common::to_datafusion_error)?;
+
+        // Remove delete files from disk (they live under <catalog>.files/)
+        let data_dir = temp_dir.path().join("missing_delete.ducklake.files");
+        remove_delete_files(&data_dir)?;
+
+        // Create catalog and query - should error
+        let catalog = create_catalog(&catalog_path.to_string_lossy())?;
+        let ctx = SessionContext::new();
+        ctx.register_catalog("missing_delete", catalog);
+
+        let df = ctx
+            .sql("SELECT * FROM missing_delete.main.products ORDER BY id")
+            .await?;
+        let result = df.collect().await;
+
+        assert!(result.is_err(), "Query should fail when delete file is missing");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("missing from storage"),
+            "Error should mention missing file, got: {}",
+            err_msg
+        );
+
+        Ok(())
+    }
+
+    /// Test that COUNT(*) also errors when delete file is missing
+    #[tokio::test]
+    async fn test_missing_delete_file_count_also_errors() -> DataFusionResult<()> {
+        let temp_dir = TempDir::new()
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        let catalog_path = temp_dir.path().join("missing_delete_count.ducklake");
+
+        // Generate test data with deletes
+        common::create_catalog_with_deletes(&catalog_path).map_err(common::to_datafusion_error)?;
+
+        // Remove delete files from disk
+        let data_dir = temp_dir.path().join("missing_delete_count.ducklake.files");
+        remove_delete_files(&data_dir)?;
+
+        // Create catalog and query COUNT(*) - should also error
+        let catalog = create_catalog(&catalog_path.to_string_lossy())?;
+        let ctx = SessionContext::new();
+        ctx.register_catalog("missing_delete_count", catalog);
+
+        let df = ctx
+            .sql("SELECT COUNT(*) FROM missing_delete_count.main.products")
+            .await?;
+        let result = df.collect().await;
+
+        assert!(
+            result.is_err(),
+            "COUNT(*) should fail when delete file is missing"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("missing from storage"),
+            "Error should mention missing file, got: {}",
+            err_msg
+        );
+
+        Ok(())
+    }
 }
