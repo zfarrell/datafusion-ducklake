@@ -24,7 +24,7 @@ async fn create_test_writer() -> (SqliteMetadataWriter, TempDir) {
 }
 
 fn test_columns() -> Vec<ColumnDef> {
-    vec![ColumnDef::new("id", "int32", false), ColumnDef::new("name", "varchar", true)]
+    vec![ColumnDef::new("id", "int32", false).unwrap(), ColumnDef::new("name", "varchar", true).unwrap()]
 }
 
 // ==================== INSERT after DROP conflicts ====================

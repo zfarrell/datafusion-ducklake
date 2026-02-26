@@ -15,7 +15,7 @@ pub fn ducklake_to_arrow_type(ducklake_type: &str) -> Result<DataType> {
     let normalized = ducklake_type.trim().to_lowercase();
 
     // Handle parameterized types first
-    if let Some(decimal_params) = parse_decimal(&normalized) {
+    if let Some(decimal_params) = parse_decimal(&normalized)? {
         return Ok(decimal_params);
     }
 
@@ -48,7 +48,7 @@ pub fn ducklake_to_arrow_type(ducklake_type: &str) -> Result<DataType> {
 
         // Floating point
         "float32" | "float" | "real" => Ok(DataType::Float32),
-        "float64" | "double" => Ok(DataType::Float64),
+        "float64" | "double" | "double precision" => Ok(DataType::Float64),
 
         // Temporal types
         "time" => Ok(DataType::Time64(TimeUnit::Microsecond)),
@@ -182,39 +182,90 @@ pub fn arrow_to_ducklake_type(arrow_type: &DataType) -> Result<String> {
     }
 }
 
+/// Maximum precision for Arrow Decimal256
+const DECIMAL_MAX_PRECISION: u8 = 76;
+
+/// Validate decimal precision and scale bounds
+fn validate_decimal_precision_scale(precision: u8, scale: i8, type_str: &str) -> Result<()> {
+    if precision == 0 {
+        return Err(DuckLakeError::UnsupportedType(format!(
+            "Decimal precision must be >= 1, got 0 in type '{}'",
+            type_str
+        )));
+    }
+    if precision > DECIMAL_MAX_PRECISION {
+        return Err(DuckLakeError::UnsupportedType(format!(
+            "Decimal precision must be <= {}, got {} in type '{}'",
+            DECIMAL_MAX_PRECISION, precision, type_str
+        )));
+    }
+    if scale >= 0 && scale as u8 > precision {
+        return Err(DuckLakeError::UnsupportedType(format!(
+            "Decimal scale ({}) must not exceed precision ({}) in type '{}'",
+            scale, precision, type_str
+        )));
+    }
+    Ok(())
+}
+
 /// Parse decimal type with precision and scale
 /// Format: "decimal(precision, scale)" or "decimal(precision)"
-fn parse_decimal(type_str: &str) -> Option<DataType> {
+///
+/// Returns `Ok(None)` if the type string is not a decimal type.
+/// Returns `Err` if it is a decimal type but has invalid precision/scale.
+fn parse_decimal(type_str: &str) -> Result<Option<DataType>> {
     if !type_str.starts_with("decimal") && !type_str.starts_with("numeric") {
-        return None;
+        return Ok(None);
     }
 
     // Extract parameters from parentheses
-    let start = type_str.find('(')?;
-    let end = type_str.find(')')?;
+    let start = match type_str.find('(') {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+    let end = match type_str.find(')') {
+        Some(e) => e,
+        None => return Ok(None),
+    };
     let params = &type_str[start + 1..end];
 
     let parts: Vec<&str> = params.split(',').map(|s| s.trim()).collect();
 
     match parts.len() {
         1 => {
-            // decimal(precision) with scale=0
-            let precision: u8 = parts[0].parse().ok()?;
-            Some(DataType::Decimal128(precision, 0))
+            let precision: u8 = parts[0].parse().map_err(|_| {
+                DuckLakeError::UnsupportedType(format!(
+                    "Invalid decimal precision '{}' in type '{}'",
+                    parts[0], type_str
+                ))
+            })?;
+            validate_decimal_precision_scale(precision, 0, type_str)?;
+            Ok(Some(DataType::Decimal128(precision, 0)))
         },
         2 => {
-            // decimal(precision, scale)
-            let precision: u8 = parts[0].parse().ok()?;
-            let scale: i8 = parts[1].parse().ok()?;
-
-            // Use Decimal256 for high precision
+            let precision: u8 = parts[0].parse().map_err(|_| {
+                DuckLakeError::UnsupportedType(format!(
+                    "Invalid decimal precision '{}' in type '{}'",
+                    parts[0], type_str
+                ))
+            })?;
+            let scale: i8 = parts[1].parse().map_err(|_| {
+                DuckLakeError::UnsupportedType(format!(
+                    "Invalid decimal scale '{}' in type '{}'",
+                    parts[1], type_str
+                ))
+            })?;
+            validate_decimal_precision_scale(precision, scale, type_str)?;
             if precision > 38 {
-                Some(DataType::Decimal256(precision, scale))
+                Ok(Some(DataType::Decimal256(precision, scale)))
             } else {
-                Some(DataType::Decimal128(precision, scale))
+                Ok(Some(DataType::Decimal128(precision, scale)))
             }
         },
-        _ => None,
+        n => Err(DuckLakeError::UnsupportedType(format!(
+            "Invalid decimal type: expected at most 2 parameters (precision, scale), got {} in type '{}'",
+            n, type_str
+        ))),
     }
 }
 
@@ -1145,6 +1196,78 @@ mod tests {
     }
 
     #[test]
+    fn test_decimal_precision_zero_rejected() {
+        let result = ducklake_to_arrow_type("decimal(0, 0)");
+        assert!(result.is_err());
+        match result {
+            Err(DuckLakeError::UnsupportedType(msg)) => {
+                assert!(msg.contains("precision must be >= 1"));
+            },
+            _ => panic!("Expected UnsupportedType error for precision=0"),
+        }
+    }
+
+    #[test]
+    fn test_decimal_precision_too_large_rejected() {
+        let result = ducklake_to_arrow_type("decimal(77, 0)");
+        assert!(result.is_err());
+        match result {
+            Err(DuckLakeError::UnsupportedType(msg)) => {
+                assert!(msg.contains("precision must be <= 76"));
+            },
+            _ => panic!("Expected UnsupportedType error for precision=77"),
+        }
+    }
+
+    #[test]
+    fn test_decimal_precision_255_rejected() {
+        let result = ducklake_to_arrow_type("decimal(255, 0)");
+        assert!(result.is_err());
+        match result {
+            Err(DuckLakeError::UnsupportedType(msg)) => {
+                assert!(msg.contains("precision must be <= 76"));
+            },
+            _ => panic!("Expected UnsupportedType error for precision=255"),
+        }
+    }
+
+    #[test]
+    fn test_decimal_scale_exceeds_precision_rejected() {
+        let result = ducklake_to_arrow_type("decimal(10, 11)");
+        assert!(result.is_err());
+        match result {
+            Err(DuckLakeError::UnsupportedType(msg)) => {
+                assert!(msg.contains("scale (11) must not exceed precision (10)"));
+            },
+            _ => panic!("Expected UnsupportedType error for scale > precision"),
+        }
+    }
+
+    #[test]
+    fn test_decimal_valid_edge_cases() {
+        assert_eq!(
+            ducklake_to_arrow_type("decimal(1, 0)").unwrap(),
+            DataType::Decimal128(1, 0)
+        );
+        assert_eq!(
+            ducklake_to_arrow_type("decimal(38, 0)").unwrap(),
+            DataType::Decimal128(38, 0)
+        );
+        assert_eq!(
+            ducklake_to_arrow_type("decimal(39, 0)").unwrap(),
+            DataType::Decimal256(39, 0)
+        );
+        assert_eq!(
+            ducklake_to_arrow_type("decimal(76, 0)").unwrap(),
+            DataType::Decimal256(76, 0)
+        );
+        assert_eq!(
+            ducklake_to_arrow_type("decimal(10, 10)").unwrap(),
+            DataType::Decimal128(10, 10)
+        );
+    }
+
+    #[test]
     fn test_arrow_to_ducklake_map() {
         let map_type = DataType::Map(
             Arc::new(Field::new(
@@ -1163,6 +1286,43 @@ mod tests {
         assert_eq!(
             arrow_to_ducklake_type(&map_type).unwrap(),
             "map(varchar, int64)"
+        );
+    }
+
+    #[test]
+    fn test_decimal_negative_precision_rejected() {
+        let result = ducklake_to_arrow_type("decimal(-1, 0)");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decimal_too_many_parameters_rejected() {
+        let result = ducklake_to_arrow_type("decimal(1,2,3)");
+        assert!(result.is_err());
+        match result {
+            Err(DuckLakeError::UnsupportedType(msg)) => {
+                assert!(msg.contains("expected at most 2 parameters"));
+                assert!(msg.contains("got 3"));
+            },
+            _ => panic!("Expected UnsupportedType error for 3 parameters"),
+        }
+
+        let result = ducklake_to_arrow_type("decimal(10,2,5,3)");
+        assert!(result.is_err());
+        match result {
+            Err(DuckLakeError::UnsupportedType(msg)) => {
+                assert!(msg.contains("expected at most 2 parameters"));
+                assert!(msg.contains("got 4"));
+            },
+            _ => panic!("Expected UnsupportedType error for 4 parameters"),
+        }
+    }
+
+    #[test]
+    fn test_decimal_negative_scale_valid() {
+        assert_eq!(
+            ducklake_to_arrow_type("decimal(10, -2)").unwrap(),
+            DataType::Decimal128(10, -2)
         );
     }
 
@@ -1188,6 +1348,71 @@ mod tests {
         assert_eq!(
             *schema.field(1).data_type(),
             DataType::List(Arc::new(Field::new("item", DataType::Int32, true)))
+        );
+    }
+
+    #[test]
+    fn test_column_id_i32_max_succeeds() {
+        let columns = vec![DuckLakeTableColumn {
+            column_id: i32::MAX as i64,
+            column_name: "id".to_string(),
+            column_type: "int32".to_string(),
+            is_nullable: true,
+        }];
+
+        let mut parquet_field_ids = HashMap::new();
+        parquet_field_ids.insert(i32::MAX, "id".to_string());
+
+        let result = build_read_schema_with_field_id_mapping(&columns, &parquet_field_ids);
+        assert!(result.is_ok(), "column_id = i32::MAX should succeed");
+    }
+
+    #[test]
+    fn test_column_id_overflow_returns_error() {
+        let columns = vec![DuckLakeTableColumn {
+            column_id: i32::MAX as i64 + 1, // 2147483648, exceeds i32 range
+            column_name: "id".to_string(),
+            column_type: "int32".to_string(),
+            is_nullable: true,
+        }];
+
+        let parquet_field_ids = HashMap::new();
+
+        let result = build_read_schema_with_field_id_mapping(&columns, &parquet_field_ids);
+        assert!(result.is_err(), "column_id > i32::MAX should fail");
+        match result {
+            Err(DuckLakeError::Internal(msg)) => {
+                assert!(
+                    msg.contains("2147483648"),
+                    "Error should contain the overflowing value: {}",
+                    msg
+                );
+                assert!(
+                    msg.contains("exceeds i32 range"),
+                    "Error should explain the issue: {}",
+                    msg
+                );
+            },
+            _ => panic!("Expected Internal error for column_id overflow"),
+        }
+    }
+
+    #[test]
+    fn test_column_id_negative_within_i32_range_succeeds() {
+        let columns = vec![DuckLakeTableColumn {
+            column_id: -1,
+            column_name: "id".to_string(),
+            column_type: "int32".to_string(),
+            is_nullable: true,
+        }];
+
+        let mut parquet_field_ids = HashMap::new();
+        parquet_field_ids.insert(-1_i32, "id".to_string());
+
+        let result = build_read_schema_with_field_id_mapping(&columns, &parquet_field_ids);
+        assert!(
+            result.is_ok(),
+            "Negative column_id within i32 range should succeed"
         );
     }
 }

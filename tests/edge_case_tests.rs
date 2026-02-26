@@ -965,7 +965,7 @@ async fn test_alter_table_add_column_then_query() {
         .alter_table(
             table_meta.table_id,
             &AlterTableOp::AddColumn {
-                column: ColumnDef::new("email", "varchar", true),
+                column: ColumnDef::new("email", "varchar", true).unwrap(),
             },
         )
         .unwrap();

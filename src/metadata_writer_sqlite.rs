@@ -1483,8 +1483,10 @@ mod tests {
             .get_or_create_table(schema_id, "users", None, snapshot_id)
             .unwrap();
 
-        let columns =
-            vec![ColumnDef::new("id", "int64", false), ColumnDef::new("name", "varchar", true)];
+        let columns = vec![
+            ColumnDef::new("id", "int64", false).unwrap(),
+            ColumnDef::new("name", "varchar", true).unwrap(),
+        ];
 
         let column_ids = writer.set_columns(table_id, &columns, snapshot_id).unwrap();
         assert_eq!(column_ids.len(), 2);
@@ -1570,7 +1572,7 @@ mod tests {
 
         // Create columns: id (column_id=1), name (column_id=2)
         let columns =
-            vec![ColumnDef::new("id", "int64", false), ColumnDef::new("name", "varchar", true)];
+            vec![ColumnDef::new("id", "int64", false).unwrap(), ColumnDef::new("name", "varchar", true).unwrap()];
         let column_ids = writer.set_columns(table_id, &columns, snapshot_id).unwrap();
         assert_eq!(column_ids, vec![1, 2]);
 
@@ -1650,12 +1652,12 @@ mod tests {
 
         // Create columns: id (1), name (2)
         let columns =
-            vec![ColumnDef::new("id", "int64", false), ColumnDef::new("name", "varchar", true)];
+            vec![ColumnDef::new("id", "int64", false).unwrap(), ColumnDef::new("name", "varchar", true).unwrap()];
         writer.set_columns(table_id, &columns, snapshot_id).unwrap();
 
         // Add a new column
         let op = AlterTableOp::AddColumn {
-            column: ColumnDef::new("email", "varchar", true),
+            column: ColumnDef::new("email", "varchar", true).unwrap(),
         };
         writer.alter_table(table_id, &op).unwrap();
 
@@ -1693,12 +1695,12 @@ mod tests {
             .unwrap();
 
         // Create a column with default values set
-        let mut col = ColumnDef::new("status", "varchar", true);
+        let mut col = ColumnDef::new("status", "varchar", true).unwrap();
         col.initial_default = Some("active".to_string());
         col.default_value = Some("active".to_string());
         col.default_value_type = Some("VARCHAR".to_string());
         col.default_value_dialect = Some("SQL".to_string());
-        let columns = vec![ColumnDef::new("id", "int64", false), col];
+        let columns = vec![ColumnDef::new("id", "int64", false).unwrap(), col];
         writer.set_columns(table_id, &columns, snapshot_id).unwrap();
 
         // Rename "status" to "user_status"
@@ -1740,8 +1742,8 @@ mod tests {
         let (writer, _temp) = create_test_writer().await;
 
         let columns = vec![
-            ColumnDef::new("id", "int64", false),
-            ColumnDef::new("id", "int64", false), // duplicate
+            ColumnDef::new("id", "int64", false).unwrap(),
+            ColumnDef::new("id", "int64", false).unwrap(), // duplicate
         ];
 
         let result =
@@ -1767,8 +1769,8 @@ mod tests {
             .unwrap();
 
         let columns = vec![
-            ColumnDef::new("x", "int64", false),
-            ColumnDef::new("x", "varchar", true),
+            ColumnDef::new("x", "int64", false).unwrap(),
+            ColumnDef::new("x", "varchar", true).unwrap(),
         ];
 
         let result = writer.set_columns(table_id, &columns, snapshot_id);
@@ -1789,12 +1791,12 @@ mod tests {
             .unwrap();
 
         let columns =
-            vec![ColumnDef::new("id", "int64", false), ColumnDef::new("name", "varchar", true)];
+            vec![ColumnDef::new("id", "int64", false).unwrap(), ColumnDef::new("name", "varchar", true).unwrap()];
         writer.set_columns(table_id, &columns, snapshot_id).unwrap();
 
         // Add a new column
         let op = AlterTableOp::AddColumn {
-            column: ColumnDef::new("email", "varchar", true),
+            column: ColumnDef::new("email", "varchar", true).unwrap(),
         };
         writer.alter_table(table_id, &op).unwrap();
 
@@ -1840,7 +1842,7 @@ mod tests {
             .unwrap();
 
         let columns =
-            vec![ColumnDef::new("id", "int64", false), ColumnDef::new("name", "varchar", true)];
+            vec![ColumnDef::new("id", "int64", false).unwrap(), ColumnDef::new("name", "varchar", true).unwrap()];
         let col_ids = writer.set_columns(table_id, &columns, snapshot_id).unwrap();
         assert_eq!(col_ids, vec![1, 2]);
 
@@ -1849,7 +1851,7 @@ mod tests {
             .alter_table(
                 table_id,
                 &AlterTableOp::AddColumn {
-                    column: ColumnDef::new("email", "varchar", true),
+                    column: ColumnDef::new("email", "varchar", true).unwrap(),
                 },
             )
             .unwrap();

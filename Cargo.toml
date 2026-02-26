@@ -3,7 +3,7 @@ members = [".", "benchmark"]
 
 [package]
 name = "datafusion-ducklake"
-version = "0.0.6"
+version = "0.0.7"
 edition = "2024"
 authors = ["zac@hotdata.dev", "shefeek@hotdata.dev", "anoop@hotdata.dev"]
 description = "DuckLake query engine for rust, built with datafusion."
@@ -22,6 +22,7 @@ arrow = "57"
 parquet = "57"
 object_store = { version = "0.12.4", features = ["aws"] }
 url = "2.5"
+percent-encoding = "2"
 async-trait = "0.1"
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"

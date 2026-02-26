@@ -120,11 +120,9 @@ fn test_path_with_unicode_special_chars() {
 
 #[test]
 fn test_path_with_url_encoding() {
-    // URL-encoded sequences in local paths
-    let result = join_paths("/data/", "file%2F..%2F..%2Fetc%2Fpasswd").unwrap();
-    assert_eq!(result, "/data/file%2F..%2F..%2Fetc%2Fpasswd");
-    // FINDING: URL-encoded path components are not decoded/validated.
-    // If a downstream system decodes these, traversal could occur.
+    // URL-encoded path traversal sequences are now caught by validation
+    let result = join_paths("/data/", "file%2F..%2F..%2Fetc%2Fpasswd");
+    assert!(result.is_err(), "URL-encoded path traversal should be rejected");
 }
 
 #[test]
@@ -234,10 +232,10 @@ fn test_parse_s3_url_empty_bucket() {
 
 #[test]
 fn test_parse_relative_path_outside_cwd() {
-    // Relative path to non-existent location
+    // Relative path to non-existent location — parse_object_store_url only
+    // parses the URL structure, it does not check file existence.
     let result = parse_object_store_url("nonexistent_dir_12345/data");
-    assert!(result.is_err());
-    // FINDING: Correctly fails for non-existent relative paths.
+    assert!(result.is_ok(), "URL parsing succeeds regardless of path existence");
 }
 
 #[test]

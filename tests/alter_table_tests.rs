@@ -26,7 +26,7 @@ async fn create_test_writer() -> (SqliteMetadataWriter, TempDir) {
 }
 
 fn test_columns() -> Vec<ColumnDef> {
-    vec![ColumnDef::new("id", "int32", false), ColumnDef::new("name", "varchar", true)]
+    vec![ColumnDef::new("id", "int32", false).unwrap(), ColumnDef::new("name", "varchar", true).unwrap()]
 }
 
 /// Helper: create a table and return (table_id, schema_id, snapshot_id)
@@ -48,7 +48,7 @@ async fn test_add_column_basic() {
         .alter_table(
             table_id,
             &AlterTableOp::AddColumn {
-                column: ColumnDef::new("email", "varchar", true),
+                column: ColumnDef::new("email", "varchar", true).unwrap(),
             },
         )
         .unwrap();
@@ -72,7 +72,7 @@ async fn test_add_column_non_nullable_fails() {
     let result = writer.alter_table(
         table_id,
         &AlterTableOp::AddColumn {
-            column: ColumnDef::new("age", "int32", false),
+            column: ColumnDef::new("age", "int32", false).unwrap(),
         },
     );
 
@@ -93,7 +93,7 @@ async fn test_add_column_duplicate_name_fails() {
     let result = writer.alter_table(
         table_id,
         &AlterTableOp::AddColumn {
-            column: ColumnDef::new("name", "varchar", true),
+            column: ColumnDef::new("name", "varchar", true).unwrap(),
         },
     );
 
@@ -114,7 +114,7 @@ async fn test_add_multiple_columns() {
         .alter_table(
             table_id,
             &AlterTableOp::AddColumn {
-                column: ColumnDef::new("email", "varchar", true),
+                column: ColumnDef::new("email", "varchar", true).unwrap(),
             },
         )
         .unwrap();
@@ -123,7 +123,7 @@ async fn test_add_multiple_columns() {
         .alter_table(
             table_id,
             &AlterTableOp::AddColumn {
-                column: ColumnDef::new("age", "int32", true),
+                column: ColumnDef::new("age", "int32", true).unwrap(),
             },
         )
         .unwrap();
@@ -305,7 +305,7 @@ async fn test_alter_column_type_widening() {
 
     // Create table with int32 column
     let columns =
-        vec![ColumnDef::new("id", "int32", false), ColumnDef::new("value", "int32", true)];
+        vec![ColumnDef::new("id", "int32", false).unwrap(), ColumnDef::new("value", "int32", true).unwrap()];
     let setup = writer
         .begin_write_transaction("main", "data", &columns, WriteMode::Replace)
         .unwrap();
@@ -332,7 +332,7 @@ async fn test_alter_column_type_widening() {
 async fn test_alter_column_type_narrowing_fails() {
     let (writer, _temp) = create_test_writer().await;
 
-    let columns = vec![ColumnDef::new("value", "int64", true)];
+    let columns = vec![ColumnDef::new("value", "int64", true).unwrap()];
     let setup = writer
         .begin_write_transaction("main", "data", &columns, WriteMode::Replace)
         .unwrap();
@@ -360,7 +360,7 @@ async fn test_alter_column_type_narrowing_fails() {
 async fn test_alter_column_type_float_to_double() {
     let (writer, _temp) = create_test_writer().await;
 
-    let columns = vec![ColumnDef::new("value", "float", true)];
+    let columns = vec![ColumnDef::new("value", "float", true).unwrap()];
     let setup = writer
         .begin_write_transaction("main", "data", &columns, WriteMode::Replace)
         .unwrap();
@@ -383,7 +383,7 @@ async fn test_alter_column_type_float_to_double() {
 async fn test_alter_column_type_incompatible_fails() {
     let (writer, _temp) = create_test_writer().await;
 
-    let columns = vec![ColumnDef::new("value", "varchar", true)];
+    let columns = vec![ColumnDef::new("value", "varchar", true).unwrap()];
     let setup = writer
         .begin_write_transaction("main", "data", &columns, WriteMode::Replace)
         .unwrap();
@@ -404,7 +404,7 @@ async fn test_alter_column_type_incompatible_fails() {
 async fn test_alter_column_type_preserves_nullable() {
     let (writer, _temp) = create_test_writer().await;
 
-    let columns = vec![ColumnDef::new("value", "int32", false)];
+    let columns = vec![ColumnDef::new("value", "int32", false).unwrap()];
     let setup = writer
         .begin_write_transaction("main", "data", &columns, WriteMode::Replace)
         .unwrap();
@@ -447,7 +447,7 @@ async fn test_type_promotion_int_widening_chain() {
     let (writer, _temp) = create_test_writer().await;
 
     // int16 → int32 → int64
-    let columns = vec![ColumnDef::new("v", "int16", true)];
+    let columns = vec![ColumnDef::new("v", "int16", true).unwrap()];
     let setup = writer
         .begin_write_transaction("main", "chain", &columns, WriteMode::Replace)
         .unwrap();
@@ -490,7 +490,7 @@ async fn test_combined_add_rename_drop() {
         .alter_table(
             table_id,
             &AlterTableOp::AddColumn {
-                column: ColumnDef::new("email", "varchar", true),
+                column: ColumnDef::new("email", "varchar", true).unwrap(),
             },
         )
         .unwrap();
@@ -533,7 +533,7 @@ async fn test_alter_creates_new_snapshot() {
         .alter_table(
             table_id,
             &AlterTableOp::AddColumn {
-                column: ColumnDef::new("email", "varchar", true),
+                column: ColumnDef::new("email", "varchar", true).unwrap(),
             },
         )
         .unwrap();
@@ -567,7 +567,7 @@ async fn test_alter_on_dropped_table_fails() {
     let result = writer.alter_table(
         table_id,
         &AlterTableOp::AddColumn {
-            column: ColumnDef::new("email", "varchar", true),
+            column: ColumnDef::new("email", "varchar", true).unwrap(),
         },
     );
 
@@ -593,7 +593,7 @@ async fn test_compound_alter_add_then_rename() {
         .alter_table(
             table_id,
             &AlterTableOp::AddColumn {
-                column: ColumnDef::new("email", "varchar", true),
+                column: ColumnDef::new("email", "varchar", true).unwrap(),
             },
         )
         .unwrap();
@@ -628,7 +628,7 @@ async fn test_compound_alter_add_rename_drop() {
         .alter_table(
             table_id,
             &AlterTableOp::AddColumn {
-                column: ColumnDef::new("email", "varchar", true),
+                column: ColumnDef::new("email", "varchar", true).unwrap(),
             },
         )
         .unwrap();
@@ -636,7 +636,7 @@ async fn test_compound_alter_add_rename_drop() {
         .alter_table(
             table_id,
             &AlterTableOp::AddColumn {
-                column: ColumnDef::new("age", "int32", true),
+                column: ColumnDef::new("age", "int32", true).unwrap(),
             },
         )
         .unwrap();
@@ -688,9 +688,9 @@ async fn test_write_with_duplicate_columns_fails() {
     let (writer, _temp) = create_test_writer().await;
 
     let dup_columns = vec![
-        ColumnDef::new("id", "int32", false),
-        ColumnDef::new("name", "varchar", true),
-        ColumnDef::new("id", "int32", false), // duplicate
+        ColumnDef::new("id", "int32", false).unwrap(),
+        ColumnDef::new("name", "varchar", true).unwrap(),
+        ColumnDef::new("id", "int32", false).unwrap(), // duplicate
     ];
 
     let result = writer.begin_write_transaction("main", "bad_table", &dup_columns, WriteMode::Replace);

@@ -153,8 +153,8 @@ async fn test_sqli_column_name_injection() {
         .unwrap();
 
     let malicious_columns = vec![
-        ColumnDef::new("id", "int32", false),
-        ColumnDef::new("'; DELETE FROM ducklake_column; --", "varchar", true),
+        ColumnDef::new("id", "int32", false).unwrap(),
+        ColumnDef::new("'; DELETE FROM ducklake_column; --", "varchar", true).unwrap(),
     ];
 
     let result = writer.set_columns(table_id, &malicious_columns, snap);
@@ -171,14 +171,13 @@ async fn test_sqli_column_type_injection() {
         .get_or_create_table(schema_id, "test", None, snap)
         .unwrap();
 
-    let malicious_columns = vec![ColumnDef::new(
+    // With type validation, the malicious type string is rejected at construction time
+    let result = ColumnDef::new(
         "col",
         "varchar'); DROP TABLE ducklake_data_file; --",
         true,
-    )];
-
-    let result = writer.set_columns(table_id, &malicious_columns, snap);
-    assert!(result.is_ok(), "Type string injection should be stored as literal");
+    );
+    assert!(result.is_err(), "SQL injection type string should be rejected by validation");
 }
 
 /// VULN-NONE: SQL injection via begin_write_transaction (end-to-end write path).
@@ -186,7 +185,7 @@ async fn test_sqli_column_type_injection() {
 async fn test_sqli_begin_write_transaction() {
     let (writer, _temp) = create_test_env().await;
 
-    let columns = vec![ColumnDef::new("id", "int32", false)];
+    let columns = vec![ColumnDef::new("id", "int32", false).unwrap()];
     let result = writer.begin_write_transaction(
         "main'; DROP TABLE ducklake_snapshot; --",
         "test",
@@ -947,7 +946,7 @@ async fn test_e2e_unicode_confusable_schemas() {
 async fn test_boundary_record_count_values() {
     let (writer, _temp) = create_test_env().await;
 
-    let columns = vec![ColumnDef::new("id", "int32", false)];
+    let columns = vec![ColumnDef::new("id", "int32", false).unwrap()];
     let setup = writer
         .begin_write_transaction("main", "test", &columns, WriteMode::Replace)
         .unwrap();

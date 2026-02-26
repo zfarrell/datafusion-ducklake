@@ -359,7 +359,7 @@ async fn test_schema_evolution_roundtrip() {
     use datafusion_ducklake::metadata_writer::AlterTableOp;
     use datafusion_ducklake::ColumnDef;
     let add_col_op = AlterTableOp::AddColumn {
-        column: ColumnDef::new("email", "varchar", true),
+        column: ColumnDef::new("email", "varchar", true).unwrap(),
     };
     writer_arc.alter_table(result1.table_id, &add_col_op).unwrap();
 

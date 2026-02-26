@@ -959,9 +959,9 @@ mod validation_patterns {
     #[test]
     fn test_pattern_268_column_def_creation() {
         // Case-sensitive: "ID" and "id" are different columns in the ColumnDef API
-        let col1 = ColumnDef::new("id", "int64", false);
-        let col2 = ColumnDef::new("ID", "int64", false);
-        assert_ne!(col1.name, col2.name, "Case-sensitive: 'id' and 'ID' should be different");
+        let col1 = ColumnDef::new("id", "int64", false).unwrap();
+        let col2 = ColumnDef::new("ID", "int64", false).unwrap();
+        assert_ne!(col1.name(), col2.name(), "Case-sensitive: 'id' and 'ID' should be different");
 
         // Verify ColumnDef::from_arrow handles edge types
         use arrow::datatypes::DataType;
@@ -974,11 +974,11 @@ mod validation_patterns {
     // ANALOGOUS CODE: ColumnDef::new allows empty names.
     #[test]
     fn test_pattern_268_empty_column_name() {
-        let col = ColumnDef::new("", "int64", false);
-        assert_eq!(col.name, "", "Empty column name is allowed at ColumnDef level");
+        let col = ColumnDef::new("", "int64", false).unwrap();
+        assert_eq!(col.name(), "", "Empty column name is allowed at ColumnDef level");
 
-        let col2 = ColumnDef::new("  ", "int64", false);
-        assert_eq!(col2.name, "  ", "Whitespace column name is allowed at ColumnDef level");
+        let col2 = ColumnDef::new("  ", "int64", false).unwrap();
+        assert_eq!(col2.name(), "  ", "Whitespace column name is allowed at ColumnDef level");
     }
 
     // Pattern from issue #297: Default values.
@@ -995,7 +995,7 @@ mod validation_patterns {
         assert_eq!(ducklake_str, "list(int32)");
 
         let col = ColumnDef::from_arrow("data", &list_type, true).unwrap();
-        assert_eq!(col.ducklake_type, "list(int32)");
+        assert_eq!(col.ducklake_type(), "list(int32)");
     }
 }
 
@@ -1162,8 +1162,7 @@ mod edge_case_patterns {
     }
 
     // Pattern from issue #217: S3 URL scheme case sensitivity.
-    // ROOT CAUSE: "S3://" vs "s3://" treated differently.
-    // ANALOGOUS CODE: parse_object_store_url only checks lowercase "s3://".
+    // FIXED: parse_object_store_url now handles case-insensitive schemes per RFC 3986.
     #[test]
     fn test_pattern_217_url_scheme_case_sensitivity() {
         use datafusion_ducklake::path_resolver::parse_object_store_url;
@@ -1171,41 +1170,27 @@ mod edge_case_patterns {
         // Lowercase works
         assert!(parse_object_store_url("s3://bucket/data").is_ok());
 
-        // Uppercase does NOT work (documented limitation)
-        let result = parse_object_store_url("S3://bucket/data");
-        assert!(result.is_err(),
-            "BUG? Uppercase S3:// scheme should work per RFC 3986 (schemes are case-insensitive)");
+        // Uppercase now works (fixed per RFC 3986)
+        assert!(parse_object_store_url("S3://bucket/data").is_ok());
 
         // file:// lowercase works
         assert!(parse_object_store_url("file:///tmp/data").is_ok());
     }
 
     // Pattern from issue #255: Trailing/leading whitespace in data_path from metadata.
-    // ROOT CAUSE: Metadata value not trimmed.
-    // ANALOGOUS CODE: parse_object_store_url does NOT trim input.
+    // FIXED: parse_object_store_url now trims whitespace from input.
     #[test]
     fn test_pattern_255_whitespace_in_data_path() {
         use datafusion_ducklake::path_resolver::parse_object_store_url;
 
-        // Leading whitespace
-        let result = parse_object_store_url("  s3://bucket/data");
-        // This will likely fail because " s3://..." doesn't start with "s3://"
-        assert!(result.is_err(),
-            "BUG? Leading whitespace in data_path not trimmed before URL parsing");
+        // Leading whitespace now handled (trimmed before parsing)
+        assert!(parse_object_store_url("  s3://bucket/data").is_ok());
 
-        // Trailing whitespace
+        // Trailing whitespace now handled (trimmed before parsing)
         let result = parse_object_store_url("s3://bucket/data  ");
-        // The url::Url parser may handle trailing whitespace
-        match result {
-            Ok((_, path)) => {
-                // If it succeeds, the path should not have trailing spaces
-                assert!(!path.ends_with(' '),
-                    "BUG? Trailing whitespace preserved in parsed path: '{}'", path);
-            }
-            Err(_) => {
-                // Also acceptable — trailing whitespace causes parse error
-            }
-        }
+        assert!(result.is_ok());
+        let (_, path) = result.unwrap();
+        assert!(!path.ends_with(' '), "Trailing whitespace should be trimmed");
     }
 
     // Pattern from issue #44: Empty string inputs.

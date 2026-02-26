@@ -36,7 +36,7 @@ use futures::Stream;
 
 use crate::metadata_provider::{DeleteFileChange, MetadataProvider};
 use crate::path_resolver::resolve_path;
-use crate::table::delete_file_schema;
+use crate::table::{delete_file_schema, validated_file_size};
 
 /// TableProvider that exposes deleted rows between snapshots
 ///
@@ -101,7 +101,8 @@ impl TableDeletionsTable {
             &self.table_path,
             &delete_file.data_file_path,
             delete_file.data_file_path_is_relative,
-        )?;
+        )
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
         // Create scan for current delete file (if exists - None means full file delete)
         let current_delete_exec = if let Some(ref current_path) = delete_file.current_delete_path {
@@ -152,11 +153,17 @@ impl TableDeletionsTable {
         size_bytes: i64,
         footer_size: i64,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let resolved_path = resolve_path(&self.table_path, path, is_relative)?;
+        let resolved_path = resolve_path(&self.table_path, path, is_relative)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-        let mut pf = PartitionedFile::new(&resolved_path, size_bytes as u64);
-        if footer_size > 0 {
-            pf = pf.with_metadata_size_hint(footer_size as usize);
+        let mut pf = PartitionedFile::new(
+            &resolved_path,
+            validated_file_size(size_bytes, &resolved_path)?,
+        );
+        if footer_size > 0
+            && let Ok(hint) = usize::try_from(footer_size)
+        {
+            pf = pf.with_metadata_size_hint(hint);
         }
 
         let builder = FileScanConfigBuilder::new(
@@ -176,9 +183,11 @@ impl TableDeletionsTable {
         size_bytes: i64,
         footer_size: i64,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let mut pf = PartitionedFile::new(path, size_bytes as u64);
-        if footer_size > 0 {
-            pf = pf.with_metadata_size_hint(footer_size as usize);
+        let mut pf = PartitionedFile::new(path, validated_file_size(size_bytes, path)?);
+        if footer_size > 0
+            && let Ok(hint) = usize::try_from(footer_size)
+        {
+            pf = pf.with_metadata_size_hint(hint);
         }
 
         let builder = FileScanConfigBuilder::new(

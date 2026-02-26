@@ -295,28 +295,28 @@ mod tests {
     #[test]
     fn test_schema_evolution_replace_mode_skips_validation() {
         let existing = vec![("id".into(), "int64".into(), false)];
-        let new = vec![ColumnDef::new("id", "varchar", false)]; // type mismatch
+        let new = vec![ColumnDef::new("id", "varchar", false).unwrap()]; // type mismatch
         assert!(validate_schema_evolution(&existing, &new, WriteMode::Replace).is_ok());
     }
 
     #[test]
     fn test_schema_evolution_empty_existing_skips_validation() {
         let existing: Vec<(String, String, bool)> = vec![];
-        let new = vec![ColumnDef::new("id", "int64", false)];
+        let new = vec![ColumnDef::new("id", "int64", false).unwrap()];
         assert!(validate_schema_evolution(&existing, &new, WriteMode::Append).is_ok());
     }
 
     #[test]
     fn test_schema_evolution_matching_types_ok() {
         let existing = vec![("id".into(), "int64".into(), false)];
-        let new = vec![ColumnDef::new("id", "int64", false)];
+        let new = vec![ColumnDef::new("id", "int64", false).unwrap()];
         assert!(validate_schema_evolution(&existing, &new, WriteMode::Append).is_ok());
     }
 
     #[test]
     fn test_schema_evolution_type_mismatch_fails() {
         let existing = vec![("id".into(), "int64".into(), false)];
-        let new = vec![ColumnDef::new("id", "varchar", false)];
+        let new = vec![ColumnDef::new("id", "varchar", false).unwrap()];
         let err = validate_schema_evolution(&existing, &new, WriteMode::Append).unwrap_err();
         assert!(err.to_string().contains("Type changes are not allowed"));
     }
@@ -325,7 +325,7 @@ mod tests {
     fn test_schema_evolution_new_nullable_column_ok() {
         let existing = vec![("id".into(), "int64".into(), false)];
         let new =
-            vec![ColumnDef::new("id", "int64", false), ColumnDef::new("name", "varchar", true)];
+            vec![ColumnDef::new("id", "int64", false).unwrap(), ColumnDef::new("name", "varchar", true).unwrap()];
         assert!(validate_schema_evolution(&existing, &new, WriteMode::Append).is_ok());
     }
 
@@ -333,7 +333,7 @@ mod tests {
     fn test_schema_evolution_new_non_nullable_column_fails() {
         let existing = vec![("id".into(), "int64".into(), false)];
         let new =
-            vec![ColumnDef::new("id", "int64", false), ColumnDef::new("name", "varchar", false)];
+            vec![ColumnDef::new("id", "int64", false).unwrap(), ColumnDef::new("name", "varchar", false).unwrap()];
         let err = validate_schema_evolution(&existing, &new, WriteMode::Append).unwrap_err();
         assert!(err.to_string().contains("must be nullable"));
     }
@@ -357,7 +357,7 @@ mod tests {
     fn test_add_nullable_column_ok() {
         let columns = make_columns(&[("id", "int64", 0, false)]);
         let op = AlterTableOp::AddColumn {
-            column: ColumnDef::new("name", "varchar", true),
+            column: ColumnDef::new("name", "varchar", true).unwrap(),
         };
         let action = validate_alter_table(&columns, &op).unwrap();
         match action {
@@ -373,7 +373,7 @@ mod tests {
     fn test_add_non_nullable_column_fails() {
         let columns = make_columns(&[("id", "int64", 0, false)]);
         let op = AlterTableOp::AddColumn {
-            column: ColumnDef::new("name", "varchar", false),
+            column: ColumnDef::new("name", "varchar", false).unwrap(),
         };
         assert!(validate_alter_table(&columns, &op).is_err());
     }
@@ -382,7 +382,7 @@ mod tests {
     fn test_add_duplicate_column_fails() {
         let columns = make_columns(&[("id", "int64", 0, false)]);
         let op = AlterTableOp::AddColumn {
-            column: ColumnDef::new("id", "varchar", true),
+            column: ColumnDef::new("id", "varchar", true).unwrap(),
         };
         let err = validate_alter_table(&columns, &op).unwrap_err();
         assert!(err.to_string().contains("already exists"));
@@ -519,8 +519,8 @@ mod tests {
     #[test]
     fn test_no_duplicate_columns_ok() {
         let columns = vec![
-            ColumnDef::new("id", "int64", false),
-            ColumnDef::new("name", "varchar", true),
+            ColumnDef::new("id", "int64", false).unwrap(),
+            ColumnDef::new("name", "varchar", true).unwrap(),
         ];
         assert!(validate_no_duplicate_columns(&columns).is_ok());
     }
@@ -528,8 +528,8 @@ mod tests {
     #[test]
     fn test_duplicate_columns_fails() {
         let columns = vec![
-            ColumnDef::new("id", "int64", false),
-            ColumnDef::new("id", "int64", false),
+            ColumnDef::new("id", "int64", false).unwrap(),
+            ColumnDef::new("id", "int64", false).unwrap(),
         ];
         let err = validate_no_duplicate_columns(&columns).unwrap_err();
         assert!(err.to_string().contains("Duplicate column name"));
@@ -538,8 +538,8 @@ mod tests {
     #[test]
     fn test_duplicate_columns_different_types_fails() {
         let columns = vec![
-            ColumnDef::new("x", "int64", false),
-            ColumnDef::new("x", "varchar", true),
+            ColumnDef::new("x", "int64", false).unwrap(),
+            ColumnDef::new("x", "varchar", true).unwrap(),
         ];
         let err = validate_no_duplicate_columns(&columns).unwrap_err();
         assert!(err.to_string().contains("Duplicate column name 'x'"));

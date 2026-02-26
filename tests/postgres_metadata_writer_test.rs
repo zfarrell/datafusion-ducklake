@@ -98,7 +98,7 @@ async fn test_set_columns() {
         .unwrap();
 
     let columns =
-        vec![ColumnDef::new("id", "int64", false), ColumnDef::new("name", "varchar", true)];
+        vec![ColumnDef::new("id", "int64", false).unwrap(), ColumnDef::new("name", "varchar", true).unwrap()];
 
     let column_ids = writer.set_columns(table_id, &columns, snapshot_id).unwrap();
     assert_eq!(column_ids.len(), 2);
@@ -172,7 +172,7 @@ async fn test_begin_write_transaction() {
     let (writer, _container) = create_writer().await;
 
     let columns =
-        vec![ColumnDef::new("id", "int64", false), ColumnDef::new("name", "varchar", true)];
+        vec![ColumnDef::new("id", "int64", false).unwrap(), ColumnDef::new("name", "varchar", true).unwrap()];
 
     let result = writer
         .begin_write_transaction("main", "users", &columns, WriteMode::Replace)
@@ -220,7 +220,7 @@ async fn test_drop_table() {
         .get_or_create_table(schema_id, "users", None, snapshot_id)
         .unwrap();
 
-    let columns = vec![ColumnDef::new("id", "int64", false)];
+    let columns = vec![ColumnDef::new("id", "int64", false).unwrap()];
     writer.set_columns(table_id, &columns, snapshot_id).unwrap();
 
     let drop_snapshot = writer.drop_table(table_id).unwrap();
@@ -279,7 +279,7 @@ async fn test_register_column_stats() {
         .get_or_create_table(schema_id, "users", None, snapshot_id)
         .unwrap();
 
-    let columns = vec![ColumnDef::new("id", "int64", false)];
+    let columns = vec![ColumnDef::new("id", "int64", false).unwrap()];
     let column_ids = writer.set_columns(table_id, &columns, snapshot_id).unwrap();
 
     let file = DataFileInfo::new("data.parquet", 1024, 100);
@@ -338,7 +338,7 @@ async fn test_get_active_columns() {
         .unwrap();
 
     let columns =
-        vec![ColumnDef::new("id", "int64", false), ColumnDef::new("name", "varchar", true)];
+        vec![ColumnDef::new("id", "int64", false).unwrap(), ColumnDef::new("name", "varchar", true).unwrap()];
     writer.set_columns(table_id, &columns, snapshot_id).unwrap();
 
     let active = writer.get_active_columns(table_id).unwrap();
@@ -378,14 +378,14 @@ async fn test_alter_table_add_column() {
         .get_or_create_table(schema_id, "users", None, snapshot_id)
         .unwrap();
 
-    let columns = vec![ColumnDef::new("id", "int64", false)];
+    let columns = vec![ColumnDef::new("id", "int64", false).unwrap()];
     writer.set_columns(table_id, &columns, snapshot_id).unwrap();
 
     let alter_snap = writer
         .alter_table(
             table_id,
             &AlterTableOp::AddColumn {
-                column: ColumnDef::new("email", "varchar", true),
+                column: ColumnDef::new("email", "varchar", true).unwrap(),
             },
         )
         .unwrap();
@@ -409,7 +409,7 @@ async fn test_alter_table_drop_column() {
         .unwrap();
 
     let columns =
-        vec![ColumnDef::new("id", "int64", false), ColumnDef::new("name", "varchar", true)];
+        vec![ColumnDef::new("id", "int64", false).unwrap(), ColumnDef::new("name", "varchar", true).unwrap()];
     writer.set_columns(table_id, &columns, snapshot_id).unwrap();
 
     writer
@@ -438,7 +438,7 @@ async fn test_alter_table_rename_column() {
         .get_or_create_table(schema_id, "users", None, snapshot_id)
         .unwrap();
 
-    let columns = vec![ColumnDef::new("id", "int64", false)];
+    let columns = vec![ColumnDef::new("id", "int64", false).unwrap()];
     writer.set_columns(table_id, &columns, snapshot_id).unwrap();
 
     writer
@@ -468,7 +468,7 @@ async fn test_alter_table_change_type() {
         .get_or_create_table(schema_id, "users", None, snapshot_id)
         .unwrap();
 
-    let columns = vec![ColumnDef::new("id", "int32", false)];
+    let columns = vec![ColumnDef::new("id", "int32", false).unwrap()];
     writer.set_columns(table_id, &columns, snapshot_id).unwrap();
 
     writer
@@ -490,7 +490,7 @@ async fn test_alter_table_change_type() {
 async fn test_begin_checked_write_transaction() {
     let (writer, _container) = create_writer().await;
 
-    let columns = vec![ColumnDef::new("id", "int64", false)];
+    let columns = vec![ColumnDef::new("id", "int64", false).unwrap()];
 
     // First write
     let result = writer
@@ -523,7 +523,7 @@ async fn test_drop_table_checked_conflict() {
         .get_or_create_table(schema_id, "users", None, snapshot_id)
         .unwrap();
 
-    let columns = vec![ColumnDef::new("id", "int64", false)];
+    let columns = vec![ColumnDef::new("id", "int64", false).unwrap()];
     writer.set_columns(table_id, &columns, snapshot_id).unwrap();
 
     // Drop table

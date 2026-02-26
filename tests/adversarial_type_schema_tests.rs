@@ -635,8 +635,8 @@ mod schema_evolution_tests {
 
     fn setup_table(writer: &SqliteMetadataWriter) -> i64 {
         let columns = vec![
-            ColumnDef::new("id", "int32", false),
-            ColumnDef::new("name", "varchar", true),
+            ColumnDef::new("id", "int32", false).unwrap(),
+            ColumnDef::new("name", "varchar", true).unwrap(),
         ];
         let result = writer
             .begin_write_transaction("main", "test_tbl", &columns, WriteMode::Replace)
@@ -763,7 +763,7 @@ mod schema_evolution_tests {
 
         let long_name = "a".repeat(10000);
         let op = AlterTableOp::AddColumn {
-            column: ColumnDef::new(&long_name, "varchar", true),
+            column: ColumnDef::new(&long_name, "varchar", true).unwrap(),
         };
         let result = writer.alter_table(table_id, &op);
         // BUG: No length limit on column names. 10000-char name accepted.
@@ -778,7 +778,7 @@ mod schema_evolution_tests {
         let table_id = setup_table(&writer);
 
         let op = AlterTableOp::AddColumn {
-            column: ColumnDef::new("", "varchar", true),
+            column: ColumnDef::new("", "varchar", true).unwrap(),
         };
         let result = writer.alter_table(table_id, &op);
         // BUG: Adding a column with empty name SUCCEEDS.
@@ -802,29 +802,10 @@ mod schema_evolution_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn attack_add_column_invalid_type() {
-        let (writer, _temp) = create_test_writer().await;
-        let table_id = setup_table(&writer);
-
-        let op = AlterTableOp::AddColumn {
-            column: ColumnDef::new("bad_col", "not_a_real_type", true),
-        };
-        let result = writer.alter_table(table_id, &op);
-        // BUG: The column type is NOT validated when adding a column!
-        // The type string is stored as-is in the catalog. It will only fail
-        // when someone tries to READ the table and build_arrow_schema() is called.
-        // This is a deferred failure: corrupts metadata that will break reads later.
-        match result {
-            Ok(_) => {
-                // BUG CONFIRMED: Invalid type stored in catalog
-                let cols = writer.get_active_columns(table_id).unwrap();
-                let bad_col = cols.iter().find(|(name, _, _)| name == "bad_col");
-                assert!(bad_col.is_some());
-                assert_eq!(bad_col.unwrap().1, "not_a_real_type", "BUG: invalid type stored in catalog");
-            }
-            Err(_) => {
-                // Would be correct: validate type at write time
-            }
-        }
+        // ColumnDef::new now validates types at construction time, preventing invalid types
+        // from ever reaching the catalog
+        let result = ColumnDef::new("bad_col", "not_a_real_type", true);
+        assert!(result.is_err(), "Invalid type should be rejected at ColumnDef construction");
     }
 
     // ---------- Drop all columns (one by one) ----------
@@ -928,7 +909,7 @@ mod schema_evolution_tests {
 
         // Step 1: Add "email" column.
         let add_op = AlterTableOp::AddColumn {
-            column: ColumnDef::new("email", "varchar", true),
+            column: ColumnDef::new("email", "varchar", true).unwrap(),
         };
         writer.alter_table(table_id, &add_op).unwrap();
 
@@ -940,7 +921,7 @@ mod schema_evolution_tests {
 
         // Step 3: Re-add "email" with a DIFFERENT type.
         let readd_op = AlterTableOp::AddColumn {
-            column: ColumnDef::new("email", "int64", true),
+            column: ColumnDef::new("email", "int64", true).unwrap(),
         };
         let result = writer.alter_table(table_id, &readd_op);
         // This should succeed. The dropped column's end_snapshot is set,
@@ -965,7 +946,7 @@ mod schema_evolution_tests {
         // Add 100 columns in rapid succession.
         for i in 0..100 {
             let op = AlterTableOp::AddColumn {
-                column: ColumnDef::new(format!("col_{}", i), "int32", true),
+                column: ColumnDef::new(format!("col_{}", i), "int32", true).unwrap(),
             };
             writer.alter_table(table_id, &op).unwrap();
         }
@@ -983,13 +964,13 @@ mod schema_evolution_tests {
         let (writer, _temp) = create_test_writer().await;
 
         // Create table with int32 column.
-        let columns = vec![ColumnDef::new("id", "int32", false)];
+        let columns = vec![ColumnDef::new("id", "int32", false).unwrap()];
         writer
             .begin_write_transaction("main", "evolve_test", &columns, WriteMode::Replace)
             .unwrap();
 
         // Try to append with different type for same column.
-        let bad_columns = vec![ColumnDef::new("id", "varchar", false)];
+        let bad_columns = vec![ColumnDef::new("id", "varchar", false).unwrap()];
         let result =
             writer.begin_write_transaction("main", "evolve_test", &bad_columns, WriteMode::Append);
         assert!(result.is_err());
@@ -1008,15 +989,15 @@ mod schema_evolution_tests {
     async fn attack_schema_evolution_append_non_nullable_new_col() {
         let (writer, _temp) = create_test_writer().await;
 
-        let columns = vec![ColumnDef::new("id", "int32", false)];
+        let columns = vec![ColumnDef::new("id", "int32", false).unwrap()];
         writer
             .begin_write_transaction("main", "evolve_test2", &columns, WriteMode::Replace)
             .unwrap();
 
         // Append with a new non-nullable column.
         let bad_columns = vec![
-            ColumnDef::new("id", "int32", false),
-            ColumnDef::new("required_field", "varchar", false), // non-nullable
+            ColumnDef::new("id", "int32", false).unwrap(),
+            ColumnDef::new("required_field", "varchar", false).unwrap(), // non-nullable
         ];
         let result =
             writer.begin_write_transaction("main", "evolve_test2", &bad_columns, WriteMode::Append);
@@ -1031,7 +1012,7 @@ mod schema_evolution_tests {
     async fn attack_empty_table_name() {
         let (writer, _temp) = create_test_writer().await;
 
-        let columns = vec![ColumnDef::new("id", "int32", false)];
+        let columns = vec![ColumnDef::new("id", "int32", false).unwrap()];
         let result = writer.begin_write_transaction("main", "", &columns, WriteMode::Replace);
         // BUG: Empty table name is accepted! No validation on table name.
         match result {
@@ -1050,7 +1031,7 @@ mod schema_evolution_tests {
     async fn attack_empty_schema_name() {
         let (writer, _temp) = create_test_writer().await;
 
-        let columns = vec![ColumnDef::new("id", "int32", false)];
+        let columns = vec![ColumnDef::new("id", "int32", false).unwrap()];
         let result = writer.begin_write_transaction("", "test_tbl", &columns, WriteMode::Replace);
         // BUG: Empty schema name is accepted! No validation on schema name.
         match result {
@@ -1092,8 +1073,8 @@ mod schema_evolution_tests {
         let (writer, _temp) = create_test_writer().await;
 
         let columns = vec![
-            ColumnDef::new("id", "int32", false),
-            ColumnDef::new("id", "varchar", true),
+            ColumnDef::new("id", "int32", false).unwrap(),
+            ColumnDef::new("id", "varchar", true).unwrap(),
         ];
         let result = writer.begin_write_transaction("main", "dup_test", &columns, WriteMode::Replace);
         assert!(result.is_err());
@@ -1109,7 +1090,7 @@ mod schema_evolution_tests {
         let table_id = setup_table(&writer);
 
         let op = AlterTableOp::AddColumn {
-            column: ColumnDef::new("line\none", "varchar", true),
+            column: ColumnDef::new("line\none", "varchar", true).unwrap(),
         };
         let result = writer.alter_table(table_id, &op);
         // BUG: Newlines in column names are accepted. No sanitization.
@@ -1136,7 +1117,7 @@ mod schema_evolution_tests {
         let table_id = setup_table(&writer);
 
         let op = AlterTableOp::AddColumn {
-            column: ColumnDef::new("col\0name", "varchar", true),
+            column: ColumnDef::new("col\0name", "varchar", true).unwrap(),
         };
         let result = writer.alter_table(table_id, &op);
         // Null bytes in column names: SQLite may or may not accept this.
@@ -1157,7 +1138,7 @@ mod schema_evolution_tests {
         let (writer, _temp) = create_test_writer().await;
 
         // Create table with "integer" type (alias for int32).
-        let columns = vec![ColumnDef::new("id", "integer", false)];
+        let columns = vec![ColumnDef::new("id", "integer", false).unwrap()];
         let setup = writer
             .begin_write_transaction("main", "alias_test", &columns, WriteMode::Replace)
             .unwrap();
@@ -1190,7 +1171,7 @@ mod schema_evolution_tests {
         let (writer, _temp) = create_test_writer().await;
 
         // Create table with "INT32" type (uppercase).
-        let columns = vec![ColumnDef::new("id", "INT32", false)];
+        let columns = vec![ColumnDef::new("id", "INT32", false).unwrap()];
         let setup = writer
             .begin_write_transaction("main", "case_test", &columns, WriteMode::Replace)
             .unwrap();
@@ -1223,7 +1204,7 @@ mod schema_evolution_tests {
     async fn attack_table_name_sql_injection() {
         let (writer, _temp) = create_test_writer().await;
 
-        let columns = vec![ColumnDef::new("id", "int32", false)];
+        let columns = vec![ColumnDef::new("id", "int32", false).unwrap()];
         let result = writer.begin_write_transaction(
             "main",
             "t'; DROP TABLE ducklake_table; --",
@@ -1241,7 +1222,7 @@ mod schema_evolution_tests {
     async fn attack_schema_name_sql_injection() {
         let (writer, _temp) = create_test_writer().await;
 
-        let columns = vec![ColumnDef::new("id", "int32", false)];
+        let columns = vec![ColumnDef::new("id", "int32", false).unwrap()];
         let result = writer.begin_write_transaction(
             "s'; DROP TABLE ducklake_schema; --",
             "test_tbl",
@@ -1264,7 +1245,7 @@ mod schema_evolution_tests {
 
         // Try to alter the dropped table.
         let op = AlterTableOp::AddColumn {
-            column: ColumnDef::new("new_col", "varchar", true),
+            column: ColumnDef::new("new_col", "varchar", true).unwrap(),
         };
         let result = writer.alter_table(table_id, &op);
         // After dropping, all columns have end_snapshot set, so get_active_columns returns [].
@@ -1374,7 +1355,7 @@ mod schema_evolution_tests {
             .alter_table(
                 table_id,
                 &AlterTableOp::AddColumn {
-                    column: ColumnDef::new("score", "int8", true),
+                    column: ColumnDef::new("score", "int8", true).unwrap(),
                 },
             )
             .unwrap();
@@ -1402,7 +1383,7 @@ mod schema_evolution_tests {
         let (writer, _temp) = create_test_writer().await;
 
         // Store uppercase type. This gets stored as-is in the catalog.
-        let columns = vec![ColumnDef::new("id", "INT32", false)];
+        let columns = vec![ColumnDef::new("id", "INT32", false).unwrap()];
         let setup = writer
             .begin_write_transaction("main", "case_table", &columns, WriteMode::Replace)
             .unwrap();

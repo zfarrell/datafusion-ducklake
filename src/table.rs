@@ -62,12 +62,11 @@ pub const DELETE_POS_COL: &str = "pos";
 ///
 /// DuckLake stores file sizes as signed integers in SQL. A negative value indicates
 /// corrupt or invalid metadata. Without this check, a negative i64 cast to u64 would
-/// wrap to a huge value (e.g., -1 becomes u64::MAX), causing confusing "invalid range"
-/// errors downstream.
+/// wrap to a huge value (e.g., -1 becomes u64::MAX), causing confusing downstream errors.
 pub(crate) fn validated_file_size(file_size_bytes: i64, file_path: &str) -> DataFusionResult<u64> {
     u64::try_from(file_size_bytes).map_err(|_| {
         DataFusionError::Execution(format!(
-            "Invalid file_size_bytes ({}) for file '{}': file size cannot be negative",
+            "Invalid file_size_bytes ({}) for file '{}': value must be non-negative",
             file_size_bytes, file_path
         ))
     })
@@ -358,33 +357,16 @@ impl DuckLakeTable {
         // Resolve the delete file path
         let resolved_delete_path = self.resolve_file_path(delete_file)?;
 
-        // Verify the delete file exists before attempting to read it.
-        // A missing delete file is a data integrity issue: the catalog metadata
-        // references a file that should contain deleted row positions. Without it,
-        // we cannot filter deleted rows and would silently return corrupted data.
-        let object_store = state
-            .runtime_env()
-            .object_store(self.object_store_url.as_ref())?;
-        let object_path = ObjectPath::from(resolved_delete_path.as_str());
-        object_store.head(&object_path).await.map_err(|e| {
-            DataFusionError::Execution(format!(
-                "Delete file referenced in catalog metadata is missing from storage: '{}'. \
-                 This indicates data corruption — the catalog expects a delete file that \
-                 does not exist. Without this file, deleted rows cannot be filtered out. \
-                 Error: {}",
-                resolved_delete_path, e
-            ))
-        })?;
-
         // Create PartitionedFile with footer size hint if available
         let mut pf = PartitionedFile::new(
             &resolved_delete_path,
             validated_file_size(delete_file.file_size_bytes, &resolved_delete_path)?,
         );
-        if let Some(footer_size) = delete_file.footer_size {
-            if footer_size > 0 {
-                pf = pf.with_metadata_size_hint(footer_size as usize);
-            }
+        if let Some(footer_size) = delete_file.footer_size
+            && footer_size > 0
+            && let Ok(hint) = usize::try_from(footer_size)
+        {
+            pf = pf.with_metadata_size_hint(hint);
         }
 
         // Create file scan config for the delete file
@@ -407,7 +389,17 @@ impl DuckLakeTable {
             .collect::<Vec<_>>()
             .await
             .into_iter()
-            .collect::<DataFusionResult<Vec<_>>>()?;
+            .collect::<DataFusionResult<Vec<_>>>()
+            .map_err(|e| {
+                if is_object_store_not_found(&e) {
+                    DataFusionError::Execution(format!(
+                        "Delete file '{}' referenced in catalog metadata was not found. This may indicate catalog corruption or that the file was deleted outside of DuckLake.",
+                        resolved_delete_path
+                    ))
+                } else {
+                    e
+                }
+            })?;
 
         // Extract all positions from all batches
         let mut positions = HashSet::new();
@@ -433,7 +425,7 @@ impl DuckLakeTable {
 
         let partitioned_files: Vec<PartitionedFile> = files
             .iter()
-            .map(|table_file| -> DataFusionResult<PartitionedFile> {
+            .map(|table_file| {
                 let resolved_path = self.resolve_file_path(&table_file.file)?;
                 let mut pf = PartitionedFile::new(
                     &resolved_path,
@@ -442,10 +434,11 @@ impl DuckLakeTable {
 
                 // Apply footer size hint if available from DuckLake metadata
                 // This reduces I/O from 2 reads to 1 read per file (especially beneficial for S3/MinIO)
-                if let Some(footer_size) = table_file.file.footer_size {
-                    if footer_size > 0 {
-                        pf = pf.with_metadata_size_hint(footer_size as usize);
-                    }
+                if let Some(footer_size) = table_file.file.footer_size
+                    && footer_size > 0
+                    && let Ok(hint) = usize::try_from(footer_size)
+                {
+                    pf = pf.with_metadata_size_hint(hint);
                 }
 
                 Ok(pf)
@@ -673,10 +666,11 @@ impl DuckLakeTable {
             &resolved_path,
             validated_file_size(table_file.file.file_size_bytes, &resolved_path)?,
         );
-        if let Some(footer_size) = table_file.file.footer_size {
-            if footer_size > 0 {
-                pf = pf.with_metadata_size_hint(footer_size as usize);
-            }
+        if let Some(footer_size) = table_file.file.footer_size
+            && footer_size > 0
+            && let Ok(hint) = usize::try_from(footer_size)
+        {
+            pf = pf.with_metadata_size_hint(hint);
         }
 
         // Use read_schema (with original Parquet names) for reading
@@ -1302,4 +1296,58 @@ fn extract_deleted_positions_from_batch(
     }
 
     Ok(())
+}
+
+/// Check if a DataFusion error is caused by an object store NotFound error.
+fn is_object_store_not_found(err: &DataFusionError) -> bool {
+    if let DataFusionError::ObjectStore(os_err) = err {
+        return matches!(os_err.as_ref(), object_store::Error::NotFound { .. });
+    }
+    let mut source = std::error::Error::source(err);
+    while let Some(e) = source {
+        if let Some(os_err) = e.downcast_ref::<object_store::Error>() {
+            return matches!(os_err, object_store::Error::NotFound { .. });
+        }
+        source = e.source();
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validated_file_size_positive() {
+        assert_eq!(validated_file_size(0, "test.parquet").unwrap(), 0);
+        assert_eq!(validated_file_size(1024, "test.parquet").unwrap(), 1024);
+        assert_eq!(
+            validated_file_size(i64::MAX, "test.parquet").unwrap(),
+            i64::MAX as u64
+        );
+    }
+
+    #[test]
+    fn test_validated_file_size_negative() {
+        let err = validated_file_size(-1, "data/test.parquet").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("-1"),
+            "Error should contain the negative value: {}",
+            msg
+        );
+        assert!(
+            msg.contains("data/test.parquet"),
+            "Error should contain the file path: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_validated_file_size_large_negative() {
+        let err = validated_file_size(i64::MIN, "bad.parquet").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("bad.parquet"));
+        assert!(msg.contains(&i64::MIN.to_string()));
+    }
 }

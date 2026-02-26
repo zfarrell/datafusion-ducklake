@@ -184,8 +184,8 @@ fn get_table_id(writer: &SqliteMetadataWriter) -> i64 {
             "main",
             "test_tbl",
             &[
-                ColumnDef::new("id", "int32", false),
-                ColumnDef::new("name", "varchar", true),
+                ColumnDef::new("id", "int32", false).unwrap(),
+                ColumnDef::new("name", "varchar", true).unwrap(),
             ],
             WriteMode::Replace,
         )
@@ -210,8 +210,8 @@ async fn test_rename_column_to_same_name() {
         w.set_data_path(temp_dir.path().to_str().unwrap()).unwrap();
 
         let columns = vec![
-            ColumnDef::new("id", "int32", false),
-            ColumnDef::new("name", "varchar", true),
+            ColumnDef::new("id", "int32", false).unwrap(),
+            ColumnDef::new("name", "varchar", true).unwrap(),
         ];
         let setup = w
             .begin_write_transaction("main", "t", &columns, WriteMode::Replace)
@@ -248,9 +248,9 @@ async fn test_drop_and_readd_same_column_name() {
     w.set_data_path(temp_dir.path().to_str().unwrap()).unwrap();
 
     let columns = vec![
-        ColumnDef::new("id", "int32", false),
-        ColumnDef::new("name", "varchar", true),
-        ColumnDef::new("email", "varchar", true),
+        ColumnDef::new("id", "int32", false).unwrap(),
+        ColumnDef::new("name", "varchar", true).unwrap(),
+        ColumnDef::new("email", "varchar", true).unwrap(),
     ];
     let setup = w
         .begin_write_transaction("main", "t", &columns, WriteMode::Replace)
@@ -269,7 +269,7 @@ async fn test_drop_and_readd_same_column_name() {
     let result = w.alter_table(
         setup.table_id,
         &AlterTableOp::AddColumn {
-            column: ColumnDef::new("email", "int64", true),
+            column: ColumnDef::new("email", "int64", true).unwrap(),
         },
     );
 
@@ -298,7 +298,7 @@ async fn test_alter_column_type_to_same_type() {
     let w = SqliteMetadataWriter::new_with_init(&conn_str).await.unwrap();
     w.set_data_path(temp_dir.path().to_str().unwrap()).unwrap();
 
-    let columns = vec![ColumnDef::new("value", "int32", true)];
+    let columns = vec![ColumnDef::new("value", "int32", true).unwrap()];
     let setup = w
         .begin_write_transaction("main", "t", &columns, WriteMode::Replace)
         .unwrap();

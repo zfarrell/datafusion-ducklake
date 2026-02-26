@@ -120,14 +120,14 @@ async fn test_issue_297_function_default_values() {
     let (writer, temp_dir) = create_test_env().await;
 
     // Create table with a column that has a default value
-    let id_col = ColumnDef::new("id", "INTEGER", false);
-    let mut name_col = ColumnDef::new("name", "VARCHAR", true);
+    let id_col = ColumnDef::new("id", "INTEGER", false).unwrap();
+    let mut name_col = ColumnDef::new("name", "VARCHAR", true).unwrap();
     name_col.default_value = Some("unknown".to_string());
     name_col.default_value_type = Some("VARCHAR".to_string());
     name_col.default_value_dialect = Some("SQL".to_string());
 
     // Also test a timestamp column with function default metadata
-    let mut created_col = ColumnDef::new("created_at", "TIMESTAMP", true);
+    let mut created_col = ColumnDef::new("created_at", "TIMESTAMP", true).unwrap();
     created_col.default_value = Some("now()".to_string());
     created_col.default_value_type = Some("TIMESTAMP".to_string());
     created_col.default_value_dialect = Some("SQL".to_string());
@@ -286,7 +286,7 @@ async fn test_issue_794_schema_evolution_with_defaults() {
         .unwrap();
 
     // Add column with default (use lowercase to match Arrow type mapping)
-    let mut new_col = ColumnDef::new("status", "varchar", true);
+    let mut new_col = ColumnDef::new("status", "varchar", true).unwrap();
     new_col.default_value = Some("active".to_string());
     new_col.default_value_type = Some("VARCHAR".to_string());
 

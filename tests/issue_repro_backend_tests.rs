@@ -152,11 +152,11 @@ mod postgres_tests {
         let (writer, _container) = create_writer().await;
 
         let columns = vec![
-            ColumnDef::new("id", "int64", false),
-            ColumnDef::new("metadata", "STRUCT(name VARCHAR, age INTEGER)", true),
-            ColumnDef::new("tags", "VARCHAR[]", true),
-            ColumnDef::new("properties", "MAP(VARCHAR, VARCHAR)", true),
-            ColumnDef::new("nested", "STRUCT(items STRUCT(name VARCHAR, value DOUBLE)[])", true),
+            ColumnDef::new("id", "int64", false).unwrap(),
+            ColumnDef::new("metadata", "STRUCT(name VARCHAR, age INTEGER)", true).unwrap(),
+            ColumnDef::new("tags", "VARCHAR[]", true).unwrap(),
+            ColumnDef::new("properties", "MAP(VARCHAR, VARCHAR)", true).unwrap(),
+            ColumnDef::new("nested", "STRUCT(items STRUCT(name VARCHAR, value DOUBLE)[])", true).unwrap(),
         ];
 
         let result = writer.begin_write_transaction("main", "complex_table", &columns, WriteMode::Replace);
@@ -204,8 +204,8 @@ mod postgres_tests {
         assert_eq!(long_name.len(), 100);
 
         let columns = vec![
-            ColumnDef::new("id", "int64", false),
-            ColumnDef::new(&long_name, "varchar", true),
+            ColumnDef::new("id", "int64", false).unwrap(),
+            ColumnDef::new(&long_name, "varchar", true).unwrap(),
         ];
 
         let result = writer.begin_write_transaction("main", "long_cols", &columns, WriteMode::Replace);
@@ -246,11 +246,11 @@ mod postgres_tests {
         let (writer, _container) = create_writer().await;
 
         let columns = vec![
-            ColumnDef::new("id", "int64", false),
-            ColumnDef::new("value", "double", true),
-            ColumnDef::new("price", "DOUBLE", true),
-            ColumnDef::new("rate", "float", true),
-            ColumnDef::new("amount", "DOUBLE PRECISION", true),
+            ColumnDef::new("id", "int64", false).unwrap(),
+            ColumnDef::new("value", "double", true).unwrap(),
+            ColumnDef::new("price", "DOUBLE", true).unwrap(),
+            ColumnDef::new("rate", "float", true).unwrap(),
+            ColumnDef::new("amount", "DOUBLE PRECISION", true).unwrap(),
         ];
 
         let result = writer.begin_write_transaction("main", "doubles_table", &columns, WriteMode::Replace);
@@ -289,8 +289,8 @@ mod postgres_tests {
         let (writer, _container) = create_writer().await;
 
         let columns = vec![
-            ColumnDef::new("id", "int64", false),
-            ColumnDef::new("value", "varchar", true),
+            ColumnDef::new("id", "int64", false).unwrap(),
+            ColumnDef::new("value", "varchar", true).unwrap(),
         ];
 
         let result = writer
@@ -448,8 +448,8 @@ mod mysql_tests {
         let (writer, _container) = create_mysql_writer().await.unwrap();
 
         let columns = vec![
-            ColumnDef::new("id", "int64", false),
-            ColumnDef::new("name", "varchar", true),
+            ColumnDef::new("id", "int64", false).unwrap(),
+            ColumnDef::new("name", "varchar", true).unwrap(),
         ];
 
         // First insert
