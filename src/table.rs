@@ -16,7 +16,8 @@ use crate::types::{
     build_arrow_schema, build_read_schema_with_field_id_mapping, extract_parquet_field_ids,
 };
 use crate::virtual_column_exec::{
-    VIRTUAL_COL_FILE_ROW_NUMBER, VIRTUAL_COL_FILENAME, VirtualColumnExec,
+    VIRTUAL_COL_FILE_INDEX, VIRTUAL_COL_FILE_ROW_NUMBER, VIRTUAL_COL_FILENAME, VIRTUAL_COL_ROWID,
+    VIRTUAL_COL_SNAPSHOT_ID, VirtualColumnExec, VirtualColumnFileInfo, VirtualColumnSet,
 };
 
 #[cfg(feature = "write")]
@@ -167,6 +168,21 @@ impl DuckLakeTable {
             fields.push(Arc::new(Field::new(
                 VIRTUAL_COL_FILE_ROW_NUMBER,
                 DataType::Int64,
+                true,
+            )));
+            fields.push(Arc::new(Field::new(
+                VIRTUAL_COL_ROWID,
+                DataType::Int64,
+                true,
+            )));
+            fields.push(Arc::new(Field::new(
+                VIRTUAL_COL_SNAPSHOT_ID,
+                DataType::Int64,
+                true,
+            )));
+            fields.push(Arc::new(Field::new(
+                VIRTUAL_COL_FILE_INDEX,
+                DataType::UInt64,
                 true,
             )));
             Arc::new(Schema::new(fields))
@@ -1349,6 +1365,9 @@ impl TableProvider for DuckLakeTable {
         let base_field_count = self.schema.fields().len();
         let filename_idx = base_field_count;
         let row_number_idx = base_field_count + 1;
+        let rowid_idx = base_field_count + 2;
+        let snapshot_id_idx = base_field_count + 3;
+        let file_index_idx = base_field_count + 4;
 
         // Apply partition pruning to filter out files that don't match partition filters
         let partition_pruned = self.prune_files_by_partition(&self.table_files, filters);
@@ -1356,15 +1375,24 @@ impl TableProvider for DuckLakeTable {
         // Apply stats-based file pruning using per-file column statistics
         let active_files = self.prune_files_by_stats(partition_pruned, filters);
 
-        // Determine if any virtual columns are requested
-        let (needs_virtual, include_filename, include_row_number) = match projection {
-            Some(indices) => {
-                let has_filename = indices.contains(&filename_idx);
-                let has_row_number = indices.contains(&row_number_idx);
-                (has_filename || has_row_number, has_filename, has_row_number)
+        // Determine which virtual columns are requested
+        let included = match projection {
+            Some(indices) => VirtualColumnSet {
+                filename: indices.contains(&filename_idx),
+                file_row_number: indices.contains(&row_number_idx),
+                rowid: indices.contains(&rowid_idx),
+                snapshot_id: indices.contains(&snapshot_id_idx),
+                file_index: indices.contains(&file_index_idx),
             },
-            None => (true, true, true), // SELECT * includes virtual columns
+            None => VirtualColumnSet {
+                filename: true,
+                file_row_number: true,
+                rowid: true,
+                snapshot_id: true,
+                file_index: true,
+            },
         };
+        let needs_virtual = included.any();
 
         if !needs_virtual {
             // No virtual columns — use optimized grouped scan path
@@ -1415,24 +1443,45 @@ impl TableProvider for DuckLakeTable {
                 .collect()
         });
 
-        // Build VirtualColumnExec output schema: [real projected cols..., filename?, row_number?]
+        // Build VirtualColumnExec output schema: [real projected cols..., virtual cols...]
         let real_output_schema = match &real_projection {
             Some(indices) if !indices.is_empty() => Arc::new(self.schema.project(indices)?),
             Some(_) => Arc::new(Schema::empty()),
             None => self.schema.clone(),
         };
         let mut vc_fields = real_output_schema.fields().to_vec();
-        if include_filename {
+        if included.filename {
             vc_fields.push(Arc::new(Field::new(
                 VIRTUAL_COL_FILENAME,
                 DataType::Utf8,
                 true,
             )));
         }
-        if include_row_number {
+        if included.file_row_number {
             vc_fields.push(Arc::new(Field::new(
                 VIRTUAL_COL_FILE_ROW_NUMBER,
                 DataType::Int64,
+                true,
+            )));
+        }
+        if included.rowid {
+            vc_fields.push(Arc::new(Field::new(
+                VIRTUAL_COL_ROWID,
+                DataType::Int64,
+                true,
+            )));
+        }
+        if included.snapshot_id {
+            vc_fields.push(Arc::new(Field::new(
+                VIRTUAL_COL_SNAPSHOT_ID,
+                DataType::Int64,
+                true,
+            )));
+        }
+        if included.file_index {
+            vc_fields.push(Arc::new(Field::new(
+                VIRTUAL_COL_FILE_INDEX,
+                DataType::UInt64,
                 true,
             )));
         }
@@ -1440,8 +1489,14 @@ impl TableProvider for DuckLakeTable {
         let real_proj_ref = real_projection.as_ref();
 
         let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
-        for table_file in &active_files {
+        for (file_idx, table_file) in active_files.iter().enumerate() {
             let resolved_path = self.resolve_file_path(&table_file.file)?;
+            let file_info = VirtualColumnFileInfo {
+                filename: resolved_path,
+                row_id_start: table_file.row_id_start,
+                snapshot_id: table_file.snapshot_id,
+                file_index: file_idx as u64,
+            };
             let file_exec = if table_file.delete_file.is_some() {
                 self.build_exec_for_file_with_deletes(state, table_file, real_proj_ref, limit)
                     .await?
@@ -1451,19 +1506,23 @@ impl TableProvider for DuckLakeTable {
             };
             execs.push(Arc::new(VirtualColumnExec::new(
                 file_exec,
-                resolved_path,
-                include_filename,
-                include_row_number,
+                file_info,
+                included.clone(),
                 Arc::clone(&vc_output_schema),
             )));
         }
         // Add inlined data with virtual columns (empty path for inlined rows)
         if let Some(inlined_exec) = self.build_inlined_data_exec(state, real_proj_ref).await? {
+            let inlined_info = VirtualColumnFileInfo {
+                filename: String::new(),
+                row_id_start: None,
+                snapshot_id: None,
+                file_index: active_files.len() as u64,
+            };
             execs.push(Arc::new(VirtualColumnExec::new(
                 inlined_exec,
-                String::new(), // inlined data has no file path
-                include_filename,
-                include_row_number,
+                inlined_info,
+                included.clone(),
                 Arc::clone(&vc_output_schema),
             )));
         }
@@ -1488,11 +1547,20 @@ impl TableProvider for DuckLakeTable {
                     expected.push(idx);
                 }
             }
-            if include_filename {
+            if included.filename {
                 expected.push(filename_idx);
             }
-            if include_row_number {
+            if included.file_row_number {
                 expected.push(row_number_idx);
+            }
+            if included.rowid {
+                expected.push(rowid_idx);
+            }
+            if included.snapshot_id {
+                expected.push(snapshot_id_idx);
+            }
+            if included.file_index {
+                expected.push(file_index_idx);
             }
 
             if indices != expected.as_slice() {
@@ -1506,12 +1574,24 @@ impl TableProvider for DuckLakeTable {
                     }
                 }
                 let mut vc_pos = real_col_pos;
-                if include_filename {
+                if included.filename {
                     index_to_vc_pos.insert(filename_idx, vc_pos);
                     vc_pos += 1;
                 }
-                if include_row_number {
+                if included.file_row_number {
                     index_to_vc_pos.insert(row_number_idx, vc_pos);
+                    vc_pos += 1;
+                }
+                if included.rowid {
+                    index_to_vc_pos.insert(rowid_idx, vc_pos);
+                    vc_pos += 1;
+                }
+                if included.snapshot_id {
+                    index_to_vc_pos.insert(snapshot_id_idx, vc_pos);
+                    vc_pos += 1;
+                }
+                if included.file_index {
+                    index_to_vc_pos.insert(file_index_idx, vc_pos);
                 }
 
                 use datafusion::physical_expr::expressions::Column;

@@ -336,8 +336,8 @@ async fn cross_engine_duckdb_write_df_read_virtual_columns() {
     // SELECT * should include virtual columns
     let rows = df_query(&ctx, "SELECT * FROM ducklake.main.items ORDER BY id").await;
     assert_eq!(rows.len(), 3);
-    // Schema should have id, name, filename, file_row_number (4 columns)
-    assert_eq!(rows[0].len(), 4, "SELECT * should include virtual columns");
+    // Schema should have id, name, filename, file_row_number, rowid, snapshot_id, file_index (7 columns)
+    assert_eq!(rows[0].len(), 7, "SELECT * should include virtual columns");
 
     // Verify real data + virtual columns have values
     assert_eq!(rows[0][0], "1");
@@ -351,6 +351,19 @@ async fn cross_engine_duckdb_write_df_read_virtual_columns() {
     let mut row_numbers: Vec<i64> = rows.iter().map(|r| r[3].parse().unwrap()).collect();
     row_numbers.sort();
     assert_eq!(row_numbers, vec![0, 1, 2]);
+
+    // rowid values should be 0, 1, 2 (single file, row_id_start=0)
+    let mut rowids: Vec<i64> = rows.iter().map(|r| r[4].parse().unwrap()).collect();
+    rowids.sort();
+    assert_eq!(rowids, vec![0, 1, 2]);
+
+    // snapshot_id should be non-zero
+    let snap_id: i64 = rows[0][5].parse().unwrap();
+    assert!(snap_id > 0, "snapshot_id should be positive");
+
+    // file_index should be 0 (only one file)
+    let file_idx: u64 = rows[0][6].parse().unwrap();
+    assert_eq!(file_idx, 0);
 }
 
 /// Virtual columns work with DELETE operations.

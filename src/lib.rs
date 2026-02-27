@@ -101,7 +101,8 @@ pub use schema::DuckLakeSchema;
 pub use table::DuckLakeTable;
 pub use table_functions::register_ducklake_functions;
 pub use virtual_column_exec::{
-    VIRTUAL_COL_FILE_ROW_NUMBER, VIRTUAL_COL_FILENAME, VirtualColumnExec,
+    VIRTUAL_COL_FILE_INDEX, VIRTUAL_COL_FILE_ROW_NUMBER, VIRTUAL_COL_FILENAME, VIRTUAL_COL_ROWID,
+    VIRTUAL_COL_SNAPSHOT_ID, VirtualColumnExec, VirtualColumnFileInfo, VirtualColumnSet,
 };
 
 // Re-export compaction functions (DuckDB-specific)

@@ -476,7 +476,7 @@ async fn test_read_parquet_with_more_columns_than_schema() -> DataFusionResult<(
                 let schema = batches[0].schema();
                 let col_count = schema.fields().len();
                 eprintln!(
-                    "[#704 column drop read] Columns returned: {} (expected 2 without virtual cols, up to 4 with virtual cols)",
+                    "[#704 column drop read] Columns returned: {} (expected 2 without virtual cols, up to 7 with virtual cols)",
                     col_count
                 );
                 // Base columns should be a and b only
@@ -484,7 +484,13 @@ async fn test_read_parquet_with_more_columns_than_schema() -> DataFusionResult<(
                     .fields()
                     .iter()
                     .map(|f| f.name().as_str())
-                    .filter(|n| *n != "filename" && *n != "file_row_number")
+                    .filter(|n| {
+                        *n != "filename"
+                            && *n != "file_row_number"
+                            && *n != "rowid"
+                            && *n != "snapshot_id"
+                            && *n != "file_index"
+                    })
                     .collect();
                 assert_eq!(
                     base_names,

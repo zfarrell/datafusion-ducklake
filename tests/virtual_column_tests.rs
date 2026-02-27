@@ -78,13 +78,16 @@ async fn test_select_star_includes_virtual_columns() {
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 3);
 
-    // Schema should have 4 columns: id, name, filename, file_row_number
+    // Schema should have 7 columns: id, name, filename, file_row_number, rowid, snapshot_id, file_index
     let schema = batches[0].schema();
-    assert_eq!(schema.fields().len(), 4);
+    assert_eq!(schema.fields().len(), 7);
     assert_eq!(schema.field(0).name(), "id");
     assert_eq!(schema.field(1).name(), "name");
     assert_eq!(schema.field(2).name(), "filename");
     assert_eq!(schema.field(3).name(), "file_row_number");
+    assert_eq!(schema.field(4).name(), "rowid");
+    assert_eq!(schema.field(5).name(), "snapshot_id");
+    assert_eq!(schema.field(6).name(), "file_index");
 
     // Verify filename is non-empty and ends with .parquet
     let filename_col = batches[0]

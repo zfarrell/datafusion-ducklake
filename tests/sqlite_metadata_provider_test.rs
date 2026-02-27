@@ -34,7 +34,21 @@ async fn init_schema(pool: &SqlitePool) -> anyhow::Result<()> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS ducklake_snapshot (
             snapshot_id INTEGER PRIMARY KEY,
-            snapshot_time TEXT
+            snapshot_time TEXT,
+            schema_version INTEGER
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS ducklake_snapshot_changes (
+            snapshot_id INTEGER PRIMARY KEY,
+            changes_made TEXT,
+            author TEXT,
+            commit_message TEXT,
+            commit_extra_info TEXT,
+            FOREIGN KEY (snapshot_id) REFERENCES ducklake_snapshot(snapshot_id)
         )",
     )
     .execute(pool)
@@ -58,6 +72,7 @@ async fn init_schema(pool: &SqlitePool) -> anyhow::Result<()> {
             table_id INTEGER PRIMARY KEY,
             schema_id INTEGER NOT NULL,
             table_name TEXT NOT NULL,
+            table_uuid TEXT,
             path TEXT NOT NULL,
             path_is_relative INTEGER NOT NULL,
             begin_snapshot INTEGER NOT NULL,
@@ -94,6 +109,7 @@ async fn init_schema(pool: &SqlitePool) -> anyhow::Result<()> {
             footer_size INTEGER,
             encryption_key TEXT,
             record_count INTEGER,
+            row_id_start INTEGER,
             begin_snapshot INTEGER NOT NULL DEFAULT 1,
             end_snapshot INTEGER,
             FOREIGN KEY (table_id) REFERENCES ducklake_table(table_id)
@@ -910,11 +926,11 @@ async fn test_query_real_parquet_files() {
     assert_eq!(batch.num_rows(), 4, "Should have 4 rows");
 
     // Verify schema
-    // 3 real columns + 2 virtual columns (filename, file_row_number)
+    // 3 real columns + 5 virtual columns (filename, file_row_number, rowid, snapshot_id, file_index)
     assert_eq!(
         batch.num_columns(),
-        5,
-        "Should have 5 columns (3 real + 2 virtual)"
+        8,
+        "Should have 8 columns (3 real + 5 virtual)"
     );
     let schema = batch.schema();
     assert_eq!(schema.field(0).name(), "id");

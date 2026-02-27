@@ -1,14 +1,15 @@
 //! Custom execution plan for appending virtual columns
 //!
 //! This module implements a DataFusion execution plan that wraps a scan
-//! and appends virtual columns (`filename` and `file_row_number`) to the output.
+//! and appends virtual columns (`filename`, `file_row_number`, `rowid`,
+//! `snapshot_id`, `file_index`) to the output.
 
 use std::any::Any;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use arrow::array::{Int64Array, StringArray};
+use arrow::array::{Int64Array, StringArray, UInt64Array};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
@@ -24,18 +25,51 @@ use futures::Stream;
 pub const VIRTUAL_COL_FILENAME: &str = "filename";
 /// Virtual column name for the row number within a file
 pub const VIRTUAL_COL_FILE_ROW_NUMBER: &str = "file_row_number";
+/// Virtual column name for the global row ID
+pub const VIRTUAL_COL_ROWID: &str = "rowid";
+/// Virtual column name for the snapshot ID when the file was committed
+pub const VIRTUAL_COL_SNAPSHOT_ID: &str = "snapshot_id";
+/// Virtual column name for the 0-based file index within the table
+pub const VIRTUAL_COL_FILE_INDEX: &str = "file_index";
+
+/// Per-file metadata needed to populate virtual columns
+#[derive(Debug, Clone)]
+pub struct VirtualColumnFileInfo {
+    /// The filename/path for the `filename` virtual column
+    pub filename: String,
+    /// Starting row ID for this file (from `ducklake_data_file.row_id_start`)
+    pub row_id_start: Option<i64>,
+    /// Snapshot ID when this file was committed (from `ducklake_data_file.begin_snapshot`)
+    pub snapshot_id: Option<i64>,
+    /// 0-based ordinal position of this file in the table's file list
+    pub file_index: u64,
+}
+
+/// Tracks which virtual columns are requested in the query
+#[derive(Debug, Clone, Default)]
+pub struct VirtualColumnSet {
+    pub filename: bool,
+    pub file_row_number: bool,
+    pub rowid: bool,
+    pub snapshot_id: bool,
+    pub file_index: bool,
+}
+
+impl VirtualColumnSet {
+    pub fn any(&self) -> bool {
+        self.filename || self.file_row_number || self.rowid || self.snapshot_id || self.file_index
+    }
+}
 
 /// Custom execution plan that appends virtual columns to the output
 #[derive(Debug)]
 pub struct VirtualColumnExec {
     /// The input execution plan
     input: Arc<dyn ExecutionPlan>,
-    /// The filename to populate the `filename` virtual column with
-    filename: String,
-    /// Whether to include the `filename` virtual column
-    include_filename: bool,
-    /// Whether to include the `file_row_number` virtual column
-    include_row_number: bool,
+    /// Per-file metadata for virtual column values
+    file_info: VirtualColumnFileInfo,
+    /// Which virtual columns to include
+    included: VirtualColumnSet,
     /// The output schema (input schema + virtual columns)
     output_schema: SchemaRef,
     /// Cached plan properties
@@ -45,9 +79,8 @@ pub struct VirtualColumnExec {
 impl VirtualColumnExec {
     pub fn new(
         input: Arc<dyn ExecutionPlan>,
-        filename: String,
-        include_filename: bool,
-        include_row_number: bool,
+        file_info: VirtualColumnFileInfo,
+        included: VirtualColumnSet,
         output_schema: SchemaRef,
     ) -> Self {
         let eq_props = EquivalenceProperties::new(Arc::clone(&output_schema));
@@ -60,9 +93,8 @@ impl VirtualColumnExec {
 
         Self {
             input,
-            filename,
-            include_filename,
-            include_row_number,
+            file_info,
+            included,
             output_schema,
             properties,
         }
@@ -73,8 +105,13 @@ impl DisplayAs for VirtualColumnExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "VirtualColumnExec: file={}, filename={}, row_number={}",
-            self.filename, self.include_filename, self.include_row_number
+            "VirtualColumnExec: file={}, filename={}, row_number={}, rowid={}, snapshot_id={}, file_index={}",
+            self.file_info.filename,
+            self.included.filename,
+            self.included.file_row_number,
+            self.included.rowid,
+            self.included.snapshot_id,
+            self.included.file_index,
         )
     }
 }
@@ -108,9 +145,8 @@ impl ExecutionPlan for VirtualColumnExec {
 
         Ok(Arc::new(VirtualColumnExec::new(
             Arc::clone(&children[0]),
-            self.filename.clone(),
-            self.include_filename,
-            self.include_row_number,
+            self.file_info.clone(),
+            self.included.clone(),
             Arc::clone(&self.output_schema),
         )))
     }
@@ -124,9 +160,8 @@ impl ExecutionPlan for VirtualColumnExec {
 
         Ok(Box::pin(VirtualColumnStream {
             input: input_stream,
-            filename: self.filename.clone(),
-            include_filename: self.include_filename,
-            include_row_number: self.include_row_number,
+            file_info: self.file_info.clone(),
+            included: self.included.clone(),
             row_offset: 0,
             output_schema: Arc::clone(&self.output_schema),
         }))
@@ -136,9 +171,8 @@ impl ExecutionPlan for VirtualColumnExec {
 /// Stream that appends virtual columns to each output batch
 struct VirtualColumnStream {
     input: SendableRecordBatchStream,
-    filename: String,
-    include_filename: bool,
-    include_row_number: bool,
+    file_info: VirtualColumnFileInfo,
+    included: VirtualColumnSet,
     row_offset: i64,
     output_schema: SchemaRef,
 }
@@ -155,18 +189,38 @@ impl Stream for VirtualColumnStream {
                 // Start with input columns
                 let mut columns: Vec<Arc<dyn arrow::array::Array>> = batch.columns().to_vec();
 
-                // Append filename column if requested
-                if self.include_filename {
-                    let filename_array = StringArray::from(vec![self.filename.as_str(); num_rows]);
+                // Append virtual columns in schema order: filename, file_row_number, rowid, snapshot_id, file_index
+                if self.included.filename {
+                    let filename_array =
+                        StringArray::from(vec![self.file_info.filename.as_str(); num_rows]);
                     columns.push(Arc::new(filename_array));
                 }
 
-                // Append file_row_number column if requested
-                if self.include_row_number {
+                if self.included.file_row_number {
                     let row_numbers: Vec<i64> =
                         (row_offset..row_offset + num_rows as i64).collect();
                     let row_number_array = Int64Array::from(row_numbers);
                     columns.push(Arc::new(row_number_array));
+                }
+
+                if self.included.rowid {
+                    let row_id_start = self.file_info.row_id_start.unwrap_or(0);
+                    let rowids: Vec<i64> = (row_offset..row_offset + num_rows as i64)
+                        .map(|offset| row_id_start + offset)
+                        .collect();
+                    columns.push(Arc::new(Int64Array::from(rowids)));
+                }
+
+                if self.included.snapshot_id {
+                    let snap_id = self.file_info.snapshot_id.unwrap_or(0);
+                    let snapshot_ids = Int64Array::from(vec![snap_id; num_rows]);
+                    columns.push(Arc::new(snapshot_ids));
+                }
+
+                if self.included.file_index {
+                    let file_idx = self.file_info.file_index;
+                    let file_indices = UInt64Array::from(vec![file_idx; num_rows]);
+                    columns.push(Arc::new(file_indices));
                 }
 
                 // Update row offset
@@ -176,7 +230,7 @@ impl Stream for VirtualColumnStream {
                     .map_err(|e| DataFusionError::ArrowError(Box::new(e), None));
 
                 Poll::Ready(Some(result))
-            },
+            }
             Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
@@ -204,19 +258,35 @@ mod tests {
             Field::new("id", DataType::Int32, false),
             Field::new(VIRTUAL_COL_FILENAME, DataType::Utf8, true),
             Field::new(VIRTUAL_COL_FILE_ROW_NUMBER, DataType::Int64, true),
+            Field::new(VIRTUAL_COL_ROWID, DataType::Int64, true),
+            Field::new(VIRTUAL_COL_SNAPSHOT_ID, DataType::Int64, true),
+            Field::new(VIRTUAL_COL_FILE_INDEX, DataType::UInt64, true),
         ]));
 
         let stream = VirtualColumnStream {
             input: Box::pin(EmptyRecordBatchStream::new(input_schema)),
-            filename: "test.parquet".to_string(),
-            include_filename: true,
-            include_row_number: true,
+            file_info: VirtualColumnFileInfo {
+                filename: "test.parquet".to_string(),
+                row_id_start: Some(0),
+                snapshot_id: Some(1),
+                file_index: 0,
+            },
+            included: VirtualColumnSet {
+                filename: true,
+                file_row_number: true,
+                rowid: true,
+                snapshot_id: true,
+                file_index: true,
+            },
             row_offset: 0,
             output_schema: Arc::clone(&output_schema),
         };
 
-        assert_eq!(stream.schema().fields().len(), 3);
+        assert_eq!(stream.schema().fields().len(), 6);
         assert_eq!(stream.schema().field(1).name(), VIRTUAL_COL_FILENAME);
         assert_eq!(stream.schema().field(2).name(), VIRTUAL_COL_FILE_ROW_NUMBER);
+        assert_eq!(stream.schema().field(3).name(), VIRTUAL_COL_ROWID);
+        assert_eq!(stream.schema().field(4).name(), VIRTUAL_COL_SNAPSHOT_ID);
+        assert_eq!(stream.schema().field(5).name(), VIRTUAL_COL_FILE_INDEX);
     }
 }
