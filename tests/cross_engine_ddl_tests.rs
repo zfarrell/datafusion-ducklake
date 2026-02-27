@@ -552,6 +552,155 @@ async fn cross_engine_duckdb_view_roundtrip() {
 }
 
 // =============================================================================
+// ALTER VIEW RENAME: Cross-engine tests
+// =============================================================================
+
+/// DF creates a view → DF renames it → DF reads it under the new name.
+#[tokio::test(flavor = "multi_thread")]
+async fn cross_engine_df_creates_view_df_renames() {
+    let env = setup_sqlite_env_with_table("main", "users", &[make_test_batch()]).await;
+
+    // Create view via MetadataWriter
+    let conn_str = format!("sqlite:{}?mode=rwc", env.catalog_db_path.display());
+    let provider = SqliteMetadataProvider::new(&conn_str).await.unwrap();
+    let writer = SqliteMetadataWriter::new(&conn_str).await.unwrap();
+
+    let snapshot = provider.get_current_snapshot().unwrap();
+    let schema_meta = provider
+        .get_schema_by_name("main", snapshot)
+        .unwrap()
+        .unwrap();
+    let (view_id, _) = writer
+        .create_view(
+            schema_meta.schema_id,
+            "old_view",
+            "SELECT id, name FROM users WHERE name = 'Bob'",
+        )
+        .unwrap();
+
+    // Verify old name works
+    let ctx = open_readonly_df_sqlite(&env.catalog_db_path).await;
+    let rows = df_query(&ctx, "SELECT id, name FROM ducklake.main.old_view").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0], vec!["2", "Bob"]);
+
+    // Rename the view
+    writer.rename_view(view_id, "new_view").unwrap();
+
+    // Fresh context: new name should work
+    let ctx2 = open_readonly_df_sqlite(&env.catalog_db_path).await;
+    let rows2 = df_query(&ctx2, "SELECT id, name FROM ducklake.main.new_view").await;
+    assert_eq!(rows2.len(), 1);
+    assert_eq!(rows2[0], vec!["2", "Bob"]);
+
+    // Old name should not work
+    let result = df_query_result(&ctx2, "SELECT * FROM ducklake.main.old_view").await;
+    assert!(result.is_err(), "Old view name should not be accessible");
+}
+
+/// DuckDB creates a view → DF renames it → DF reads under new name.
+#[tokio::test(flavor = "multi_thread")]
+async fn cross_engine_duckdb_creates_view_df_renames() {
+    let env = setup_sqlite_env_with_table("main", "users", &[make_test_batch()]).await;
+
+    // Create view via MetadataWriter (simulating DuckDB-created view)
+    let conn_str = format!("sqlite:{}?mode=rwc", env.catalog_db_path.display());
+    let provider = SqliteMetadataProvider::new(&conn_str).await.unwrap();
+    let writer = SqliteMetadataWriter::new(&conn_str).await.unwrap();
+
+    let snapshot = provider.get_current_snapshot().unwrap();
+    let schema_meta = provider
+        .get_schema_by_name("main", snapshot)
+        .unwrap()
+        .unwrap();
+    let (view_id, _) = writer
+        .create_view(
+            schema_meta.schema_id,
+            "original_view",
+            "SELECT name FROM users",
+        )
+        .unwrap();
+
+    // DF renames
+    writer.rename_view(view_id, "renamed_view").unwrap();
+
+    // DF reads the renamed view
+    let ctx = open_readonly_df_sqlite(&env.catalog_db_path).await;
+    let rows = df_query(&ctx, "SELECT name FROM ducklake.main.renamed_view ORDER BY name").await;
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0][0], "Alice");
+
+    // Verify renamed view appears in table_names() and table_exist()
+    let catalog = ctx.catalog("ducklake").unwrap();
+    let schema = catalog.schema("main").unwrap();
+    assert!(
+        schema.table_exist("renamed_view"),
+        "Renamed view should exist"
+    );
+    assert!(
+        !schema.table_exist("original_view"),
+        "Original view name should not exist"
+    );
+    let names = schema.table_names();
+    assert!(
+        names.contains(&"renamed_view".to_string()),
+        "Renamed view should appear in table_names: {:?}",
+        names
+    );
+}
+
+/// Rename a nonexistent view should fail.
+#[tokio::test(flavor = "multi_thread")]
+async fn cross_engine_rename_nonexistent_view_fails() {
+    let env = setup_sqlite_env_with_table("main", "users", &[make_test_batch()]).await;
+
+    let conn_str = format!("sqlite:{}?mode=rwc", env.catalog_db_path.display());
+    let writer = SqliteMetadataWriter::new(&conn_str).await.unwrap();
+
+    let result = writer.rename_view(999, "new_name");
+    assert!(result.is_err(), "Renaming nonexistent view should fail");
+}
+
+/// Rename view preserves the SQL definition, so queries still work correctly.
+#[tokio::test(flavor = "multi_thread")]
+async fn cross_engine_rename_view_preserves_sql() {
+    let env = setup_sqlite_env_with_table("main", "users", &[make_test_batch()]).await;
+
+    let conn_str = format!("sqlite:{}?mode=rwc", env.catalog_db_path.display());
+    let provider = SqliteMetadataProvider::new(&conn_str).await.unwrap();
+    let writer = SqliteMetadataWriter::new(&conn_str).await.unwrap();
+
+    let snapshot = provider.get_current_snapshot().unwrap();
+    let schema_meta = provider
+        .get_schema_by_name("main", snapshot)
+        .unwrap()
+        .unwrap();
+
+    // Create a filtered view
+    let (view_id, _) = writer
+        .create_view(
+            schema_meta.schema_id,
+            "filtered",
+            "SELECT id, name FROM users WHERE id > 1",
+        )
+        .unwrap();
+
+    // Rename
+    writer.rename_view(view_id, "filtered_renamed").unwrap();
+
+    // Query the renamed view — should still have the filter
+    let ctx = open_readonly_df_sqlite(&env.catalog_db_path).await;
+    let rows = df_query(
+        &ctx,
+        "SELECT id, name FROM ducklake.main.filtered_renamed ORDER BY id",
+    )
+    .await;
+    assert_eq!(rows.len(), 2); // id=2 Bob, id=3 Charlie
+    assert_eq!(rows[0][0], "2");
+    assert_eq!(rows[1][0], "3");
+}
+
+// =============================================================================
 // DROP TABLE: Cross-engine tests
 // =============================================================================
 

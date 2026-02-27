@@ -1268,6 +1268,12 @@ impl MetadataWriter for MySqlMetadataWriter {
         })
     }
 
+    fn rename_view(&self, _view_id: i64, _new_name: &str) -> Result<i64> {
+        Err(crate::error::DuckLakeError::Internal(
+            "rename_view not yet implemented for MySQL".to_string(),
+        ))
+    }
+
     fn alter_table(&self, table_id: i64, op: &AlterTableOp) -> Result<i64> {
         block_on(async {
             let mut tx = self.pool.begin().await?;

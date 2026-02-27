@@ -2,6 +2,7 @@
 
 use datafusion::catalog::TableFunctionImpl;
 use datafusion::common::{Result as DataFusionResult, ScalarValue, plan_err};
+use datafusion::error::DataFusionError;
 use datafusion::datasource::TableProvider;
 use datafusion::logical_expr::Expr;
 use std::sync::Arc;
@@ -59,7 +60,11 @@ impl TableFunctionImpl for DucklakeTableInfoFunction {
             return plan_err!("ducklake_table_info() takes no arguments");
         }
 
-        Ok(Arc::new(TableInfoTable::new(self.provider.clone())))
+        let snapshot_id = self
+            .provider
+            .get_current_snapshot()
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(Arc::new(TableInfoTable::new(self.provider.clone(), snapshot_id)))
     }
 }
 

@@ -1186,6 +1186,92 @@ impl MetadataWriter for SqliteMetadataWriter {
         })
     }
 
+    fn rename_view(&self, view_id: i64, new_name: &str) -> Result<i64> {
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+
+            // Fetch the current active view row
+            let view_row = sqlx::query(
+                "SELECT schema_id, view_uuid, sql, dialect, column_aliases
+                 FROM ducklake_view
+                 WHERE view_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(view_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+
+            let Some(view_row) = view_row else {
+                return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                    "View with id {} not found or already dropped",
+                    view_id
+                )));
+            };
+
+            let schema_id: i64 = view_row.try_get(0)?;
+            let view_uuid: Option<String> = view_row.try_get(1)?;
+            let sql: String = view_row.try_get(2)?;
+            let dialect: Option<String> = view_row.try_get(3)?;
+            let column_aliases: Option<String> = view_row.try_get(4)?;
+
+            // Create a new snapshot
+            let row = sqlx::query(
+                "INSERT INTO ducklake_snapshot (snapshot_time) VALUES (CURRENT_TIMESTAMP) RETURNING snapshot_id",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            let snapshot_id: i64 = row.try_get(0)?;
+
+            // End the existing view row
+            sqlx::query(
+                "UPDATE ducklake_view SET end_snapshot = ?
+                 WHERE view_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(snapshot_id)
+            .bind(view_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // Insert new view row with updated name (same view_id, same SQL)
+            sqlx::query(
+                "INSERT INTO ducklake_view (view_id, view_uuid, schema_id, view_name, dialect, sql, column_aliases, begin_snapshot)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(view_id)
+            .bind(&view_uuid)
+            .bind(schema_id)
+            .bind(new_name)
+            .bind(&dialect)
+            .bind(&sql)
+            .bind(&column_aliases)
+            .bind(snapshot_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // Record change for conflict detection
+            sqlx::query(
+                "INSERT INTO _df_change_tracking (snapshot_id, change_type, table_id)
+                 VALUES (?, 'ALTER_VIEW', ?)",
+            )
+            .bind(snapshot_id)
+            .bind(view_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // Record in spec-compliant snapshot changes
+            sqlx::query(
+                "INSERT OR REPLACE INTO ducklake_snapshot_changes (snapshot_id, changes_made)
+                 VALUES (?, ?)",
+            )
+            .bind(snapshot_id)
+            .bind(format!("Renamed view (id={})", view_id))
+            .execute(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
+            Ok(snapshot_id)
+        })
+    }
+
     fn alter_table(&self, table_id: i64, op: &AlterTableOp) -> Result<i64> {
         block_on(async {
             let mut tx = self.pool.begin().await?;
@@ -2396,5 +2482,65 @@ mod tests {
         let columns2 = writer.get_active_columns(table_id).unwrap();
         assert_eq!(columns2[1].0, "name");
         assert!(columns2[1].2); // nullable again
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_rename_view() {
+        let (writer, _temp) = create_test_writer().await;
+        let snapshot_id = writer.create_snapshot().unwrap();
+        let (schema_id, _) = writer
+            .get_or_create_schema("main", None, snapshot_id)
+            .unwrap();
+
+        // Create a view
+        let (view_id, create_snap) = writer
+            .create_view(schema_id, "old_view", "SELECT 1 AS x")
+            .unwrap();
+
+        // Rename the view
+        let rename_snap = writer.rename_view(view_id, "new_view").unwrap();
+        assert!(rename_snap > create_snap);
+
+        // Verify: old row is ended, new row has new name
+        let rows = block_on(async {
+            sqlx::query(
+                "SELECT view_name, end_snapshot FROM ducklake_view
+                 WHERE view_id = ? ORDER BY begin_snapshot",
+            )
+            .bind(view_id)
+            .fetch_all(&writer.pool)
+            .await
+            .unwrap()
+        });
+        assert_eq!(rows.len(), 2);
+        let old_name: String = rows[0].try_get(0).unwrap();
+        let old_end: Option<i64> = rows[0].try_get(1).unwrap();
+        let new_name: String = rows[1].try_get(0).unwrap();
+        let new_end: Option<i64> = rows[1].try_get(1).unwrap();
+        assert_eq!(old_name, "old_view");
+        assert!(old_end.is_some());
+        assert_eq!(new_name, "new_view");
+        assert!(new_end.is_none());
+
+        // Verify SQL is preserved
+        let sql_row = block_on(async {
+            sqlx::query(
+                "SELECT sql FROM ducklake_view
+                 WHERE view_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(view_id)
+            .fetch_one(&writer.pool)
+            .await
+            .unwrap()
+        });
+        let sql: String = sql_row.try_get(0).unwrap();
+        assert_eq!(sql, "SELECT 1 AS x");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_rename_nonexistent_view_fails() {
+        let (writer, _temp) = create_test_writer().await;
+        let result = writer.rename_view(999, "new_name");
+        assert!(result.is_err());
     }
 }

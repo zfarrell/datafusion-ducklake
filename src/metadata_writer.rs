@@ -505,6 +505,13 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// Creates a new snapshot and marks the view as dropped.
     /// Returns the snapshot_id created for the drop.
     fn drop_view(&self, view_id: i64) -> Result<i64>;
+
+    /// Rename a view in the catalog.
+    ///
+    /// Creates a new snapshot, ends the existing view row, and inserts a new row
+    /// with the updated name. The view's SQL definition does NOT change.
+    /// Returns the snapshot_id created for the rename.
+    fn rename_view(&self, view_id: i64, new_name: &str) -> Result<i64>;
 }
 
 #[cfg(test)]

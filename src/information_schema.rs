@@ -133,11 +133,12 @@ impl TableProvider for SnapshotsTable {
 #[derive(Debug)]
 pub struct SchemataTable {
     provider: Arc<dyn MetadataProvider>,
+    snapshot_id: i64,
     schema: SchemaRef,
 }
 
 impl SchemataTable {
-    pub fn new(provider: Arc<dyn MetadataProvider>) -> Self {
+    pub fn new(provider: Arc<dyn MetadataProvider>, snapshot_id: i64) -> Self {
         let schema = Arc::new(Schema::new(vec![
             Field::new("snapshot_id", DataType::Int64, false),
             Field::new("schema_id", DataType::Int64, false),
@@ -147,15 +148,13 @@ impl SchemataTable {
         ]));
         Self {
             provider,
+            snapshot_id,
             schema,
         }
     }
 
     fn query_schemata(&self) -> DataFusionResult<RecordBatch> {
-        let snapshot_id = self
-            .provider
-            .get_current_snapshot()
-            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        let snapshot_id = self.snapshot_id;
 
         let schemas = self
             .provider
@@ -228,11 +227,12 @@ impl TableProvider for SchemataTable {
 #[derive(Debug)]
 pub struct TablesTable {
     provider: Arc<dyn MetadataProvider>,
+    snapshot_id: i64,
     schema: SchemaRef,
 }
 
 impl TablesTable {
-    pub fn new(provider: Arc<dyn MetadataProvider>) -> Self {
+    pub fn new(provider: Arc<dyn MetadataProvider>, snapshot_id: i64) -> Self {
         let schema = Arc::new(Schema::new(vec![
             Field::new("snapshot_id", DataType::Int64, false),
             Field::new("schema_name", DataType::Utf8, false),
@@ -243,15 +243,13 @@ impl TablesTable {
         ]));
         Self {
             provider,
+            snapshot_id,
             schema,
         }
     }
 
     fn query_tables(&self) -> DataFusionResult<RecordBatch> {
-        let snapshot_id = self
-            .provider
-            .get_current_snapshot()
-            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        let snapshot_id = self.snapshot_id;
 
         // Single bulk query instead of N+1 queries
         let all_tables = self
@@ -339,11 +337,12 @@ impl TableProvider for TablesTable {
 #[derive(Debug)]
 pub struct ColumnsTable {
     provider: Arc<dyn MetadataProvider>,
+    snapshot_id: i64,
     schema: SchemaRef,
 }
 
 impl ColumnsTable {
-    pub fn new(provider: Arc<dyn MetadataProvider>) -> Self {
+    pub fn new(provider: Arc<dyn MetadataProvider>, snapshot_id: i64) -> Self {
         let schema = Arc::new(Schema::new(vec![
             Field::new("schema_name", DataType::Utf8, false),
             Field::new("table_name", DataType::Utf8, false),
@@ -353,15 +352,13 @@ impl ColumnsTable {
         ]));
         Self {
             provider,
+            snapshot_id,
             schema,
         }
     }
 
     fn query_columns(&self) -> DataFusionResult<RecordBatch> {
-        let snapshot_id = self
-            .provider
-            .get_current_snapshot()
-            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        let snapshot_id = self.snapshot_id;
 
         // Single bulk query instead of N*M queries
         let all_columns_data = self
@@ -446,11 +443,12 @@ impl TableProvider for ColumnsTable {
 #[derive(Debug)]
 pub struct TableInfoTable {
     provider: Arc<dyn MetadataProvider>,
+    snapshot_id: i64,
     schema: SchemaRef,
 }
 
 impl TableInfoTable {
-    pub fn new(provider: Arc<dyn MetadataProvider>) -> Self {
+    pub fn new(provider: Arc<dyn MetadataProvider>, snapshot_id: i64) -> Self {
         let schema = Arc::new(Schema::new(vec![
             Field::new("table_name", DataType::Utf8, false),
             Field::new("schema_id", DataType::Int64, false),
@@ -463,15 +461,13 @@ impl TableInfoTable {
         ]));
         Self {
             provider,
+            snapshot_id,
             schema,
         }
     }
 
     fn query_table_info(&self) -> DataFusionResult<RecordBatch> {
-        let snapshot_id = self
-            .provider
-            .get_current_snapshot()
-            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        let snapshot_id = self.snapshot_id;
 
         // Single bulk query instead of N*M queries
         let all_files = self
@@ -620,11 +616,12 @@ impl TableProvider for TableInfoTable {
 #[derive(Debug)]
 pub struct FilesTable {
     provider: Arc<dyn MetadataProvider>,
+    snapshot_id: i64,
     schema: SchemaRef,
 }
 
 impl FilesTable {
-    pub fn new(provider: Arc<dyn MetadataProvider>) -> Self {
+    pub fn new(provider: Arc<dyn MetadataProvider>, snapshot_id: i64) -> Self {
         let schema = Arc::new(Schema::new(vec![
             Field::new("schema_name", DataType::Utf8, false),
             Field::new("table_name", DataType::Utf8, false),
@@ -635,15 +632,13 @@ impl FilesTable {
         ]));
         Self {
             provider,
+            snapshot_id,
             schema,
         }
     }
 
     fn query_files(&self) -> DataFusionResult<RecordBatch> {
-        let snapshot_id = self
-            .provider
-            .get_current_snapshot()
-            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        let snapshot_id = self.snapshot_id;
 
         // Single bulk query instead of N*M queries
         let all_files_data = self
@@ -739,12 +734,15 @@ impl TableProvider for FilesTable {
 #[derive(Debug)]
 pub(crate) struct InformationSchemaProvider {
     provider: Arc<dyn MetadataProvider>,
+    /// Pinned snapshot_id from the catalog for consistency across tables
+    snapshot_id: i64,
 }
 
 impl InformationSchemaProvider {
-    pub fn new(provider: Arc<dyn MetadataProvider>) -> Self {
+    pub fn new(provider: Arc<dyn MetadataProvider>, snapshot_id: i64) -> Self {
         Self {
             provider,
+            snapshot_id,
         }
     }
 }
@@ -770,11 +768,11 @@ impl SchemaProvider for InformationSchemaProvider {
         // Create table provider on-demand - queries will be live
         let provider: Option<Arc<dyn TableProvider>> = match name {
             "snapshots" => Some(Arc::new(SnapshotsTable::new(self.provider.clone()))),
-            "schemata" => Some(Arc::new(SchemataTable::new(self.provider.clone()))),
-            "tables" => Some(Arc::new(TablesTable::new(self.provider.clone()))),
-            "table_info" => Some(Arc::new(TableInfoTable::new(self.provider.clone()))),
-            "columns" => Some(Arc::new(ColumnsTable::new(self.provider.clone()))),
-            "files" => Some(Arc::new(FilesTable::new(self.provider.clone()))),
+            "schemata" => Some(Arc::new(SchemataTable::new(self.provider.clone(), self.snapshot_id))),
+            "tables" => Some(Arc::new(TablesTable::new(self.provider.clone(), self.snapshot_id))),
+            "table_info" => Some(Arc::new(TableInfoTable::new(self.provider.clone(), self.snapshot_id))),
+            "columns" => Some(Arc::new(ColumnsTable::new(self.provider.clone(), self.snapshot_id))),
+            "files" => Some(Arc::new(FilesTable::new(self.provider.clone(), self.snapshot_id))),
             _ => None,
         };
         Ok(provider)

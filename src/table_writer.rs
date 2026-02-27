@@ -240,6 +240,14 @@ impl TableWriteSession {
             .zip(expected_schema.fields().iter())
             .enumerate()
         {
+            if batch_field.name() != expected_field.name() {
+                return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                    "Schema mismatch at column {}: batch has name '{}', expected '{}'",
+                    i,
+                    batch_field.name(),
+                    expected_field.name()
+                )));
+            }
             if batch_field.data_type() != expected_field.data_type() {
                 return Err(crate::error::DuckLakeError::InvalidConfig(format!(
                     "Schema mismatch at column {}: batch has type {:?}, expected {:?}",
@@ -503,9 +511,14 @@ pub(crate) fn calculate_footer_size_from_bytes(buffer: &[u8]) -> Result<i64> {
     }
 
     let metadata_len =
-        i32::from_le_bytes([footer_bytes[0], footer_bytes[1], footer_bytes[2], footer_bytes[3]])
-            as i64;
-    Ok(metadata_len)
+        i32::from_le_bytes([footer_bytes[0], footer_bytes[1], footer_bytes[2], footer_bytes[3]]);
+    if metadata_len < 0 {
+        return Err(crate::error::DuckLakeError::Internal(format!(
+            "Invalid Parquet file: negative metadata length {}",
+            metadata_len
+        )));
+    }
+    Ok(metadata_len as i64)
 }
 
 #[cfg(test)]

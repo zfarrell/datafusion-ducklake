@@ -269,3 +269,64 @@ async fn test_drop_view() {
     assert!(!schema2.table_exist("my_view"));
     assert!(schema2.table_exist("test_table")); // table still exists
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_rename_view() {
+    let (writer, temp_dir) = create_test_env().await;
+    let batch = make_batch(vec![1, 2, 3], vec!["alice", "bob", "charlie"]);
+    write_test_data(writer, &[batch]).await;
+
+    let (view_id, _snapshot_id) =
+        create_view(&temp_dir, "old_name", "SELECT id, name FROM test_table WHERE id > 1").await;
+
+    // Verify the view is accessible under old name
+    let ctx = create_read_context(&temp_dir).await;
+    let df = ctx
+        .sql("SELECT id, name FROM test.main.old_name ORDER BY id")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    let mut rows = Vec::new();
+    for batch in &batches {
+        let ids = batch.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        let names = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        for i in 0..batch.num_rows() {
+            rows.push((ids.value(i), names.value(i).to_string()));
+        }
+    }
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0], (2, "bob".to_string()));
+
+    // Rename the view
+    let db_path = temp_dir.path().join("test.db");
+    let conn_str = format!("sqlite:{}?mode=rwc", db_path.display());
+    let rename_writer = SqliteMetadataWriter::new(&conn_str).await.unwrap();
+    rename_writer.rename_view(view_id, "new_name").unwrap();
+
+    // Fresh context should see the renamed view
+    let ctx2 = create_read_context(&temp_dir).await;
+
+    // New name works
+    let df2 = ctx2
+        .sql("SELECT id, name FROM test.main.new_name ORDER BY id")
+        .await
+        .unwrap();
+    let batches2 = df2.collect().await.unwrap();
+    let mut rows2 = Vec::new();
+    for batch in &batches2 {
+        let ids = batch.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        let names = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        for i in 0..batch.num_rows() {
+            rows2.push((ids.value(i), names.value(i).to_string()));
+        }
+    }
+    assert_eq!(rows2.len(), 2);
+    assert_eq!(rows2[0], (2, "bob".to_string()));
+
+    // Old name should not work
+    let catalog = ctx2.catalog("test").unwrap();
+    let schema = catalog.schema("main").unwrap();
+    assert!(!schema.table_exist("old_name"));
+    assert!(schema.table_exist("new_name"));
+    assert!(schema.table_exist("test_table"));
+}
