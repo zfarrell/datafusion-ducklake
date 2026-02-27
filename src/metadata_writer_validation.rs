@@ -139,6 +139,19 @@ pub(crate) fn validate_alter_table(
         AlterTableOp::AlterColumnType(alter_type) => {
             validate_alter_column_type(columns, &alter_type.column_name, &alter_type.new_type)
         },
+        AlterTableOp::SetColumnDefault {
+            column_name,
+            default_value,
+        } => validate_set_column_default(columns, column_name, default_value),
+        AlterTableOp::DropColumnDefault {
+            column_name,
+        } => validate_drop_column_default(columns, column_name),
+        AlterTableOp::SetNotNull {
+            column_name,
+        } => validate_set_not_null(columns, column_name),
+        AlterTableOp::DropNotNull {
+            column_name,
+        } => validate_drop_not_null(columns, column_name),
     }
 }
 
@@ -260,6 +273,115 @@ fn validate_alter_column_type(
         column_type: new_type.to_string(),
         column_order: target_col.column_order,
         is_nullable: target_col.is_nullable,
+        initial_default: target_col.initial_default.clone(),
+        default_value: target_col.default_value.clone(),
+        parent_column: target_col.parent_column,
+        default_value_type: target_col.default_value_type.clone(),
+        default_value_dialect: target_col.default_value_dialect.clone(),
+    })
+}
+
+fn validate_set_column_default(
+    columns: &[ActiveColumnInfo],
+    column_name: &str,
+    default_value: &str,
+) -> Result<AlterTableAction> {
+    let target = columns.iter().find(|c| c.column_name == column_name);
+
+    let Some(target_col) = target else {
+        return Err(DuckLakeError::InvalidConfig(format!(
+            "Column '{}' not found in table",
+            column_name
+        )));
+    };
+
+    Ok(AlterTableAction::ReplaceColumn {
+        end_column_id: target_col.column_id,
+        column_name: target_col.column_name.clone(),
+        column_type: target_col.column_type.clone(),
+        column_order: target_col.column_order,
+        is_nullable: target_col.is_nullable,
+        initial_default: target_col.initial_default.clone(),
+        default_value: Some(default_value.to_string()),
+        parent_column: target_col.parent_column,
+        default_value_type: target_col.default_value_type.clone(),
+        default_value_dialect: target_col.default_value_dialect.clone(),
+    })
+}
+
+fn validate_drop_column_default(
+    columns: &[ActiveColumnInfo],
+    column_name: &str,
+) -> Result<AlterTableAction> {
+    let target = columns.iter().find(|c| c.column_name == column_name);
+
+    let Some(target_col) = target else {
+        return Err(DuckLakeError::InvalidConfig(format!(
+            "Column '{}' not found in table",
+            column_name
+        )));
+    };
+
+    Ok(AlterTableAction::ReplaceColumn {
+        end_column_id: target_col.column_id,
+        column_name: target_col.column_name.clone(),
+        column_type: target_col.column_type.clone(),
+        column_order: target_col.column_order,
+        is_nullable: target_col.is_nullable,
+        initial_default: target_col.initial_default.clone(),
+        default_value: None,
+        parent_column: target_col.parent_column,
+        default_value_type: target_col.default_value_type.clone(),
+        default_value_dialect: target_col.default_value_dialect.clone(),
+    })
+}
+
+fn validate_set_not_null(
+    columns: &[ActiveColumnInfo],
+    column_name: &str,
+) -> Result<AlterTableAction> {
+    let target = columns.iter().find(|c| c.column_name == column_name);
+
+    let Some(target_col) = target else {
+        return Err(DuckLakeError::InvalidConfig(format!(
+            "Column '{}' not found in table",
+            column_name
+        )));
+    };
+
+    Ok(AlterTableAction::ReplaceColumn {
+        end_column_id: target_col.column_id,
+        column_name: target_col.column_name.clone(),
+        column_type: target_col.column_type.clone(),
+        column_order: target_col.column_order,
+        is_nullable: false,
+        initial_default: target_col.initial_default.clone(),
+        default_value: target_col.default_value.clone(),
+        parent_column: target_col.parent_column,
+        default_value_type: target_col.default_value_type.clone(),
+        default_value_dialect: target_col.default_value_dialect.clone(),
+    })
+}
+
+fn validate_drop_not_null(
+    columns: &[ActiveColumnInfo],
+    column_name: &str,
+) -> Result<AlterTableAction> {
+    let target = columns.iter().find(|c| c.column_name == column_name);
+
+    let Some(target_col) = target else {
+        return Err(DuckLakeError::InvalidConfig(format!(
+            "Column '{}' not found in table",
+            column_name
+        )));
+    };
+
+    Ok(AlterTableAction::ReplaceColumn {
+        end_column_id: target_col.column_id,
+        column_name: target_col.column_name.clone(),
+        column_type: target_col.column_type.clone(),
+        column_order: target_col.column_order,
+        is_nullable: true,
         initial_default: target_col.initial_default.clone(),
         default_value: target_col.default_value.clone(),
         parent_column: target_col.parent_column,
@@ -543,5 +665,131 @@ mod tests {
         ];
         let err = validate_no_duplicate_columns(&columns).unwrap_err();
         assert!(err.to_string().contains("Duplicate column name 'x'"));
+    }
+
+    // --- validate_set_column_default tests ---
+
+    #[test]
+    fn test_set_column_default_ok() {
+        let columns = make_columns(&[("id", "int64", 0, false), ("name", "varchar", 1, true)]);
+        let op = AlterTableOp::SetColumnDefault {
+            column_name: "name".into(),
+            default_value: "'unknown'".into(),
+        };
+        let action = validate_alter_table(&columns, &op).unwrap();
+        match action {
+            AlterTableAction::ReplaceColumn {
+                default_value,
+                column_name,
+                ..
+            } => {
+                assert_eq!(default_value, Some("'unknown'".to_string()));
+                assert_eq!(column_name, "name");
+            },
+            _ => panic!("Expected ReplaceColumn"),
+        }
+    }
+
+    #[test]
+    fn test_set_column_default_nonexistent_fails() {
+        let columns = make_columns(&[("id", "int64", 0, false)]);
+        let op = AlterTableOp::SetColumnDefault {
+            column_name: "missing".into(),
+            default_value: "0".into(),
+        };
+        assert!(validate_alter_table(&columns, &op).is_err());
+    }
+
+    // --- validate_drop_column_default tests ---
+
+    #[test]
+    fn test_drop_column_default_ok() {
+        let columns = make_columns(&[("id", "int64", 0, false), ("name", "varchar", 1, true)]);
+        let op = AlterTableOp::DropColumnDefault {
+            column_name: "name".into(),
+        };
+        let action = validate_alter_table(&columns, &op).unwrap();
+        match action {
+            AlterTableAction::ReplaceColumn {
+                default_value,
+                column_name,
+                ..
+            } => {
+                assert!(default_value.is_none());
+                assert_eq!(column_name, "name");
+            },
+            _ => panic!("Expected ReplaceColumn"),
+        }
+    }
+
+    #[test]
+    fn test_drop_column_default_nonexistent_fails() {
+        let columns = make_columns(&[("id", "int64", 0, false)]);
+        let op = AlterTableOp::DropColumnDefault {
+            column_name: "missing".into(),
+        };
+        assert!(validate_alter_table(&columns, &op).is_err());
+    }
+
+    // --- validate_set_not_null tests ---
+
+    #[test]
+    fn test_set_not_null_ok() {
+        let columns = make_columns(&[("id", "int64", 0, false), ("name", "varchar", 1, true)]);
+        let op = AlterTableOp::SetNotNull {
+            column_name: "name".into(),
+        };
+        let action = validate_alter_table(&columns, &op).unwrap();
+        match action {
+            AlterTableAction::ReplaceColumn {
+                is_nullable,
+                column_name,
+                ..
+            } => {
+                assert!(!is_nullable);
+                assert_eq!(column_name, "name");
+            },
+            _ => panic!("Expected ReplaceColumn"),
+        }
+    }
+
+    #[test]
+    fn test_set_not_null_nonexistent_fails() {
+        let columns = make_columns(&[("id", "int64", 0, false)]);
+        let op = AlterTableOp::SetNotNull {
+            column_name: "missing".into(),
+        };
+        assert!(validate_alter_table(&columns, &op).is_err());
+    }
+
+    // --- validate_drop_not_null tests ---
+
+    #[test]
+    fn test_drop_not_null_ok() {
+        let columns = make_columns(&[("id", "int64", 0, false), ("name", "varchar", 1, false)]);
+        let op = AlterTableOp::DropNotNull {
+            column_name: "name".into(),
+        };
+        let action = validate_alter_table(&columns, &op).unwrap();
+        match action {
+            AlterTableAction::ReplaceColumn {
+                is_nullable,
+                column_name,
+                ..
+            } => {
+                assert!(is_nullable);
+                assert_eq!(column_name, "name");
+            },
+            _ => panic!("Expected ReplaceColumn"),
+        }
+    }
+
+    #[test]
+    fn test_drop_not_null_nonexistent_fails() {
+        let columns = make_columns(&[("id", "int64", 0, false)]);
+        let op = AlterTableOp::DropNotNull {
+            column_name: "missing".into(),
+        };
+        assert!(validate_alter_table(&columns, &op).is_err());
     }
 }

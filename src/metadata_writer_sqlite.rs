@@ -1401,6 +1401,231 @@ impl MetadataWriter for SqliteMetadataWriter {
             Ok(columns)
         })
     }
+
+    fn rename_table(&self, table_id: i64, new_name: &str) -> Result<i64> {
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+
+            // Fetch the current active table row
+            let table_row = sqlx::query(
+                "SELECT schema_id, table_uuid, path, path_is_relative
+                 FROM ducklake_table
+                 WHERE table_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(table_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+
+            let Some(table_row) = table_row else {
+                return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                    "Table with id {} not found or already dropped",
+                    table_id
+                )));
+            };
+
+            let schema_id: i64 = table_row.try_get(0)?;
+            let table_uuid: Option<String> = table_row.try_get(1)?;
+            let path: String = table_row.try_get(2)?;
+            let path_is_relative: bool = table_row.try_get(3)?;
+
+            // Create a new snapshot
+            let row = sqlx::query(
+                "INSERT INTO ducklake_snapshot (snapshot_time) VALUES (CURRENT_TIMESTAMP) RETURNING snapshot_id",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            let snapshot_id: i64 = row.try_get(0)?;
+
+            // End the existing table row
+            sqlx::query(
+                "UPDATE ducklake_table SET end_snapshot = ?
+                 WHERE table_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(snapshot_id)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // Insert new table row with updated name (same table_id, same path)
+            sqlx::query(
+                "INSERT INTO ducklake_table (table_id, table_uuid, schema_id, table_name, path, path_is_relative, begin_snapshot)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(table_id)
+            .bind(&table_uuid)
+            .bind(schema_id)
+            .bind(new_name)
+            .bind(&path)
+            .bind(path_is_relative)
+            .bind(snapshot_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // Record change for conflict detection
+            sqlx::query(
+                "INSERT INTO _df_change_tracking (snapshot_id, change_type, table_id)
+                 VALUES (?, 'ALTER_TABLE', ?)",
+            )
+            .bind(snapshot_id)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // Record in spec-compliant snapshot changes
+            sqlx::query(
+                "INSERT OR REPLACE INTO ducklake_snapshot_changes (snapshot_id, changes_made)
+                 VALUES (?, ?)",
+            )
+            .bind(snapshot_id)
+            .bind(format!("Renamed table (id={})", table_id))
+            .execute(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
+            Ok(snapshot_id)
+        })
+    }
+
+    fn set_table_comment(&self, table_id: i64, comment: &str) -> Result<i64> {
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+
+            // Create a new snapshot
+            let row = sqlx::query(
+                "INSERT INTO ducklake_snapshot (snapshot_time) VALUES (CURRENT_TIMESTAMP) RETURNING snapshot_id",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            let snapshot_id: i64 = row.try_get(0)?;
+
+            // End any existing comment tag for this table
+            sqlx::query(
+                "UPDATE ducklake_tag SET end_snapshot = ?
+                 WHERE object_id = ? AND key = 'comment' AND end_snapshot IS NULL",
+            )
+            .bind(snapshot_id)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // Insert new comment tag
+            sqlx::query(
+                "INSERT INTO ducklake_tag (object_id, begin_snapshot, key, value)
+                 VALUES (?, ?, 'comment', ?)",
+            )
+            .bind(table_id)
+            .bind(snapshot_id)
+            .bind(comment)
+            .execute(&mut *tx)
+            .await?;
+
+            // Record change for conflict detection
+            sqlx::query(
+                "INSERT INTO _df_change_tracking (snapshot_id, change_type, table_id)
+                 VALUES (?, 'ALTER_TABLE', ?)",
+            )
+            .bind(snapshot_id)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // Record in spec-compliant snapshot changes
+            sqlx::query(
+                "INSERT OR REPLACE INTO ducklake_snapshot_changes (snapshot_id, changes_made)
+                 VALUES (?, ?)",
+            )
+            .bind(snapshot_id)
+            .bind(format!("Altered table (id={})", table_id))
+            .execute(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
+            Ok(snapshot_id)
+        })
+    }
+
+    fn set_column_comment(
+        &self,
+        table_id: i64,
+        column_name: &str,
+        comment: &str,
+    ) -> Result<i64> {
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+
+            // Look up the column_id for the named column
+            let col_row = sqlx::query(
+                "SELECT column_id FROM ducklake_column
+                 WHERE table_id = ? AND column_name = ? AND end_snapshot IS NULL",
+            )
+            .bind(table_id)
+            .bind(column_name)
+            .fetch_optional(&mut *tx)
+            .await?;
+
+            let Some(col_row) = col_row else {
+                return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                    "Column '{}' not found in table",
+                    column_name
+                )));
+            };
+            let column_id: i64 = col_row.try_get(0)?;
+
+            // Create a new snapshot
+            let row = sqlx::query(
+                "INSERT INTO ducklake_snapshot (snapshot_time) VALUES (CURRENT_TIMESTAMP) RETURNING snapshot_id",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            let snapshot_id: i64 = row.try_get(0)?;
+
+            // End any existing comment tag for this column
+            sqlx::query(
+                "UPDATE ducklake_column_tag SET end_snapshot = ?
+                 WHERE table_id = ? AND column_id = ? AND key = 'comment' AND end_snapshot IS NULL",
+            )
+            .bind(snapshot_id)
+            .bind(table_id)
+            .bind(column_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // Insert new comment tag
+            sqlx::query(
+                "INSERT INTO ducklake_column_tag (table_id, column_id, begin_snapshot, key, value)
+                 VALUES (?, ?, ?, 'comment', ?)",
+            )
+            .bind(table_id)
+            .bind(column_id)
+            .bind(snapshot_id)
+            .bind(comment)
+            .execute(&mut *tx)
+            .await?;
+
+            // Record change for conflict detection
+            sqlx::query(
+                "INSERT INTO _df_change_tracking (snapshot_id, change_type, table_id)
+                 VALUES (?, 'ALTER_TABLE', ?)",
+            )
+            .bind(snapshot_id)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // Record in spec-compliant snapshot changes
+            sqlx::query(
+                "INSERT OR REPLACE INTO ducklake_snapshot_changes (snapshot_id, changes_made)
+                 VALUES (?, ?)",
+            )
+            .bind(snapshot_id)
+            .bind(format!("Altered table (id={})", table_id))
+            .execute(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
+            Ok(snapshot_id)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1913,5 +2138,263 @@ mod tests {
         assert_eq!(renamed_col_name, "contact_email");
         // The rename reuses the same column_id
         assert_eq!(renamed_col_id, 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_rename_table() {
+        let (writer, _temp) = create_test_writer().await;
+        let snapshot_id = writer.create_snapshot().unwrap();
+        let (schema_id, _) = writer
+            .get_or_create_schema("main", None, snapshot_id)
+            .unwrap();
+        let (table_id, _) = writer
+            .get_or_create_table(schema_id, "old_name", None, snapshot_id)
+            .unwrap();
+        let columns = vec![ColumnDef::new("id", "int64", false).unwrap()];
+        writer.set_columns(table_id, &columns, snapshot_id).unwrap();
+
+        // Rename the table
+        let rename_snap = writer.rename_table(table_id, "new_name").unwrap();
+        assert!(rename_snap > snapshot_id);
+
+        // Verify: old row is ended, new row has new name
+        let rows = block_on(async {
+            sqlx::query(
+                "SELECT table_name, end_snapshot FROM ducklake_table
+                 WHERE table_id = ? ORDER BY begin_snapshot",
+            )
+            .bind(table_id)
+            .fetch_all(&writer.pool)
+            .await
+            .unwrap()
+        });
+        assert_eq!(rows.len(), 2);
+        let old_name: String = rows[0].try_get(0).unwrap();
+        let old_end: Option<i64> = rows[0].try_get(1).unwrap();
+        let new_name: String = rows[1].try_get(0).unwrap();
+        let new_end: Option<i64> = rows[1].try_get(1).unwrap();
+        assert_eq!(old_name, "old_name");
+        assert!(old_end.is_some());
+        assert_eq!(new_name, "new_name");
+        assert!(new_end.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_rename_nonexistent_table_fails() {
+        let (writer, _temp) = create_test_writer().await;
+        let result = writer.rename_table(999, "new_name");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_set_table_comment() {
+        let (writer, _temp) = create_test_writer().await;
+        let snapshot_id = writer.create_snapshot().unwrap();
+        let (schema_id, _) = writer
+            .get_or_create_schema("main", None, snapshot_id)
+            .unwrap();
+        let (table_id, _) = writer
+            .get_or_create_table(schema_id, "t1", None, snapshot_id)
+            .unwrap();
+        let columns = vec![ColumnDef::new("id", "int64", false).unwrap()];
+        writer.set_columns(table_id, &columns, snapshot_id).unwrap();
+
+        // Set a comment
+        let snap1 = writer
+            .set_table_comment(table_id, "First comment")
+            .unwrap();
+        assert!(snap1 > snapshot_id);
+
+        // Verify
+        let rows = block_on(async {
+            sqlx::query(
+                "SELECT value FROM ducklake_tag
+                 WHERE object_id = ? AND key = 'comment' AND end_snapshot IS NULL",
+            )
+            .bind(table_id)
+            .fetch_all(&writer.pool)
+            .await
+            .unwrap()
+        });
+        assert_eq!(rows.len(), 1);
+        let comment: String = rows[0].try_get(0).unwrap();
+        assert_eq!(comment, "First comment");
+
+        // Update the comment
+        let snap2 = writer
+            .set_table_comment(table_id, "Updated comment")
+            .unwrap();
+        assert!(snap2 > snap1);
+
+        // Verify old comment is ended, new one is active
+        let all_rows = block_on(async {
+            sqlx::query(
+                "SELECT value, end_snapshot FROM ducklake_tag
+                 WHERE object_id = ? AND key = 'comment'
+                 ORDER BY begin_snapshot",
+            )
+            .bind(table_id)
+            .fetch_all(&writer.pool)
+            .await
+            .unwrap()
+        });
+        assert_eq!(all_rows.len(), 2);
+        let first_end: Option<i64> = all_rows[0].try_get(1).unwrap();
+        let second_val: String = all_rows[1].try_get(0).unwrap();
+        let second_end: Option<i64> = all_rows[1].try_get(1).unwrap();
+        assert!(first_end.is_some()); // old comment ended
+        assert_eq!(second_val, "Updated comment");
+        assert!(second_end.is_none()); // new comment active
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_set_column_comment() {
+        let (writer, _temp) = create_test_writer().await;
+        let snapshot_id = writer.create_snapshot().unwrap();
+        let (schema_id, _) = writer
+            .get_or_create_schema("main", None, snapshot_id)
+            .unwrap();
+        let (table_id, _) = writer
+            .get_or_create_table(schema_id, "t1", None, snapshot_id)
+            .unwrap();
+        let columns = vec![
+            ColumnDef::new("id", "int64", false).unwrap(),
+            ColumnDef::new("name", "varchar", true).unwrap(),
+        ];
+        writer.set_columns(table_id, &columns, snapshot_id).unwrap();
+
+        // Set a column comment
+        let snap1 = writer
+            .set_column_comment(table_id, "name", "The user name")
+            .unwrap();
+        assert!(snap1 > snapshot_id);
+
+        // Verify
+        let rows = block_on(async {
+            sqlx::query(
+                "SELECT value FROM ducklake_column_tag
+                 WHERE table_id = ? AND key = 'comment' AND end_snapshot IS NULL",
+            )
+            .bind(table_id)
+            .fetch_all(&writer.pool)
+            .await
+            .unwrap()
+        });
+        assert_eq!(rows.len(), 1);
+        let comment: String = rows[0].try_get(0).unwrap();
+        assert_eq!(comment, "The user name");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_set_column_comment_nonexistent_column_fails() {
+        let (writer, _temp) = create_test_writer().await;
+        let snapshot_id = writer.create_snapshot().unwrap();
+        let (schema_id, _) = writer
+            .get_or_create_schema("main", None, snapshot_id)
+            .unwrap();
+        let (table_id, _) = writer
+            .get_or_create_table(schema_id, "t1", None, snapshot_id)
+            .unwrap();
+        let columns = vec![ColumnDef::new("id", "int64", false).unwrap()];
+        writer.set_columns(table_id, &columns, snapshot_id).unwrap();
+
+        let result = writer.set_column_comment(table_id, "missing", "comment");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_alter_table_set_column_default() {
+        let (writer, _temp) = create_test_writer().await;
+        let snapshot_id = writer.create_snapshot().unwrap();
+        let (schema_id, _) = writer
+            .get_or_create_schema("main", None, snapshot_id)
+            .unwrap();
+        let (table_id, _) = writer
+            .get_or_create_table(schema_id, "t1", None, snapshot_id)
+            .unwrap();
+        let columns = vec![
+            ColumnDef::new("id", "int64", false).unwrap(),
+            ColumnDef::new("age", "int32", true).unwrap(),
+        ];
+        writer.set_columns(table_id, &columns, snapshot_id).unwrap();
+
+        // SET DEFAULT
+        let op = AlterTableOp::SetColumnDefault {
+            column_name: "age".into(),
+            default_value: "0".into(),
+        };
+        writer.alter_table(table_id, &op).unwrap();
+
+        // Verify default_value is set
+        let rows = block_on(async {
+            sqlx::query(
+                "SELECT default_value FROM ducklake_column
+                 WHERE table_id = ? AND column_name = 'age' AND end_snapshot IS NULL",
+            )
+            .bind(table_id)
+            .fetch_all(&writer.pool)
+            .await
+            .unwrap()
+        });
+        assert_eq!(rows.len(), 1);
+        let default_val: Option<String> = rows[0].try_get(0).unwrap();
+        assert_eq!(default_val.as_deref(), Some("0"));
+
+        // DROP DEFAULT
+        let op2 = AlterTableOp::DropColumnDefault {
+            column_name: "age".into(),
+        };
+        writer.alter_table(table_id, &op2).unwrap();
+
+        let rows2 = block_on(async {
+            sqlx::query(
+                "SELECT default_value FROM ducklake_column
+                 WHERE table_id = ? AND column_name = 'age' AND end_snapshot IS NULL",
+            )
+            .bind(table_id)
+            .fetch_all(&writer.pool)
+            .await
+            .unwrap()
+        });
+        assert_eq!(rows2.len(), 1);
+        let default_val2: Option<String> = rows2[0].try_get(0).unwrap();
+        assert!(default_val2.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_alter_table_set_not_null() {
+        let (writer, _temp) = create_test_writer().await;
+        let snapshot_id = writer.create_snapshot().unwrap();
+        let (schema_id, _) = writer
+            .get_or_create_schema("main", None, snapshot_id)
+            .unwrap();
+        let (table_id, _) = writer
+            .get_or_create_table(schema_id, "t1", None, snapshot_id)
+            .unwrap();
+        let columns = vec![
+            ColumnDef::new("id", "int64", false).unwrap(),
+            ColumnDef::new("name", "varchar", true).unwrap(),
+        ];
+        writer.set_columns(table_id, &columns, snapshot_id).unwrap();
+
+        // SET NOT NULL
+        let op = AlterTableOp::SetNotNull {
+            column_name: "name".into(),
+        };
+        writer.alter_table(table_id, &op).unwrap();
+
+        let columns = writer.get_active_columns(table_id).unwrap();
+        assert_eq!(columns[1].0, "name");
+        assert!(!columns[1].2); // not nullable
+
+        // DROP NOT NULL
+        let op2 = AlterTableOp::DropNotNull {
+            column_name: "name".into(),
+        };
+        writer.alter_table(table_id, &op2).unwrap();
+
+        let columns2 = writer.get_active_columns(table_id).unwrap();
+        assert_eq!(columns2[1].0, "name");
+        assert!(columns2[1].2); // nullable again
     }
 }

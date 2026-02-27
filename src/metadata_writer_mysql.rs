@@ -1481,4 +1481,27 @@ impl MetadataWriter for MySqlMetadataWriter {
             Ok(columns)
         })
     }
+
+    fn rename_table(&self, _table_id: i64, _new_name: &str) -> Result<i64> {
+        Err(crate::error::DuckLakeError::Internal(
+            "rename_table not yet implemented for MySQL".to_string(),
+        ))
+    }
+
+    fn set_table_comment(&self, _table_id: i64, _comment: &str) -> Result<i64> {
+        Err(crate::error::DuckLakeError::Internal(
+            "set_table_comment not yet implemented for MySQL".to_string(),
+        ))
+    }
+
+    fn set_column_comment(
+        &self,
+        _table_id: i64,
+        _column_name: &str,
+        _comment: &str,
+    ) -> Result<i64> {
+        Err(crate::error::DuckLakeError::Internal(
+            "set_column_comment not yet implemented for MySQL".to_string(),
+        ))
+    }
 }

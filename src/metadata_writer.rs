@@ -34,6 +34,23 @@ pub enum AlterTableOp {
     },
     /// Change a column's type (widening only).
     AlterColumnType(AlterColumnTypeOp),
+    /// Set a column's default value.
+    SetColumnDefault {
+        column_name: String,
+        default_value: String,
+    },
+    /// Drop a column's default value.
+    DropColumnDefault {
+        column_name: String,
+    },
+    /// Set a column as NOT NULL.
+    SetNotNull {
+        column_name: String,
+    },
+    /// Drop a column's NOT NULL constraint (allow NULLs).
+    DropNotNull {
+        column_name: String,
+    },
 }
 
 /// Parameters for ALTER COLUMN TYPE operation.
@@ -453,6 +470,32 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// Returns columns ordered by column_order. Only returns columns
     /// that have no end_snapshot (i.e., currently active).
     fn get_active_columns(&self, table_id: i64) -> Result<Vec<(String, String, bool)>>;
+
+    /// Rename a table in the catalog.
+    ///
+    /// Creates a new snapshot, ends the existing table row, and inserts a new row
+    /// with the updated name. The table's physical path does NOT change.
+    /// Returns the snapshot_id created for the rename.
+    fn rename_table(&self, table_id: i64, new_name: &str) -> Result<i64>;
+
+    /// Set or update a comment on a table.
+    ///
+    /// Stores the comment in `ducklake_tag` with key='comment'.
+    /// If a comment already exists, it is ended and replaced.
+    /// Returns the snapshot_id created for the comment.
+    fn set_table_comment(&self, table_id: i64, comment: &str) -> Result<i64>;
+
+    /// Set or update a comment on a column.
+    ///
+    /// Stores the comment in `ducklake_column_tag` with key='comment'.
+    /// If a comment already exists, it is ended and replaced.
+    /// Returns the snapshot_id created for the comment.
+    fn set_column_comment(
+        &self,
+        table_id: i64,
+        column_name: &str,
+        comment: &str,
+    ) -> Result<i64>;
 
     /// Create a view in the catalog.
     /// Creates a new snapshot, stores the view SQL definition, and returns (view_id, snapshot_id).
