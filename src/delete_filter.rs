@@ -138,7 +138,18 @@ impl Stream for DeleteFilterStream {
                 match self.filter_batch(&batch) {
                     Ok(filtered_batch) => {
                         // Update row offset for next batch
-                        self.row_offset += batch.num_rows() as i64;
+                        let num_rows = match i64::try_from(batch.num_rows()) {
+                            Ok(n) => n,
+                            Err(_) => {
+                                return Poll::Ready(Some(Err(DataFusionError::Internal(
+                                    format!(
+                                        "batch row count {} exceeds i64::MAX",
+                                        batch.num_rows()
+                                    ),
+                                ))));
+                            },
+                        };
+                        self.row_offset += num_rows;
                         Poll::Ready(Some(Ok(filtered_batch)))
                     },
                     Err(e) => Poll::Ready(Some(Err(e))),
@@ -160,12 +171,19 @@ impl DeleteFilterStream {
 
         // Build list of row indices to keep
         let num_rows = batch.num_rows();
-        let mut keep_indices: Vec<usize> = Vec::with_capacity(num_rows);
+        if num_rows > u32::MAX as usize {
+            return Err(DataFusionError::Internal(format!(
+                "batch row count {} exceeds u32::MAX",
+                num_rows
+            )));
+        }
+        let mut keep_indices: Vec<u32> = Vec::with_capacity(num_rows);
 
         for i in 0..num_rows {
+            // Safe: i < num_rows which fits in i64 (checked via u32::MAX above)
             let global_pos = self.row_offset + i as i64;
             if !self.deleted_positions.contains(&global_pos) {
-                keep_indices.push(i);
+                keep_indices.push(i as u32);
             }
         }
 
@@ -186,7 +204,7 @@ impl DeleteFilterStream {
         use arrow::array::UInt32Array;
         use arrow::compute::take;
 
-        let indices = UInt32Array::from(keep_indices.iter().map(|&i| i as u32).collect::<Vec<_>>());
+        let indices = UInt32Array::from(keep_indices);
 
         let filtered_columns: DataFusionResult<Vec<_>> = batch
             .columns()

@@ -245,6 +245,9 @@ impl CatalogProvider for DuckLakeCatalog {
             )
         })?;
 
+        // Validate schema name to prevent path traversal attacks
+        crate::schema::validate_schema_name(name)?;
+
         // Cannot create information_schema
         if name == "information_schema" {
             return Err(DataFusionError::Plan(

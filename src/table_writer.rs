@@ -213,7 +213,12 @@ impl TableWriteSession {
             RecordBatch::try_new(self.schema_with_ids.clone(), batch.columns().to_vec())?;
         let writer = self.writer.as_mut().unwrap();
         writer.write(&batch_with_ids)?;
-        self.row_count += batch.num_rows() as i64;
+        self.row_count += i64::try_from(batch.num_rows()).map_err(|_| {
+            crate::error::DuckLakeError::Internal(format!(
+                "batch row count {} exceeds i64::MAX",
+                batch.num_rows()
+            ))
+        })?;
         Ok(())
     }
 
@@ -271,7 +276,12 @@ impl TableWriteSession {
 
         let buffer = writer.into_inner()?;
 
-        let file_size = buffer.len() as i64;
+        let file_size = i64::try_from(buffer.len()).map_err(|_| {
+            crate::error::DuckLakeError::Internal(format!(
+                "file size {} exceeds i64::MAX",
+                buffer.len()
+            ))
+        })?;
         let footer_size = calculate_footer_size_from_bytes(&buffer)?;
 
         // Upload via object_store

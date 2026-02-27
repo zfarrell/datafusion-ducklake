@@ -93,6 +93,7 @@ async fn init_schema(pool: &MySqlPool) -> anyhow::Result<()> {
             file_size_bytes BIGINT NOT NULL,
             footer_size BIGINT,
             encryption_key VARCHAR(255),
+            record_count BIGINT,
             begin_snapshot BIGINT NOT NULL DEFAULT 1,
             end_snapshot BIGINT,
             FOREIGN KEY (table_id) REFERENCES ducklake_table(table_id)

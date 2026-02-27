@@ -294,7 +294,7 @@ pub const SQL_LIST_ALL_FILES: &str = "
         del.file_size_bytes AS delete_file_size,
         del.footer_size AS delete_footer_size,
         del.encryption_key AS delete_encryption_key,
-        del.delete_count
+        data.record_count
     FROM ducklake_schema s
     JOIN ducklake_table t ON s.schema_id = t.schema_id
     JOIN ducklake_data_file data ON t.table_id = data.table_id

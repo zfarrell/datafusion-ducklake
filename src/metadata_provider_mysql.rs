@@ -141,7 +141,7 @@ impl MetadataProvider for MySqlMetadataProvider {
             let rows = sqlx::query(
                 "SELECT column_id, column_name, column_type, nulls_allowed
                  FROM ducklake_column
-                 WHERE table_id = ?
+                 WHERE table_id = ? AND end_snapshot IS NULL
                  ORDER BY column_order",
             )
             .bind(table_id)
@@ -415,7 +415,7 @@ impl MetadataProvider for MySqlMetadataProvider {
                     del.file_size_bytes AS delete_file_size,
                     del.footer_size AS delete_footer_size,
                     del.encryption_key AS delete_encryption_key,
-                    del.delete_count
+                    data.record_count
                 FROM ducklake_schema s
                 JOIN ducklake_table t ON s.schema_id = t.schema_id
                 JOIN ducklake_data_file data ON t.table_id = data.table_id

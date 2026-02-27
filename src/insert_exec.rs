@@ -16,6 +16,7 @@ use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+use datafusion::physical_plan::ExecutionPlanProperties;
 use futures::stream::{self, TryStreamExt};
 
 use crate::metadata_writer::{MetadataWriter, WriteMode};
@@ -161,8 +162,15 @@ impl ExecutionPlan for DuckLakeInsertExec {
         let output_schema = make_insert_count_schema();
 
         let stream = stream::once(async move {
-            let input_stream = input.execute(0, Arc::clone(&context))?;
-            let batches: Vec<RecordBatch> = input_stream.try_collect().await?;
+            // Collect batches from ALL input partitions to avoid dropping data
+            let num_partitions = input.output_partitioning().partition_count();
+            let mut batches: Vec<RecordBatch> = Vec::new();
+            for p in 0..num_partitions {
+                let partition_stream = input.execute(p, Arc::clone(&context))?;
+                let partition_batches: Vec<RecordBatch> =
+                    partition_stream.try_collect().await?;
+                batches.extend(partition_batches);
+            }
 
             if batches.is_empty() {
                 let count_array: ArrayRef = Arc::new(UInt64Array::from(vec![0u64]));
@@ -210,7 +218,7 @@ impl ExecutionPlan for DuckLakeInsertExec {
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
             }
 
-            let row_count = session.row_count() as u64;
+            let row_count = u64::try_from(session.row_count()).unwrap_or(0);
 
             session
                 .finish()

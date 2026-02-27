@@ -93,6 +93,7 @@ async fn init_schema(pool: &SqlitePool) -> anyhow::Result<()> {
             file_size_bytes INTEGER NOT NULL,
             footer_size INTEGER,
             encryption_key TEXT,
+            record_count INTEGER,
             begin_snapshot INTEGER NOT NULL DEFAULT 1,
             end_snapshot INTEGER,
             FOREIGN KEY (table_id) REFERENCES ducklake_table(table_id)

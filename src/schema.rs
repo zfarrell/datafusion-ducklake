@@ -22,30 +22,41 @@ use crate::table_writer::DuckLakeTableWriter;
 #[cfg(feature = "write")]
 use datafusion::error::DataFusionError;
 
-/// Validate table name to prevent path traversal attacks.
-/// Table names are used to construct file paths, so we must ensure they
+/// Validate a name (table or schema) to prevent path traversal attacks.
+/// These names are used to construct file paths, so we must ensure they
 /// don't contain path separators or parent directory references.
 #[cfg(feature = "write")]
-fn validate_table_name(name: &str) -> DataFusionResult<()> {
+fn validate_name(name: &str, kind: &str) -> DataFusionResult<()> {
     if name.is_empty() {
-        return Err(DataFusionError::Plan(
-            "Table name cannot be empty".to_string(),
-        ));
+        return Err(DataFusionError::Plan(format!(
+            "{} name cannot be empty",
+            kind
+        )));
     }
     if name.contains('/') || name.contains('\\') || name.contains("..") {
         return Err(DataFusionError::Plan(format!(
-            "Invalid table name '{}': must not contain path separators or '..'",
-            name
+            "Invalid {} name '{}': must not contain path separators or '..'",
+            kind, name
         )));
     }
     // Also reject names that are just dots
     if name.chars().all(|c| c == '.') {
         return Err(DataFusionError::Plan(format!(
-            "Invalid table name '{}': must not be only dots",
-            name
+            "Invalid {} name '{}': must not be only dots",
+            kind, name
         )));
     }
     Ok(())
+}
+
+#[cfg(feature = "write")]
+fn validate_table_name(name: &str) -> DataFusionResult<()> {
+    validate_name(name, "table")
+}
+
+#[cfg(feature = "write")]
+pub(crate) fn validate_schema_name(name: &str) -> DataFusionResult<()> {
+    validate_name(name, "schema")
 }
 
 /// DuckLake schema provider
@@ -395,5 +406,21 @@ mod tests {
         assert!(validate_table_name(".").is_err());
         assert!(validate_table_name("..").is_err());
         assert!(validate_table_name("...").is_err());
+    }
+
+    #[test]
+    fn test_validate_schema_name_valid() {
+        assert!(validate_schema_name("main").is_ok());
+        assert!(validate_schema_name("my_schema").is_ok());
+        assert!(validate_schema_name("Schema123").is_ok());
+    }
+
+    #[test]
+    fn test_validate_schema_name_rejects_traversal() {
+        assert!(validate_schema_name("").is_err());
+        assert!(validate_schema_name("../etc").is_err());
+        assert!(validate_schema_name("foo/bar").is_err());
+        assert!(validate_schema_name("..").is_err());
+        assert!(validate_schema_name(".").is_err());
     }
 }

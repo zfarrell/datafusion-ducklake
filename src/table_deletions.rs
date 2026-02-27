@@ -450,6 +450,22 @@ enum StreamState {
     Done,
 }
 
+/// Represents current delete positions, avoiding large allocations for full-file deletes
+enum CurrentDeletePositions {
+    /// All rows in the file are deleted (full-file delete)
+    All { record_count: i64 },
+    /// Only specific positions are deleted
+    Partial(HashSet<i64>),
+}
+
+/// Represents computed delta positions (newly deleted rows)
+enum DeltaPositions {
+    /// All rows in the file are newly deleted
+    All,
+    /// Specific sorted positions are newly deleted
+    Specific(Vec<i64>),
+}
+
 /// Stream that reads deleted rows from a data file
 struct DeletedRowsStream {
     /// Current delete file stream (None for full file delete)
@@ -462,12 +478,12 @@ struct DeletedRowsStream {
     snapshot_id: i64,
     /// Output schema
     output_schema: SchemaRef,
-    /// Collected current positions (or all positions for full delete)
-    current_positions: HashSet<i64>,
+    /// Collected current positions (or All for full delete)
+    current_positions: CurrentDeletePositions,
     /// Collected previous positions
     previous_positions: HashSet<i64>,
     /// Computed delta positions (sorted)
-    deleted_positions: Option<Vec<i64>>,
+    deleted_positions: Option<DeltaPositions>,
     /// Current row offset in data file
     row_offset: i64,
     /// State machine
@@ -486,18 +502,24 @@ impl DeletedRowsStream {
         // Determine initial state and compute positions if needed
         let (initial_state, current_positions, deleted_positions) =
             if current_delete_stream.is_some() {
-                (StreamState::ReadingCurrentDelete, HashSet::new(), None)
+                (
+                    StreamState::ReadingCurrentDelete,
+                    CurrentDeletePositions::Partial(HashSet::new()),
+                    None,
+                )
             } else if previous_delete_stream.is_some() {
                 // Full file delete but has previous - need to subtract previous positions
-                let current: HashSet<i64> = (0..record_count).collect();
-                (StreamState::ReadingPreviousDelete, current, None)
+                (
+                    StreamState::ReadingPreviousDelete,
+                    CurrentDeletePositions::All { record_count },
+                    None,
+                )
             } else {
                 // Full file delete with no previous - all positions are deleted
-                let positions: Vec<i64> = (0..record_count).collect();
                 (
                     StreamState::ReadingData,
-                    HashSet::new(),
-                    Some(positions), // Pre-computed sorted positions
+                    CurrentDeletePositions::All { record_count },
+                    Some(DeltaPositions::All),
                 )
             };
 
@@ -516,48 +538,90 @@ impl DeletedRowsStream {
     }
 
     /// Extract positions from a delete file batch
-    fn extract_positions(batch: &RecordBatch) -> HashSet<i64> {
+    fn extract_positions(batch: &RecordBatch) -> DataFusionResult<HashSet<i64>> {
         if batch.num_columns() < 2 {
-            return HashSet::new();
+            return Ok(HashSet::new());
         }
 
         let pos_array = batch
             .column(1)
             .as_any()
             .downcast_ref::<Int64Array>()
-            .expect("pos column should be Int64");
+            .ok_or_else(|| {
+                DataFusionError::Internal(
+                    "delete file pos column is not Int64".to_string(),
+                )
+            })?;
 
-        pos_array.values().iter().copied().collect()
+        // Use .iter() to respect null bitmap; skip null entries
+        Ok(pos_array.iter().flatten().collect())
     }
 
     /// Compute the delta and sort it
     fn compute_deleted_positions(&mut self) {
-        let mut delta: Vec<i64> = self
-            .current_positions
-            .iter()
-            .filter(|pos| !self.previous_positions.contains(pos))
-            .copied()
-            .collect();
-        delta.sort_unstable();
-        self.deleted_positions = Some(delta);
+        match &self.current_positions {
+            CurrentDeletePositions::All { record_count } => {
+                if self.previous_positions.is_empty() {
+                    self.deleted_positions = Some(DeltaPositions::All);
+                } else {
+                    let mut delta: Vec<i64> = (0..*record_count)
+                        .filter(|pos| !self.previous_positions.contains(pos))
+                        .collect();
+                    delta.sort_unstable();
+                    self.deleted_positions = Some(DeltaPositions::Specific(delta));
+                }
+            },
+            CurrentDeletePositions::Partial(current) => {
+                let mut delta: Vec<i64> = current
+                    .iter()
+                    .filter(|pos| !self.previous_positions.contains(pos))
+                    .copied()
+                    .collect();
+                delta.sort_unstable();
+                self.deleted_positions = Some(DeltaPositions::Specific(delta));
+            },
+        }
     }
 
     /// Filter batch to only include deleted rows and append CDC columns
     fn filter_batch(&mut self, batch: &RecordBatch) -> DataFusionResult<Option<RecordBatch>> {
-        let deleted_positions = self.deleted_positions.as_ref().unwrap();
         let num_rows = batch.num_rows();
+        let num_rows_i64 = i64::try_from(num_rows).map_err(|_| {
+            DataFusionError::Internal(format!("batch row count {} exceeds i64::MAX", num_rows))
+        })?;
 
-        // Find which rows in this batch are deleted
-        let mut keep_indices: Vec<u32> = Vec::new();
-        for i in 0..num_rows {
-            let global_pos = self.row_offset + i as i64;
-            if deleted_positions.binary_search(&global_pos).is_ok() {
-                keep_indices.push(i as u32);
-            }
-        }
+        let keep_indices: Vec<u32> = match self.deleted_positions.as_ref().unwrap() {
+            DeltaPositions::All => {
+                // All rows are deleted — keep all rows in this batch
+                if num_rows > u32::MAX as usize {
+                    return Err(DataFusionError::Internal(format!(
+                        "batch row count {} exceeds u32::MAX",
+                        num_rows
+                    )));
+                }
+                (0..num_rows as u32).collect()
+            },
+            DeltaPositions::Specific(deleted_positions) => {
+                if num_rows > u32::MAX as usize {
+                    return Err(DataFusionError::Internal(format!(
+                        "batch row count {} exceeds u32::MAX",
+                        num_rows
+                    )));
+                }
+                let mut indices = Vec::new();
+                for i in 0..num_rows {
+                    // Safe: i < num_rows and num_rows fits in u32 (checked above)
+                    let global_pos = self.row_offset + i as i64;
+                    if deleted_positions.binary_search(&global_pos).is_ok() {
+                        indices.push(i as u32);
+                    }
+                }
+                indices
+            },
+        };
 
         // Update row offset for next batch
-        self.row_offset += num_rows as i64;
+        self.row_offset += num_rows_i64;
 
         // If no deleted rows in this batch, return None
         if keep_indices.is_empty() {
@@ -598,8 +662,15 @@ impl Stream for DeletedRowsStream {
                     let current = self.current_delete_stream.as_mut().unwrap();
                     match Pin::new(current).poll_next(cx) {
                         Poll::Ready(Some(Ok(batch))) => {
-                            let positions = Self::extract_positions(&batch);
-                            self.current_positions.extend(positions);
+                            let positions = match Self::extract_positions(&batch) {
+                                Ok(p) => p,
+                                Err(e) => return Poll::Ready(Some(Err(e))),
+                            };
+                            if let CurrentDeletePositions::Partial(ref mut set) =
+                                self.current_positions
+                            {
+                                set.extend(positions);
+                            }
                         },
                         Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
                         Poll::Ready(None) => {
@@ -617,7 +688,10 @@ impl Stream for DeletedRowsStream {
                     let prev = self.previous_delete_stream.as_mut().unwrap();
                     match Pin::new(prev).poll_next(cx) {
                         Poll::Ready(Some(Ok(batch))) => {
-                            let positions = Self::extract_positions(&batch);
+                            let positions = match Self::extract_positions(&batch) {
+                                Ok(p) => p,
+                                Err(e) => return Poll::Ready(Some(Err(e))),
+                            };
                             self.previous_positions.extend(positions);
                         },
                         Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
