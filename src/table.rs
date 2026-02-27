@@ -784,6 +784,236 @@ impl DuckLakeTable {
     }
 }
 
+/// Per-file column statistics for pruning decisions
+struct FileStats {
+    /// column_name -> (min_value, max_value)
+    columns: HashMap<String, (Option<datafusion::common::ScalarValue>, Option<datafusion::common::ScalarValue>)>,
+}
+
+impl DuckLakeTable {
+    /// Prune files based on per-file column statistics.
+    ///
+    /// Loads file-level column stats from metadata and evaluates filter predicates
+    /// against each file's min/max range. Files where no rows can possibly match
+    /// are excluded.
+    fn prune_files_by_stats<'a>(
+        &'a self,
+        files: Vec<&'a DuckLakeTableFile>,
+        filters: &[Expr],
+    ) -> Vec<&'a DuckLakeTableFile> {
+        if files.is_empty() || filters.is_empty() {
+            return files;
+        }
+
+        // Load per-file column stats
+        let raw_stats = match self
+            .provider
+            .get_file_column_stats(self.table_id, self.snapshot_id)
+        {
+            Ok(stats) if !stats.is_empty() => stats,
+            _ => return files, // No stats available — can't prune
+        };
+
+        // Build column name -> data type map from schema
+        let col_type_map: HashMap<&str, &DataType> = self
+            .columns
+            .iter()
+            .zip(self.schema.fields().iter())
+            .map(|(col, field)| (col.column_name.as_str(), field.data_type()))
+            .collect();
+
+        // Build per-file stats: data_file_id -> FileStats
+        let mut file_stats_map: HashMap<i64, FileStats> = HashMap::new();
+        for stat in &raw_stats {
+            let data_type = match col_type_map.get(stat.column_name.as_str()) {
+                Some(dt) => dt,
+                None => continue,
+            };
+
+            let min_sv = stat
+                .min_value
+                .as_deref()
+                .and_then(|s| parse_stat_value(s, data_type));
+            let max_sv = stat
+                .max_value
+                .as_deref()
+                .and_then(|s| parse_stat_value(s, data_type));
+
+            file_stats_map
+                .entry(stat.data_file_id)
+                .or_insert_with(|| FileStats {
+                    columns: HashMap::new(),
+                })
+                .columns
+                .insert(stat.column_name.clone(), (min_sv, max_sv));
+        }
+
+        // If no stats loaded, can't prune
+        if file_stats_map.is_empty() {
+            return files;
+        }
+
+        // Extract prunable filter predicates
+        let pruning_predicates = extract_pruning_predicates(filters);
+        if pruning_predicates.is_empty() {
+            return files;
+        }
+
+        files
+            .into_iter()
+            .filter(|tf| {
+                let Some(file_id) = tf.data_file_id else {
+                    return true; // No file_id — can't check stats
+                };
+                let Some(stats) = file_stats_map.get(&file_id) else {
+                    return true; // No stats for this file — include it
+                };
+
+                // File is included unless ALL rows are definitively excluded
+                for pred in &pruning_predicates {
+                    if file_definitely_excluded(stats, pred) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .collect()
+    }
+}
+
+/// A simple pruning predicate extracted from a filter expression.
+struct PruningPredicate {
+    column_name: String,
+    op: datafusion::logical_expr::Operator,
+    value: datafusion::common::ScalarValue,
+}
+
+/// Extract simple comparison predicates that can be used for file pruning.
+///
+/// Supports: column op literal and literal op column for =, <, >, <=, >=, !=
+fn extract_pruning_predicates(filters: &[Expr]) -> Vec<PruningPredicate> {
+    use datafusion::logical_expr::Operator;
+
+    let mut result = Vec::new();
+
+    for filter in filters {
+        if let Expr::BinaryExpr(binary) = filter {
+            match binary.op {
+                Operator::Eq
+                | Operator::NotEq
+                | Operator::Lt
+                | Operator::LtEq
+                | Operator::Gt
+                | Operator::GtEq => {}
+                _ => continue,
+            }
+
+            // Try column op literal
+            if let (Expr::Column(col), Expr::Literal(scalar, _)) =
+                (binary.left.as_ref(), binary.right.as_ref())
+            {
+                if !scalar.is_null() {
+                    result.push(PruningPredicate {
+                        column_name: col.name.clone(),
+                        op: binary.op,
+                        value: scalar.clone(),
+                    });
+                }
+            }
+            // Try literal op column (flip the operator)
+            else if let (Expr::Literal(scalar, _), Expr::Column(col)) =
+                (binary.left.as_ref(), binary.right.as_ref())
+            {
+                if !scalar.is_null() {
+                    let flipped_op = match binary.op {
+                        Operator::Lt => Operator::Gt,
+                        Operator::LtEq => Operator::GtEq,
+                        Operator::Gt => Operator::Lt,
+                        Operator::GtEq => Operator::LtEq,
+                        other => other, // Eq and NotEq are symmetric
+                    };
+                    result.push(PruningPredicate {
+                        column_name: col.name.clone(),
+                        op: flipped_op,
+                        value: scalar.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    result
+}
+
+/// Check if a file can be definitively excluded based on its column stats and a predicate.
+///
+/// Returns true if the file's min/max stats prove no rows can match the predicate.
+fn file_definitely_excluded(stats: &FileStats, pred: &PruningPredicate) -> bool {
+    use datafusion::logical_expr::Operator;
+
+    let Some((min_val, max_val)) = stats.columns.get(&pred.column_name) else {
+        return false; // No stats for this column — can't exclude
+    };
+
+    match pred.op {
+        // column = value: exclude if value < min or value > max
+        Operator::Eq => {
+            if let Some(min) = min_val {
+                if pred.value < *min {
+                    return true;
+                }
+            }
+            if let Some(max) = max_val {
+                if pred.value > *max {
+                    return true;
+                }
+            }
+            false
+        }
+        // column != value: exclude only if min == max == value (all rows have this value)
+        Operator::NotEq => {
+            if let (Some(min), Some(max)) = (min_val, max_val) {
+                min == max && pred.value == *min
+            } else {
+                false
+            }
+        }
+        // column < value: exclude if min >= value
+        Operator::Lt => {
+            if let Some(min) = min_val {
+                pred.value <= *min
+            } else {
+                false
+            }
+        }
+        // column <= value: exclude if min > value
+        Operator::LtEq => {
+            if let Some(min) = min_val {
+                pred.value < *min
+            } else {
+                false
+            }
+        }
+        // column > value: exclude if max <= value
+        Operator::Gt => {
+            if let Some(max) = max_val {
+                pred.value >= *max
+            } else {
+                false
+            }
+        }
+        // column >= value: exclude if max < value
+        Operator::GtEq => {
+            if let Some(max) = max_val {
+                pred.value > *max
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
 /// Extract equality filters on partition columns from filter expressions.
 ///
 /// Returns a list of (partition_key_index, string_value) pairs for simple
@@ -1003,7 +1233,10 @@ impl TableProvider for DuckLakeTable {
         let row_number_idx = base_field_count + 1;
 
         // Apply partition pruning to filter out files that don't match partition filters
-        let active_files = self.prune_files_by_partition(&self.table_files, filters);
+        let partition_pruned = self.prune_files_by_partition(&self.table_files, filters);
+
+        // Apply stats-based file pruning using per-file column statistics
+        let active_files = self.prune_files_by_stats(partition_pruned, filters);
 
         // Determine if any virtual columns are requested
         let (needs_virtual, include_filename, include_row_number) = match projection {

@@ -1,14 +1,14 @@
 use crate::DuckLakeError;
 use crate::metadata_provider::{
     ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileData, DuckLakeTableColumn,
-    DuckLakeTableFile, FilePartitionValue, FileWithTable, MetadataProvider, PartitionColumn,
-    SQL_GET_DATA_FILES, SQL_GET_DATA_FILES_ADDED_BETWEEN_SNAPSHOTS, SQL_GET_DATA_PATH,
-    SQL_GET_DELETE_FILES_ADDED_BETWEEN_SNAPSHOTS, SQL_GET_FILE_PARTITION_VALUES,
-    SQL_GET_LATEST_SNAPSHOT, SQL_GET_PARTITION_COLUMNS, SQL_GET_SCHEMA_BY_NAME,
-    SQL_GET_TABLE_BY_NAME, SQL_GET_TABLE_COLUMNS, SQL_GET_TABLE_ROW_COUNT,
-    SQL_LIST_ALL_COLUMNS, SQL_LIST_ALL_FILES, SQL_LIST_ALL_TABLES, SQL_LIST_SCHEMAS,
-    SQL_LIST_SNAPSHOTS, SQL_LIST_TABLES, SQL_TABLE_EXISTS, SchemaMetadata, SnapshotMetadata,
-    TableMetadata, TableWithSchema,
+    DuckLakeTableFile, FileColumnStats, FilePartitionValue, FileWithTable, MetadataProvider,
+    PartitionColumn, SQL_GET_DATA_FILES, SQL_GET_DATA_FILES_ADDED_BETWEEN_SNAPSHOTS,
+    SQL_GET_DATA_PATH, SQL_GET_DELETE_FILES_ADDED_BETWEEN_SNAPSHOTS,
+    SQL_GET_FILE_COLUMN_STATS, SQL_GET_FILE_PARTITION_VALUES, SQL_GET_LATEST_SNAPSHOT,
+    SQL_GET_PARTITION_COLUMNS, SQL_GET_SCHEMA_BY_NAME, SQL_GET_TABLE_BY_NAME,
+    SQL_GET_TABLE_COLUMNS, SQL_GET_TABLE_ROW_COUNT, SQL_LIST_ALL_COLUMNS, SQL_LIST_ALL_FILES,
+    SQL_LIST_ALL_TABLES, SQL_LIST_SCHEMAS, SQL_LIST_SNAPSHOTS, SQL_LIST_TABLES,
+    SQL_TABLE_EXISTS, SchemaMetadata, SnapshotMetadata, TableMetadata, TableWithSchema,
 };
 use duckdb::AccessMode::ReadOnly;
 use duckdb::{Config, Connection, params};
@@ -439,6 +439,29 @@ impl MetadataProvider for DuckdbMetadataProvider {
             |row| row.get(0),
         )?;
         Ok(row_count)
+    }
+
+    fn get_file_column_stats(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+    ) -> crate::Result<Vec<FileColumnStats>> {
+        let conn = self.connection();
+        let mut stmt = conn.prepare(SQL_GET_FILE_COLUMN_STATS)?;
+
+        let stats = stmt
+            .query_map(params![table_id, snapshot_id, snapshot_id], |row| {
+                Ok(FileColumnStats {
+                    data_file_id: row.get(0)?,
+                    column_name: row.get(1)?,
+                    null_count: row.get(2)?,
+                    min_value: row.get(3)?,
+                    max_value: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(stats)
     }
 
     fn get_partition_columns(
