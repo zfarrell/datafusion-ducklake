@@ -583,11 +583,14 @@ impl DuckLakeTable {
             }
         }
 
+        let column_ids: Vec<i64> = self.columns.iter().map(|c| c.column_id).collect();
+
         Ok(Arc::new(DuckLakeUpdateExec::new(
             self.table_id,
             self.table_name.clone(),
             schema_name.clone(),
             self.schema.clone(),
+            column_ids,
             self.table_files.clone(),
             filters.to_vec(),
             assignments,

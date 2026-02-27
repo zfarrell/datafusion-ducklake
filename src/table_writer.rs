@@ -324,7 +324,7 @@ fn arrow_schema_to_column_defs(schema: &Schema) -> Result<Vec<ColumnDef>> {
         .collect()
 }
 
-fn build_schema_with_field_ids(schema: &Schema, column_ids: &[i64]) -> Schema {
+pub(crate) fn build_schema_with_field_ids(schema: &Schema, column_ids: &[i64]) -> Schema {
     let fields: Vec<Field> = schema
         .fields()
         .iter()
