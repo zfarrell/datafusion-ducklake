@@ -48,6 +48,7 @@ pub mod table;
 pub mod table_changes;
 pub mod table_deletions;
 pub mod table_functions;
+pub mod table_insertions;
 pub mod types;
 pub mod virtual_column_exec;
 
