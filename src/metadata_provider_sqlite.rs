@@ -66,8 +66,11 @@ impl MetadataProvider for SqliteMetadataProvider {
     fn list_snapshots(&self) -> Result<Vec<SnapshotMetadata>> {
         block_on(async {
             let rows = sqlx::query(
-                "SELECT snapshot_id, snapshot_time
-                 FROM ducklake_snapshot ORDER BY snapshot_id",
+                "SELECT s.snapshot_id, s.snapshot_time, s.schema_version,
+                        c.changes_made, c.author, c.commit_message, c.commit_extra_info
+                 FROM ducklake_snapshot s
+                 LEFT JOIN ducklake_snapshot_changes c ON s.snapshot_id = c.snapshot_id
+                 ORDER BY s.snapshot_id",
             )
             .fetch_all(&self.pool)
             .await?;
@@ -76,12 +79,17 @@ impl MetadataProvider for SqliteMetadataProvider {
                 .map(|row| {
                     let snapshot_id: i64 = row.try_get(0)?;
                     let timestamp: Option<NaiveDateTime> = row.try_get(1)?;
-                    let timestamp_str = timestamp
+                    let snapshot_time = timestamp
                         .map(|ts: NaiveDateTime| ts.format("%Y-%m-%d %H:%M:%S%.6f").to_string());
 
                     Ok(SnapshotMetadata {
                         snapshot_id,
-                        timestamp: timestamp_str,
+                        snapshot_time,
+                        schema_version: row.try_get(2)?,
+                        changes: row.try_get(3)?,
+                        author: row.try_get(4)?,
+                        commit_message: row.try_get(5)?,
+                        commit_extra_info: row.try_get(6)?,
                     })
                 })
                 .collect()
@@ -185,7 +193,10 @@ impl MetadataProvider for SqliteMetadataProvider {
                     del.file_size_bytes AS delete_file_size,
                     del.footer_size AS delete_footer_size,
                     del.encryption_key AS delete_encryption_key,
-                    del.delete_count
+                    del.delete_count,
+                    data.begin_snapshot,
+                    data.row_id_start,
+                    data.record_count
                 FROM ducklake_data_file AS data
                 LEFT JOIN ducklake_delete_file AS del
                     ON data.data_file_id = del.data_file_id
@@ -228,13 +239,17 @@ impl MetadataProvider for SqliteMetadataProvider {
                         None
                     };
 
+                    let begin_snapshot: Option<i64> = row.try_get(13)?;
+                    let row_id_start: Option<i64> = row.try_get(14)?;
+                    let record_count: Option<i64> = row.try_get(15)?;
+
                     Ok(DuckLakeTableFile {
                         data_file_id,
                         file: data_file,
                         delete_file,
-                        row_id_start: None,
-                        snapshot_id: None,
-                        max_row_count: None,
+                        row_id_start,
+                        snapshot_id: begin_snapshot,
+                        max_row_count: record_count,
                     })
                 })
                 .collect()
@@ -324,7 +339,8 @@ impl MetadataProvider for SqliteMetadataProvider {
     fn list_all_tables(&self, snapshot_id: i64) -> Result<Vec<TableWithSchema>> {
         block_on(async {
             let rows = sqlx::query(
-                "SELECT s.schema_name, t.table_id, t.table_name, t.path, t.path_is_relative
+                "SELECT s.schema_name, s.schema_id, t.table_id, t.table_name,
+                        CAST(t.table_uuid AS TEXT) AS table_uuid, t.path, t.path_is_relative
                  FROM ducklake_schema s
                  JOIN ducklake_table t ON s.schema_id = t.schema_id
                  WHERE ? >= s.begin_snapshot
@@ -343,14 +359,18 @@ impl MetadataProvider for SqliteMetadataProvider {
             rows.into_iter()
                 .map(|row| {
                     let schema_name: String = row.try_get(0)?;
+                    let schema_id: i64 = row.try_get(1)?;
                     let table = TableMetadata {
-                        table_id: row.try_get(1)?,
-                        table_name: row.try_get(2)?,
-                        path: row.try_get(3)?,
-                        path_is_relative: row.try_get(4)?,
+                        table_id: row.try_get(2)?,
+                        table_name: row.try_get(3)?,
+                        path: row.try_get(5)?,
+                        path_is_relative: row.try_get(6)?,
                     };
+                    let table_uuid: Option<String> = row.try_get(4)?;
                     Ok(TableWithSchema {
                         schema_name,
+                        schema_id,
+                        table_uuid,
                         table,
                     })
                 })

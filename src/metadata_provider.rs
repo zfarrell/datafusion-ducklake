@@ -5,7 +5,12 @@ use crate::Result;
 pub const SQL_GET_LATEST_SNAPSHOT: &str =
     "SELECT COALESCE(MAX(snapshot_id), 0) FROM ducklake_snapshot";
 
-pub const SQL_LIST_SNAPSHOTS: &str = "SELECT snapshot_id, CAST(snapshot_time AS VARCHAR) as timestamp FROM ducklake_snapshot ORDER BY snapshot_id";
+pub const SQL_LIST_SNAPSHOTS: &str = "
+    SELECT s.snapshot_id, CAST(s.snapshot_time AS VARCHAR) as snapshot_time, s.schema_version,
+           c.changes_made, c.author, c.commit_message, c.commit_extra_info
+    FROM ducklake_snapshot s
+    LEFT JOIN ducklake_snapshot_changes c ON s.snapshot_id = c.snapshot_id
+    ORDER BY s.snapshot_id";
 
 pub const SQL_LIST_SCHEMAS: &str =
     "SELECT schema_id, schema_name, path, path_is_relative FROM ducklake_schema
@@ -36,7 +41,10 @@ pub const SQL_GET_DATA_FILES: &str = "
         del.file_size_bytes AS delete_file_size,
         del.footer_size AS delete_footer_size,
         del.encryption_key AS delete_encryption_key,
-        del.delete_count
+        del.delete_count,
+        data.begin_snapshot,
+        data.row_id_start,
+        data.record_count
     FROM ducklake_data_file AS data
     LEFT JOIN ducklake_delete_file AS del
         ON data.data_file_id = del.data_file_id
@@ -249,8 +257,10 @@ WHERE data.table_id = p.table_identifier
 pub const SQL_LIST_ALL_TABLES: &str = "
     SELECT
         s.schema_name,
+        s.schema_id,
         t.table_id,
         t.table_name,
+        CAST(t.table_uuid AS VARCHAR) AS table_uuid,
         t.path,
         t.path_is_relative
     FROM ducklake_schema s
@@ -326,7 +336,17 @@ pub struct SnapshotMetadata {
     /// Unique identifier for this snapshot
     pub snapshot_id: i64,
     /// Timestamp when the snapshot was created (optional)
-    pub timestamp: Option<String>,
+    pub snapshot_time: Option<String>,
+    /// Schema version at this snapshot
+    pub schema_version: Option<i64>,
+    /// Description of changes made in this snapshot
+    pub changes: Option<String>,
+    /// Author of this snapshot
+    pub author: Option<String>,
+    /// Commit message for this snapshot
+    pub commit_message: Option<String>,
+    /// Extra commit info for this snapshot
+    pub commit_extra_info: Option<String>,
 }
 
 /// Metadata for a schema in the DuckLake catalog
@@ -386,6 +406,10 @@ pub struct FileColumnStats {
 pub struct TableWithSchema {
     /// Name of the schema this table belongs to
     pub schema_name: String,
+    /// ID of the schema this table belongs to
+    pub schema_id: i64,
+    /// UUID of the table (optional, for table_info output)
+    pub table_uuid: Option<String>,
     /// Table metadata
     pub table: TableMetadata,
 }

@@ -505,9 +505,273 @@ fn extract_bool_arg(expr: &Expr, func_name: &str, pos: usize) -> DataFusionResul
     }
 }
 
+// ==================== ducklake_options ====================
+
+/// Returns catalog-level and scoped options for a DuckLake catalog.
+///
+/// Usage:
+///   `SELECT * FROM ducklake_options()`
+///
+/// Returns: `(option_name: Utf8, description: Utf8, value: Utf8, scope: Utf8, scope_entry: Utf8)`
+#[derive(Debug)]
+pub struct DucklakeOptionsFunction {
+    catalog_path: String,
+}
+
+impl DucklakeOptionsFunction {
+    pub fn new(catalog_path: impl Into<String>) -> Self {
+        Self {
+            catalog_path: catalog_path.into(),
+        }
+    }
+}
+
+impl TableFunctionImpl for DucklakeOptionsFunction {
+    fn call(&self, exprs: &[Expr]) -> DataFusionResult<Arc<dyn TableProvider>> {
+        if !exprs.is_empty() {
+            return plan_err!("ducklake_options() takes no arguments");
+        }
+
+        let conn = open_compaction_connection(&self.catalog_path)?;
+
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("option_name", arrow::datatypes::DataType::Utf8, true),
+            arrow::datatypes::Field::new("description", arrow::datatypes::DataType::Utf8, true),
+            arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Utf8, true),
+            arrow::datatypes::Field::new("scope", arrow::datatypes::DataType::Utf8, true),
+            arrow::datatypes::Field::new("scope_entry", arrow::datatypes::DataType::Utf8, true),
+        ]));
+
+        let sql = "SELECT option_name, description, value, scope, scope_entry FROM ducklake_options('__compaction')";
+
+        let mut stmt = conn
+            .prepare(sql)
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        let mut rows = stmt
+            .query([])
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+
+        let mut option_names: Vec<Option<String>> = Vec::new();
+        let mut descriptions: Vec<Option<String>> = Vec::new();
+        let mut values: Vec<Option<String>> = Vec::new();
+        let mut scopes: Vec<Option<String>> = Vec::new();
+        let mut scope_entries: Vec<Option<String>> = Vec::new();
+
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?
+        {
+            option_names.push(row.get(0).map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?);
+            descriptions.push(row.get(1).map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?);
+            values.push(row.get(2).map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?);
+            scopes.push(row.get(3).map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?);
+            scope_entries.push(row.get(4).map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?);
+        }
+
+        let batch = if option_names.is_empty() {
+            RecordBatch::new_empty(schema.clone())
+        } else {
+            let arrays: Vec<ArrayRef> = vec![
+                Arc::new(StringArray::from(option_names)),
+                Arc::new(StringArray::from(descriptions)),
+                Arc::new(StringArray::from(values)),
+                Arc::new(StringArray::from(scopes)),
+                Arc::new(StringArray::from(scope_entries)),
+            ];
+            RecordBatch::try_new(schema.clone(), arrays)
+                .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?
+        };
+
+        let mem = datafusion::datasource::memory::MemTable::try_new(schema, vec![vec![batch]])?;
+        Ok(Arc::new(mem))
+    }
+}
+
+// ==================== ducklake_add_data_files ====================
+
+/// Adds existing Parquet files to a DuckLake table.
+///
+/// Usage:
+///   `SELECT * FROM ducklake_add_data_files('table_name', 'file_pattern')`
+///
+/// Returns: `(filename: Utf8)` — typically 0 rows on success.
+#[derive(Debug)]
+pub struct DucklakeAddDataFilesFunction {
+    catalog_path: String,
+}
+
+impl DucklakeAddDataFilesFunction {
+    pub fn new(catalog_path: impl Into<String>) -> Self {
+        Self {
+            catalog_path: catalog_path.into(),
+        }
+    }
+}
+
+impl TableFunctionImpl for DucklakeAddDataFilesFunction {
+    fn call(&self, exprs: &[Expr]) -> DataFusionResult<Arc<dyn TableProvider>> {
+        if exprs.len() < 2 || exprs.len() > 3 {
+            return plan_err!(
+                "ducklake_add_data_files() requires 2-3 arguments: (table_name, file_pattern, [schema])"
+            );
+        }
+
+        let table_name = extract_string_arg(&exprs[0], "ducklake_add_data_files", 1)?;
+        let file_pattern = extract_string_arg(&exprs[1], "ducklake_add_data_files", 2)?;
+
+        let conn = open_compaction_connection(&self.catalog_path)?;
+
+        let sql = if exprs.len() == 3 {
+            let schema_name = extract_string_arg(&exprs[2], "ducklake_add_data_files", 3)?;
+            format!(
+                "SELECT * FROM ducklake_add_data_files('__compaction', '{}', '{}', schema := '{}')",
+                table_name.replace('\'', "''"),
+                file_pattern.replace('\'', "''"),
+                schema_name.replace('\'', "''")
+            )
+        } else {
+            format!(
+                "SELECT * FROM ducklake_add_data_files('__compaction', '{}', '{}')",
+                table_name.replace('\'', "''"),
+                file_pattern.replace('\'', "''")
+            )
+        };
+
+        // Return schema: (filename: Utf8)
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("filename", arrow::datatypes::DataType::Utf8, true),
+        ]));
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        let mut rows = stmt
+            .query([])
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+
+        let mut filenames: Vec<Option<String>> = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?
+        {
+            filenames.push(row.get(0).map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?);
+        }
+
+        let batch = if filenames.is_empty() {
+            RecordBatch::new_empty(schema.clone())
+        } else {
+            let arr: ArrayRef = Arc::new(StringArray::from(filenames));
+            RecordBatch::try_new(schema.clone(), vec![arr])
+                .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?
+        };
+
+        let mem = datafusion::datasource::memory::MemTable::try_new(schema, vec![vec![batch]])?;
+        Ok(Arc::new(mem))
+    }
+}
+
+// ==================== ducklake_set_option ====================
+
+/// Sets a DuckLake catalog option.
+///
+/// Usage:
+///   `SELECT * FROM ducklake_set_option('option_name', 'value')`
+///
+/// Returns: `(Success: Boolean)` — typically 0 rows.
+#[derive(Debug)]
+pub struct DucklakeSetOptionFunction {
+    catalog_path: String,
+}
+
+impl DucklakeSetOptionFunction {
+    pub fn new(catalog_path: impl Into<String>) -> Self {
+        Self {
+            catalog_path: catalog_path.into(),
+        }
+    }
+}
+
+impl TableFunctionImpl for DucklakeSetOptionFunction {
+    fn call(&self, exprs: &[Expr]) -> DataFusionResult<Arc<dyn TableProvider>> {
+        if exprs.len() != 2 {
+            return plan_err!(
+                "ducklake_set_option() requires 2 arguments: (option_name, value)"
+            );
+        }
+
+        let option_name = extract_string_arg(&exprs[0], "ducklake_set_option", 1)?;
+        let value = extract_string_arg(&exprs[1], "ducklake_set_option", 2)?;
+
+        let conn = open_compaction_connection(&self.catalog_path)?;
+
+        let sql = format!(
+            "SELECT * FROM ducklake_set_option('__compaction', '{}', '{}')",
+            option_name.replace('\'', "''"),
+            value.replace('\'', "''")
+        );
+
+        execute_success_query(&conn, &sql)
+    }
+}
+
+// ==================== ducklake_set_commit_message ====================
+
+/// Sets the author and commit message for the next DuckLake snapshot.
+///
+/// Usage:
+///   `SELECT * FROM ducklake_set_commit_message('author', 'message')`
+///   `SELECT * FROM ducklake_set_commit_message('author', 'message', 'extra_info')`
+///
+/// Returns: `(Success: Boolean)` — typically 0 rows.
+#[derive(Debug)]
+pub struct DucklakeSetCommitMessageFunction {
+    catalog_path: String,
+}
+
+impl DucklakeSetCommitMessageFunction {
+    pub fn new(catalog_path: impl Into<String>) -> Self {
+        Self {
+            catalog_path: catalog_path.into(),
+        }
+    }
+}
+
+impl TableFunctionImpl for DucklakeSetCommitMessageFunction {
+    fn call(&self, exprs: &[Expr]) -> DataFusionResult<Arc<dyn TableProvider>> {
+        if exprs.len() < 2 || exprs.len() > 3 {
+            return plan_err!(
+                "ducklake_set_commit_message() requires 2-3 arguments: (author, message, [extra_info])"
+            );
+        }
+
+        let author = extract_string_arg(&exprs[0], "ducklake_set_commit_message", 1)?;
+        let message = extract_string_arg(&exprs[1], "ducklake_set_commit_message", 2)?;
+
+        let conn = open_compaction_connection(&self.catalog_path)?;
+
+        let sql = if exprs.len() == 3 {
+            let extra_info = extract_string_arg(&exprs[2], "ducklake_set_commit_message", 3)?;
+            format!(
+                "SELECT * FROM ducklake_set_commit_message('__compaction', '{}', '{}', extra_info := '{}')",
+                author.replace('\'', "''"),
+                message.replace('\'', "''"),
+                extra_info.replace('\'', "''")
+            )
+        } else {
+            format!(
+                "SELECT * FROM ducklake_set_commit_message('__compaction', '{}', '{}')",
+                author.replace('\'', "''"),
+                message.replace('\'', "''")
+            )
+        };
+
+        execute_success_query(&conn, &sql)
+    }
+}
+
 // ==================== Registration ====================
 
-/// Registers all ducklake compaction table functions with a SessionContext.
+/// Registers all ducklake compaction and catalog management table functions with a SessionContext.
 ///
 /// The `catalog_path` should be the path to the DuckLake catalog database file
 /// (the same path used to create a `DuckdbMetadataProvider`).
@@ -534,6 +798,22 @@ pub fn register_ducklake_compaction_functions(
     );
     ctx.register_udtf(
         "ducklake_delete_orphaned_files",
-        Arc::new(DucklakeDeleteOrphanedFilesFunction::new(path)),
+        Arc::new(DucklakeDeleteOrphanedFilesFunction::new(path.clone())),
+    );
+    ctx.register_udtf(
+        "ducklake_options",
+        Arc::new(DucklakeOptionsFunction::new(path.clone())),
+    );
+    ctx.register_udtf(
+        "ducklake_add_data_files",
+        Arc::new(DucklakeAddDataFilesFunction::new(path.clone())),
+    );
+    ctx.register_udtf(
+        "ducklake_set_option",
+        Arc::new(DucklakeSetOptionFunction::new(path.clone())),
+    );
+    ctx.register_udtf(
+        "ducklake_set_commit_message",
+        Arc::new(DucklakeSetCommitMessageFunction::new(path)),
     );
 }

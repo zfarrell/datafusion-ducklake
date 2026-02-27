@@ -395,7 +395,7 @@ async fn test_ducklake_list_files_function() -> Result<(), Box<dyn std::error::E
     register_ducklake_functions(&ctx, Arc::new(provider));
 
     let df = ctx
-        .sql("SELECT file_path, file_size_bytes FROM ducklake_list_files()")
+        .sql("SELECT data_file, data_file_size_bytes FROM ducklake_list_files('users')")
         .await?;
     let results = df.collect().await?;
 

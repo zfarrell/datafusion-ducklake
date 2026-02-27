@@ -368,7 +368,7 @@ async fn populate_from_duckdb_catalog(
     for snapshot in &snapshots {
         sqlx::query("INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time) VALUES (?, ?)")
             .bind(snapshot.snapshot_id)
-            .bind(&snapshot.timestamp)
+            .bind(&snapshot.snapshot_time)
             .execute(pool)
             .await?;
     }

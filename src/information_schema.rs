@@ -50,7 +50,12 @@ impl SnapshotsTable {
     pub fn new(provider: Arc<dyn MetadataProvider>) -> Self {
         let schema = Arc::new(Schema::new(vec![
             Field::new("snapshot_id", DataType::Int64, false),
-            Field::new("timestamp", DataType::Utf8, true),
+            Field::new("snapshot_time", DataType::Utf8, true),
+            Field::new("schema_version", DataType::Int64, true),
+            Field::new("changes", DataType::Utf8, true),
+            Field::new("author", DataType::Utf8, true),
+            Field::new("commit_message", DataType::Utf8, true),
+            Field::new("commit_extra_info", DataType::Utf8, true),
         ]));
         Self {
             provider,
@@ -67,16 +72,30 @@ impl SnapshotsTable {
         let snapshot_ids: ArrayRef = Arc::new(Int64Array::from(
             snapshots.iter().map(|s| s.snapshot_id).collect::<Vec<_>>(),
         ));
-
-        let timestamps: ArrayRef = Arc::new(StringArray::from(
-            snapshots
-                .iter()
-                .map(|s| s.timestamp.as_deref())
-                .collect::<Vec<_>>(),
+        let snapshot_times: ArrayRef = Arc::new(StringArray::from(
+            snapshots.iter().map(|s| s.snapshot_time.as_deref()).collect::<Vec<_>>(),
+        ));
+        let schema_versions: ArrayRef = Arc::new(Int64Array::from(
+            snapshots.iter().map(|s| s.schema_version).collect::<Vec<_>>(),
+        ));
+        let changes: ArrayRef = Arc::new(StringArray::from(
+            snapshots.iter().map(|s| s.changes.as_deref()).collect::<Vec<_>>(),
+        ));
+        let authors: ArrayRef = Arc::new(StringArray::from(
+            snapshots.iter().map(|s| s.author.as_deref()).collect::<Vec<_>>(),
+        ));
+        let commit_messages: ArrayRef = Arc::new(StringArray::from(
+            snapshots.iter().map(|s| s.commit_message.as_deref()).collect::<Vec<_>>(),
+        ));
+        let commit_extra_infos: ArrayRef = Arc::new(StringArray::from(
+            snapshots.iter().map(|s| s.commit_extra_info.as_deref()).collect::<Vec<_>>(),
         ));
 
-        RecordBatch::try_new(self.schema.clone(), vec![snapshot_ids, timestamps])
-            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+        RecordBatch::try_new(
+            self.schema.clone(),
+            vec![snapshot_ids, snapshot_times, schema_versions, changes, authors, commit_messages, commit_extra_infos],
+        )
+        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
     }
 }
 
@@ -433,9 +452,10 @@ pub struct TableInfoTable {
 impl TableInfoTable {
     pub fn new(provider: Arc<dyn MetadataProvider>) -> Self {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("schema_name", DataType::Utf8, false),
             Field::new("table_name", DataType::Utf8, false),
+            Field::new("schema_id", DataType::Int64, false),
             Field::new("table_id", DataType::Int64, false),
+            Field::new("table_uuid", DataType::Utf8, true),
             Field::new("file_count", DataType::Int64, false),
             Field::new("file_size_bytes", DataType::Int64, false),
             Field::new("delete_file_count", DataType::Int64, false),
@@ -470,7 +490,9 @@ impl TableInfoTable {
 
         #[derive(Default, Debug)]
         struct TableStats {
+            schema_id: i64,
             table_id: i64,
+            table_uuid: Option<String>,
             file_count: i64,
             file_size: i64,
             delete_count: i64,
@@ -486,7 +508,9 @@ impl TableInfoTable {
             table_stats.insert(
                 (t.schema_name.clone(), t.table.table_name.clone()),
                 TableStats {
+                    schema_id: t.schema_id,
                     table_id: t.table.table_id,
+                    table_uuid: t.table_uuid.clone(),
                     file_count: 0,
                     file_size: 0,
                     delete_count: 0,
@@ -508,39 +532,41 @@ impl TableInfoTable {
                     .delete_file
                     .as_ref()
                     .map(|d| d.file_size_bytes)
-                    .unwrap_or(0); // delete_file_size_bytes
+                    .unwrap_or(0);
             }
         }
 
         // Convert to vector and sort for deterministic output
         let mut all_table_info: Vec<_> = table_stats.into_iter().collect();
         all_table_info.sort_by(|a, b| {
-            // Sort by schema_name, then table_name
-            a.0.0.cmp(&b.0.0).then_with(|| a.0.1.cmp(&b.0.1))
+            a.0 .0.cmp(&b.0 .0).then_with(|| a.0 .1.cmp(&b.0 .1))
         });
 
         // Build arrays in a single pass
         let mut table_names = Vec::with_capacity(all_table_info.len());
-        let mut schema_names = Vec::with_capacity(all_table_info.len());
+        let mut schema_ids = Vec::with_capacity(all_table_info.len());
         let mut table_ids = Vec::with_capacity(all_table_info.len());
+        let mut table_uuids: Vec<Option<String>> = Vec::with_capacity(all_table_info.len());
         let mut file_counts = Vec::with_capacity(all_table_info.len());
         let mut file_sizes = Vec::with_capacity(all_table_info.len());
         let mut delete_file_counts = Vec::with_capacity(all_table_info.len());
         let mut delete_file_sizes = Vec::with_capacity(all_table_info.len());
 
-        for ((schema_name, table_name), stats) in all_table_info {
-            schema_names.push(schema_name);
+        for ((_schema_name, table_name), stats) in all_table_info {
             table_names.push(table_name);
+            schema_ids.push(stats.schema_id);
             table_ids.push(stats.table_id);
+            table_uuids.push(stats.table_uuid);
             file_counts.push(stats.file_count);
             file_sizes.push(stats.file_size);
             delete_file_counts.push(stats.delete_count);
             delete_file_sizes.push(stats.delete_size);
         }
 
-        let schema_names: ArrayRef = Arc::new(StringArray::from(schema_names));
         let table_names: ArrayRef = Arc::new(StringArray::from(table_names));
+        let schema_ids: ArrayRef = Arc::new(Int64Array::from(schema_ids));
         let table_ids: ArrayRef = Arc::new(Int64Array::from(table_ids));
+        let table_uuids: ArrayRef = Arc::new(StringArray::from(table_uuids));
         let file_counts: ArrayRef = Arc::new(Int64Array::from(file_counts));
         let file_sizes: ArrayRef = Arc::new(Int64Array::from(file_sizes));
         let delete_file_counts: ArrayRef = Arc::new(Int64Array::from(delete_file_counts));
@@ -549,9 +575,10 @@ impl TableInfoTable {
         RecordBatch::try_new(
             self.schema.clone(),
             vec![
-                schema_names,
                 table_names,
+                schema_ids,
                 table_ids,
+                table_uuids,
                 file_counts,
                 file_sizes,
                 delete_file_counts,

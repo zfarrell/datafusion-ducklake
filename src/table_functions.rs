@@ -9,7 +9,7 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
-use crate::information_schema::{FilesTable, SnapshotsTable, TableInfoTable};
+use crate::information_schema::{SnapshotsTable, TableInfoTable};
 use crate::metadata_provider::MetadataProvider;
 use crate::path_resolver::{parse_object_store_url, resolve_path};
 use crate::table_changes::TableChangesTable;
@@ -78,11 +78,125 @@ impl DucklakeListFilesFunction {
 
 impl TableFunctionImpl for DucklakeListFilesFunction {
     fn call(&self, exprs: &[Expr]) -> DataFusionResult<Arc<dyn TableProvider>> {
-        if !exprs.is_empty() {
-            return plan_err!("ducklake_list_files() takes no arguments");
+        if exprs.len() != 1 {
+            return plan_err!(
+                "ducklake_list_files() requires 1 argument: ducklake_list_files('table_name')"
+            );
         }
 
-        Ok(Arc::new(FilesTable::new(self.provider.clone())))
+        let table_name = match &exprs[0] {
+            Expr::Literal(ScalarValue::Utf8(Some(name)), _) => name.clone(),
+            _ => {
+                return plan_err!(
+                    "First argument to ducklake_list_files() must be a string literal"
+                );
+            }
+        };
+
+        let resolved = resolve_table_for_function(
+            &*self.provider,
+            &table_name,
+            "ducklake_list_files",
+        )?;
+
+        let snapshot_id = self
+            .provider
+            .get_current_snapshot()
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+
+        let files = self
+            .provider
+            .get_table_files_for_select(resolved.table_id, snapshot_id)
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+
+        // Build the DuckDB-compatible schema
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("data_file", DataType::Utf8, false),
+            Field::new("data_file_size_bytes", DataType::Int64, false),
+            Field::new("data_file_footer_size", DataType::Int64, true),
+            Field::new("data_file_encryption_key", DataType::Utf8, true),
+            Field::new("delete_file", DataType::Utf8, true),
+            Field::new("delete_file_size_bytes", DataType::Int64, true),
+            Field::new("delete_file_footer_size", DataType::Int64, true),
+            Field::new("delete_file_encryption_key", DataType::Utf8, true),
+        ]));
+
+        let mut data_file_paths: Vec<String> = Vec::with_capacity(files.len());
+        let mut data_file_sizes: Vec<i64> = Vec::with_capacity(files.len());
+        let mut data_file_footer_sizes: Vec<Option<i64>> = Vec::with_capacity(files.len());
+        let mut data_file_encryption_keys: Vec<Option<String>> = Vec::with_capacity(files.len());
+        let mut delete_file_paths: Vec<Option<String>> = Vec::with_capacity(files.len());
+        let mut delete_file_sizes: Vec<Option<i64>> = Vec::with_capacity(files.len());
+        let mut delete_file_footer_sizes: Vec<Option<i64>> = Vec::with_capacity(files.len());
+        let mut delete_file_encryption_keys: Vec<Option<String>> = Vec::with_capacity(files.len());
+
+        // Resolve the table path for constructing full file paths
+        let data_path = self
+            .provider
+            .get_data_path()
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+
+        for f in &files {
+            // Resolve the data file path
+            let file_path = if f.file.path_is_relative {
+                resolve_path(&resolved.table_path, &f.file.path, true)
+                    .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?
+            } else {
+                f.file.path.clone()
+            };
+
+            // Strip the data_path prefix if the file path starts with the base URL path
+            let display_path = file_path.strip_prefix(&data_path).map_or_else(
+                || file_path.clone(),
+                |stripped| stripped.to_string(),
+            );
+
+            data_file_paths.push(display_path);
+            data_file_sizes.push(f.file.file_size_bytes);
+            data_file_footer_sizes.push(f.file.footer_size);
+            data_file_encryption_keys.push(f.file.encryption_key.clone());
+
+            if let Some(del) = &f.delete_file {
+                let del_path = if del.path_is_relative {
+                    resolve_path(&resolved.table_path, &del.path, true)
+                        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?
+                } else {
+                    del.path.clone()
+                };
+                let display_del = del_path.strip_prefix(&data_path).map_or_else(
+                    || del_path.clone(),
+                    |stripped| stripped.to_string(),
+                );
+                delete_file_paths.push(Some(display_del));
+                delete_file_sizes.push(Some(del.file_size_bytes));
+                delete_file_footer_sizes.push(del.footer_size);
+                delete_file_encryption_keys.push(del.encryption_key.clone());
+            } else {
+                delete_file_paths.push(None);
+                delete_file_sizes.push(None);
+                delete_file_footer_sizes.push(None);
+                delete_file_encryption_keys.push(None);
+            }
+        }
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow::array::StringArray::from(data_file_paths)) as ArrayRef,
+                Arc::new(Int64Array::from(data_file_sizes)) as ArrayRef,
+                Arc::new(Int64Array::from(data_file_footer_sizes)) as ArrayRef,
+                Arc::new(arrow::array::StringArray::from(data_file_encryption_keys)) as ArrayRef,
+                Arc::new(arrow::array::StringArray::from(delete_file_paths)) as ArrayRef,
+                Arc::new(Int64Array::from(delete_file_sizes)) as ArrayRef,
+                Arc::new(Int64Array::from(delete_file_footer_sizes)) as ArrayRef,
+                Arc::new(arrow::array::StringArray::from(delete_file_encryption_keys)) as ArrayRef,
+            ],
+        )
+        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+
+        let mem_table =
+            datafusion::datasource::memory::MemTable::try_new(schema, vec![vec![batch]])?;
+        Ok(Arc::new(mem_table))
     }
 }
 

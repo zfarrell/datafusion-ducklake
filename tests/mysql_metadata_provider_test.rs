@@ -373,7 +373,7 @@ async fn populate_from_duckdb_catalog(
     // Insert snapshots
     for snapshot in &snapshots {
         let timestamp_value: Option<sqlx::types::chrono::NaiveDateTime> =
-            snapshot.timestamp.as_ref().and_then(|ts_str| {
+            snapshot.snapshot_time.as_ref().and_then(|ts_str| {
                 sqlx::types::chrono::NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%d %H:%M:%S%.6f")
                     .ok()
             });

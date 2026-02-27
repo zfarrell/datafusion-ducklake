@@ -88,11 +88,14 @@ impl MetadataProvider for DuckdbMetadataProvider {
 
         let snapshots = stmt
             .query_map([], |row| {
-                let snapshot_id: i64 = row.get(0)?;
-                let timestamp: Option<String> = row.get(1)?;
                 Ok(SnapshotMetadata {
-                    snapshot_id,
-                    timestamp,
+                    snapshot_id: row.get(0)?,
+                    snapshot_time: row.get(1)?,
+                    schema_version: row.get(2)?,
+                    changes: row.get(3)?,
+                    author: row.get(4)?,
+                    commit_message: row.get(5)?,
+                    commit_extra_info: row.get(6)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -202,14 +205,17 @@ impl MetadataProvider for DuckdbMetadataProvider {
                     };
 
                     let _delete_count: Option<i64> = row.get(12)?;
+                    let begin_snapshot: Option<i64> = row.get(13)?;
+                    let row_id_start: Option<i64> = row.get(14)?;
+                    let record_count: Option<i64> = row.get(15)?;
 
                     Ok(DuckLakeTableFile {
                         data_file_id: Some(data_file_id),
                         file: data_file,
                         delete_file,
-                        row_id_start: None,
-                        snapshot_id: Some(snapshot_id),
-                        max_row_count: None,
+                        row_id_start,
+                        snapshot_id: begin_snapshot,
+                        max_row_count: record_count,
                     })
                 },
             )?
@@ -290,14 +296,18 @@ impl MetadataProvider for DuckdbMetadataProvider {
                 params![snapshot_id, snapshot_id, snapshot_id, snapshot_id],
                 |row| {
                     let schema_name: String = row.get(0)?;
+                    let schema_id: i64 = row.get(1)?;
                     let table = TableMetadata {
-                        table_id: row.get(1)?,
-                        table_name: row.get(2)?,
-                        path: row.get(3)?,
-                        path_is_relative: row.get(4)?,
+                        table_id: row.get(2)?,
+                        table_name: row.get(3)?,
+                        path: row.get(5)?,
+                        path_is_relative: row.get(6)?,
                     };
+                    let table_uuid: Option<String> = row.get(4)?;
                     Ok(TableWithSchema {
                         schema_name,
+                        schema_id,
+                        table_uuid,
                         table,
                     })
                 },
