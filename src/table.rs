@@ -8,7 +8,8 @@ use crate::Result;
 use crate::column_rename::ColumnRenameExec;
 use crate::delete_filter::DeleteFilterExec;
 use crate::metadata_provider::{
-    DuckLakeFileData, DuckLakeTableColumn, DuckLakeTableFile, MetadataProvider, PartitionColumn,
+    DuckLakeFileData, DuckLakeTableColumn, DuckLakeTableFile, InlinedDataRow, MetadataProvider,
+    PartitionColumn,
 };
 use crate::path_resolver::resolve_path;
 use crate::types::{
@@ -115,6 +116,8 @@ pub struct DuckLakeTable {
     partition_columns: Vec<PartitionColumn>,
     /// Partition values per file: data_file_id -> [(partition_key_index, value)]
     file_partition_values: HashMap<i64, Vec<(i32, Option<String>)>>,
+    /// Inlined data rows stored directly in the catalog database
+    inlined_data: Vec<InlinedDataRow>,
     /// Cached schema mapping (read_schema, name_mapping) - computed once on first scan
     schema_mapping_cache: OnceCell<SchemaMappingCache>,
     /// Encryption factory for decrypting encrypted Parquet files (when encryption feature is enabled)
@@ -192,6 +195,11 @@ impl DuckLakeTable {
             HashMap::new()
         };
 
+        // Load inlined data from catalog database
+        let inlined_data = provider
+            .get_inlined_data(table_id, snapshot_id)
+            .unwrap_or_default();
+
         // Build encryption factory from file encryption keys (when encryption feature is enabled)
         #[cfg(feature = "encryption")]
         let encryption_factory = {
@@ -234,6 +242,7 @@ impl DuckLakeTable {
             cached_row_count,
             partition_columns,
             file_partition_values,
+            inlined_data,
             #[cfg(feature = "encryption")]
             encryption_factory,
             schema_mapping_cache: OnceCell::new(),
@@ -242,6 +251,56 @@ impl DuckLakeTable {
             #[cfg(feature = "write")]
             writer: None,
         })
+    }
+
+    /// Build a MemTable-based plan for inlined data rows.
+    ///
+    /// Converts the cached inlined data rows into Arrow RecordBatches and wraps them
+    /// in a MemTable scan for inclusion in the scan plan.
+    async fn build_inlined_data_exec(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+    ) -> DataFusionResult<Option<Arc<dyn ExecutionPlan>>> {
+        if self.inlined_data.is_empty() {
+            return Ok(None);
+        }
+
+        let schema = &self.schema;
+        let num_rows = self.inlined_data.len();
+
+        // Build column arrays from inlined data
+        let mut column_arrays: Vec<Arc<dyn Array>> = Vec::new();
+        for field in schema.fields().iter() {
+            let col_name = field.name();
+            let data_type = field.data_type();
+
+            // Collect values for this column from all inlined rows
+            let mut string_values: Vec<Option<String>> = Vec::with_capacity(num_rows);
+            for row in &self.inlined_data {
+                let value = row
+                    .column_names
+                    .iter()
+                    .position(|n| n == col_name)
+                    .and_then(|pos| row.values.get(pos))
+                    .and_then(|v| v.clone());
+                string_values.push(value);
+            }
+
+            // Parse string values into the appropriate Arrow array type
+            let array = parse_inlined_column(&string_values, data_type)?;
+            column_arrays.push(array);
+        }
+
+        let batch = RecordBatch::try_new(schema.clone(), column_arrays)
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+
+        let mem_table =
+            datafusion::datasource::memory::MemTable::try_new(schema.clone(), vec![vec![batch]])?;
+
+        let exec = mem_table.scan(state, projection, &[], None).await?;
+
+        Ok(Some(exec))
     }
 
     /// Resolve a file path (data or delete file) to its absolute path
@@ -594,6 +653,65 @@ impl DuckLakeTable {
             self.table_files.clone(),
             filters.to_vec(),
             assignments,
+            Arc::clone(writer),
+            self.object_store_url.clone(),
+            self.table_path.clone(),
+            existing_deletes,
+        )))
+    }
+
+    /// Create a MERGE INTO execution plan for this table.
+    ///
+    /// Returns an execution plan that, when executed, will:
+    /// 1. Scan each target data file and join with source data on key columns
+    /// 2. For matched rows: apply the matched action (UPDATE or DELETE)
+    /// 3. For unmatched source rows: insert them as new data
+    /// 4. Write delete files for matched rows and new data files for updated/inserted rows
+    /// 5. Return the total count of affected rows
+    #[cfg(feature = "write")]
+    pub async fn merge(
+        &self,
+        state: &dyn Session,
+        source_batches: Vec<RecordBatch>,
+        join_key_pairs: Vec<(usize, usize)>,
+        matched_action: Option<crate::merge_exec::MergeMatchedAction>,
+        insert_unmatched: bool,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        use crate::merge_exec::DuckLakeMergeExec;
+
+        let writer = self.writer.as_ref().ok_or_else(|| {
+            DataFusionError::Plan(
+                "Table is read-only. Use DuckLakeCatalog::with_writer() to enable writes."
+                    .to_string(),
+            )
+        })?;
+
+        let schema_name = self.schema_name.as_ref().ok_or_else(|| {
+            DataFusionError::Internal("Schema name not set for writable table".to_string())
+        })?;
+
+        let mut existing_deletes = HashMap::new();
+        for table_file in &self.table_files {
+            if let Some(ref delete_file) = table_file.delete_file {
+                let resolved_path = self.resolve_file_path(&table_file.file)?;
+                let positions = self.read_delete_file_positions(state, delete_file).await?;
+                existing_deletes.insert(resolved_path, positions);
+            }
+        }
+
+        let column_ids: Vec<i64> = self.columns.iter().map(|c| c.column_id).collect();
+
+        Ok(Arc::new(DuckLakeMergeExec::new(
+            self.table_id,
+            self.table_name.clone(),
+            schema_name.clone(),
+            self.schema.clone(),
+            column_ids,
+            self.table_files.clone(),
+            source_batches,
+            join_key_pairs,
+            matched_action,
+            insert_unmatched,
             Arc::clone(writer),
             self.object_store_url.clone(),
             self.table_path.clone(),
@@ -1272,6 +1390,10 @@ impl TableProvider for DuckLakeTable {
                         .await?,
                 );
             }
+            // Add inlined data if available
+            if let Some(inlined_exec) = self.build_inlined_data_exec(state, projection).await? {
+                execs.push(inlined_exec);
+            }
             if execs.is_empty() {
                 use datafusion::physical_plan::empty::EmptyExec;
                 let projected_schema = match projection {
@@ -1330,6 +1452,16 @@ impl TableProvider for DuckLakeTable {
             execs.push(Arc::new(VirtualColumnExec::new(
                 file_exec,
                 resolved_path,
+                include_filename,
+                include_row_number,
+                Arc::clone(&vc_output_schema),
+            )));
+        }
+        // Add inlined data with virtual columns (empty path for inlined rows)
+        if let Some(inlined_exec) = self.build_inlined_data_exec(state, real_proj_ref).await? {
+            execs.push(Arc::new(VirtualColumnExec::new(
+                inlined_exec,
+                String::new(), // inlined data has no file path
                 include_filename,
                 include_row_number,
                 Arc::clone(&vc_output_schema),
@@ -1532,6 +1664,96 @@ fn extract_deleted_positions_from_batch(
     }
 
     Ok(())
+}
+
+/// Parse a column of string values into an Arrow array of the given data type.
+///
+/// Used for converting inlined data (stored as strings in the catalog) back into
+/// typed Arrow arrays for query execution.
+fn parse_inlined_column(
+    values: &[Option<String>],
+    data_type: &DataType,
+) -> DataFusionResult<Arc<dyn Array>> {
+    use arrow::array::*;
+
+    macro_rules! parse_primitive {
+        ($builder_ty:ty, $values:expr) => {{
+            let mut builder = <$builder_ty>::with_capacity($values.len());
+            for val in $values {
+                match val {
+                    Some(s) => match s.parse() {
+                        Ok(v) => builder.append_value(v),
+                        Err(_) => builder.append_null(),
+                    },
+                    None => builder.append_null(),
+                }
+            }
+            Arc::new(builder.finish()) as Arc<dyn Array>
+        }};
+    }
+
+    let array: Arc<dyn Array> = match data_type {
+        DataType::Boolean => {
+            let mut builder = BooleanBuilder::with_capacity(values.len());
+            for val in values {
+                match val {
+                    Some(s) => match s.to_lowercase().as_str() {
+                        "true" | "1" | "t" => builder.append_value(true),
+                        "false" | "0" | "f" => builder.append_value(false),
+                        _ => builder.append_null(),
+                    },
+                    None => builder.append_null(),
+                }
+            }
+            Arc::new(builder.finish())
+        }
+        DataType::Int8 => parse_primitive!(Int8Builder, values),
+        DataType::Int16 => parse_primitive!(Int16Builder, values),
+        DataType::Int32 => parse_primitive!(Int32Builder, values),
+        DataType::Int64 => parse_primitive!(Int64Builder, values),
+        DataType::UInt8 => parse_primitive!(UInt8Builder, values),
+        DataType::UInt16 => parse_primitive!(UInt16Builder, values),
+        DataType::UInt32 => parse_primitive!(UInt32Builder, values),
+        DataType::UInt64 => parse_primitive!(UInt64Builder, values),
+        DataType::Float32 => parse_primitive!(Float32Builder, values),
+        DataType::Float64 => parse_primitive!(Float64Builder, values),
+        DataType::Utf8 => {
+            let mut builder = StringBuilder::new();
+            for val in values {
+                match val {
+                    Some(s) => builder.append_value(s),
+                    None => builder.append_null(),
+                }
+            }
+            Arc::new(builder.finish())
+        }
+        DataType::LargeUtf8 => {
+            let mut builder = LargeStringBuilder::new();
+            for val in values {
+                match val {
+                    Some(s) => builder.append_value(s),
+                    None => builder.append_null(),
+                }
+            }
+            Arc::new(builder.finish())
+        }
+        DataType::Date32 => parse_primitive!(Date32Builder, values),
+        DataType::Date64 => parse_primitive!(Date64Builder, values),
+        DataType::Timestamp(_, _) => parse_primitive!(Int64Builder, values),
+        _ => {
+            // Fallback: store as strings
+            let mut builder = StringBuilder::new();
+            for val in values {
+                match val {
+                    Some(s) => builder.append_value(s),
+                    None => builder.append_null(),
+                }
+            }
+            Arc::new(builder.finish())
+        }
+    };
+
+    Ok(array)
 }
 
 /// Check if a DataFusion error is caused by an object store NotFound error.

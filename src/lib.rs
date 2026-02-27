@@ -52,6 +52,10 @@ pub mod table_insertions;
 pub mod types;
 pub mod virtual_column_exec;
 
+// Compaction functions (DuckDB-specific)
+#[cfg(feature = "metadata-duckdb")]
+pub mod compaction_functions;
+
 // Metadata providers (feature-gated)
 #[cfg(feature = "metadata-duckdb")]
 pub mod metadata_provider_duckdb;
@@ -67,6 +71,8 @@ pub mod metadata_provider_sqlite;
 pub mod delete_exec;
 #[cfg(feature = "write")]
 pub mod insert_exec;
+#[cfg(feature = "write")]
+pub mod merge_exec;
 #[cfg(feature = "write")]
 pub mod metadata_writer;
 #[cfg(feature = "write-mysql")]
@@ -98,6 +104,10 @@ pub use virtual_column_exec::{
     VIRTUAL_COL_FILE_ROW_NUMBER, VIRTUAL_COL_FILENAME, VirtualColumnExec,
 };
 
+// Re-export compaction functions (DuckDB-specific)
+#[cfg(feature = "metadata-duckdb")]
+pub use compaction_functions::register_ducklake_compaction_functions;
+
 // Re-export metadata providers (feature-gated)
 #[cfg(feature = "metadata-duckdb")]
 pub use metadata_provider_duckdb::DuckdbMetadataProvider;
@@ -128,5 +138,7 @@ pub use metadata_writer_sqlite::SqliteMetadataWriter;
 pub use query_planner::DuckLakeQueryPlanner;
 #[cfg(feature = "write")]
 pub use table_writer::{DuckLakeTableWriter, TableWriteSession};
+#[cfg(feature = "write")]
+pub use merge_exec::{DuckLakeMergeExec, MergeMatchedAction};
 #[cfg(feature = "write")]
 pub use update_exec::{DuckLakeUpdateExec, UpdateAssignment};
