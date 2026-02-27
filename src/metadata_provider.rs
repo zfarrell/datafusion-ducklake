@@ -423,6 +423,19 @@ pub struct PartitionColumn {
     pub transform: Option<String>,
 }
 
+/// A row of inlined data stored directly in the catalog database.
+///
+/// DuckLake can store small amounts of data directly in the catalog database
+/// rather than writing Parquet files. This is controlled by the
+/// `data_inlining_row_limit` option.
+#[derive(Debug, Clone)]
+pub struct InlinedDataRow {
+    /// Column names for this row (matches table column order)
+    pub column_names: Vec<String>,
+    /// Values as optional strings (None = NULL)
+    pub values: Vec<Option<String>>,
+}
+
 /// Partition value for a specific data file
 #[derive(Debug, Clone)]
 pub struct FilePartitionValue {
@@ -696,6 +709,22 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
     /// Check if a view exists for a specific schema and snapshot
     fn view_exists(&self, _schema_id: i64, _name: &str, _snapshot_id: i64) -> Result<bool> {
         Ok(false)
+    }
+
+    /// Get inlined data rows for a table at a given snapshot.
+    ///
+    /// DuckLake can store small amounts of data directly in the catalog database
+    /// instead of writing Parquet files. This method returns any such inlined rows
+    /// that are active at the given snapshot (begin_snapshot <= snapshot_id and
+    /// end_snapshot is NULL or > snapshot_id).
+    ///
+    /// Returns empty vec if the table has no inlined data.
+    fn get_inlined_data(
+        &self,
+        _table_id: i64,
+        _snapshot_id: i64,
+    ) -> Result<Vec<InlinedDataRow>> {
+        Ok(Vec::new())
     }
 
     /// Get delete files added between two snapshots (exclusive start, inclusive end)

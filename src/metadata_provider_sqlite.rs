@@ -3,9 +3,10 @@
 use crate::Result;
 use crate::metadata_provider::{
     ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileData, DuckLakeTableColumn,
-    DuckLakeTableFile, FileColumnStats, FileWithTable, MetadataProvider, SQL_GET_FILE_COLUMN_STATS,
-    SQL_GET_VIEW_BY_NAME, SQL_LIST_VIEWS, SQL_VIEW_EXISTS, SchemaMetadata, SnapshotMetadata,
-    TableMetadata, TableWithSchema, ViewMetadata, block_on,
+    DuckLakeTableFile, FileColumnStats, FilePartitionValue, FileWithTable, InlinedDataRow,
+    MetadataProvider, PartitionColumn, SQL_GET_FILE_COLUMN_STATS, SQL_GET_FILE_PARTITION_VALUES,
+    SQL_GET_PARTITION_COLUMNS, SQL_GET_VIEW_BY_NAME, SQL_LIST_VIEWS, SQL_VIEW_EXISTS,
+    SchemaMetadata, SnapshotMetadata, TableMetadata, TableWithSchema, ViewMetadata, block_on,
 };
 use sqlx::Row;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
@@ -763,5 +764,225 @@ WHERE data.table_id = ?
                 .await?;
             Ok(row.try_get::<bool, _>(0)?)
         })
+    }
+
+    fn get_partition_columns(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+    ) -> Result<Vec<PartitionColumn>> {
+        block_on(async {
+            sqlx::query(SQL_GET_PARTITION_COLUMNS)
+                .bind(table_id)
+                .bind(snapshot_id)
+                .bind(snapshot_id)
+                .fetch_all(&self.pool)
+                .await?
+                .into_iter()
+                .map(|row| {
+                    Ok(PartitionColumn {
+                        partition_key_index: row.try_get(0)?,
+                        column_name: row.try_get(1)?,
+                        transform: row.try_get(2)?,
+                    })
+                })
+                .collect()
+        })
+    }
+
+    fn get_file_partition_values(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+    ) -> Result<Vec<FilePartitionValue>> {
+        block_on(async {
+            sqlx::query(SQL_GET_FILE_PARTITION_VALUES)
+                .bind(table_id)
+                .bind(snapshot_id)
+                .bind(snapshot_id)
+                .fetch_all(&self.pool)
+                .await?
+                .into_iter()
+                .map(|row| {
+                    Ok(FilePartitionValue {
+                        data_file_id: row.try_get(0)?,
+                        partition_key_index: row.try_get(1)?,
+                        partition_value: row.try_get(2)?,
+                    })
+                })
+                .collect()
+        })
+    }
+
+    fn get_inlined_data(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+    ) -> Result<Vec<InlinedDataRow>> {
+        block_on(async {
+            // First, look up the inlined data table name from ducklake_inlined_data_tables
+            let table_info = sqlx::query(
+                "SELECT table_name, schema_version FROM ducklake_inlined_data_tables WHERE table_id = ?",
+            )
+            .bind(table_id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+            let Some(info_row) = table_info else {
+                return Ok(Vec::new());
+            };
+
+            let inlined_table_name: String = info_row.try_get(0)?;
+
+            // Check if the inlined data table exists
+            let exists = sqlx::query(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?",
+            )
+            .bind(&inlined_table_name)
+            .fetch_one(&self.pool)
+            .await?;
+            let count: i64 = exists.try_get(0)?;
+            if count == 0 {
+                return Ok(Vec::new());
+            }
+
+            // Query the inlined data table - get column names dynamically
+            let pragma_query = format!("PRAGMA table_info('{}')", inlined_table_name);
+            let columns = sqlx::query(&pragma_query)
+                .fetch_all(&self.pool)
+                .await?;
+
+            // Column layout: row_id, begin_snapshot, end_snapshot, then user columns
+            let user_columns: Vec<String> = columns
+                .iter()
+                .filter_map(|row| {
+                    let name: String = row.try_get::<String, _>(1).ok()?;
+                    if name == "row_id" || name == "begin_snapshot" || name == "end_snapshot" {
+                        None
+                    } else {
+                        Some(name)
+                    }
+                })
+                .collect();
+
+            if user_columns.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            // Build select query for user columns, filtering by snapshot
+            let col_list: Vec<String> = user_columns
+                .iter()
+                .map(|c| format!("CAST(\"{}\" AS TEXT)", c))
+                .collect();
+            let select_sql = format!(
+                "SELECT {} FROM \"{}\" WHERE begin_snapshot <= ? AND (end_snapshot IS NULL OR ? < end_snapshot)",
+                col_list.join(", "),
+                inlined_table_name,
+            );
+
+            let rows = sqlx::query(&select_sql)
+                .bind(snapshot_id)
+                .bind(snapshot_id)
+                .fetch_all(&self.pool)
+                .await?;
+
+            let mut result = Vec::new();
+            for row in &rows {
+                let mut values = Vec::new();
+                for i in 0..user_columns.len() {
+                    let val: Option<String> = row.try_get(i)?;
+                    values.push(val);
+                }
+                result.push(InlinedDataRow {
+                    column_names: user_columns.clone(),
+                    values,
+                });
+            }
+
+            Ok(result)
+        })
+    }
+
+    fn get_table_row_count(&self, table_id: i64, snapshot_id: i64) -> Result<Option<i64>> {
+        block_on(async {
+            // First get row count from data files
+            let row = sqlx::query(
+                "SELECT
+                    CASE WHEN COUNT(*) = COUNT(data.record_count)
+                        THEN COALESCE(SUM(data.record_count), 0) - COALESCE(SUM(del.delete_count), 0)
+                        ELSE NULL
+                    END as row_count
+                FROM ducklake_data_file data
+                LEFT JOIN ducklake_delete_file del
+                    ON data.data_file_id = del.data_file_id
+                    AND del.table_id = ?
+                    AND ? >= del.begin_snapshot
+                    AND (? < del.end_snapshot OR del.end_snapshot IS NULL)
+                WHERE data.table_id = ?
+                  AND ? >= data.begin_snapshot
+                  AND (? < data.end_snapshot OR data.end_snapshot IS NULL)",
+            )
+            .bind(table_id)
+            .bind(snapshot_id)
+            .bind(snapshot_id)
+            .bind(table_id)
+            .bind(snapshot_id)
+            .bind(snapshot_id)
+            .fetch_one(&self.pool)
+            .await?;
+
+            let file_count: Option<i64> = row.try_get(0)?;
+
+            // Also count inlined data rows
+            let inlined_count = self.count_inlined_rows(table_id, snapshot_id).await?;
+
+            match (file_count, inlined_count) {
+                (Some(fc), ic) => Ok(Some(fc + ic)),
+                (None, _) => Ok(None),
+            }
+        })
+    }
+}
+
+impl SqliteMetadataProvider {
+    /// Count inlined rows for a table at a given snapshot.
+    async fn count_inlined_rows(&self, table_id: i64, snapshot_id: i64) -> Result<i64> {
+        let table_info = sqlx::query(
+            "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?",
+        )
+        .bind(table_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some(info_row) = table_info else {
+            return Ok(0);
+        };
+
+        let inlined_table_name: String = info_row.try_get(0)?;
+
+        // Check if the inlined data table exists
+        let exists = sqlx::query(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?",
+        )
+        .bind(&inlined_table_name)
+        .fetch_one(&self.pool)
+        .await?;
+        let count: i64 = exists.try_get(0)?;
+        if count == 0 {
+            return Ok(0);
+        }
+
+        let count_sql = format!(
+            "SELECT COUNT(*) FROM \"{}\" WHERE begin_snapshot <= ? AND (end_snapshot IS NULL OR ? < end_snapshot)",
+            inlined_table_name,
+        );
+
+        let row = sqlx::query(&count_sql)
+            .bind(snapshot_id)
+            .bind(snapshot_id)
+            .fetch_one(&self.pool)
+            .await?;
+
+        Ok(row.try_get(0)?)
     }
 }

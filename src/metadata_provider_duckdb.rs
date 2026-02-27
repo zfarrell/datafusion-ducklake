@@ -1,14 +1,15 @@
 use crate::DuckLakeError;
 use crate::metadata_provider::{
     ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileData, DuckLakeTableColumn,
-    DuckLakeTableFile, FileColumnStats, FilePartitionValue, FileWithTable, MetadataProvider,
-    PartitionColumn, SQL_GET_DATA_FILES, SQL_GET_DATA_FILES_ADDED_BETWEEN_SNAPSHOTS,
-    SQL_GET_DATA_PATH, SQL_GET_DELETE_FILES_ADDED_BETWEEN_SNAPSHOTS,
-    SQL_GET_FILE_COLUMN_STATS, SQL_GET_FILE_PARTITION_VALUES, SQL_GET_LATEST_SNAPSHOT,
-    SQL_GET_PARTITION_COLUMNS, SQL_GET_SCHEMA_BY_NAME, SQL_GET_TABLE_BY_NAME,
-    SQL_GET_TABLE_COLUMNS, SQL_GET_TABLE_ROW_COUNT, SQL_LIST_ALL_COLUMNS, SQL_LIST_ALL_FILES,
-    SQL_LIST_ALL_TABLES, SQL_LIST_SCHEMAS, SQL_LIST_SNAPSHOTS, SQL_LIST_TABLES,
-    SQL_TABLE_EXISTS, SchemaMetadata, SnapshotMetadata, TableMetadata, TableWithSchema,
+    DuckLakeTableFile, FileColumnStats, FilePartitionValue, FileWithTable, InlinedDataRow,
+    MetadataProvider, PartitionColumn, SQL_GET_DATA_FILES,
+    SQL_GET_DATA_FILES_ADDED_BETWEEN_SNAPSHOTS, SQL_GET_DATA_PATH,
+    SQL_GET_DELETE_FILES_ADDED_BETWEEN_SNAPSHOTS, SQL_GET_FILE_COLUMN_STATS,
+    SQL_GET_FILE_PARTITION_VALUES, SQL_GET_LATEST_SNAPSHOT, SQL_GET_PARTITION_COLUMNS,
+    SQL_GET_SCHEMA_BY_NAME, SQL_GET_TABLE_BY_NAME, SQL_GET_TABLE_COLUMNS,
+    SQL_GET_TABLE_ROW_COUNT, SQL_LIST_ALL_COLUMNS, SQL_LIST_ALL_FILES, SQL_LIST_ALL_TABLES,
+    SQL_LIST_SCHEMAS, SQL_LIST_SNAPSHOTS, SQL_LIST_TABLES, SQL_TABLE_EXISTS, SchemaMetadata,
+    SnapshotMetadata, TableMetadata, TableWithSchema,
 };
 use duckdb::AccessMode::ReadOnly;
 use duckdb::{Config, Connection, params};
@@ -504,6 +505,72 @@ impl MetadataProvider for DuckdbMetadataProvider {
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(values)
+    }
+
+    fn get_inlined_data(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+    ) -> crate::Result<Vec<InlinedDataRow>> {
+        let conn = self.connection();
+
+        // Look up the inlined data table name
+        let result = conn.query_row(
+            "SELECT table_name, schema_version FROM ducklake_inlined_data_tables WHERE table_id = ?",
+            [table_id],
+            |row| {
+                let table_name: String = row.get(0)?;
+                let _schema_version: i64 = row.get(1)?;
+                Ok(table_name)
+            },
+        );
+
+        let inlined_table_name = match result {
+            Ok(name) => name,
+            Err(duckdb::Error::QueryReturnedNoRows) => return Ok(Vec::new()),
+            Err(e) => return Err(DuckLakeError::DuckDb(e)),
+        };
+
+        // Get column names from the inlined data table (skip row_id, begin_snapshot, end_snapshot)
+        let pragma_sql = format!("PRAGMA table_info('{}')", inlined_table_name);
+        let mut pragma_stmt = conn.prepare(&pragma_sql)?;
+        let user_columns: Vec<String> = pragma_stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(|r| r.ok())
+            .filter(|name| name != "row_id" && name != "begin_snapshot" && name != "end_snapshot")
+            .collect();
+
+        if user_columns.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Build select query
+        let col_list: Vec<String> = user_columns
+            .iter()
+            .map(|c| format!("CAST(\"{}\" AS VARCHAR)", c))
+            .collect();
+        let select_sql = format!(
+            "SELECT {} FROM \"{}\" WHERE begin_snapshot <= ? AND (end_snapshot IS NULL OR ? < end_snapshot)",
+            col_list.join(", "),
+            inlined_table_name,
+        );
+
+        let mut stmt = conn.prepare(&select_sql)?;
+        let rows = stmt
+            .query_map([snapshot_id, snapshot_id], |row| {
+                let mut values = Vec::new();
+                for i in 0..user_columns.len() {
+                    let val: Option<String> = row.get(i)?;
+                    values.push(val);
+                }
+                Ok(InlinedDataRow {
+                    column_names: user_columns.clone(),
+                    values,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(rows)
     }
 
     fn get_delete_files_added_between_snapshots(
