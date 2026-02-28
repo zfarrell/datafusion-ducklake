@@ -50,6 +50,12 @@ fn preprocess_test_file(content: &str) -> String {
             || trimmed.starts_with("# description:")
             || trimmed.starts_with("# group:")
         {
+            // Tests requiring no_extension_autoloading are incompatible with hybrid mode
+            // (parquet is always loaded, so expected failures become successes)
+            if trimmed.starts_with("require no_extension_autoloading") {
+                output.push_str("halt\n\n");
+                return output;
+            }
             continue;
         }
 
@@ -73,9 +79,10 @@ fn preprocess_test_file(content: &str) -> String {
             continue;
         }
 
-        // Handle unzip directives (not supported)
+        // Tests requiring unzip are incompatible (need pre-existing databases)
         if trimmed.starts_with("unzip ") {
-            continue;
+            output.push_str("halt\n\n");
+            return output;
         }
 
         // Handle statement maybe → statement ok (strip any ---- and error text)
@@ -641,6 +648,11 @@ fn contains_unsupported_function(sql_upper: &str) -> bool {
         || sql_upper.contains("DUCKLAKE_METADATA.")
         || sql_upper.contains("DUCKLAKE_META.")
         || sql_upper.contains("METADATA.DUCKLAKE_")
+        // DuckDB functions not available
+        || sql_upper.contains("COLUMNS(")
+        // Infinity timestamp literals (DataFusion optimizer can't handle)
+        || sql_upper.contains("'INFINITY'")
+        || sql_upper.contains("'-INFINITY'")
         // DuckDB SQL not supported in DataFusion
         || sql_upper.contains("COMMENT ON ")
         || sql_upper.contains("PRAGMA ")
