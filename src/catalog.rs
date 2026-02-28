@@ -316,14 +316,15 @@ impl CatalogProvider for DuckLakeCatalog {
     }
 
     fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
+        let snapshot_id = self.snapshot_id.load(Ordering::Acquire);
+
         // Handle information_schema specially
         if name == "information_schema" {
-            return Some(Arc::new(InformationSchemaProvider::new(Arc::clone(
-                &self.provider,
-            ))));
+            return Some(Arc::new(InformationSchemaProvider::new(
+                Arc::clone(&self.provider),
+                snapshot_id,
+            )));
         }
-
-        let snapshot_id = self.snapshot_id.load(Ordering::Acquire);
 
         // Query database with the current snapshot_id for data schemas
         match self.provider.get_schema_by_name(name, snapshot_id) {

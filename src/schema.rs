@@ -229,10 +229,28 @@ impl SchemaProvider for DuckLakeSchema {
         // Use cached snapshot_id — check tables and views
         self.provider
             .table_exists(self.schema_id, name, self.snapshot_id)
+            .inspect_err(|e| {
+                tracing::warn!(
+                    error = %e,
+                    schema_id = %self.schema_id,
+                    table_name = %name,
+                    snapshot_id = %self.snapshot_id,
+                    "Failed to check table existence"
+                )
+            })
             .unwrap_or(false)
             || self
                 .provider
                 .view_exists(self.schema_id, name, self.snapshot_id)
+                .inspect_err(|e| {
+                    tracing::warn!(
+                        error = %e,
+                        schema_id = %self.schema_id,
+                        view_name = %name,
+                        snapshot_id = %self.snapshot_id,
+                        "Failed to check view existence"
+                    )
+                })
                 .unwrap_or(false)
     }
 

@@ -10,7 +10,9 @@ use sqlx::Row;
 use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
 use sqlx::types::chrono::NaiveDateTime;
 
-/// MySQL-based metadata provider for DuckLake catalogs.
+/// Note: This provider requires a multi-threaded Tokio runtime
+/// (`tokio::runtime::Builder::new_multi_thread()`) because it uses
+/// `tokio::task::block_in_place()` to bridge async sqlx operations.
 #[derive(Debug, Clone)]
 pub struct MySqlMetadataProvider {
     pub pool: MySqlPool,

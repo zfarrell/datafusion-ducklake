@@ -343,7 +343,7 @@ async fn test_snapshots_lists_all() -> DataFusionResult<()> {
     let ctx = create_context(catalog_path.to_str().unwrap()).await?;
 
     let df = ctx
-        .sql("SELECT snapshot_id, timestamp FROM ducklake_snapshots() ORDER BY snapshot_id")
+        .sql("SELECT snapshot_id, snapshot_time FROM ducklake_snapshots() ORDER BY snapshot_id")
         .await?;
 
     let batches = df.collect().await?;

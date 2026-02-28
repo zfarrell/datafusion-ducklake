@@ -41,8 +41,10 @@ impl DuckdbMetadataProvider {
     }
 
     /// Get a reference to the shared connection
-    fn connection(&self) -> MutexGuard<'_, Connection> {
-        self.conn.lock().expect("DuckDB connection mutex poisoned")
+    fn connection(&self) -> crate::Result<MutexGuard<'_, Connection>> {
+        self.conn.lock().map_err(|e| {
+            DuckLakeError::Internal(format!("DuckDB connection mutex poisoned: {}", e))
+        })
     }
 
     /// Create a new read-only connection to the catalog database
@@ -71,19 +73,19 @@ impl DuckdbMetadataProvider {
 
 impl MetadataProvider for DuckdbMetadataProvider {
     fn get_current_snapshot(&self) -> crate::Result<i64> {
-        let conn = self.connection();
+        let conn = self.connection()?;
         let snapshot_id: i64 = conn.query_row(SQL_GET_LATEST_SNAPSHOT, [], |row| row.get(0))?;
         Ok(snapshot_id)
     }
 
     fn get_data_path(&self) -> crate::Result<String> {
-        let conn = self.connection();
+        let conn = self.connection()?;
         let data_path: String = conn.query_row(SQL_GET_DATA_PATH, [], |row| row.get(0))?;
         Ok(data_path)
     }
 
     fn list_snapshots(&self) -> crate::Result<Vec<SnapshotMetadata>> {
-        let conn = self.connection();
+        let conn = self.connection()?;
         let mut stmt = conn.prepare(SQL_LIST_SNAPSHOTS)?;
 
         let snapshots = stmt
@@ -104,7 +106,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
     }
 
     fn list_schemas(&self, snapshot_id: i64) -> crate::Result<Vec<SchemaMetadata>> {
-        let conn = self.connection();
+        let conn = self.connection()?;
         let mut stmt = conn.prepare(SQL_LIST_SCHEMAS)?;
 
         let schemas = stmt
@@ -126,7 +128,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
     }
 
     fn list_tables(&self, schema_id: i64, snapshot_id: i64) -> crate::Result<Vec<TableMetadata>> {
-        let conn = self.connection();
+        let conn = self.connection()?;
         let mut stmt = conn.prepare(SQL_LIST_TABLES)?;
 
         let tables = stmt
@@ -148,7 +150,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
     }
 
     fn get_table_structure(&self, table_id: i64) -> crate::Result<Vec<DuckLakeTableColumn>> {
-        let conn = self.connection();
+        let conn = self.connection()?;
         let mut stmt = conn.prepare(SQL_GET_TABLE_COLUMNS)?;
 
         let columns = stmt
@@ -174,7 +176,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
         table_id: i64,
         snapshot_id: i64,
     ) -> crate::Result<Vec<DuckLakeTableFile>> {
-        let conn = self.connection();
+        let conn = self.connection()?;
         let mut stmt = conn.prepare(SQL_GET_DATA_FILES)?;
 
         let files = stmt
@@ -229,7 +231,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
         name: &str,
         snapshot_id: i64,
     ) -> crate::Result<Option<SchemaMetadata>> {
-        let conn = self.connection();
+        let conn = self.connection()?;
         let mut stmt = conn.prepare(SQL_GET_SCHEMA_BY_NAME)?;
 
         let mut rows = stmt.query(params![name, snapshot_id, snapshot_id])?;
@@ -256,7 +258,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
         name: &str,
         snapshot_id: i64,
     ) -> crate::Result<Option<TableMetadata>> {
-        let conn = self.connection();
+        let conn = self.connection()?;
         let mut stmt = conn.prepare(SQL_GET_TABLE_BY_NAME)?;
 
         let mut rows = stmt.query(params![&schema_id, &name, &snapshot_id, &snapshot_id])?;
@@ -278,7 +280,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
     }
 
     fn table_exists(&self, schema_id: i64, name: &str, snapshot_id: i64) -> crate::Result<bool> {
-        let conn = self.connection();
+        let conn = self.connection()?;
         let exists: bool = conn.query_row(
             SQL_TABLE_EXISTS,
             params![schema_id, &name, &snapshot_id, &snapshot_id],
@@ -288,7 +290,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
     }
 
     fn list_all_tables(&self, snapshot_id: i64) -> crate::Result<Vec<TableWithSchema>> {
-        let conn = self.connection();
+        let conn = self.connection()?;
         let mut stmt = conn.prepare(SQL_LIST_ALL_TABLES)?;
 
         let tables = stmt
@@ -318,7 +320,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
     }
 
     fn list_all_columns(&self, snapshot_id: i64) -> crate::Result<Vec<ColumnWithTable>> {
-        let conn = self.connection();
+        let conn = self.connection()?;
         let mut stmt = conn.prepare(SQL_LIST_ALL_COLUMNS)?;
 
         let columns = stmt
@@ -347,7 +349,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
     }
 
     fn list_all_files(&self, snapshot_id: i64) -> crate::Result<Vec<FileWithTable>> {
-        let conn = self.connection();
+        let conn = self.connection()?;
         let mut stmt = conn.prepare(SQL_LIST_ALL_FILES)?;
 
         let files = stmt
@@ -417,7 +419,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
         start_snapshot: i64,
         end_snapshot: i64,
     ) -> crate::Result<Vec<DataFileChange>> {
-        let conn = self.connection();
+        let conn = self.connection()?;
         let mut stmt = conn.prepare(SQL_GET_DATA_FILES_ADDED_BETWEEN_SNAPSHOTS)?;
 
         let files = stmt
@@ -441,7 +443,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
         table_id: i64,
         snapshot_id: i64,
     ) -> crate::Result<Option<i64>> {
-        let conn = self.connection();
+        let conn = self.connection()?;
         let row_count: Option<i64> = conn.query_row(
             SQL_GET_TABLE_ROW_COUNT,
             params![
@@ -457,7 +459,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
         table_id: i64,
         snapshot_id: i64,
     ) -> crate::Result<Vec<FileColumnStats>> {
-        let conn = self.connection();
+        let conn = self.connection()?;
         let mut stmt = conn.prepare(SQL_GET_FILE_COLUMN_STATS)?;
 
         let stats = stmt
@@ -480,7 +482,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
         table_id: i64,
         snapshot_id: i64,
     ) -> crate::Result<Vec<PartitionColumn>> {
-        let conn = self.connection();
+        let conn = self.connection()?;
         let mut stmt = conn.prepare(SQL_GET_PARTITION_COLUMNS)?;
 
         let columns = stmt
@@ -501,7 +503,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
         table_id: i64,
         snapshot_id: i64,
     ) -> crate::Result<Vec<FilePartitionValue>> {
-        let conn = self.connection();
+        let conn = self.connection()?;
         let mut stmt = conn.prepare(SQL_GET_FILE_PARTITION_VALUES)?;
 
         let values = stmt
@@ -522,7 +524,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
         table_id: i64,
         snapshot_id: i64,
     ) -> crate::Result<Vec<InlinedDataRow>> {
-        let conn = self.connection();
+        let conn = self.connection()?;
 
         // Look up the inlined data table name
         let result = conn.query_row(
@@ -589,7 +591,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
         start_snapshot: i64,
         end_snapshot: i64,
     ) -> crate::Result<Vec<DeleteFileChange>> {
-        let conn = self.connection();
+        let conn = self.connection()?;
         let mut stmt = conn.prepare(SQL_GET_DELETE_FILES_ADDED_BETWEEN_SNAPSHOTS)?;
 
         let files = stmt
