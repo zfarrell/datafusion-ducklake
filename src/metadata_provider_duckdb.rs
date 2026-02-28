@@ -8,8 +8,9 @@ use crate::metadata_provider::{
     SQL_GET_FILE_PARTITION_VALUES, SQL_GET_LATEST_SNAPSHOT, SQL_GET_PARTITION_COLUMNS,
     SQL_GET_SCHEMA_BY_NAME, SQL_GET_TABLE_BY_NAME, SQL_GET_TABLE_COLUMNS,
     SQL_GET_TABLE_ROW_COUNT, SQL_LIST_ALL_COLUMNS, SQL_LIST_ALL_FILES, SQL_LIST_ALL_TABLES,
-    SQL_LIST_SCHEMAS, SQL_LIST_SNAPSHOTS, SQL_LIST_TABLES, SQL_TABLE_EXISTS, SchemaMetadata,
-    SnapshotMetadata, TableMetadata, TableWithSchema,
+    SQL_LIST_SCHEMAS, SQL_LIST_SNAPSHOTS, SQL_LIST_TABLES, SQL_TABLE_EXISTS, SQL_LIST_VIEWS,
+    SQL_GET_VIEW_BY_NAME, SQL_VIEW_EXISTS, SchemaMetadata,
+    SnapshotMetadata, TableMetadata, TableWithSchema, ViewMetadata,
 };
 use duckdb::AccessMode::ReadOnly;
 use duckdb::{Config, Connection, params};
@@ -625,5 +626,58 @@ impl MetadataProvider for DuckdbMetadataProvider {
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(files)
+    }
+
+    fn list_views(&self, schema_id: i64, snapshot_id: i64) -> crate::Result<Vec<ViewMetadata>> {
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare(SQL_LIST_VIEWS)?;
+        let views = stmt
+            .query_map(
+                params![schema_id, snapshot_id, snapshot_id],
+                |row| {
+                    Ok(ViewMetadata {
+                        view_id: row.get(0)?,
+                        view_name: row.get(1)?,
+                        sql: row.get(2)?,
+                    })
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(views)
+    }
+
+    fn get_view_by_name(
+        &self,
+        schema_id: i64,
+        name: &str,
+        snapshot_id: i64,
+    ) -> crate::Result<Option<ViewMetadata>> {
+        let conn = self.connection()?;
+        let result = conn.query_row(
+            SQL_GET_VIEW_BY_NAME,
+            params![schema_id, name, snapshot_id, snapshot_id],
+            |row| {
+                Ok(ViewMetadata {
+                    view_id: row.get(0)?,
+                    view_name: row.get(1)?,
+                    sql: row.get(2)?,
+                })
+            },
+        );
+        match result {
+            Ok(view) => Ok(Some(view)),
+            Err(duckdb::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(DuckLakeError::DuckDb(e)),
+        }
+    }
+
+    fn view_exists(&self, schema_id: i64, name: &str, snapshot_id: i64) -> crate::Result<bool> {
+        let conn = self.connection()?;
+        let exists: bool = conn.query_row(
+            SQL_VIEW_EXISTS,
+            params![schema_id, name, snapshot_id, snapshot_id],
+            |row| row.get(0),
+        )?;
+        Ok(exists)
     }
 }

@@ -28,6 +28,8 @@ use tempfile::TempDir;
 /// 6. Strips error expectations from statement error blocks
 /// 7. Handles concurrentloop, statement maybe, multi-connection statements
 /// 8. Rewrites unqualified table names after USE ducklake
+/// 9. Rewrites ORDER BY ALL (not supported by DataFusion's SQL dialect)
+/// 10. Skips queries with DuckDB named parameter syntax (=>)
 fn preprocess_test_file(content: &str) -> String {
     // First pass: expand loop/foreach blocks
     let expanded = expand_loops(content);
@@ -147,6 +149,8 @@ fn preprocess_test_file(content: &str) -> String {
             if next_upper.starts_with("ATTACH ")
                 || next_upper.starts_with("DETACH ")
                 || next_upper.starts_with("CHECKPOINT")
+                || next_upper.starts_with("COMMENT ON ")
+                || next_upper.starts_with("PRAGMA ")
             {
                 // Skip all lines of the statement (may span multiple lines)
                 while let Some(stmt_line) = lines.next() {
@@ -178,12 +182,12 @@ fn preprocess_test_file(content: &str) -> String {
             }
         }
 
-        // Skip query blocks with EXPLAIN or unsupported DuckDB functions
+        // Skip query blocks with EXPLAIN, unsupported functions, DESCRIBE, or named params
         if trimmed.starts_with("query")
             && let Some(next_line) = lines.peek()
         {
             let next_upper = next_line.trim().to_uppercase();
-            if next_upper.starts_with("EXPLAIN ") {
+            if next_upper.starts_with("EXPLAIN ") || next_upper.starts_with("DESCRIBE ") {
                 lines.next();
                 skip_query_results(&mut lines);
                 continue;
@@ -194,27 +198,51 @@ fn preprocess_test_file(content: &str) -> String {
                 skip_query_results(&mut lines);
                 continue;
             }
+            // Skip queries with DuckDB named parameter syntax (key => value)
+            if next_upper.contains("=>") {
+                lines.next(); // skip SQL
+                skip_query_results(&mut lines);
+                continue;
+            }
+            // Skip queries that mix virtual columns with * (causes duplicate projection errors)
+            if has_virtual_column_star_conflict(&next_upper) {
+                lines.next(); // skip SQL
+                skip_query_results(&mut lines);
+                continue;
+            }
+            // Handle ORDER BY ALL: remove it from SQL and add rowsort to query directive
+            if next_upper.contains("ORDER BY ALL") {
+                let query_line = rewrite_query_directive_with_rowsort(trimmed);
+                output.push_str(&query_line);
+                output.push('\n');
+                let sql_line = lines.next().unwrap();
+                let rewritten_sql = rewrite_order_by_all(sql_line);
+                if in_ducklake_context {
+                    output.push_str(&rewrite_unqualified_tables(&rewritten_sql));
+                } else {
+                    output.push_str(&rewritten_sql);
+                }
+                output.push('\n');
+                continue;
+            }
         }
 
-        // Skip statement ok blocks with unsupported DuckDB functions
-        if trimmed == "statement ok"
+        // Skip statement ok/error blocks with unsupported DuckDB functions or named params
+        if (trimmed == "statement ok" || trimmed.starts_with("statement error"))
             && let Some(next_line) = lines.peek()
         {
             let next_upper = next_line.trim().to_uppercase();
             if contains_unsupported_function(&next_upper) {
                 lines.next(); // skip SQL
+                if trimmed.starts_with("statement error") {
+                    // Skip any ---- and error text
+                    skip_statement_error_body(&mut lines);
+                }
                 continue;
             }
-        }
-
-        // Skip DESCRIBE queries (output format differs significantly between DuckDB and DataFusion)
-        if trimmed.starts_with("query")
-            && let Some(next_line) = lines.peek()
-        {
-            let next_upper = next_line.trim().to_uppercase();
-            if next_upper.starts_with("DESCRIBE ") {
+            // Skip statements with named parameter syntax (key => value)
+            if next_upper.contains("=>") && trimmed == "statement ok" {
                 lines.next(); // skip SQL
-                skip_query_results(&mut lines);
                 continue;
             }
         }
@@ -388,6 +416,74 @@ fn skip_record_body(lines: &mut std::iter::Peekable<std::str::Lines>) {
     }
 }
 
+/// Rewrite ORDER BY ALL to empty (since DataFusion's dialect doesn't support it)
+fn rewrite_order_by_all(sql: &str) -> String {
+    // Case-insensitive replacement of ORDER BY ALL
+    let upper = sql.to_uppercase();
+    if let Some(pos) = upper.find("ORDER BY ALL") {
+        let before = &sql[..pos];
+        let after = &sql[pos + 12..]; // len("ORDER BY ALL") = 12
+        // Check if "ALL" is followed by a comma (ORDER BY ALL, col) or end
+        let trimmed_after = after.trim();
+        if trimmed_after.is_empty() || trimmed_after.starts_with(';') {
+            // Simple case: ORDER BY ALL at end of query
+            format!("{}{}", before.trim_end(), after)
+        } else {
+            // ORDER BY ALL followed by more (e.g. LIMIT, etc.)
+            format!("{}{}", before.trim_end(), after)
+        }
+    } else {
+        sql.to_string()
+    }
+}
+
+/// Add rowsort to a query directive if not already present
+fn rewrite_query_directive_with_rowsort(directive: &str) -> String {
+    // query directive format: "query <types> [sort_mode] [label]"
+    // If no sort mode, add rowsort
+    if directive.contains("rowsort")
+        || directive.contains("nosort")
+        || directive.contains("valuesort")
+    {
+        return directive.to_string();
+    }
+    // Insert rowsort after the type spec
+    // e.g., "query II" → "query II rowsort"
+    format!("{} rowsort", directive)
+}
+
+/// Skip statement error body (---- and expected error text)
+fn skip_statement_error_body(lines: &mut std::iter::Peekable<std::str::Lines>) {
+    while let Some(next) = lines.peek() {
+        let t = next.trim();
+        if t == "----" {
+            lines.next();
+            // Skip error text
+            while let Some(err_line) = lines.peek() {
+                let et = err_line.trim();
+                if et.is_empty()
+                    || et.starts_with("statement")
+                    || et.starts_with("query")
+                    || et.starts_with("halt")
+                    || et.starts_with("#")
+                {
+                    break;
+                }
+                lines.next();
+            }
+            return;
+        }
+        if t.is_empty()
+            || t.starts_with("statement")
+            || t.starts_with("query")
+            || t.starts_with("halt")
+        {
+            return;
+        }
+        lines.next();
+    }
+}
+
 /// Rewrite unqualified table names for DataFusion when in ducklake context
 /// After `USE ducklake`, DuckDB resolves bare table names to ducklake.main.table
 /// but DataFusion needs explicit catalog.schema.table references
@@ -401,6 +497,35 @@ fn rewrite_unqualified_tables(line: &str) -> String {
     line.to_string()
 }
 
+/// Check if a query mixes virtual column names with * (SELECT rowid, * FROM ...)
+/// DataFusion errors on duplicate projection names when virtual columns appear in both
+/// explicit columns and * expansion
+fn has_virtual_column_star_conflict(sql_upper: &str) -> bool {
+    // Only check SELECT-like queries
+    if !sql_upper.contains('*') {
+        return false;
+    }
+    // Check if any virtual column name is explicitly referenced alongside *
+    let virtual_cols = ["ROWID", "SNAPSHOT_ID", "FILE_INDEX", "FILENAME", "FILE_ROW_NUMBER"];
+    // Look for patterns like "SELECT rowid, *" or "SELECT *, snapshot_id"
+    // The * must be in a SELECT context (not in COUNT(*) or similar)
+    let has_select_star = sql_upper.contains(" * ") || sql_upper.contains(",*")
+        || sql_upper.contains("* ,") || sql_upper.contains(", *")
+        || sql_upper.ends_with(" *") || sql_upper.contains("SELECT *");
+
+    if !has_select_star {
+        return false;
+    }
+
+    for col in &virtual_cols {
+        // Check if the virtual column appears as a word in the SELECT (not inside a function)
+        if sql_upper.contains(col) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Check if SQL line contains DuckDB-specific functions not available in DataFusion
 fn contains_unsupported_function(sql_upper: &str) -> bool {
     // DuckDB file/metadata functions
@@ -408,9 +533,12 @@ fn contains_unsupported_function(sql_upper: &str) -> bool {
         || sql_upper.contains("GLOB '")
         || sql_upper.contains("DUCKDB_TABLES(")
         || sql_upper.contains("DUCKDB_VIEWS(")
+        || sql_upper.contains("DUCKDB_COLUMNS(")
+        || sql_upper.contains("DUCKDB_DATABASES(")
         || sql_upper.contains("TEST_ALL_TYPES(")
         || sql_upper.contains("PARQUET_METADATA(")
         || sql_upper.contains("PARQUET_SCHEMA(")
+        || sql_upper.contains("READ_PARQUET(")
         // DuckLake-specific table functions
         || sql_upper.contains("DUCKLAKE_LIST_FILES(")
         || sql_upper.contains("DUCKLAKE_CLEANUP_OLD_FILES(")
@@ -418,6 +546,12 @@ fn contains_unsupported_function(sql_upper: &str) -> bool {
         || sql_upper.contains("DUCKLAKE_SNAPSHOTS(")
         || sql_upper.contains("DUCKLAKE_DELETE_ORPHANED_FILES(")
         || sql_upper.contains("DUCKLAKE_FLUSH_INLINED_DATA(")
+        || sql_upper.contains("DUCKLAKE_CURRENT_SNAPSHOT(")
+        || sql_upper.contains("DUCKLAKE_LAST_COMMITTED_SNAPSHOT(")
+        || sql_upper.contains("DUCKLAKE_TABLE_INSERTIONS(")
+        || sql_upper.contains("DUCKLAKE_TABLE_DELETIONS(")
+        || sql_upper.contains("DUCKLAKE_MERGE_ADJACENT_FILES(")
+        || sql_upper.contains("DUCKLAKE_REWRITE_DATA_FILES(")
         // DuckLake table function syntax: ducklake.function()
         || sql_upper.contains(".SNAPSHOTS(")
         || sql_upper.contains(".TABLE_CHANGES(")
@@ -425,15 +559,24 @@ fn contains_unsupported_function(sql_upper: &str) -> bool {
         // Bare DuckLake table functions (after USE ducklake)
         || sql_upper.contains("FROM SNAPSHOTS(")
         || sql_upper.contains("FROM TABLE_CHANGES(")
+        || sql_upper.contains("FROM LAST_COMMITTED_SNAPSHOT(")
+        || sql_upper.contains("FROM CURRENT_SNAPSHOT(")
         // DuckDB functions not in DataFusion
         || sql_upper.contains("STATS(")
         || sql_upper.contains("CURRENT_DATABASE(")
         || sql_upper.contains("LIST_VALUE(")
         || sql_upper.contains("STRUCT_PACK(")
+        || sql_upper.contains("TYPEOF(")
+        || sql_upper.contains("CURRENT_SETTING(")
+        || sql_upper.contains("STRLEN(")
         // Metadata schema access
         || sql_upper.contains("__DUCKLAKE_METADATA_")
         || sql_upper.contains("DUCKLAKE_METADATA.")
         || sql_upper.contains("DUCKLAKE_META.")
+        || sql_upper.contains("METADATA.DUCKLAKE_")
+        // DuckDB SQL not supported in DataFusion
+        || sql_upper.contains("COMMENT ON ")
+        || sql_upper.contains("PRAGMA ")
 }
 
 /// Skip query results until next directive

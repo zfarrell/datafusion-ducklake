@@ -61,6 +61,8 @@ pub struct HybridDuckLakeDB {
     catalog_path: PathBuf,
     /// Whether USE ducklake has been executed (shared across clones)
     use_ducklake: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether we're inside a transaction (between BEGIN and COMMIT/ROLLBACK)
+    in_transaction: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl HybridDuckLakeDB {
@@ -94,6 +96,7 @@ impl HybridDuckLakeDB {
             datafusion_ctx: Arc::new(Mutex::new(ctx)),
             catalog_path,
             use_ducklake: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            in_transaction: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -117,6 +120,8 @@ impl HybridDuckLakeDB {
             || trimmed.starts_with("EXECUTE ")
             || trimmed.starts_with("DEALLOCATE ")
             || trimmed.starts_with("COPY ")
+            || trimmed.starts_with("COMMENT ")
+            || trimmed.starts_with("PRAGMA ")
             || trimmed == "BEGIN"
             || trimmed.starts_with("BEGIN ")
             || trimmed == "COMMIT"
@@ -126,13 +131,9 @@ impl HybridDuckLakeDB {
     }
 
     /// Rewrite table references from 2-part to 3-part names
+    /// ducklake.table → ducklake.main.table
+    /// ducklake.schema.table → unchanged (already 3-part)
     fn rewrite_table_references(sql: &str) -> String {
-        // Avoid double-conversion
-        if sql.contains("ducklake.main.") {
-            return sql.to_string();
-        }
-
-        // Simple string replacement
         let mut result = String::with_capacity(sql.len() + 100);
         let mut remaining = sql;
 
@@ -142,14 +143,45 @@ impl HybridDuckLakeDB {
             let after = &remaining[pos + 9..]; // 9 = len("ducklake.")
 
             if after.starts_with("main.") {
+                // Already has main schema
                 remaining = after;
             } else {
-                result.push_str("main.");
-                remaining = after;
+                // Check if this is already a 3-part name (ducklake.schema.table)
+                // by looking for identifier.identifier pattern
+                let is_three_part = Self::is_three_part_ref(after);
+                if is_three_part {
+                    // Already a 3-part name like ducklake.s1.v1 — don't add main
+                    remaining = after;
+                } else {
+                    result.push_str("main.");
+                    remaining = after;
+                }
             }
         }
         result.push_str(remaining);
         result
+    }
+
+    /// Check if text after "ducklake." is already a 3-part reference (schema.table)
+    fn is_three_part_ref(after: &str) -> bool {
+        // Extract the first identifier (schema candidate)
+        let first_id_end = after.find(|c: char| !c.is_alphanumeric() && c != '_');
+        if let Some(end) = first_id_end {
+            if end > 0 && after.as_bytes().get(end) == Some(&b'.') {
+                // There's a dot after the first identifier
+                let after_dot = &after[end + 1..];
+                // Check if what follows is an identifier (not empty)
+                if !after_dot.is_empty()
+                    && after_dot
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_alphabetic() || c == '_')
+                {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Refresh catalog snapshot after a write
@@ -176,11 +208,11 @@ impl HybridDuckLakeDB {
         Ok(())
     }
 
-    /// Execute WRITE via DuckDB
-    fn execute_write(&self, sql: &str) -> Result<(), HybridError> {
+    /// Execute WRITE via DuckDB, returns changed row count
+    fn execute_write(&self, sql: &str) -> Result<usize, HybridError> {
         let conn = self.duckdb_conn.lock().unwrap();
-        conn.execute(sql, [])?;
-        Ok(())
+        let count = conn.execute(sql, [])?;
+        Ok(count)
     }
 
     /// Virtual columns added by our extension that DuckDB's DuckLake doesn't include in SELECT *
@@ -189,9 +221,22 @@ impl HybridDuckLakeDB {
     /// but not in DuckDB's SELECT *
     const DUCKLAKE_VIRTUAL_COLS: &'static [&'static str] = &["rowid", "snapshot_id"];
 
+    /// Rewrite ORDER BY ALL since DataFusion's parser dialect doesn't support it
+    fn rewrite_order_by_all(sql: &str) -> String {
+        let upper = sql.to_uppercase();
+        if let Some(pos) = upper.find("ORDER BY ALL") {
+            let before = &sql[..pos];
+            let after = &sql[pos + 12..];
+            format!("{}{}", before.trim_end(), after)
+        } else {
+            sql.to_string()
+        }
+    }
+
     /// Execute READ via DataFusion
     async fn execute_read(&self, sql: &str) -> Result<Vec<RecordBatch>, HybridError> {
         let sql_rewritten = Self::rewrite_table_references(sql);
+        let sql_rewritten = Self::rewrite_order_by_all(&sql_rewritten);
 
         // Clone the context to release the lock before await
         let ctx = {
@@ -265,15 +310,92 @@ impl AsyncDB for HybridDuckLakeDB {
                 }
             }
 
+            // Track transaction state
+            if trimmed_upper == "BEGIN" || trimmed_upper.starts_with("BEGIN ") {
+                self.in_transaction
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            } else if trimmed_upper == "COMMIT"
+                || trimmed_upper.starts_with("COMMIT ")
+                || trimmed_upper == "ROLLBACK"
+                || trimmed_upper.starts_with("ROLLBACK ")
+            {
+                self.in_transaction
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+
             // DuckDB path: WRITE operations and catalog management
             // Includes: CREATE, INSERT, UPDATE, DELETE, USE, SHOW, CALL, etc.
-            self.execute_write(sql)?;
+            let changed_rows = self.execute_write(sql)?;
 
-            // Refresh catalog to pick up changes
-            self.refresh_catalog()?;
+            // Refresh catalog to pick up changes (skip during transactions - data not committed yet)
+            if !self.in_transaction.load(std::sync::atomic::Ordering::Relaxed) {
+                self.refresh_catalog()?;
+            }
 
-            // Return success
-            Ok(DBOutput::StatementComplete(0))
+            // Return row count for DML statements (INSERT/UPDATE/DELETE)
+            // The sqllogictest framework uses this for `query I` blocks that test row counts
+            if changed_rows > 0
+                && (trimmed_upper.starts_with("INSERT ")
+                    || trimmed_upper.starts_with("UPDATE ")
+                    || trimmed_upper.starts_with("DELETE "))
+            {
+                Ok(DBOutput::Rows {
+                    types: vec![DefaultColumnType::Integer],
+                    rows: vec![vec![changed_rows.to_string()]],
+                })
+            } else {
+                Ok(DBOutput::StatementComplete(changed_rows as u64))
+            }
+        } else if self.in_transaction.load(std::sync::atomic::Ordering::Relaxed) {
+            // Inside a transaction: route reads to DuckDB since DataFusion can't see
+            // uncommitted data (it uses a separate read-only connection)
+            let conn = self.duckdb_conn.lock().unwrap();
+            let mut stmt = conn.prepare(sql).map_err(HybridError::from)?;
+
+            // Use query() to execute and get result rows
+            let mut duckdb_rows = stmt.query([]).map_err(HybridError::from)?;
+
+            // Get column count from the result
+            let column_count = duckdb_rows.as_ref().map(|r| r.column_count()).unwrap_or(0);
+            if column_count == 0 {
+                return Ok(DBOutput::StatementComplete(0));
+            }
+
+            let types = (0..column_count)
+                .map(|_| DefaultColumnType::Any)
+                .collect::<Vec<_>>();
+
+            let mut rows = Vec::new();
+            while let Some(row) = duckdb_rows.next().map_err(HybridError::from)? {
+                let mut vals = Vec::new();
+                for i in 0..column_count {
+                    let val: String = match row.get::<_, duckdb::types::Value>(i) {
+                        Ok(duckdb::types::Value::Null) => "NULL".to_string(),
+                        Ok(duckdb::types::Value::Boolean(v)) => v.to_string(),
+                        Ok(duckdb::types::Value::TinyInt(v)) => v.to_string(),
+                        Ok(duckdb::types::Value::SmallInt(v)) => v.to_string(),
+                        Ok(duckdb::types::Value::Int(v)) => v.to_string(),
+                        Ok(duckdb::types::Value::BigInt(v)) => v.to_string(),
+                        Ok(duckdb::types::Value::HugeInt(v)) => v.to_string(),
+                        Ok(duckdb::types::Value::UTinyInt(v)) => v.to_string(),
+                        Ok(duckdb::types::Value::USmallInt(v)) => v.to_string(),
+                        Ok(duckdb::types::Value::UInt(v)) => v.to_string(),
+                        Ok(duckdb::types::Value::UBigInt(v)) => v.to_string(),
+                        Ok(duckdb::types::Value::Float(v)) => v.to_string(),
+                        Ok(duckdb::types::Value::Double(v)) => v.to_string(),
+                        Ok(duckdb::types::Value::Text(v)) => v,
+                        Ok(other) => format!("{:?}", other),
+                        Err(_) => "NULL".to_string(),
+                    };
+                    vals.push(val);
+                }
+                rows.push(vals);
+            }
+
+            Ok(DBOutput::Rows {
+                types,
+                rows,
+            })
         } else {
             // DataFusion path: READ operations (SELECT, etc.)
             let batches = self.execute_read(sql).await?;
@@ -481,5 +603,11 @@ mod tests {
         // Avoid double-rewrite
         let result = HybridDuckLakeDB::rewrite_table_references("SELECT * FROM ducklake.main.test");
         assert_eq!(result, "SELECT * FROM ducklake.main.test");
+
+        // Preserve 3-part names (ducklake.schema.table)
+        let result =
+            HybridDuckLakeDB::rewrite_table_references("SELECT * FROM ducklake.s1.v1");
+        assert_eq!(result, "SELECT * FROM ducklake.s1.v1",
+            "3-part name should not be rewritten");
     }
 }
