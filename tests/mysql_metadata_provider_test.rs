@@ -1026,3 +1026,567 @@ async fn test_query_with_filter() {
     assert_eq!(name_col.value(0), "Charlie");
     assert_eq!(name_col.value(1), "Diana");
 }
+
+// --- View methods ---
+
+async fn create_view_tables(pool: &MySqlPool) -> anyhow::Result<()> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS ducklake_view (
+            view_id BIGINT NOT NULL,
+            view_uuid VARCHAR(255),
+            schema_id BIGINT NOT NULL,
+            view_name VARCHAR(255) NOT NULL,
+            dialect VARCHAR(255),
+            `sql` TEXT NOT NULL,
+            column_aliases TEXT,
+            begin_snapshot BIGINT NOT NULL,
+            end_snapshot BIGINT
+        )",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn populate_view_data(pool: &MySqlPool) -> anyhow::Result<()> {
+    // Insert a view visible from snapshot 1
+    sqlx::query(
+        "INSERT INTO ducklake_view (view_id, schema_id, view_name, `sql`, begin_snapshot, end_snapshot)
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(1i64)
+    .bind(1i64)
+    .bind("user_emails")
+    .bind("SELECT id, email FROM users")
+    .bind(1i64)
+    .bind(None::<i64>)
+    .execute(pool)
+    .await?;
+
+    // Insert another view visible from snapshot 2
+    sqlx::query(
+        "INSERT INTO ducklake_view (view_id, schema_id, view_name, `sql`, begin_snapshot, end_snapshot)
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(2i64)
+    .bind(1i64)
+    .bind("user_names")
+    .bind("SELECT id, name FROM users")
+    .bind(2i64)
+    .bind(None::<i64>)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn test_list_views() {
+    let (provider, _container) = create_mysql_provider().await.unwrap();
+    populate_test_data(&provider).await.unwrap();
+    create_view_tables(&provider.pool).await.unwrap();
+    populate_view_data(&provider.pool).await.unwrap();
+
+    use datafusion_ducklake::metadata_provider::MetadataProvider;
+
+    // Snapshot 1 should see 1 view
+    let views = provider.list_views(1, 1).unwrap();
+    assert_eq!(views.len(), 1);
+    assert_eq!(views[0].view_name, "user_emails");
+    assert_eq!(views[0].sql, "SELECT id, email FROM users");
+
+    // Snapshot 2 should see 2 views
+    let views = provider.list_views(1, 2).unwrap();
+    assert_eq!(views.len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn test_get_view_by_name() {
+    let (provider, _container) = create_mysql_provider().await.unwrap();
+    populate_test_data(&provider).await.unwrap();
+    create_view_tables(&provider.pool).await.unwrap();
+    populate_view_data(&provider.pool).await.unwrap();
+
+    use datafusion_ducklake::metadata_provider::MetadataProvider;
+
+    // Should find user_emails view
+    let view = provider.get_view_by_name(1, "user_emails", 1).unwrap();
+    assert!(view.is_some());
+    let view = view.unwrap();
+    assert_eq!(view.view_name, "user_emails");
+    assert_eq!(view.view_id, 1);
+
+    // Should not find non-existent view
+    let view = provider.get_view_by_name(1, "nonexistent", 1).unwrap();
+    assert!(view.is_none());
+
+    // user_names should not be visible in snapshot 1
+    let view = provider.get_view_by_name(1, "user_names", 1).unwrap();
+    assert!(view.is_none());
+
+    // user_names should be visible in snapshot 2
+    let view = provider.get_view_by_name(1, "user_names", 2).unwrap();
+    assert!(view.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn test_view_exists() {
+    let (provider, _container) = create_mysql_provider().await.unwrap();
+    populate_test_data(&provider).await.unwrap();
+    create_view_tables(&provider.pool).await.unwrap();
+    populate_view_data(&provider.pool).await.unwrap();
+
+    use datafusion_ducklake::metadata_provider::MetadataProvider;
+
+    assert!(provider.view_exists(1, "user_emails", 1).unwrap());
+    assert!(!provider.view_exists(1, "nonexistent", 1).unwrap());
+    assert!(!provider.view_exists(1, "user_names", 1).unwrap());
+    assert!(provider.view_exists(1, "user_names", 2).unwrap());
+}
+
+// --- File column stats ---
+
+async fn create_stats_tables(pool: &MySqlPool) -> anyhow::Result<()> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS ducklake_file_column_stats (
+            data_file_id BIGINT NOT NULL,
+            table_id BIGINT NOT NULL,
+            column_id BIGINT NOT NULL,
+            column_size_bytes BIGINT,
+            value_count BIGINT,
+            null_count BIGINT,
+            min_value VARCHAR(1024),
+            max_value VARCHAR(1024),
+            contains_nan BOOLEAN,
+            extra_stats VARCHAR(1024)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn test_get_file_column_stats() {
+    let (provider, _container) = create_mysql_provider().await.unwrap();
+    populate_test_data(&provider).await.unwrap();
+    create_stats_tables(&provider.pool).await.unwrap();
+
+    let pool = &provider.pool;
+
+    // Insert column stats for file 1, column 1
+    sqlx::query(
+        "INSERT INTO ducklake_file_column_stats (data_file_id, table_id, column_id, null_count, min_value, max_value)
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(1i64)
+    .bind(1i64)
+    .bind(1i64)
+    .bind(0i64)
+    .bind("1")
+    .bind("100")
+    .execute(pool)
+    .await
+    .unwrap();
+
+    use datafusion_ducklake::metadata_provider::MetadataProvider;
+
+    let stats = provider.get_file_column_stats(1, 1).unwrap();
+    assert_eq!(stats.len(), 1);
+    assert_eq!(stats[0].data_file_id, 1);
+    assert_eq!(stats[0].column_name, "id");
+    assert_eq!(stats[0].null_count, Some(0));
+    assert_eq!(stats[0].min_value, Some("1".to_string()));
+    assert_eq!(stats[0].max_value, Some("100".to_string()));
+}
+
+// --- Row count ---
+
+async fn create_inlined_data_tables(pool: &MySqlPool) -> anyhow::Result<()> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS ducklake_inlined_data_tables (
+            table_id BIGINT,
+            table_name VARCHAR(255),
+            schema_version BIGINT
+        )",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn test_get_table_row_count() {
+    let (provider, _container) = create_mysql_provider().await.unwrap();
+
+    let pool = &provider.pool;
+
+    create_inlined_data_tables(pool).await.unwrap();
+
+    // Set up minimal data with record_count
+    sqlx::query("INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time) VALUES (?, NOW())")
+        .bind(1i64)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO ducklake_metadata (`key`, value, scope, scope_id) VALUES (?, ?, NULL, NULL)",
+    )
+    .bind("data_path")
+    .bind("/tmp/test/")
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO ducklake_schema (schema_id, schema_name, path, path_is_relative, begin_snapshot)
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(1i64)
+    .bind("main")
+    .bind("main/")
+    .bind(true)
+    .bind(1i64)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO ducklake_table (table_id, schema_id, table_name, path, path_is_relative, begin_snapshot)
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(1i64)
+    .bind(1i64)
+    .bind("t1")
+    .bind("t1/")
+    .bind(true)
+    .bind(1i64)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO ducklake_data_file (data_file_id, table_id, path, path_is_relative, file_size_bytes, record_count, begin_snapshot)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(1i64)
+    .bind(1i64)
+    .bind("f1.parquet")
+    .bind(true)
+    .bind(1024i64)
+    .bind(50i64)
+    .bind(1i64)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO ducklake_data_file (data_file_id, table_id, path, path_is_relative, file_size_bytes, record_count, begin_snapshot)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(2i64)
+    .bind(1i64)
+    .bind("f2.parquet")
+    .bind(true)
+    .bind(2048i64)
+    .bind(30i64)
+    .bind(1i64)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    use datafusion_ducklake::metadata_provider::MetadataProvider;
+
+    let count = provider.get_table_row_count(1, 1).unwrap();
+    assert_eq!(count, Some(80)); // 50 + 30
+}
+
+// --- Partition columns ---
+
+async fn create_partition_tables(pool: &MySqlPool) -> anyhow::Result<()> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS ducklake_partition_info (
+            partition_id BIGINT,
+            table_id BIGINT,
+            begin_snapshot BIGINT,
+            end_snapshot BIGINT
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS ducklake_partition_column (
+            partition_id BIGINT,
+            table_id BIGINT,
+            partition_key_index BIGINT,
+            column_id BIGINT,
+            transform VARCHAR(255)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS ducklake_file_partition_value (
+            data_file_id BIGINT,
+            table_id BIGINT,
+            partition_key_index BIGINT,
+            partition_value VARCHAR(1024)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn test_get_partition_columns() {
+    let (provider, _container) = create_mysql_provider().await.unwrap();
+    populate_test_data(&provider).await.unwrap();
+    create_partition_tables(&provider.pool).await.unwrap();
+
+    let pool = &provider.pool;
+
+    // Insert partition info
+    sqlx::query(
+        "INSERT INTO ducklake_partition_info (partition_id, table_id, begin_snapshot, end_snapshot)
+         VALUES (?, ?, ?, ?)",
+    )
+    .bind(1i64)
+    .bind(1i64)
+    .bind(1i64)
+    .bind(None::<i64>)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    // Insert partition column
+    sqlx::query(
+        "INSERT INTO ducklake_partition_column (partition_id, table_id, partition_key_index, column_id, transform)
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(1i64)
+    .bind(1i64)
+    .bind(0i64)
+    .bind(1i64) // column_id for 'id'
+    .bind(None::<String>)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    use datafusion_ducklake::metadata_provider::MetadataProvider;
+
+    let partition_cols = provider.get_partition_columns(1, 1).unwrap();
+    assert_eq!(partition_cols.len(), 1);
+    assert_eq!(partition_cols[0].partition_key_index, 0);
+    assert_eq!(partition_cols[0].column_name, "id");
+
+    // Table with no partitions should return empty
+    let partition_cols = provider.get_partition_columns(2, 2).unwrap();
+    assert!(partition_cols.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn test_get_file_partition_values() {
+    let (provider, _container) = create_mysql_provider().await.unwrap();
+    populate_test_data(&provider).await.unwrap();
+    create_partition_tables(&provider.pool).await.unwrap();
+
+    let pool = &provider.pool;
+
+    // Insert partition values for data file 1
+    sqlx::query(
+        "INSERT INTO ducklake_file_partition_value (data_file_id, table_id, partition_key_index, partition_value)
+         VALUES (?, ?, ?, ?)",
+    )
+    .bind(1i64)
+    .bind(1i64)
+    .bind(0i64)
+    .bind("value_a")
+    .execute(pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO ducklake_file_partition_value (data_file_id, table_id, partition_key_index, partition_value)
+         VALUES (?, ?, ?, ?)",
+    )
+    .bind(2i64)
+    .bind(1i64)
+    .bind(0i64)
+    .bind("value_b")
+    .execute(pool)
+    .await
+    .unwrap();
+
+    use datafusion_ducklake::metadata_provider::MetadataProvider;
+
+    let values = provider.get_file_partition_values(1, 1).unwrap();
+    assert_eq!(values.len(), 2);
+    assert_eq!(values[0].data_file_id, 1);
+    assert_eq!(values[0].partition_value, Some("value_a".to_string()));
+    assert_eq!(values[1].data_file_id, 2);
+    assert_eq!(values[1].partition_value, Some("value_b".to_string()));
+}
+
+// --- Inlined data ---
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn test_get_inlined_data_no_table() {
+    let (provider, _container) = create_mysql_provider().await.unwrap();
+    populate_test_data(&provider).await.unwrap();
+    create_inlined_data_tables(&provider.pool).await.unwrap();
+
+    use datafusion_ducklake::metadata_provider::MetadataProvider;
+
+    // No inlined data table registered - should return empty
+    let data = provider.get_inlined_data(1, 1).unwrap();
+    assert!(data.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn test_get_inlined_data_with_data() {
+    let (provider, _container) = create_mysql_provider().await.unwrap();
+    populate_test_data(&provider).await.unwrap();
+
+    let pool = &provider.pool;
+
+    create_inlined_data_tables(pool).await.unwrap();
+
+    // Create an actual inlined data table
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS ducklake_inlined_users (
+            row_id BIGINT,
+            begin_snapshot BIGINT,
+            end_snapshot BIGINT,
+            name VARCHAR(255),
+            age VARCHAR(255)
+        )",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+
+    // Register the inlined table
+    sqlx::query(
+        "INSERT INTO ducklake_inlined_data_tables (table_id, table_name, schema_version)
+         VALUES (?, ?, ?)",
+    )
+    .bind(1i64)
+    .bind("ducklake_inlined_users")
+    .bind(1i64)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    // Insert rows
+    sqlx::query(
+        "INSERT INTO ducklake_inlined_users (row_id, begin_snapshot, end_snapshot, name, age)
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(1i64)
+    .bind(1i64)
+    .bind(None::<i64>)
+    .bind("Alice")
+    .bind("30")
+    .execute(pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO ducklake_inlined_users (row_id, begin_snapshot, end_snapshot, name, age)
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(2i64)
+    .bind(1i64)
+    .bind(None::<i64>)
+    .bind("Bob")
+    .bind("25")
+    .execute(pool)
+    .await
+    .unwrap();
+
+    use datafusion_ducklake::metadata_provider::MetadataProvider;
+
+    let data = provider.get_inlined_data(1, 1).unwrap();
+    assert_eq!(data.len(), 2);
+    assert_eq!(data[0].column_names, vec!["name", "age"]);
+    assert_eq!(data[0].values, vec![Some("Alice".to_string()), Some("30".to_string())]);
+    assert_eq!(data[1].values, vec![Some("Bob".to_string()), Some("25".to_string())]);
+}
+
+// --- Row count with inlined data ---
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn test_get_table_row_count_no_record_count() {
+    let (provider, _container) = create_mysql_provider().await.unwrap();
+
+    let pool = &provider.pool;
+
+    create_inlined_data_tables(pool).await.unwrap();
+
+    sqlx::query("INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time) VALUES (?, NOW())")
+        .bind(1i64)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO ducklake_metadata (`key`, value, scope, scope_id) VALUES (?, ?, NULL, NULL)",
+    )
+    .bind("data_path")
+    .bind("/tmp/test/")
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO ducklake_schema (schema_id, schema_name, path, path_is_relative, begin_snapshot)
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(1i64)
+    .bind("main")
+    .bind("main/")
+    .bind(true)
+    .bind(1i64)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO ducklake_table (table_id, schema_id, table_name, path, path_is_relative, begin_snapshot)
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(1i64)
+    .bind(1i64)
+    .bind("t1")
+    .bind("t1/")
+    .bind(true)
+    .bind(1i64)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    // Insert file WITHOUT record_count
+    sqlx::query(
+        "INSERT INTO ducklake_data_file (data_file_id, table_id, path, path_is_relative, file_size_bytes, begin_snapshot)
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(1i64)
+    .bind(1i64)
+    .bind("f1.parquet")
+    .bind(true)
+    .bind(1024i64)
+    .bind(1i64)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    use datafusion_ducklake::metadata_provider::MetadataProvider;
+
+    // Should return None when record_count is missing
+    let count = provider.get_table_row_count(1, 1).unwrap();
+    assert_eq!(count, None);
+}

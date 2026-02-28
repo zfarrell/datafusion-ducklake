@@ -1268,10 +1268,89 @@ impl MetadataWriter for MySqlMetadataWriter {
         })
     }
 
-    fn rename_view(&self, _view_id: i64, _new_name: &str) -> Result<i64> {
-        Err(crate::error::DuckLakeError::Internal(
-            "rename_view not yet implemented for MySQL".to_string(),
-        ))
+    fn rename_view(&self, view_id: i64, new_name: &str) -> Result<i64> {
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+
+            // Fetch the current active view row
+            let view_row = sqlx::query(
+                "SELECT schema_id, view_uuid, `sql`, dialect, column_aliases
+                 FROM ducklake_view
+                 WHERE view_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(view_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+
+            let Some(view_row) = view_row else {
+                return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                    "View with id {} not found or already dropped",
+                    view_id
+                )));
+            };
+
+            let schema_id: i64 = view_row.try_get(0)?;
+            let view_uuid: Option<String> = view_row.try_get(1)?;
+            let sql: String = view_row.try_get(2)?;
+            let dialect: Option<String> = view_row.try_get(3)?;
+            let column_aliases: Option<String> = view_row.try_get(4)?;
+
+            // Create a new snapshot
+            sqlx::query("INSERT INTO ducklake_snapshot (snapshot_time) VALUES (NOW(6))")
+                .execute(&mut *tx)
+                .await?;
+            let snapshot_id = last_insert_id(&mut tx).await?;
+
+            // End the existing view row
+            sqlx::query(
+                "UPDATE ducklake_view SET end_snapshot = ?
+                 WHERE view_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(snapshot_id)
+            .bind(view_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // Insert new view row with updated name (same view_id, same SQL)
+            sqlx::query(
+                "INSERT INTO ducklake_view (view_id, view_uuid, schema_id, view_name, dialect, `sql`, column_aliases, begin_snapshot)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(view_id)
+            .bind(&view_uuid)
+            .bind(schema_id)
+            .bind(new_name)
+            .bind(&dialect)
+            .bind(&sql)
+            .bind(&column_aliases)
+            .bind(snapshot_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // Record change for conflict detection
+            sqlx::query(
+                "INSERT INTO _df_change_tracking (snapshot_id, change_type, table_id)
+                 VALUES (?, 'ALTER_VIEW', ?)",
+            )
+            .bind(snapshot_id)
+            .bind(view_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // Record in spec-compliant snapshot changes
+            sqlx::query(
+                "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made)
+                 VALUES (?, ?)
+                 ON DUPLICATE KEY UPDATE changes_made = VALUES(changes_made)",
+            )
+            .bind(snapshot_id)
+            .bind(format!("Renamed view (id={})", view_id))
+            .execute(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
+            Ok(snapshot_id)
+        })
     }
 
     fn alter_table(&self, table_id: i64, op: &AlterTableOp) -> Result<i64> {
@@ -1488,26 +1567,225 @@ impl MetadataWriter for MySqlMetadataWriter {
         })
     }
 
-    fn rename_table(&self, _table_id: i64, _new_name: &str) -> Result<i64> {
-        Err(crate::error::DuckLakeError::Internal(
-            "rename_table not yet implemented for MySQL".to_string(),
-        ))
+    fn rename_table(&self, table_id: i64, new_name: &str) -> Result<i64> {
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+
+            // Fetch the current active table row
+            let table_row = sqlx::query(
+                "SELECT schema_id, table_uuid, path, path_is_relative
+                 FROM ducklake_table
+                 WHERE table_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(table_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+
+            let Some(table_row) = table_row else {
+                return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                    "Table with id {} not found or already dropped",
+                    table_id
+                )));
+            };
+
+            let schema_id: i64 = table_row.try_get(0)?;
+            let table_uuid: Option<String> = table_row.try_get(1)?;
+            let path: String = table_row.try_get(2)?;
+            let path_is_relative: bool = table_row.try_get(3)?;
+
+            // Create a new snapshot
+            sqlx::query("INSERT INTO ducklake_snapshot (snapshot_time) VALUES (NOW(6))")
+                .execute(&mut *tx)
+                .await?;
+            let snapshot_id = last_insert_id(&mut tx).await?;
+
+            // End the existing table row
+            sqlx::query(
+                "UPDATE ducklake_table SET end_snapshot = ?
+                 WHERE table_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(snapshot_id)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // Insert new table row with updated name (same table_id, same path)
+            sqlx::query(
+                "INSERT INTO ducklake_table (table_id, table_uuid, schema_id, table_name, path, path_is_relative, begin_snapshot)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(table_id)
+            .bind(&table_uuid)
+            .bind(schema_id)
+            .bind(new_name)
+            .bind(&path)
+            .bind(path_is_relative)
+            .bind(snapshot_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // Record change for conflict detection
+            sqlx::query(
+                "INSERT INTO _df_change_tracking (snapshot_id, change_type, table_id)
+                 VALUES (?, 'ALTER_TABLE', ?)",
+            )
+            .bind(snapshot_id)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // Record in spec-compliant snapshot changes
+            sqlx::query(
+                "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made)
+                 VALUES (?, ?)
+                 ON DUPLICATE KEY UPDATE changes_made = VALUES(changes_made)",
+            )
+            .bind(snapshot_id)
+            .bind(format!("Renamed table (id={})", table_id))
+            .execute(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
+            Ok(snapshot_id)
+        })
     }
 
-    fn set_table_comment(&self, _table_id: i64, _comment: &str) -> Result<i64> {
-        Err(crate::error::DuckLakeError::Internal(
-            "set_table_comment not yet implemented for MySQL".to_string(),
-        ))
+    fn set_table_comment(&self, table_id: i64, comment: &str) -> Result<i64> {
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+
+            // Create a new snapshot
+            sqlx::query("INSERT INTO ducklake_snapshot (snapshot_time) VALUES (NOW(6))")
+                .execute(&mut *tx)
+                .await?;
+            let snapshot_id = last_insert_id(&mut tx).await?;
+
+            // End any existing comment tag for this table
+            sqlx::query(
+                "UPDATE ducklake_tag SET end_snapshot = ?
+                 WHERE object_id = ? AND `key` = 'comment' AND end_snapshot IS NULL",
+            )
+            .bind(snapshot_id)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // Insert new comment tag
+            sqlx::query(
+                "INSERT INTO ducklake_tag (object_id, begin_snapshot, `key`, value)
+                 VALUES (?, ?, 'comment', ?)",
+            )
+            .bind(table_id)
+            .bind(snapshot_id)
+            .bind(comment)
+            .execute(&mut *tx)
+            .await?;
+
+            // Record change for conflict detection
+            sqlx::query(
+                "INSERT INTO _df_change_tracking (snapshot_id, change_type, table_id)
+                 VALUES (?, 'ALTER_TABLE', ?)",
+            )
+            .bind(snapshot_id)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // Record in spec-compliant snapshot changes
+            sqlx::query(
+                "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made)
+                 VALUES (?, ?)
+                 ON DUPLICATE KEY UPDATE changes_made = VALUES(changes_made)",
+            )
+            .bind(snapshot_id)
+            .bind(format!("Altered table (id={})", table_id))
+            .execute(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
+            Ok(snapshot_id)
+        })
     }
 
     fn set_column_comment(
         &self,
-        _table_id: i64,
-        _column_name: &str,
-        _comment: &str,
+        table_id: i64,
+        column_name: &str,
+        comment: &str,
     ) -> Result<i64> {
-        Err(crate::error::DuckLakeError::Internal(
-            "set_column_comment not yet implemented for MySQL".to_string(),
-        ))
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+
+            // Look up the column_id for the named column
+            let col_row = sqlx::query(
+                "SELECT column_id FROM ducklake_column
+                 WHERE table_id = ? AND column_name = ? AND end_snapshot IS NULL",
+            )
+            .bind(table_id)
+            .bind(column_name)
+            .fetch_optional(&mut *tx)
+            .await?;
+
+            let Some(col_row) = col_row else {
+                return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                    "Column '{}' not found in table",
+                    column_name
+                )));
+            };
+            let column_id: i64 = col_row.try_get(0)?;
+
+            // Create a new snapshot
+            sqlx::query("INSERT INTO ducklake_snapshot (snapshot_time) VALUES (NOW(6))")
+                .execute(&mut *tx)
+                .await?;
+            let snapshot_id = last_insert_id(&mut tx).await?;
+
+            // End any existing comment tag for this column
+            sqlx::query(
+                "UPDATE ducklake_column_tag SET end_snapshot = ?
+                 WHERE table_id = ? AND column_id = ? AND `key` = 'comment' AND end_snapshot IS NULL",
+            )
+            .bind(snapshot_id)
+            .bind(table_id)
+            .bind(column_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // Insert new comment tag
+            sqlx::query(
+                "INSERT INTO ducklake_column_tag (table_id, column_id, begin_snapshot, `key`, value)
+                 VALUES (?, ?, ?, 'comment', ?)",
+            )
+            .bind(table_id)
+            .bind(column_id)
+            .bind(snapshot_id)
+            .bind(comment)
+            .execute(&mut *tx)
+            .await?;
+
+            // Record change for conflict detection
+            sqlx::query(
+                "INSERT INTO _df_change_tracking (snapshot_id, change_type, table_id)
+                 VALUES (?, 'ALTER_TABLE', ?)",
+            )
+            .bind(snapshot_id)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // Record in spec-compliant snapshot changes
+            sqlx::query(
+                "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made)
+                 VALUES (?, ?)
+                 ON DUPLICATE KEY UPDATE changes_made = VALUES(changes_made)",
+            )
+            .bind(snapshot_id)
+            .bind(format!("Altered table (id={})", table_id))
+            .execute(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
+            Ok(snapshot_id)
+        })
     }
 }
