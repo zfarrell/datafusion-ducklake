@@ -223,6 +223,20 @@ impl HybridDuckLakeDB {
 
     /// Execute WRITE via DuckDB, returns changed row count
     fn execute_write(&self, sql: &str) -> Result<usize, HybridError> {
+        // Auto-create parent directories for COPY TO statements
+        let sql_upper = sql.to_uppercase();
+        if sql_upper.contains(" TO '") || sql_upper.contains(" TO \"") {
+            if let Some(start) = sql.find(" TO '").or(sql.find(" TO \"")) {
+                let quote = sql.as_bytes()[start + 4] as char;
+                let path_start = start + 5;
+                if let Some(end) = sql[path_start..].find(quote) {
+                    let path = &sql[path_start..path_start + end];
+                    if let Some(parent) = std::path::Path::new(path).parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                }
+            }
+        }
         let conn = self.duckdb_conn.lock().unwrap();
         let count = conn.execute(sql, [])?;
         Ok(count)

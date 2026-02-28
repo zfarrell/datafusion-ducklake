@@ -30,11 +30,38 @@ use tempfile::TempDir;
 /// 8. Rewrites unqualified table names after USE ducklake
 /// 9. Rewrites ORDER BY ALL (not supported by DataFusion's SQL dialect)
 /// 10. Skips queries with DuckDB named parameter syntax (=>)
-fn preprocess_test_file(content: &str) -> String {
-    // First pass: expand loop/foreach blocks
-    let expanded = expand_loops(content);
+fn preprocess_test_file(content: &str, test_dir: &str) -> String {
+    // First pass: collect test-env variables and expand them
+    let mut vars = std::collections::HashMap::new();
+    vars.insert("__TEST_DIR__".to_string(), test_dir.to_string());
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("test-env ") {
+            let parts: Vec<&str> = trimmed.splitn(3, ' ').collect();
+            if parts.len() >= 3 {
+                let var_name = parts[1];
+                let var_value = parts[2];
+                // Resolve value against existing vars
+                let mut resolved = var_value.to_string();
+                for (k, v) in &vars {
+                    resolved = resolved.replace(k, v);
+                }
+                vars.insert(var_name.to_string(), resolved);
+            }
+        }
+    }
 
-    // Second pass: handle directives and rewriting
+    // Apply variable substitution to content
+    let mut substituted = content.to_string();
+    for (k, v) in &vars {
+        let pattern = format!("${{{}}}", k);
+        substituted = substituted.replace(&pattern, v);
+    }
+
+    // Second pass: expand loop/foreach blocks
+    let expanded = expand_loops(&substituted);
+
+    // Third pass: handle directives and rewriting
     let mut output = String::new();
     let mut lines = expanded.lines().peekable();
     let mut in_ducklake_context = false;
@@ -752,7 +779,8 @@ async fn run_hybrid_test(test_file: &str) -> Result<(), Box<dyn std::error::Erro
 
     // Read and preprocess test file
     let original_content = std::fs::read_to_string(test_file)?;
-    let processed_content = preprocess_test_file(&original_content);
+    let test_dir_str = temp_dir.path().to_string_lossy().to_string();
+    let processed_content = preprocess_test_file(&original_content, &test_dir_str);
 
     // Write preprocessed test to temp file
     let temp_test_file = temp_dir.path().join("test.slt");
