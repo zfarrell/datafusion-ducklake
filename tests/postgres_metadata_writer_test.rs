@@ -550,3 +550,136 @@ async fn test_drop_schema_checked_conflict() {
     let result = writer.drop_schema_checked(schema_id, snapshot_id);
     assert!(result.is_err());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn test_rename_table() {
+    let (writer, _container) = create_writer().await;
+    let snapshot_id = writer.create_snapshot().unwrap();
+    let (schema_id, _) = writer
+        .get_or_create_schema("main", None, snapshot_id)
+        .unwrap();
+    let (table_id, _) = writer
+        .get_or_create_table(schema_id, "users", None, snapshot_id)
+        .unwrap();
+
+    let columns = vec![ColumnDef::new("id", "int64", false).unwrap()];
+    writer.set_columns(table_id, &columns, snapshot_id).unwrap();
+
+    let rename_snap = writer.rename_table(table_id, "customers").unwrap();
+    assert!(rename_snap > snapshot_id);
+
+    // Old name should no longer resolve, new name should work
+    let active = writer.get_active_columns(table_id).unwrap();
+    assert_eq!(active.len(), 1, "Columns should be preserved after rename");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn test_rename_table_not_found() {
+    let (writer, _container) = create_writer().await;
+
+    // Rename non-existent table should fail
+    let result = writer.rename_table(9999, "new_name");
+    assert!(result.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn test_set_table_comment() {
+    let (writer, _container) = create_writer().await;
+    let snapshot_id = writer.create_snapshot().unwrap();
+    let (schema_id, _) = writer
+        .get_or_create_schema("main", None, snapshot_id)
+        .unwrap();
+    let (table_id, _) = writer
+        .get_or_create_table(schema_id, "users", None, snapshot_id)
+        .unwrap();
+
+    let comment_snap = writer
+        .set_table_comment(table_id, "This is a users table")
+        .unwrap();
+    assert!(comment_snap > snapshot_id);
+
+    // Setting comment again should also succeed (replaces previous)
+    let comment_snap2 = writer
+        .set_table_comment(table_id, "Updated comment")
+        .unwrap();
+    assert!(comment_snap2 > comment_snap);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn test_set_column_comment() {
+    let (writer, _container) = create_writer().await;
+    let snapshot_id = writer.create_snapshot().unwrap();
+    let (schema_id, _) = writer
+        .get_or_create_schema("main", None, snapshot_id)
+        .unwrap();
+    let (table_id, _) = writer
+        .get_or_create_table(schema_id, "users", None, snapshot_id)
+        .unwrap();
+
+    let columns =
+        vec![ColumnDef::new("id", "int64", false).unwrap(), ColumnDef::new("name", "varchar", true).unwrap()];
+    writer.set_columns(table_id, &columns, snapshot_id).unwrap();
+
+    let comment_snap = writer
+        .set_column_comment(table_id, "name", "User's display name")
+        .unwrap();
+    assert!(comment_snap > snapshot_id);
+
+    // Setting comment again should also succeed
+    let comment_snap2 = writer
+        .set_column_comment(table_id, "name", "Updated column comment")
+        .unwrap();
+    assert!(comment_snap2 > comment_snap);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn test_set_column_comment_not_found() {
+    let (writer, _container) = create_writer().await;
+    let snapshot_id = writer.create_snapshot().unwrap();
+    let (schema_id, _) = writer
+        .get_or_create_schema("main", None, snapshot_id)
+        .unwrap();
+    let (table_id, _) = writer
+        .get_or_create_table(schema_id, "users", None, snapshot_id)
+        .unwrap();
+
+    let columns = vec![ColumnDef::new("id", "int64", false).unwrap()];
+    writer.set_columns(table_id, &columns, snapshot_id).unwrap();
+
+    // Comment on non-existent column should fail
+    let result = writer.set_column_comment(table_id, "nonexistent", "comment");
+    assert!(result.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn test_rename_view() {
+    let (writer, _container) = create_writer().await;
+    let snapshot_id = writer.create_snapshot().unwrap();
+    let (schema_id, _) = writer
+        .get_or_create_schema("main", None, snapshot_id)
+        .unwrap();
+
+    let (view_id, view_snapshot) = writer
+        .create_view(schema_id, "my_view", "SELECT 1")
+        .unwrap();
+    assert!(view_id > 0);
+
+    let rename_snap = writer.rename_view(view_id, "renamed_view").unwrap();
+    assert!(rename_snap > view_snapshot);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn test_rename_view_not_found() {
+    let (writer, _container) = create_writer().await;
+
+    // Rename non-existent view should fail
+    let result = writer.rename_view(9999, "new_name");
+    assert!(result.is_err());
+}

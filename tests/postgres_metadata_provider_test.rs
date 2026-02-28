@@ -137,6 +137,95 @@ async fn init_schema(pool: &PgPool) -> anyhow::Result<()> {
     .execute(pool)
     .await?;
 
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS ducklake_snapshot_changes (
+            snapshot_id BIGINT PRIMARY KEY,
+            changes_made VARCHAR,
+            author VARCHAR,
+            commit_message VARCHAR,
+            commit_extra_info VARCHAR
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS ducklake_view (
+            view_id BIGINT NOT NULL,
+            view_uuid UUID,
+            schema_id BIGINT NOT NULL,
+            view_name VARCHAR NOT NULL,
+            dialect VARCHAR,
+            sql VARCHAR NOT NULL,
+            column_aliases VARCHAR,
+            begin_snapshot BIGINT NOT NULL,
+            end_snapshot BIGINT
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS ducklake_file_column_stats (
+            data_file_id BIGINT NOT NULL,
+            table_id BIGINT NOT NULL,
+            column_id BIGINT NOT NULL,
+            column_size_bytes BIGINT,
+            value_count BIGINT,
+            null_count BIGINT,
+            min_value VARCHAR,
+            max_value VARCHAR,
+            contains_nan BOOLEAN,
+            extra_stats VARCHAR
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS ducklake_partition_info (
+            partition_id BIGINT,
+            table_id BIGINT,
+            begin_snapshot BIGINT,
+            end_snapshot BIGINT
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS ducklake_partition_column (
+            partition_id BIGINT,
+            table_id BIGINT,
+            partition_key_index BIGINT,
+            column_id BIGINT,
+            transform VARCHAR
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS ducklake_file_partition_value (
+            data_file_id BIGINT,
+            table_id BIGINT,
+            partition_key_index BIGINT,
+            partition_value VARCHAR
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS ducklake_inlined_data_tables (
+            table_id BIGINT,
+            table_name VARCHAR,
+            schema_version BIGINT
+        )",
+    )
+    .execute(pool)
+    .await?;
+
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_schema_snapshot ON ducklake_schema(begin_snapshot, end_snapshot)")
         .execute(pool)
         .await?;
@@ -1069,4 +1158,259 @@ async fn test_query_with_filter() {
 
     assert_eq!(name_col.value(0), "Charlie");
     assert_eq!(name_col.value(1), "Diana");
+}
+
+// --- Tests for newly implemented MetadataProvider methods ---
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn test_list_views() {
+    let (provider, _container) = create_postgres_provider().await.unwrap();
+    populate_test_data(&provider).await.unwrap();
+
+    // Insert a view
+    sqlx::query(
+        "INSERT INTO ducklake_view (view_id, schema_id, view_name, sql, begin_snapshot)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(1i64)
+    .bind(1i64)
+    .bind("test_view")
+    .bind("SELECT * FROM users")
+    .bind(1i64)
+    .execute(&provider.pool)
+    .await
+    .unwrap();
+
+    let views = provider.list_views(1, 1).unwrap();
+    assert_eq!(views.len(), 1);
+    assert_eq!(views[0].view_name, "test_view");
+    assert_eq!(views[0].sql, "SELECT * FROM users");
+
+    // Non-existent schema should return empty
+    let views = provider.list_views(999, 1).unwrap();
+    assert!(views.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn test_get_view_by_name() {
+    let (provider, _container) = create_postgres_provider().await.unwrap();
+    populate_test_data(&provider).await.unwrap();
+
+    sqlx::query(
+        "INSERT INTO ducklake_view (view_id, schema_id, view_name, sql, begin_snapshot)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(1i64)
+    .bind(1i64)
+    .bind("my_view")
+    .bind("SELECT 1")
+    .bind(1i64)
+    .execute(&provider.pool)
+    .await
+    .unwrap();
+
+    let view = provider.get_view_by_name(1, "my_view", 1).unwrap();
+    assert!(view.is_some());
+    let view = view.unwrap();
+    assert_eq!(view.view_name, "my_view");
+    assert_eq!(view.sql, "SELECT 1");
+
+    // Non-existent view
+    let view = provider.get_view_by_name(1, "no_such_view", 1).unwrap();
+    assert!(view.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn test_view_exists() {
+    let (provider, _container) = create_postgres_provider().await.unwrap();
+    populate_test_data(&provider).await.unwrap();
+
+    sqlx::query(
+        "INSERT INTO ducklake_view (view_id, schema_id, view_name, sql, begin_snapshot)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(1i64)
+    .bind(1i64)
+    .bind("existing_view")
+    .bind("SELECT 1")
+    .bind(1i64)
+    .execute(&provider.pool)
+    .await
+    .unwrap();
+
+    assert!(provider.view_exists(1, "existing_view", 1).unwrap());
+    assert!(!provider.view_exists(1, "nonexistent_view", 1).unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn test_get_file_column_stats() {
+    let (provider, _container) = create_postgres_provider().await.unwrap();
+    populate_test_data(&provider).await.unwrap();
+
+    // Insert column stats for data_file_id=1, column_id=1 (id column)
+    sqlx::query(
+        "INSERT INTO ducklake_file_column_stats (data_file_id, table_id, column_id, null_count, min_value, max_value)
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(1i64)
+    .bind(1i64)
+    .bind(1i64)
+    .bind(0i64)
+    .bind("1")
+    .bind("100")
+    .execute(&provider.pool)
+    .await
+    .unwrap();
+
+    let stats = provider.get_file_column_stats(1, 1).unwrap();
+    assert_eq!(stats.len(), 1);
+    assert_eq!(stats[0].data_file_id, 1);
+    assert_eq!(stats[0].column_name, "id");
+    assert_eq!(stats[0].null_count, Some(0));
+    assert_eq!(stats[0].min_value, Some("1".to_string()));
+    assert_eq!(stats[0].max_value, Some("100".to_string()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn test_get_table_row_count() {
+    let (provider, _container) = create_postgres_provider().await.unwrap();
+    populate_test_data(&provider).await.unwrap();
+
+    // The test data has 2 data files without record_count set, so result should be None
+    let count = provider.get_table_row_count(1, 1).unwrap();
+    assert!(count.is_none(), "Should be None when files lack record_count");
+
+    // Set record_count on both data files
+    sqlx::query("UPDATE ducklake_data_file SET record_count = $1 WHERE data_file_id = $2")
+        .bind(50i64)
+        .bind(1i64)
+        .execute(&provider.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE ducklake_data_file SET record_count = $1 WHERE data_file_id = $2")
+        .bind(30i64)
+        .bind(2i64)
+        .execute(&provider.pool)
+        .await
+        .unwrap();
+
+    let count = provider.get_table_row_count(1, 1).unwrap();
+    // 50 + 30 = 80 total, minus 5 deletes = 75
+    assert_eq!(count, Some(75));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn test_get_partition_columns() {
+    let (provider, _container) = create_postgres_provider().await.unwrap();
+    populate_test_data(&provider).await.unwrap();
+
+    // Insert partition info
+    sqlx::query(
+        "INSERT INTO ducklake_partition_info (partition_id, table_id, begin_snapshot)
+         VALUES ($1, $2, $3)",
+    )
+    .bind(1i64)
+    .bind(1i64)
+    .bind(1i64)
+    .execute(&provider.pool)
+    .await
+    .unwrap();
+
+    // Insert partition column (column_id=1 = 'id' column)
+    sqlx::query(
+        "INSERT INTO ducklake_partition_column (partition_id, table_id, partition_key_index, column_id, transform)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(1i64)
+    .bind(1i64)
+    .bind(0i64)
+    .bind(1i64)
+    .bind("identity")
+    .execute(&provider.pool)
+    .await
+    .unwrap();
+
+    let cols = provider.get_partition_columns(1, 1).unwrap();
+    assert_eq!(cols.len(), 1);
+    assert_eq!(cols[0].partition_key_index, 0);
+    assert_eq!(cols[0].column_name, "id");
+    assert_eq!(cols[0].transform, Some("identity".to_string()));
+
+    // Non-partitioned table
+    let cols = provider.get_partition_columns(2, 2).unwrap();
+    assert!(cols.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn test_get_file_partition_values() {
+    let (provider, _container) = create_postgres_provider().await.unwrap();
+    populate_test_data(&provider).await.unwrap();
+
+    // Insert partition values for data file 1
+    sqlx::query(
+        "INSERT INTO ducklake_file_partition_value (data_file_id, table_id, partition_key_index, partition_value)
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(1i64)
+    .bind(1i64)
+    .bind(0i64)
+    .bind("42")
+    .execute(&provider.pool)
+    .await
+    .unwrap();
+
+    let vals = provider.get_file_partition_values(1, 1).unwrap();
+    assert_eq!(vals.len(), 1);
+    assert_eq!(vals[0].data_file_id, 1);
+    assert_eq!(vals[0].partition_key_index, 0);
+    assert_eq!(vals[0].partition_value, Some("42".to_string()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn test_get_inlined_data_empty() {
+    let (provider, _container) = create_postgres_provider().await.unwrap();
+    populate_test_data(&provider).await.unwrap();
+
+    // No inlined data registered for any table
+    let rows = provider.get_inlined_data(1, 1).unwrap();
+    assert!(rows.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn test_view_snapshot_isolation() {
+    let (provider, _container) = create_postgres_provider().await.unwrap();
+    populate_test_data(&provider).await.unwrap();
+
+    // Insert a view only visible from snapshot 2
+    sqlx::query(
+        "INSERT INTO ducklake_view (view_id, schema_id, view_name, sql, begin_snapshot)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(1i64)
+    .bind(1i64)
+    .bind("late_view")
+    .bind("SELECT 1")
+    .bind(2i64)
+    .execute(&provider.pool)
+    .await
+    .unwrap();
+
+    // Should NOT be visible in snapshot 1
+    assert!(!provider.view_exists(1, "late_view", 1).unwrap());
+    let views = provider.list_views(1, 1).unwrap();
+    assert!(views.is_empty());
+
+    // Should be visible in snapshot 2
+    assert!(provider.view_exists(1, "late_view", 2).unwrap());
+    let views = provider.list_views(1, 2).unwrap();
+    assert_eq!(views.len(), 1);
 }
