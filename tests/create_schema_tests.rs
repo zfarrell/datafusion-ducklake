@@ -320,6 +320,52 @@ async fn test_create_schema_then_drop() {
     );
 }
 
+// ==================== Reserved schema names ====================
+
+/// CREATE SCHEMA information_schema should be rejected as a reserved name.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_create_schema_information_schema_reserved() {
+    let (_writer, temp_dir) = create_test_env().await;
+    let ctx = create_writable_ctx(&temp_dir).await;
+
+    let result = ctx.sql("CREATE SCHEMA ducklake.information_schema").await;
+
+    // Should fail at planning or execution stage
+    let is_error = match result {
+        Err(_) => true,
+        Ok(df) => df.collect().await.is_err(),
+    };
+    assert!(
+        is_error,
+        "CREATE SCHEMA information_schema should be rejected as a reserved name"
+    );
+}
+
+/// CREATE SCHEMA IF NOT EXISTS information_schema is a no-op since it already exists
+/// as a virtual schema. DataFusion sees it exists and skips register_schema.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_create_schema_if_not_exists_information_schema_is_noop() {
+    let (_writer, temp_dir) = create_test_env().await;
+    let ctx = create_writable_ctx(&temp_dir).await;
+
+    // IF NOT EXISTS should succeed silently because information_schema exists as a virtual schema
+    let result = ctx
+        .sql("CREATE SCHEMA IF NOT EXISTS ducklake.information_schema")
+        .await;
+
+    match result {
+        Err(e) => panic!("IF NOT EXISTS should not error for existing virtual schema: {}", e),
+        Ok(df) => {
+            let collect_result = df.collect().await;
+            assert!(
+                collect_result.is_ok(),
+                "IF NOT EXISTS should silently succeed: {:?}",
+                collect_result.err()
+            );
+        }
+    }
+}
+
 // ==================== MetadataWriter-level test ====================
 
 /// Test that get_or_create_schema via register_schema creates the schema in metadata.
