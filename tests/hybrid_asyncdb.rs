@@ -59,6 +59,8 @@ pub struct HybridDuckLakeDB {
     datafusion_ctx: Arc<Mutex<SessionContext>>,
     /// Path to DuckLake catalog file
     catalog_path: PathBuf,
+    /// Whether USE ducklake has been executed (shared across clones)
+    use_ducklake: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl HybridDuckLakeDB {
@@ -91,13 +93,14 @@ impl HybridDuckLakeDB {
             duckdb_conn: Arc::new(Mutex::new(conn)),
             datafusion_ctx: Arc::new(Mutex::new(ctx)),
             catalog_path,
+            use_ducklake: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
     /// Detect if SQL should be routed to DuckDB
-    /// Includes WRITE operations and catalog management statements
+    /// Includes WRITE operations, catalog management, and DuckDB-specific statements
     fn is_write_statement(sql: &str) -> bool {
-        let trimmed = sql.trim().to_uppercase();
+        let trimmed = sql.trim().trim_end_matches(';').trim().to_uppercase();
         trimmed.starts_with("CREATE ")
             || trimmed.starts_with("INSERT ")
             || trimmed.starts_with("UPDATE ")
@@ -108,6 +111,12 @@ impl HybridDuckLakeDB {
             || trimmed.starts_with("USE ")
             || trimmed.starts_with("SHOW ")
             || trimmed.starts_with("CALL ")
+            || trimmed.starts_with("SET ")
+            || trimmed.starts_with("RESET ")
+            || trimmed.starts_with("PREPARE ")
+            || trimmed.starts_with("EXECUTE ")
+            || trimmed.starts_with("DEALLOCATE ")
+            || trimmed.starts_with("COPY ")
             || trimmed == "BEGIN"
             || trimmed.starts_with("BEGIN ")
             || trimmed == "COMMIT"
@@ -148,7 +157,15 @@ impl HybridDuckLakeDB {
         let mut ctx_guard = self.datafusion_ctx.lock().unwrap();
 
         // Create new session context with fresh catalog
-        let new_ctx = SessionContext::new();
+        // If USE ducklake was executed, set default catalog/schema so bare table names resolve
+        let new_ctx =
+            if self.use_ducklake.load(std::sync::atomic::Ordering::Relaxed) {
+                let config = SessionConfig::new()
+                    .with_default_catalog_and_schema("ducklake", "main");
+                SessionContext::new_with_config(config)
+            } else {
+                SessionContext::new()
+            };
         let metadata_provider = DuckdbMetadataProvider::new(self.catalog_path.to_str().unwrap())?;
         let catalog = Arc::new(DuckLakeCatalog::new(metadata_provider)?);
         new_ctx.register_catalog("ducklake", catalog);
@@ -166,6 +183,12 @@ impl HybridDuckLakeDB {
         Ok(())
     }
 
+    /// Virtual columns added by our extension that DuckDB's DuckLake doesn't include in SELECT *
+    const EXTENSION_VIRTUAL_COLS: &'static [&'static str] = &["filename", "file_row_number", "file_index"];
+    /// DuckLake virtual columns that appear in SELECT * from our extension
+    /// but not in DuckDB's SELECT *
+    const DUCKLAKE_VIRTUAL_COLS: &'static [&'static str] = &["rowid", "snapshot_id"];
+
     /// Execute READ via DataFusion
     async fn execute_read(&self, sql: &str) -> Result<Vec<RecordBatch>, HybridError> {
         let sql_rewritten = Self::rewrite_table_references(sql);
@@ -178,7 +201,48 @@ impl HybridDuckLakeDB {
 
         let df = ctx.sql(&sql_rewritten).await?;
         let batches = df.collect().await?;
-        Ok(batches)
+
+        // Strip virtual columns from results unless explicitly referenced in SQL
+        // This matches DuckDB behavior where virtual columns don't appear in SELECT *
+        if batches.is_empty() {
+            return Ok(batches);
+        }
+
+        let sql_upper = sql.to_uppercase();
+        let schema = batches[0].schema();
+        let keep_indices: Vec<usize> = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| {
+                let name = f.name().as_str();
+                // Always strip extension-specific virtual columns unless explicitly referenced
+                if Self::EXTENSION_VIRTUAL_COLS.contains(&name) {
+                    return sql_upper.contains(&name.to_uppercase());
+                }
+                // Strip DuckLake virtual columns (rowid, snapshot_id) unless explicitly referenced
+                if Self::DUCKLAKE_VIRTUAL_COLS.contains(&name) {
+                    return sql_upper.contains(&name.to_uppercase());
+                }
+                true
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        // If all columns are kept, no need to project
+        if keep_indices.len() == schema.fields().len() {
+            return Ok(batches);
+        }
+
+        let projected: Result<Vec<RecordBatch>, _> = batches
+            .into_iter()
+            .map(|batch| {
+                batch
+                    .project(&keep_indices)
+                    .map_err(|e| HybridError(format!("Projection error: {}", e)))
+            })
+            .collect();
+        projected
     }
 }
 
@@ -189,6 +253,18 @@ impl AsyncDB for HybridDuckLakeDB {
 
     async fn run(&mut self, sql: &str) -> Result<DBOutput<Self::ColumnType>, Self::Error> {
         if Self::is_write_statement(sql) {
+            // Track USE ducklake for default catalog/schema resolution
+            let trimmed_upper = sql.trim().to_uppercase();
+            if trimmed_upper.starts_with("USE ") {
+                if trimmed_upper.contains("DUCKLAKE") {
+                    self.use_ducklake
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    self.use_ducklake
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+
             // DuckDB path: WRITE operations and catalog management
             // Includes: CREATE, INSERT, UPDATE, DELETE, USE, SHOW, CALL, etc.
             self.execute_write(sql)?;
@@ -266,6 +342,22 @@ fn convert_batch_to_strings(batch: &RecordBatch) -> Result<Vec<Vec<String>>, Hyb
                         let arr = column.as_any().downcast_ref::<Int64Array>().unwrap();
                         arr.value(row_idx).to_string()
                     },
+                    DataType::UInt8 => {
+                        let arr = column.as_any().downcast_ref::<UInt8Array>().unwrap();
+                        arr.value(row_idx).to_string()
+                    },
+                    DataType::UInt16 => {
+                        let arr = column.as_any().downcast_ref::<UInt16Array>().unwrap();
+                        arr.value(row_idx).to_string()
+                    },
+                    DataType::UInt32 => {
+                        let arr = column.as_any().downcast_ref::<UInt32Array>().unwrap();
+                        arr.value(row_idx).to_string()
+                    },
+                    DataType::UInt64 => {
+                        let arr = column.as_any().downcast_ref::<UInt64Array>().unwrap();
+                        arr.value(row_idx).to_string()
+                    },
                     DataType::Float32 => {
                         let arr = column.as_any().downcast_ref::<Float32Array>().unwrap();
                         arr.value(row_idx).to_string()
@@ -276,6 +368,10 @@ fn convert_batch_to_strings(batch: &RecordBatch) -> Result<Vec<Vec<String>>, Hyb
                     },
                     DataType::Utf8 => {
                         let arr = column.as_any().downcast_ref::<StringArray>().unwrap();
+                        arr.value(row_idx).to_string()
+                    },
+                    DataType::LargeUtf8 => {
+                        let arr = column.as_any().downcast_ref::<LargeStringArray>().unwrap();
                         arr.value(row_idx).to_string()
                     },
                     DataType::Boolean => {
@@ -303,7 +399,17 @@ fn convert_batch_to_strings(batch: &RecordBatch) -> Result<Vec<Vec<String>>, Hyb
                             scale = *scale as usize
                         )
                     },
-                    _ => format!("{:?}", column),
+                    DataType::Binary => {
+                        let arr = column.as_any().downcast_ref::<BinaryArray>().unwrap();
+                        let bytes = arr.value(row_idx);
+                        // Format as hex string
+                        bytes.iter().map(|b| format!("{:02X}", b)).collect::<String>()
+                    },
+                    _ => {
+                        // Use Arrow's built-in display formatting as fallback
+                        datafusion::arrow::util::display::array_value_to_string(column, row_idx)
+                            .unwrap_or_else(|_| format!("{:?}", column.data_type()))
+                    },
                 }
             };
             row.push(value);
