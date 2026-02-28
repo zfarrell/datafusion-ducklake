@@ -12,6 +12,7 @@
 use datafusion::arrow::array::*;
 use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::logical_expr::{ScalarUDF, Volatility};
 use datafusion::prelude::*;
 use datafusion_ducklake::DuckdbMetadataProvider;
 use datafusion_ducklake::catalog::DuckLakeCatalog;
@@ -87,6 +88,7 @@ impl HybridDuckLakeDB {
 
         // Create DataFusion context for READ operations
         let ctx = SessionContext::new();
+        Self::register_compat_udfs(&ctx);
         let metadata_provider = DuckdbMetadataProvider::new(catalog_path.to_str().unwrap())?;
         let catalog = Arc::new(DuckLakeCatalog::new(metadata_provider)?);
         ctx.register_catalog("ducklake", catalog);
@@ -98,6 +100,16 @@ impl HybridDuckLakeDB {
             use_ducklake: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             in_transaction: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
+    }
+
+    /// Register DuckDB-compatible UDFs (year, month, day) in DataFusion context
+    fn register_compat_udfs(ctx: &SessionContext) {
+        // year(date/timestamp) → date_part('year', input)
+        ctx.register_udf(ScalarUDF::new_from_impl(DatePartAliasUdf::new("year")));
+        // month(date/timestamp) → date_part('month', input)
+        ctx.register_udf(ScalarUDF::new_from_impl(DatePartAliasUdf::new("month")));
+        // day(date/timestamp) → date_part('day', input)
+        ctx.register_udf(ScalarUDF::new_from_impl(DatePartAliasUdf::new("day")));
     }
 
     /// Detect if SQL should be routed to DuckDB
@@ -198,6 +210,7 @@ impl HybridDuckLakeDB {
             } else {
                 SessionContext::new()
             };
+        Self::register_compat_udfs(&new_ctx);
         let metadata_provider = DuckdbMetadataProvider::new(self.catalog_path.to_str().unwrap())?;
         let catalog = Arc::new(DuckLakeCatalog::new(metadata_provider)?);
         new_ctx.register_catalog("ducklake", catalog);
@@ -540,6 +553,78 @@ fn convert_batch_to_strings(batch: &RecordBatch) -> Result<Vec<Vec<String>>, Hyb
     }
 
     Ok(rows)
+}
+
+/// UDF that aliases date_part for DuckDB compatibility (year, month, day)
+#[derive(Debug)]
+struct DatePartAliasUdf {
+    name: String,
+    part_name: String,
+    signature: datafusion::logical_expr::Signature,
+}
+
+impl std::hash::Hash for DatePartAliasUdf {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+    }
+}
+
+impl PartialEq for DatePartAliasUdf {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+    }
+}
+
+impl Eq for DatePartAliasUdf {}
+
+impl DatePartAliasUdf {
+    fn new(part: &str) -> Self {
+        Self {
+            name: part.to_string(),
+            part_name: part.to_string(),
+            signature: datafusion::logical_expr::Signature::new(
+                datafusion::logical_expr::TypeSignature::Any(1),
+                Volatility::Immutable,
+            ),
+        }
+    }
+}
+
+impl datafusion::logical_expr::ScalarUDFImpl for DatePartAliasUdf {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn signature(&self) -> &datafusion::logical_expr::Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
+        // date_part returns Int32 in DataFusion
+        Ok(DataType::Int32)
+    }
+
+    fn invoke_with_args(
+        &self,
+        args: datafusion::logical_expr::ScalarFunctionArgs,
+    ) -> datafusion::error::Result<datafusion::physical_plan::ColumnarValue> {
+        use datafusion::physical_plan::ColumnarValue;
+        // Create the part name as a scalar
+        let part = ColumnarValue::Scalar(
+            datafusion::common::ScalarValue::Utf8(Some(self.part_name.clone())),
+        );
+        // Call the built-in date_part function
+        let date_part_udf = datafusion::functions::datetime::date_part();
+        let new_args = datafusion::logical_expr::ScalarFunctionArgs {
+            args: vec![part, args.args.into_iter().next().unwrap()],
+            ..args
+        };
+        date_part_udf.invoke_with_args(new_args)
+    }
 }
 
 #[cfg(test)]

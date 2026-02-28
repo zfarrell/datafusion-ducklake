@@ -142,7 +142,8 @@ fn preprocess_test_file(content: &str) -> String {
 
         // Skip ATTACH/DETACH statements (we handle connection in Rust)
         // Also handles multi-line ATTACH with parenthesized options
-        if trimmed == "statement ok"
+        // Applies to both statement ok and statement error (ATTACH errors don't apply in hybrid)
+        if (trimmed == "statement ok" || trimmed.starts_with("statement error"))
             && let Some(next_line) = lines.peek()
         {
             let next_upper = next_line.trim().to_uppercase();
@@ -174,6 +175,10 @@ fn preprocess_test_file(content: &str) -> String {
                         break;
                     }
                 }
+                // For statement error blocks, also skip ---- and error text
+                if trimmed.starts_with("statement error") {
+                    skip_statement_error_body(&mut lines);
+                }
                 continue;
             }
             if next_upper.starts_with("EXPLAIN ") {
@@ -192,26 +197,29 @@ fn preprocess_test_file(content: &str) -> String {
                 skip_query_results(&mut lines);
                 continue;
             }
+            // Collect all SQL lines (until ---- or blank line or next directive) to check
+            // for unsupported functions across multi-line queries
+            let full_sql_upper = collect_query_sql_preview(&lines, &next_upper);
             // Skip queries using DuckDB-specific functions not available in DataFusion
-            if contains_unsupported_function(&next_upper) {
-                lines.next(); // skip SQL
+            if contains_unsupported_function(&full_sql_upper) {
+                lines.next(); // skip first SQL line
                 skip_query_results(&mut lines);
                 continue;
             }
             // Skip queries with DuckDB named parameter syntax (key => value)
-            if next_upper.contains("=>") {
+            if full_sql_upper.contains("=>") {
                 lines.next(); // skip SQL
                 skip_query_results(&mut lines);
                 continue;
             }
             // Skip queries that mix virtual columns with * (causes duplicate projection errors)
-            if has_virtual_column_star_conflict(&next_upper) {
+            if has_virtual_column_star_conflict(&full_sql_upper) {
                 lines.next(); // skip SQL
                 skip_query_results(&mut lines);
                 continue;
             }
             // Handle ORDER BY ALL: remove it from SQL and add rowsort to query directive
-            if next_upper.contains("ORDER BY ALL") {
+            if full_sql_upper.contains("ORDER BY ALL") {
                 let query_line = rewrite_query_directive_with_rowsort(trimmed);
                 output.push_str(&query_line);
                 output.push('\n');
@@ -232,8 +240,20 @@ fn preprocess_test_file(content: &str) -> String {
             && let Some(next_line) = lines.peek()
         {
             let next_upper = next_line.trim().to_uppercase();
-            if contains_unsupported_function(&next_upper) {
+            let full_sql_upper = collect_query_sql_preview(&lines, &next_upper);
+            if contains_unsupported_function(&full_sql_upper) {
                 lines.next(); // skip SQL
+                // Skip remaining SQL lines
+                while let Some(peek) = lines.peek() {
+                    let t = peek.trim();
+                    if t == "----" || t.is_empty()
+                        || t.starts_with("statement") || t.starts_with("query")
+                        || t.starts_with("halt") || t.starts_with("#")
+                    {
+                        break;
+                    }
+                    lines.next();
+                }
                 if trimmed.starts_with("statement error") {
                     // Skip any ---- and error text
                     skip_statement_error_body(&mut lines);
@@ -241,17 +261,64 @@ fn preprocess_test_file(content: &str) -> String {
                 continue;
             }
             // Skip statements with named parameter syntax (key => value)
-            if next_upper.contains("=>") && trimmed == "statement ok" {
+            if full_sql_upper.contains("=>") && trimmed == "statement ok" {
                 lines.next(); // skip SQL
                 continue;
             }
         }
 
         // Strip error expectations from statement error blocks
-        // Convert multiline expected errors to empty (accept any error)
+        // Convert to statement ok when error condition can't occur in hybrid mode
         if trimmed.starts_with("statement error") {
-            output.push_str("statement error\n");
-            // Pass through SQL lines until ---- or blank line or next record
+            // Collect SQL lines and error text to decide conversion
+            let mut sql_lines_collected = Vec::new();
+            let mut error_text = String::new();
+            // Use a clone to peek ahead without consuming
+            let mut preview = lines.clone();
+            while let Some(next) = preview.next() {
+                let next_trimmed = next.trim();
+                if next_trimmed == "----" {
+                    // Collect error text lines
+                    while let Some(err_line) = preview.next() {
+                        let t = err_line.trim();
+                        if t.is_empty()
+                            || t.starts_with("statement")
+                            || t.starts_with("query")
+                            || t.starts_with("halt")
+                            || t.starts_with("#")
+                            || t.starts_with("loop ")
+                            || t.starts_with("foreach ")
+                        {
+                            break;
+                        }
+                        if !error_text.is_empty() {
+                            error_text.push(' ');
+                        }
+                        error_text.push_str(t);
+                    }
+                    break;
+                } else if next_trimmed.is_empty()
+                    || next_trimmed.starts_with("statement")
+                    || next_trimmed.starts_with("query")
+                    || next_trimmed.starts_with("halt")
+                {
+                    break;
+                } else {
+                    sql_lines_collected.push(next.to_string());
+                }
+            }
+
+            // Check if error text matches patterns that can't occur in hybrid mode
+            let error_upper = error_text.to_uppercase();
+            let convert_to_ok = is_hybrid_incompatible_error(&error_upper);
+
+            if convert_to_ok {
+                output.push_str("statement ok\n");
+            } else {
+                output.push_str("statement error\n");
+            }
+
+            // Now consume and output SQL lines from the actual iterator
             while let Some(next) = lines.peek() {
                 let next_trimmed = next.trim();
                 if next_trimmed == "----" {
@@ -577,6 +644,50 @@ fn contains_unsupported_function(sql_upper: &str) -> bool {
         // DuckDB SQL not supported in DataFusion
         || sql_upper.contains("COMMENT ON ")
         || sql_upper.contains("PRAGMA ")
+}
+
+/// Check if an expected error text matches patterns that can't occur in hybrid mode.
+/// When these patterns match, the statement error should be converted to statement ok.
+fn is_hybrid_incompatible_error(error_upper: &str) -> bool {
+    // Read-only errors: hybrid adapter always has writable DuckDB
+    error_upper.contains("READ-ONLY")
+    || error_upper.contains("READ ONLY")
+    // Detach-related: DETACH is skipped in hybrid mode, catalog remains available
+    || error_upper.contains("DOES NOT EXIST!")
+    // Missing extension: parquet is always loaded in hybrid mode
+    || error_upper.contains("MISSING EXTENSION ERROR")
+    || error_upper.contains("COULD NOT LOAD THE COPY FUNCTION")
+    // Transaction-local inlined data: only relevant for DuckDB internal handling
+    || error_upper.contains("TRANSACTION-LOCAL INLINED DATA")
+}
+
+/// Preview all SQL lines of a query block without consuming the iterator.
+/// Used to check multi-line queries for unsupported functions.
+/// Takes the already-peeked first line's uppercase and the peekable iterator.
+fn collect_query_sql_preview(
+    lines: &std::iter::Peekable<std::str::Lines>,
+    first_line_upper: &str,
+) -> String {
+    // We can't peek more than one line ahead, so clone the iterator to preview
+    let mut preview = lines.clone();
+    let mut full_sql = first_line_upper.to_string();
+    preview.next(); // skip the first SQL line (already in first_line_upper)
+    while let Some(line) = preview.next() {
+        let t = line.trim();
+        // Stop at separator, blank line, or next directive
+        if t == "----"
+            || t.is_empty()
+            || t.starts_with("statement")
+            || t.starts_with("query")
+            || t.starts_with("halt")
+            || t.starts_with("#")
+        {
+            break;
+        }
+        full_sql.push(' ');
+        full_sql.push_str(&t.to_uppercase());
+    }
+    full_sql
 }
 
 /// Skip query results until next directive
