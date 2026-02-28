@@ -422,6 +422,7 @@ impl MetadataProvider for PostgresMetadataProvider {
                    AND ($2 < s.end_snapshot OR s.end_snapshot IS NULL)
                    AND $3 >= t.begin_snapshot
                    AND ($4 < t.end_snapshot OR t.end_snapshot IS NULL)
+                   AND c.end_snapshot IS NULL
                  ORDER BY s.schema_name, t.table_name, c.column_order",
             )
             .bind(snapshot_id)

@@ -286,6 +286,7 @@ pub const SQL_LIST_ALL_COLUMNS: &str = "
       AND (? < s.end_snapshot OR s.end_snapshot IS NULL)
       AND ? >= t.begin_snapshot
       AND (? < t.end_snapshot OR t.end_snapshot IS NULL)
+      AND c.end_snapshot IS NULL
     ORDER BY s.schema_name, t.table_name, c.column_order";
 
 pub const SQL_LIST_ALL_FILES: &str = "
