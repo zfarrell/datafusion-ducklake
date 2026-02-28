@@ -227,7 +227,7 @@
 |----------|-------|
 | **Total `#[test]` + `#[tokio::test]`** | **666** |
 | SLT test files | 248 |
-| SLT pass rate | ~120/248 (48.4%) |
+| SLT pass rate | ~151/248 (60.9%) |
 
 ### 2.2 Test Breakdown by File
 
@@ -316,7 +316,7 @@ Note: Postgres/MySQL tests require running database containers (testcontainers).
 
 | Item | Effort | Details |
 |------|--------|---------|
-| SLT pass rate improvement | Medium | Currently 120/248 (48.4%). Many failures are SQL dialect mismatches (DuckDB vs DataFusion). Low-hanging fruit: table-not-found fixes, view tests, UDF shims. |
+| SLT pass rate improvement | Medium | Currently 151/248 (60.9%). Remaining failures: 21 add_files issues, 12 unsupported struct evolution, 10 data inlining, 9 macros, 30 result mismatches, 15 other blocked. Fixable subset: ~10-15 result mismatches, 2-3 CTAS visibility. |
 | SET PARTITIONED BY (ALTER TABLE) | Small | Add `AlterTableOp::SetPartitionedBy` variant + writer implementations |
 | ADD/REMOVE/RENAME FIELD (struct evolution) | Medium | Add `AlterTableOp` variants for nested struct field operations |
 | Write-side Hive partitioning | Large | INSERT should partition output by partition columns into Hive-style directory layout |
@@ -439,9 +439,9 @@ A comprehensive test harness with three SLT execution modes that validate every 
 | **Mode 2**: Pure DataFusion | DataFusion | DataFusion | Validates the full DF stack (writes + reads) end-to-end, no DuckDB dependency |
 | **Mode 3**: Reverse Interop (DF→DuckDB) | DataFusion | DuckDB | Proves catalogs written by DF are readable by DuckDB (interop guarantee) |
 
-### 5.2 Mode 1: Hybrid DuckDB→DataFusion (EXISTING — ~48% pass rate)
+### 5.2 Mode 1: Hybrid DuckDB→DataFusion (EXISTING — ~61% pass rate)
 
-**Status**: Operational. 120/248 tests passing.
+**Status**: Operational. 151/248 tests passing.
 
 **Infrastructure**:
 - `tests/sqllogictest_runner.rs`: Auto-discovers 248 `.test` files, preprocesses DuckDB-specific directives
@@ -460,7 +460,7 @@ A comprehensive test harness with three SLT execution modes that validate every 
 - Rewrites: `ORDER BY ALL` → removed (adds `rowsort` to query directive)
 - Filters: DuckDB-specific functions (`GLOB()`, `DUCKDB_TABLES()`, `PARQUET_METADATA()`, internal metadata tables, etc.)
 
-**Remaining 128 failures**: Mix of SQL dialect mismatches, missing UDF shims, unsupported DuckDB-only features, and type conversion gaps.
+**Remaining 97 failures**: 21 add_files issues, 12 unsupported struct/list/map evolution types, 10 data inlining (fundamental hybrid limitation), 9 macros (DuckLake limitation), 30 result mismatches, 15 other blocked (catalog names, DuckDB-specific, transactions).
 
 ### 5.3 Mode 2: Pure DataFusion (NOT STARTED — Feasibility Analysis)
 

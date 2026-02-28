@@ -2,7 +2,7 @@
 
 **Date**: 2026-02-28
 **Auditor**: Comprehensive cross-document reconciliation
-**Branch audited**: `ducklake-features/integration` at commit `d332b28`
+**Branch audited**: `ducklake-features/integration` (updated 2026-02-28 with SLT results at commit `f792458`)
 **Documents reviewed**: 12 (see methodology at end)
 
 ---
@@ -37,7 +37,7 @@ Here is a corrected breakdown:
 | Complex types (read/write) | Type parsing done | 50% (evolution missing) |
 | Encrypted writes | Not started | 0% |
 | Multi-backend writers (Postgres/MySQL) | Fully implemented | 90% (cross-engine tests missing) |
-| SQLLogicTest pass rate | 120/248 (48.4%) | 48% |
+| SQLLogicTest pass rate | 151/248 (60.9%) | 61% (up from 48.4%) |
 | Table functions | 12 of ~16 implemented | 75% |
 
 ### Remaining Items by Effort Level
@@ -151,35 +151,37 @@ The feature-parity-plan has a "Cross-Engine Testing Matrix" at the bottom with A
 - **Dependencies**: None fundamental, but architecturally questionable for Postgres/MySQL backends (see remaining-gaps.md Section 3)
 - **Note**: DuckDB stores inlined data as actual DuckDB tables in the catalog database. Implementing for non-DuckDB backends requires a different storage approach.
 
-#### T1-3: SLT Pass Rate Improvements -- "Table Not Found" Fixes (8 tests)
+#### T1-3: SLT Pass Rate Improvements -- "Table Not Found" Fixes (3 remaining tests)
 - **Plan reference**: Phase 6.3, slt-failure-report Category 8
-- **What needs to be done**:
-  - Expose metadata tables (`ducklake_metadata.ducklake_data_file`) to DataFusion -- 3 tests
-  - Fix CTAS table visibility (tables created via `CREATE TABLE ... AS`) -- 2 tests
-  - Fix table resolution after write/read sequence -- 2 tests
-  - Fix glob path table reference -- 1 test
+- **Status**: PARTIALLY DONE (4 of 8 original tests fixed: compaction_partitioned_non_adjacent, compaction_partitioned_table, delete_ignore_extra_columns, basic_partitioning)
+- **What remains**:
+  - Fix CTAS table visibility (tables created via `CREATE TABLE ... AS`) -- 2-3 tests (data_inlining_large, data_inlining_types, types/all_types)
+  - Fix table resolution timing for merge_update_insert -- 1 test
 - **Files to modify**: `tests/hybrid_asyncdb.rs` (test adapter), `src/schema.rs` (table visibility)
-- **Estimated effort**: Medium (M)
-- **SLT tests unlocked**: Up to 8 tests
-- **Dependencies**: None
-
-#### T1-4: SLT Pass Rate Improvements -- Expected Failure Mismatch Fixes (4 tests)
-- **Plan reference**: Phase 6.3, slt-failure-report Category 9
-- **What needs to be done**: Adjust test adapter to handle cases where hybrid mode succeeds but DuckDB-only would fail
-- **Files to modify**: `tests/hybrid_asyncdb.rs`
 - **Estimated effort**: Small (S)
-- **SLT tests unlocked**: 4 tests
+- **SLT tests unlocked**: 2-3 tests
 - **Dependencies**: None
 
-#### T1-5: SLT Pass Rate Improvements -- Query Result Mismatch Fixes (subset of 33 tests)
+#### T1-4: SLT Pass Rate Improvements -- Expected Failure Mismatch Fixes (1 remaining test)
+- **Plan reference**: Phase 6.3, slt-failure-report Category 9
+- **Status**: MOSTLY DONE (3 of 4 original tests fixed: detach_ducklake, ducklake_read_only, missing_parquet)
+- **What remains**: data_inlining/data_inlining_transaction_local_alter.test now shows as result mismatch rather than expected failure mismatch
+- **Estimated effort**: Small (S)
+- **SLT tests unlocked**: 0-1 tests (merged into result mismatch category)
+- **Dependencies**: None
+
+#### T1-5: SLT Pass Rate Improvements -- Query Result Mismatch Fixes (30 tests remaining)
 - **Plan reference**: Phase 6.3, slt-failure-report Category 12
+- **Status**: 2 of original 33 fixed (checkpoint_updates_interleaved, timestamp). Net count changed due to reclassification.
 - **What needs to be done**: Case-by-case analysis. Some are fixable:
-  - Rowid computation differences -- fix in virtual column logic
-  - Type promotion display -- fix in type formatter
-  - Default value application -- fix in insert logic
-  - NULL/NaN/Inf display -- fix in result formatting
+  - Rowid computation differences -- fix in virtual column logic (2 tests)
+  - Type promotion display -- fix in type formatter (2-3 tests)
+  - Default value application -- fix in insert logic (2 tests)
+  - NaN/Inf display -- fix in result formatting (1 test)
+  - View result format -- fix view query output (1 test)
+  - Virtual column values -- fix computation (1 test)
 - **Estimated effort**: Medium (M), varies per test
-- **SLT tests unlocked**: Estimated 10-15 of the 33
+- **SLT tests unlocked**: Estimated 10-15 of the 30
 - **Dependencies**: None (each fix is independent)
 
 #### T1-6: File Pruning Benchmark
@@ -242,12 +244,12 @@ The feature-parity-plan has a "Cross-Engine Testing Matrix" at the bottom with A
 - **Workaround**: Table functions (`ducklake_table_changes`, `ducklake_table_insertions`, `ducklake_current_snapshot`, etc.) provide time travel access today. Programmatic `DuckLakeCatalog::with_snapshot()` also works.
 - **Estimated effort if unblocked**: Low-Medium
 
-#### T2-3: DuckDB/DuckLake Extension Version Mismatch (19 SLT tests)
+#### T2-3: add_files DuckDB Issues (21 SLT tests)
 - **Plan reference**: slt-failure-report Category 1
-- **What blocks it**: The `ducklake_add_data_files()` function's SQL parser in the installed DuckDB version doesn't recognize the path format used in tests
-- **When resolved**: Update DuckDB or DuckLake extension
-- **Workaround**: None for these specific tests
-- **Impact**: 19 tests permanently blocked until DuckDB update
+- **What blocks it**: Mix of DuckDB version issues (within-transaction query problems, function signature mismatches, NULL shared_ptr dereference) and result format differences after add_files operations
+- **When resolved**: Update DuckDB or DuckLake extension for internal errors; result format fixes may be partially addressable
+- **Workaround**: None for DuckDB internal errors; some result mismatches may be fixable
+- **Impact**: ~15 tests permanently blocked by DuckDB issues, ~6 may be fixable with result format improvements
 
 #### T2-4: DuckDB Macros Not Supported (9 SLT tests)
 - **Plan reference**: slt-failure-report Category 3
@@ -256,11 +258,10 @@ The feature-parity-plan has a "Cross-Engine Testing Matrix" at the bottom with A
 - **Workaround**: None -- this is a DuckLake limitation, not a DataFusion one
 - **Impact**: 9 tests permanently blocked until upstream DuckLake changes
 
-#### T2-5: DuckDB Spatial Extension (4 SLT tests)
+#### T2-5: DuckDB Spatial Extension (RESOLVED)
 - **Plan reference**: slt-failure-report Category 4
-- **What blocks it**: DuckDB spatial extension not installed in test environment
-- **When resolved**: Install and load the spatial extension
-- **Estimated effort**: Small if spatial extension is available; but GEOMETRY type support in DataFusion-DuckLake is basic (mapped to Binary/WKB)
+- **Status**: RESOLVED. All 5 geo tests now pass (ducklake_geometry, ducklake_geometry_add_files, ducklake_geometry_inlining, ducklake_geometry_merge, ducklake_geometry_nested).
+- **How resolved**: Improved spatial type handling and function routing.
 
 ### Tier 3: Architectural Changes Required
 
@@ -274,7 +275,7 @@ The feature-parity-plan has a "Cross-Engine Testing Matrix" at the bottom with A
 - **Risk**: Medium-high. The metadata layer's column representation is flat (no parent/child hierarchy). Retrofitting nested structure evolution is a significant refactor.
 - **Worth doing?**: Medium priority. Struct evolution is used in real-world DuckLake catalogs, but only for advanced schema evolution scenarios. Basic struct READ support works fine.
 - **Estimated effort**: Large (L)
-- **SLT tests unlocked**: 13 tests (complex types + struct evolution)
+- **SLT tests unlocked**: 12 tests (complex types + struct evolution). Previously 13, but `time_travel/basic_time_travel.test` now passes.
 
 #### T3-2: Encrypted Writes
 - **Plan reference**: Phase 4.6, research-encryption-deep-dive.md
@@ -331,51 +332,54 @@ The feature-parity-plan has a "Cross-Engine Testing Matrix" at the bottom with A
 | Metric | Value |
 |--------|-------|
 | Total tests | 248 |
-| Passing | 120 |
-| Failing | 128 |
-| Pass rate | 48.4% |
+| Passing | 151 |
+| Failing | 97 |
+| Pass rate | 60.9% |
 | Baseline (pre-Phase 6) | 16 / 248 (6.5%) |
-| Improvement | +104 tests (+42 percentage points) |
+| Previous milestone | 120 / 248 (48.4%) |
+| Improvement (from baseline) | +135 tests (+54.4 percentage points) |
+| Improvement (from previous) | +31 tests (+12.5 percentage points) |
 
 ### Realistic Target
 
-With the items in Tier 1 completed:
-- Fix "Table Not Found" issues: +5-8 tests
-- Fix "Expected Failure Mismatch": +4 tests
+With the remaining fixable items completed:
 - Fix subset of "Query Result Mismatch": +10-15 tests
-- Port view-related tests: +3-5 tests
+- Fix CTAS table visibility: +2-3 tests
+- Fix rowid computation: +2 tests
+- Fix transaction table resolution: +2-3 tests
 
-**Realistic achievable**: ~140-150 / 248 (~57-60%)
+**Realistic achievable**: ~165-175 / 248 (~67-71%)
 
-### Breakdown of 128 Remaining Failures by Actionability
+**Hard ceiling** (without upstream changes): ~185 / 248 (~75%) — would require complex type evolution (T3-1) + all fixable result mismatches.
+
+### Breakdown of 97 Remaining Failures by Actionability
 
 | Category | Count | Actionability | Estimated Fixable |
 |----------|-------|---------------|-------------------|
-| DuckDB add_files syntax error | 19 | BLOCKED -- DuckDB version | 0 (without update) |
-| Unsupported complex types (struct/list/map evolution) | 13 | REQUIRES T3-1 (arch change) | 0 (without T3-1) |
+| add_files result mismatches & DuckDB issues | 21 | MOSTLY BLOCKED -- DuckDB version / within-transaction issues | 3-5 (result format fixes) |
+| Unsupported complex types (struct/list/map evolution) | 12 | REQUIRES T3-1 (arch change) | 0 (without T3-1) |
+| Data inlining (hybrid limitation) | 10 | FUNDAMENTAL LIMITATION -- hybrid mode can't read inlined data | 0-2 (CTAS fixes only) |
 | DuckDB macros not supported | 9 | BLOCKED -- upstream DuckLake | 0 |
-| DuckDB spatial extension | 4 | BLOCKED -- extension install | 0-4 |
-| SET schema / multi-catalog | 4 | BLOCKED -- test adapter limitation | 0 |
-| Missing DataFusion functions | 7 | PARTIAL -- some fixable | 2-3 (register year() UDF) |
-| DuckDB-specific errors (misc) | 12 | BLOCKED -- various DuckDB limitations | 0 |
-| Table/schema not found | 8 | FIXABLE (T1-3) | 5-8 |
-| Expected failure mismatch | 4 | FIXABLE (T1-4) | 4 |
-| Transaction/concurrency | 7 | PARTIALLY FIXABLE | 2-3 |
-| Data inlining visibility | 7 | FIXABLE with write-side inlining (T1-2) | 5-7 |
-| Query result mismatch (various) | 34 | PARTIALLY FIXABLE (T1-5) | 10-15 |
-| **Total** | **128** | | **28-44 fixable** |
+| Query result mismatch (various) | 30 | PARTIALLY FIXABLE (T1-5) | 10-15 |
+| Other (catalog names, DuckDB-specific, transactions) | 15 | MOSTLY BLOCKED -- various limitations | 2-3 (table resolution) |
+| **Total** | **97** | | **15-25 fixable** |
 
 ### Which Feature Implementations Would Unlock the Most Tests
 
 | Feature | Tests Unlocked | Effort |
 |---------|---------------|--------|
-| Complex type evolution (T3-1) | 13 | Large |
-| Data inlining write-side (T1-2) | 7 | Large |
-| Table/schema resolution fixes (T1-3) | 5-8 | Medium |
 | Result mismatch fixes (T1-5) | 10-15 | Medium |
-| Expected failure mismatch fixes (T1-4) | 4 | Small |
-| Register year() UDF | 3 | Small |
-| DuckDB extension update (T2-3) | 19 | Small (but external) |
+| Complex type evolution (T3-1) | 12 | Large |
+| CTAS table visibility fixes | 2-3 | Small |
+| Rowid computation alignment | 2 | Small |
+| Transaction table resolution | 2-3 | Small |
+| DuckDB extension update (T2-3) | ~15 | Small (but external) |
+
+Note: Several previously-listed items are now resolved:
+- year() UDF: registered (6 tests fixed)
+- Table/schema resolution fixes: mostly done (4 tests fixed)
+- Expected failure mismatch fixes: mostly done (3 tests fixed)
+- Spatial extension: now working (5 tests fixed)
 
 ---
 
@@ -444,7 +448,7 @@ With the items in Tier 1 completed:
 |----------|---------|----------|-------|
 | feature-parity-plan-feb-28.md | Feb 27 | **Mostly current** | Checkboxes accurately reflect integration branch state; cross-engine matrix never updated |
 | remaining-gaps.md | Feb 28 (commit 3d874ff) | **STALE** | Written before Postgres/MySQL implementations, file pruning, compaction. 6 of 14 gap items already resolved. |
-| slt-failure-report.md | Feb 28 | **Current** | Accurately reflects 120/248 pass rate at commit d332b28 |
+| slt-failure-report.md | Feb 28 | **Current** | Updated to reflect 151/248 (60.9%) pass rate |
 | handoff-prompt.md | Feb 28 | **Current** | Accurately describes Phases 0-5 complete, Phase 6 in progress |
 | review-feature-parity.md | Feb 26 | **HEAVILY STALE** | Pre-Phase 2-5. Shows many features as "None" that are now implemented. Do not use for current status. |
 | review-work-completeness.md | Feb 26 | **STALE** | Pre-Phase 2-5. Gap cross-reference is outdated. |
