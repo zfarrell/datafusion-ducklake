@@ -50,9 +50,11 @@ fn preprocess_test_file(content: &str) -> String {
             || trimmed.starts_with("# description:")
             || trimmed.starts_with("# group:")
         {
-            // Tests requiring no_extension_autoloading are incompatible with hybrid mode
-            // (parquet is always loaded, so expected failures become successes)
-            if trimmed.starts_with("require no_extension_autoloading") {
+            // Tests requiring unavailable extensions or incompatible modes are halted
+            if trimmed.starts_with("require no_extension_autoloading")
+                || trimmed == "require spatial"
+                || trimmed == "require icu"
+            {
                 output.push_str("halt\n\n");
                 return output;
             }
@@ -159,6 +161,10 @@ fn preprocess_test_file(content: &str) -> String {
                 || next_upper.starts_with("CHECKPOINT")
                 || next_upper.starts_with("COMMENT ON ")
                 || next_upper.starts_with("PRAGMA ")
+                || next_upper.starts_with("SET ALLOW_PERSISTENT_SECRETS")
+                || next_upper.starts_with("SET EXTENSION_DIRECTORY")
+                || next_upper.starts_with("SET AUTOLOAD_")
+                || next_upper.starts_with("SET AUTOINSTALL_")
             {
                 // Skip all lines of the statement (may span multiple lines)
                 while let Some(stmt_line) = lines.next() {
@@ -199,7 +205,11 @@ fn preprocess_test_file(content: &str) -> String {
             && let Some(next_line) = lines.peek()
         {
             let next_upper = next_line.trim().to_uppercase();
-            if next_upper.starts_with("EXPLAIN ") || next_upper.starts_with("DESCRIBE ") {
+            if next_upper.starts_with("EXPLAIN ")
+                || next_upper.starts_with("DESCRIBE ")
+                || next_upper.starts_with("SHOW TABLES")
+                || next_upper.starts_with("SHOW ALL TABLES")
+            {
                 lines.next();
                 skip_query_results(&mut lines);
                 continue;
@@ -656,6 +666,11 @@ fn contains_unsupported_function(sql_upper: &str) -> bool {
         // DuckDB SQL not supported in DataFusion
         || sql_upper.contains("COMMENT ON ")
         || sql_upper.contains("PRAGMA ")
+        // DuckDB-specific table functions
+        || sql_upper.contains("PRAGMA_DATABASE_SIZE(")
+        || sql_upper.contains("TABLE_INFO(")
+        // DuckDB SHOW commands
+        || sql_upper.contains("SHOW TABLES")
 }
 
 /// Check if an expected error text matches patterns that can't occur in hybrid mode.
