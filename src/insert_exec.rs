@@ -1,5 +1,8 @@
 //! DuckLake INSERT execution plan.
 //!
+//! Delegates to [`DuckLakeTableWriter`] for file writing and metadata commit.
+//! See `table_writer.rs` module docs for write atomicity guarantees.
+//!
 //! Limitations:
 //! - Collects all batches into memory before writing (no streaming yet)
 //! - Single partition only (partition 0)

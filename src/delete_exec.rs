@@ -5,6 +5,10 @@
 //! 2. Tracking row positions of matching rows
 //! 3. Writing Parquet delete files with (file_path, pos) schema
 //! 4. Registering delete files in catalog metadata
+//!
+//! If metadata registration fails after a delete file has been uploaded,
+//! best-effort cleanup removes the orphaned file. See `table_writer.rs`
+//! for full write atomicity guarantees.
 
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
@@ -33,7 +37,7 @@ use crate::metadata_provider::DuckLakeTableFile;
 use crate::metadata_writer::{DeleteFileInfo, MetadataWriter};
 use crate::path_resolver::join_paths;
 use crate::table::delete_file_schema;
-use crate::table_writer::calculate_footer_size_from_bytes;
+use crate::table_writer::{calculate_footer_size_from_bytes, cleanup_orphaned_files};
 
 /// Schema for the output of delete operations (count of rows deleted)
 fn make_delete_count_schema() -> SchemaRef {
@@ -204,6 +208,8 @@ impl ExecutionPlan for DuckLakeDeleteExec {
                 .collect::<DataFusionResult<Vec<_>>>()?;
 
             let mut total_deleted: u64 = 0;
+            // Track uploaded files for cleanup if metadata commit fails
+            let mut uploaded_files: Vec<ObjectPath> = Vec::new();
 
             // Process each data file
             for table_file in &table_files {
@@ -351,15 +357,17 @@ impl ExecutionPlan for DuckLakeDeleteExec {
                     .put(&delete_object_path, PutPayload::from(buffer))
                     .await
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                uploaded_files.push(delete_object_path);
 
-                // Register the delete file in metadata
+                // Register the delete file in metadata; clean up on failure
                 let delete_file_info =
                     DeleteFileInfo::new(data_file_id, &delete_file_name, file_size, delete_count)
                         .with_footer_size(footer_size);
 
-                writer
-                    .register_delete_file(table_id, snapshot_id, &delete_file_info)
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                if let Err(e) = writer.register_delete_file(table_id, snapshot_id, &delete_file_info) {
+                    cleanup_orphaned_files(&*object_store, &uploaded_files).await;
+                    return Err(DataFusionError::External(Box::new(e)));
+                }
             }
 
             // Return the count of deleted rows

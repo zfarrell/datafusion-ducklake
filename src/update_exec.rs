@@ -9,6 +9,10 @@
 //!
 //! This implements the copy-on-write (MOR) pattern: old rows are marked deleted,
 //! new rows with updated values are written as new data files.
+//!
+//! If metadata registration fails after files have been uploaded,
+//! best-effort cleanup removes all orphaned files (both delete and data files).
+//! See `table_writer.rs` for full write atomicity guarantees.
 
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
@@ -37,7 +41,7 @@ use crate::metadata_provider::DuckLakeTableFile;
 use crate::metadata_writer::{DataFileInfo, DeleteFileInfo, MetadataWriter};
 use crate::path_resolver::join_paths;
 use crate::table::delete_file_schema;
-use crate::table_writer::{build_schema_with_field_ids, calculate_footer_size_from_bytes};
+use crate::table_writer::{build_schema_with_field_ids, calculate_footer_size_from_bytes, cleanup_orphaned_files};
 
 /// Schema for the output of update operations (count of rows updated)
 fn make_update_count_schema() -> SchemaRef {
@@ -246,6 +250,8 @@ impl ExecutionPlan for DuckLakeUpdateExec {
             let mut total_updated: u64 = 0;
             // Collect all updated rows across all files for writing as new data
             let mut updated_batches: Vec<RecordBatch> = Vec::new();
+            // Track uploaded files for cleanup if metadata commit fails
+            let mut uploaded_files: Vec<ObjectPath> = Vec::new();
 
             // Process each data file
             for table_file in &table_files {
@@ -418,14 +424,16 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                     .put(&delete_object_path, PutPayload::from(buffer))
                     .await
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                uploaded_files.push(delete_object_path);
 
                 let delete_file_info =
                     DeleteFileInfo::new(data_file_id, &delete_file_name, file_size, update_count)
                         .with_footer_size(footer_size);
 
-                writer
-                    .register_delete_file(table_id, snapshot_id, &delete_file_info)
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                if let Err(e) = writer.register_delete_file(table_id, snapshot_id, &delete_file_info) {
+                    cleanup_orphaned_files(&*object_store, &uploaded_files).await;
+                    return Err(DataFusionError::External(Box::new(e)));
+                }
             }
 
             // Write updated rows as new data file(s)
@@ -476,13 +484,15 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                     .put(&data_object_path, PutPayload::from(buffer))
                     .await
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                uploaded_files.push(data_object_path);
 
                 let data_file_info = DataFileInfo::new(&data_file_name, file_size, total_records)
                     .with_footer_size(footer_size);
 
-                writer
-                    .register_data_file(table_id, snapshot_id, &data_file_info)
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                if let Err(e) = writer.register_data_file(table_id, snapshot_id, &data_file_info) {
+                    cleanup_orphaned_files(&*object_store, &uploaded_files).await;
+                    return Err(DataFusionError::External(Box::new(e)));
+                }
             }
 
             // Return the count of updated rows

@@ -138,7 +138,7 @@ pub use metadata_writer_sqlite::SqliteMetadataWriter;
 #[cfg(feature = "write")]
 pub use query_planner::DuckLakeQueryPlanner;
 #[cfg(feature = "write")]
-pub use table_writer::{DuckLakeTableWriter, TableWriteSession};
+pub use table_writer::{DuckLakeTableWriter, TableWriteSession, cleanup_orphaned_files};
 #[cfg(feature = "write")]
 pub use merge_exec::{DuckLakeMergeExec, MergeMatchedAction};
 #[cfg(feature = "write")]

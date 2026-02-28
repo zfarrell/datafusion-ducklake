@@ -109,8 +109,8 @@ async fn test_write_and_read_basic_types() {
 
     assert_eq!(batches.len(), 1);
     assert_eq!(batches[0].num_rows(), 3);
-    // 5 real columns + 2 virtual columns (filename, file_row_number)
-    assert_eq!(batches[0].num_columns(), 7);
+    // 5 real columns + 5 virtual columns (filename, file_row_number, rowid, snapshot_id, file_index)
+    assert_eq!(batches[0].num_columns(), 10);
 
     // Verify data
     let ids = batches[0]
@@ -909,4 +909,37 @@ async fn test_append_reorder_columns() {
         .unwrap()
         .value(0);
     assert_eq!(count, 4);
+}
+
+/// Verify that `cleanup_orphaned_files` removes files from object store.
+///
+/// This tests the core cleanup mechanism used by TableWriteSession::finish(),
+/// DuckLakeDeleteExec, and DuckLakeUpdateExec when metadata commits fail.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_orphaned_file_cleanup() {
+    use object_store::path::Path as ObjectPath;
+    use object_store::PutPayload;
+
+    let temp_dir = TempDir::new().unwrap();
+    let data_dir = temp_dir.path().join("cleanup_test");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let object_store = create_object_store();
+    let file_path = ObjectPath::from(data_dir.join("orphan.parquet").to_str().unwrap());
+
+    // Upload a file
+    object_store
+        .put(&file_path, PutPayload::from_static(b"fake parquet data"))
+        .await
+        .unwrap();
+
+    // Verify it exists
+    let full_path = std::path::Path::new("/").join(file_path.as_ref());
+    assert!(full_path.exists(), "File should exist after upload");
+
+    // Run cleanup
+    datafusion_ducklake::cleanup_orphaned_files(&*object_store, &[file_path]).await;
+
+    // Verify it was deleted
+    assert!(!full_path.exists(), "File should be deleted after cleanup");
 }

@@ -1,4 +1,33 @@
 //! High-level table writer for DuckLake catalogs.
+//!
+//! # Write Atomicity Guarantees
+//!
+//! The write path follows a **write-then-commit** pattern:
+//!
+//! 1. **Parquet file upload** — Data is serialized and uploaded to the object store.
+//! 2. **Metadata commit** — The catalog database is updated to reference the new file.
+//!
+//! ## Failure Modes
+//!
+//! - **Process crash between steps 1 and 2**: The Parquet file exists on the object
+//!   store but is not referenced by any catalog entry. It becomes an orphaned file
+//!   that can be cleaned up via a garbage-collection sweep (not yet implemented).
+//!
+//! - **Object store upload succeeds, metadata commit fails**: The `finish()` method
+//!   performs best-effort cleanup by deleting the uploaded Parquet file. If cleanup
+//!   also fails (e.g., object store is temporarily unavailable), a warning is logged
+//!   and the original commit error is propagated. The file becomes orphaned.
+//!
+//! - **Object store upload fails**: No metadata is written; the operation is cleanly
+//!   aborted with no side effects.
+//!
+//! ## Guarantees
+//!
+//! - A successful `finish()` call means both the file and metadata are committed.
+//! - A failed `finish()` call means the metadata was NOT committed; the file may
+//!   or may not exist (best-effort cleanup is attempted).
+//! - The `Drop` implementation for `TableWriteSession` is a no-op: if `finish()`
+//!   is never called, no file is uploaded and no metadata is written.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -297,6 +326,31 @@ impl TableWriteSession {
             .put(&self.object_path, PutPayload::from(buffer))
             .await?;
 
+        // Attempt to commit metadata. If this fails, the uploaded file is orphaned
+        // and we make a best-effort attempt to clean it up.
+        match self.commit_metadata(file_size, footer_size, &column_stats) {
+            Ok(result) => Ok(result),
+            Err(commit_err) => {
+                // Best-effort cleanup: delete the orphaned Parquet file
+                if let Err(cleanup_err) = self.object_store.delete(&self.object_path).await {
+                    tracing::warn!(
+                        path = %self.object_path,
+                        error = %cleanup_err,
+                        "Failed to clean up orphaned Parquet file after metadata commit failure"
+                    );
+                }
+                Err(commit_err)
+            },
+        }
+    }
+    /// Commit file metadata to the catalog. Separated from `finish()` so that
+    /// cleanup of orphaned files can happen if this step fails.
+    fn commit_metadata(
+        &self,
+        file_size: i64,
+        footer_size: i64,
+        column_stats: &[ColumnStatInfo],
+    ) -> Result<WriteResult> {
         let mut file_info = DataFileInfo::new(&self.catalog_path, file_size, self.row_count)
             .with_footer_size(footer_size);
         if !self.path_is_relative {
@@ -306,10 +360,9 @@ impl TableWriteSession {
             self.metadata
                 .register_data_file(self.table_id, self.snapshot_id, &file_info)?;
 
-        // Register column-level statistics
         if !column_stats.is_empty() {
             self.metadata
-                .register_column_stats(data_file_id, self.table_id, &column_stats)?;
+                .register_column_stats(data_file_id, self.table_id, column_stats)?;
         }
 
         Ok(WriteResult {
@@ -519,6 +572,26 @@ pub(crate) fn calculate_footer_size_from_bytes(buffer: &[u8]) -> Result<i64> {
         )));
     }
     Ok(metadata_len as i64)
+}
+
+/// Best-effort cleanup of uploaded files after a metadata commit failure.
+///
+/// Attempts to delete each file from the object store. If any deletion fails,
+/// a warning is logged but the error is not propagated — the caller should
+/// propagate the original commit error instead.
+pub async fn cleanup_orphaned_files(
+    object_store: &dyn ObjectStore,
+    paths: &[ObjectPath],
+) {
+    for path in paths {
+        if let Err(e) = object_store.delete(path).await {
+            tracing::warn!(
+                path = %path,
+                error = %e,
+                "Failed to clean up orphaned file after metadata commit failure"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
