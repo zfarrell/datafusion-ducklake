@@ -27,11 +27,8 @@ fn duckdb_setup(catalog_path: &std::path::Path) -> duckdb::Connection {
     conn.execute("INSTALL ducklake;", []).unwrap();
     conn.execute("LOAD ducklake;", []).unwrap();
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
-    conn.execute(
-        &format!("ATTACH '{}' AS test_catalog;", ducklake_path),
-        [],
-    )
-    .unwrap();
+    conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])
+        .unwrap();
     conn
 }
 
@@ -94,7 +91,10 @@ async fn test_issue_125_partitioned_table_read() -> DataFusionResult<()> {
     let batches = df.collect().await?;
 
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(total_rows, 4, "Should read all 4 rows from partitioned table");
+    assert_eq!(
+        total_rows, 4,
+        "Should read all 4 rows from partitioned table"
+    );
 
     // Verify filtering on partition column returns correct data
     let df = ctx
@@ -159,11 +159,8 @@ async fn test_issue_332_add_column_id_ordering() -> DataFusionResult<()> {
     )
     .unwrap();
 
-    conn.execute(
-        "ALTER TABLE test_catalog.users ADD COLUMN age INT;",
-        [],
-    )
-    .unwrap();
+    conn.execute("ALTER TABLE test_catalog.users ADD COLUMN age INT;", [])
+        .unwrap();
 
     // Insert new row with all columns
     conn.execute(
@@ -181,7 +178,10 @@ async fn test_issue_332_add_column_id_ordering() -> DataFusionResult<()> {
         .await?;
     let batches = df.collect().await?;
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(total_rows, 3, "Should have 3 rows after ADD COLUMN + INSERT");
+    assert_eq!(
+        total_rows, 3,
+        "Should have 3 rows after ADD COLUMN + INSERT"
+    );
 
     // Row 3 should have the email and age values
     let last_batch = batches.last().unwrap();
@@ -301,7 +301,10 @@ async fn test_issue_470_filter_or_in_partitioned() -> DataFusionResult<()> {
         .await?;
     let batches = df.collect().await?;
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(total, 2, "Single equality filter should return 2 rows for p1");
+    assert_eq!(
+        total, 2,
+        "Single equality filter should return 2 rows for p1"
+    );
 
     // Test OR condition (issue #470: this reads all files)
     let df = ctx
@@ -525,7 +528,11 @@ async fn test_issue_643_partition_by_year() -> DataFusionResult<()> {
     // Verify the actual data values are correct (not corrupted by partition weirdness)
     let mut all_ids: Vec<i32> = Vec::new();
     for batch in &batches {
-        let ids = batch.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
         for i in 0..ids.len() {
             if !ids.is_null(i) {
                 all_ids.push(ids.value(i));
@@ -599,7 +606,11 @@ async fn test_issue_745_limit_on_partitioned() -> DataFusionResult<()> {
         .as_any()
         .downcast_ref::<Int32Array>()
         .unwrap();
-    assert_eq!(reading_ids.value(0), 4, "Should get reading_id=4 (value=40.0)");
+    assert_eq!(
+        reading_ids.value(0),
+        4,
+        "Should get reading_id=4 (value=40.0)"
+    );
 
     // Also test without filter but with LIMIT
     let df = ctx
@@ -612,4 +623,3 @@ async fn test_issue_745_limit_on_partitioned() -> DataFusionResult<()> {
     std::mem::forget(temp_dir);
     Ok(())
 }
-

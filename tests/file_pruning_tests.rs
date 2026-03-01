@@ -149,9 +149,7 @@ async fn test_pruning_range_filter_correct_results() {
     let (writer, temp_dir) = create_test_env().await;
     let object_store = create_object_store();
 
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("val", DataType::Int32, false),
-    ]));
+    let schema = Arc::new(Schema::new(vec![Field::new("val", DataType::Int32, false)]));
 
     // File 1: values 1-5
     let batch1 = RecordBatch::try_new(
@@ -191,11 +189,7 @@ async fn test_pruning_range_filter_correct_results() {
     let all_vals: Vec<i32> = rows
         .iter()
         .flat_map(|b| {
-            let arr = b
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .unwrap();
+            let arr = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
             (0..arr.len()).map(move |i| arr.value(i))
         })
         .collect();
@@ -214,11 +208,7 @@ async fn test_pruning_range_filter_correct_results() {
     let all_vals: Vec<i32> = rows
         .iter()
         .flat_map(|b| {
-            let arr = b
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .unwrap();
+            let arr = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
             (0..arr.len()).map(move |i| arr.value(i))
         })
         .collect();
@@ -323,9 +313,11 @@ async fn test_pruning_float_filter_correct_results() {
     let (writer, temp_dir) = create_test_env().await;
     let object_store = create_object_store();
 
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("score", DataType::Float64, false),
-    ]));
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "score",
+        DataType::Float64,
+        false,
+    )]));
 
     // File 1: scores 1.0-3.0
     let batch1 = RecordBatch::try_new(
@@ -365,11 +357,7 @@ async fn test_pruning_float_filter_correct_results() {
     let all_scores: Vec<f64> = rows
         .iter()
         .flat_map(|b| {
-            let arr = b
-                .column(0)
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .unwrap();
+            let arr = b.column(0).as_any().downcast_ref::<Float64Array>().unwrap();
             (0..arr.len()).map(move |i| arr.value(i))
         })
         .collect();
@@ -383,9 +371,7 @@ async fn test_no_pruning_when_stats_absent() {
     let (writer, temp_dir) = create_test_env().await;
     let object_store = create_object_store();
 
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int32, false),
-    ]));
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
 
     let batch = RecordBatch::try_new(
         schema,
@@ -411,11 +397,7 @@ async fn test_no_pruning_when_stats_absent() {
     let all_ids: Vec<i32> = rows
         .iter()
         .flat_map(|b| {
-            let arr = b
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .unwrap();
+            let arr = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
             (0..arr.len()).map(move |i| arr.value(i))
         })
         .collect();
@@ -430,16 +412,12 @@ async fn test_pruning_no_false_negatives() {
     let (writer, temp_dir) = create_test_env().await;
     let object_store = create_object_store();
 
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int32, false),
-    ]));
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
 
     // File 1: ids 1-10
     let batch1 = RecordBatch::try_new(
         schema.clone(),
-        vec![Arc::new(Int32Array::from(vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
-        ]))],
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]))],
     )
     .unwrap();
 
@@ -494,11 +472,7 @@ async fn test_pruning_no_false_negatives() {
     let all_ids: Vec<i32> = rows
         .iter()
         .flat_map(|b| {
-            let arr = b
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .unwrap();
+            let arr = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
             (0..arr.len()).map(move |i| arr.value(i))
         })
         .collect();
@@ -594,11 +568,7 @@ async fn test_pruning_with_nulls() {
     let all_ids: Vec<i32> = rows
         .iter()
         .flat_map(|b| {
-            let arr = b
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .unwrap();
+            let arr = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
             (0..arr.len()).map(move |i| arr.value(i))
         })
         .collect();
@@ -645,18 +615,13 @@ async fn test_file_pruning_effectiveness() {
 
         let batch = RecordBatch::try_new(
             schema.clone(),
-            vec![
-                Arc::new(Int32Array::from(ids)),
-                Arc::new(Float64Array::from(values)),
-            ],
+            vec![Arc::new(Int32Array::from(ids)), Arc::new(Float64Array::from(values))],
         )
         .unwrap();
 
         let tw = DuckLakeTableWriter::new(writer.clone(), object_store.clone()).unwrap();
         if file_idx == 0 {
-            tw.write_table("main", "prune_eff", &[batch])
-                .await
-                .unwrap();
+            tw.write_table("main", "prune_eff", &[batch]).await.unwrap();
         } else {
             tw.append_table("main", "prune_eff", &[batch])
                 .await
@@ -696,7 +661,10 @@ async fn test_file_pruning_effectiveness() {
         .downcast_ref::<arrow::array::Int64Array>()
         .unwrap()
         .value(0);
-    assert_eq!(filtered_count, 100, "Should match exactly one file's worth of rows");
+    assert_eq!(
+        filtered_count, 100,
+        "Should match exactly one file's worth of rows"
+    );
 
     // Very selective filter: id = 42 should match only 1 row from file 0
     let rows = ctx
@@ -839,11 +807,7 @@ async fn test_pruning_duckdb_written_stats() {
     let all_ids: Vec<i32> = rows
         .iter()
         .flat_map(|b| {
-            let arr = b
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .unwrap();
+            let arr = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
             (0..arr.len()).map(move |i| arr.value(i))
         })
         .collect();

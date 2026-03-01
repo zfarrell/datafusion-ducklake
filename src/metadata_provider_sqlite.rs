@@ -837,11 +837,7 @@ WHERE data.table_id = ?
         })
     }
 
-    fn get_inlined_data(
-        &self,
-        table_id: i64,
-        snapshot_id: i64,
-    ) -> Result<Vec<InlinedDataRow>> {
+    fn get_inlined_data(&self, table_id: i64, snapshot_id: i64) -> Result<Vec<InlinedDataRow>> {
         block_on(async {
             // First, look up the inlined data table name from ducklake_inlined_data_tables
             let table_info = sqlx::query(
@@ -858,12 +854,11 @@ WHERE data.table_id = ?
             let inlined_table_name: String = info_row.try_get(0)?;
 
             // Check if the inlined data table exists
-            let exists = sqlx::query(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?",
-            )
-            .bind(&inlined_table_name)
-            .fetch_one(&self.pool)
-            .await?;
+            let exists =
+                sqlx::query("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?")
+                    .bind(&inlined_table_name)
+                    .fetch_one(&self.pool)
+                    .await?;
             let count: i64 = exists.try_get(0)?;
             if count == 0 {
                 return Ok(Vec::new());
@@ -871,9 +866,7 @@ WHERE data.table_id = ?
 
             // Query the inlined data table - get column names dynamically
             let pragma_query = format!("PRAGMA table_info('{}')", inlined_table_name);
-            let columns = sqlx::query(&pragma_query)
-                .fetch_all(&self.pool)
-                .await?;
+            let columns = sqlx::query(&pragma_query).fetch_all(&self.pool).await?;
 
             // Column layout: row_id, begin_snapshot, end_snapshot, then user columns
             let user_columns: Vec<String> = columns
@@ -970,12 +963,11 @@ WHERE data.table_id = ?
 impl SqliteMetadataProvider {
     /// Count inlined rows for a table at a given snapshot.
     async fn count_inlined_rows(&self, table_id: i64, snapshot_id: i64) -> Result<i64> {
-        let table_info = sqlx::query(
-            "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?",
-        )
-        .bind(table_id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let table_info =
+            sqlx::query("SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?")
+                .bind(table_id)
+                .fetch_optional(&self.pool)
+                .await?;
 
         let Some(info_row) = table_info else {
             return Ok(0);
@@ -984,12 +976,11 @@ impl SqliteMetadataProvider {
         let inlined_table_name: String = info_row.try_get(0)?;
 
         // Check if the inlined data table exists
-        let exists = sqlx::query(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?",
-        )
-        .bind(&inlined_table_name)
-        .fetch_one(&self.pool)
-        .await?;
+        let exists =
+            sqlx::query("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?")
+                .bind(&inlined_table_name)
+                .fetch_one(&self.pool)
+                .await?;
         let count: i64 = exists.try_get(0)?;
         if count == 0 {
             return Ok(0);

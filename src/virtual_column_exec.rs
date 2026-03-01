@@ -230,7 +230,7 @@ impl Stream for VirtualColumnStream {
                     .map_err(|e| DataFusionError::ArrowError(Box::new(e), None));
 
                 Poll::Ready(Some(result))
-            }
+            },
             Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,

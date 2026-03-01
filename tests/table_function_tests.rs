@@ -11,8 +11,8 @@ use arrow::array::{Array, Int64Array, StringArray};
 use arrow::record_batch::RecordBatch;
 use datafusion::prelude::*;
 use datafusion_ducklake::{
-    DuckLakeCatalog, DuckdbMetadataProvider, register_ducklake_functions,
-    register_ducklake_compaction_functions,
+    DuckLakeCatalog, DuckdbMetadataProvider, register_ducklake_compaction_functions,
+    register_ducklake_functions,
 };
 use tempfile::TempDir;
 
@@ -99,7 +99,10 @@ async fn test_snapshots_schema_matches_duckdb() -> Result<(), Box<dyn std::error
 
     let batch = &results[0];
     let num_rows = batch.num_rows();
-    assert!(num_rows >= 2, "Should have at least 2 snapshots (schema creation + table creation + insert)");
+    assert!(
+        num_rows >= 2,
+        "Should have at least 2 snapshots (schema creation + table creation + insert)"
+    );
 
     // Verify snapshot_id is present and starts at 0
     let ids = get_i64_values(batch, 0);
@@ -115,7 +118,10 @@ async fn test_snapshots_schema_matches_duckdb() -> Result<(), Box<dyn std::error
 
     // Verify changes column is populated
     let changes = get_string_values(batch, 3);
-    assert!(changes[0].is_some(), "Changes should be populated for first snapshot");
+    assert!(
+        changes[0].is_some(),
+        "Changes should be populated for first snapshot"
+    );
 
     Ok(())
 }
@@ -275,14 +281,14 @@ async fn test_options_returns_catalog_options() -> Result<(), Box<dyn std::error
     assert!(!results.is_empty());
 
     let batch = &results[0];
-    assert!(batch.num_rows() >= 3, "Should have at least 3 options (created_by, data_path, version)");
+    assert!(
+        batch.num_rows() >= 3,
+        "Should have at least 3 options (created_by, data_path, version)"
+    );
 
     // Verify known options are present
     let option_names = get_string_values(batch, 0);
-    let option_name_strs: Vec<&str> = option_names
-        .iter()
-        .filter_map(|o| o.as_deref())
-        .collect();
+    let option_name_strs: Vec<&str> = option_names.iter().filter_map(|o| o.as_deref()).collect();
     assert!(
         option_name_strs.contains(&"data_path"),
         "Should have data_path option"
@@ -311,7 +317,9 @@ async fn test_current_snapshot_returns_value() -> Result<(), Box<dyn std::error:
     let id = get_i64_values(&results[0], 0);
     assert!(id[0].unwrap() >= 0, "Snapshot ID should be non-negative");
 
-    let df2 = ctx.sql("SELECT * FROM ducklake_last_committed_snapshot()").await?;
+    let df2 = ctx
+        .sql("SELECT * FROM ducklake_last_committed_snapshot()")
+        .await?;
     let results2 = df2.collect().await?;
     assert_eq!(results2[0].num_rows(), 1);
 
@@ -342,7 +350,10 @@ async fn test_snapshots_cross_engine_verify() -> Result<(), Box<dyn std::error::
 
     // Verify schema_versions are present
     let versions = get_i64_values(batch, 1);
-    assert!(versions.iter().all(|v| v.is_some()), "All schema versions should be present");
+    assert!(
+        versions.iter().all(|v| v.is_some()),
+        "All schema versions should be present"
+    );
 
     Ok(())
 }

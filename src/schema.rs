@@ -136,9 +136,23 @@ impl DuckLakeSchema {
 
         temp_ctx.register_catalog("ducklake", Arc::new(temp_catalog));
 
-        let plan = temp_ctx.state().create_logical_plan(&view.sql).await?;
+        // Rewrite DuckDB-specific SQL constructs in view definitions
+        let sql = Self::rewrite_duckdb_view_sql(&view.sql);
+
+        let plan = temp_ctx.state().create_logical_plan(&sql).await?;
 
         Ok(ViewTable::new(plan, Some(view.sql.clone())))
+    }
+
+    /// Rewrite DuckDB-specific SQL in view definitions to DataFusion-compatible SQL.
+    /// DuckDB serializes some functions differently (e.g., COUNT(*) becomes count_star()).
+    fn rewrite_duckdb_view_sql(sql: &str) -> String {
+        let mut result = sql.to_string();
+        // Handle count_star() - DuckDB's internal representation of COUNT(*)
+        while let Some(pos) = result.to_lowercase().find("count_star()") {
+            result.replace_range(pos..pos + 12, "COUNT(*)");
+        }
+        result
     }
 }
 

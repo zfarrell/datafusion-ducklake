@@ -6,11 +6,11 @@ use crate::metadata_provider::{
     SQL_GET_DATA_FILES_ADDED_BETWEEN_SNAPSHOTS, SQL_GET_DATA_PATH,
     SQL_GET_DELETE_FILES_ADDED_BETWEEN_SNAPSHOTS, SQL_GET_FILE_COLUMN_STATS,
     SQL_GET_FILE_PARTITION_VALUES, SQL_GET_LATEST_SNAPSHOT, SQL_GET_PARTITION_COLUMNS,
-    SQL_GET_SCHEMA_BY_NAME, SQL_GET_TABLE_BY_NAME, SQL_GET_TABLE_COLUMNS,
-    SQL_GET_TABLE_ROW_COUNT, SQL_LIST_ALL_COLUMNS, SQL_LIST_ALL_FILES, SQL_LIST_ALL_TABLES,
-    SQL_LIST_SCHEMAS, SQL_LIST_SNAPSHOTS, SQL_LIST_TABLES, SQL_TABLE_EXISTS, SQL_LIST_VIEWS,
-    SQL_GET_VIEW_BY_NAME, SQL_VIEW_EXISTS, SchemaMetadata,
-    SnapshotMetadata, TableMetadata, TableWithSchema, ViewMetadata,
+    SQL_GET_SCHEMA_BY_NAME, SQL_GET_TABLE_BY_NAME, SQL_GET_TABLE_COLUMNS, SQL_GET_TABLE_ROW_COUNT,
+    SQL_GET_VIEW_BY_NAME, SQL_LIST_ALL_COLUMNS, SQL_LIST_ALL_FILES, SQL_LIST_ALL_TABLES,
+    SQL_LIST_SCHEMAS, SQL_LIST_SNAPSHOTS, SQL_LIST_TABLES, SQL_LIST_VIEWS, SQL_TABLE_EXISTS,
+    SQL_VIEW_EXISTS, SchemaMetadata, SnapshotMetadata, TableMetadata, TableWithSchema,
+    ViewMetadata,
 };
 use duckdb::AccessMode::ReadOnly;
 use duckdb::{Config, Connection, params};
@@ -439,17 +439,11 @@ impl MetadataProvider for DuckdbMetadataProvider {
         Ok(files)
     }
 
-    fn get_table_row_count(
-        &self,
-        table_id: i64,
-        snapshot_id: i64,
-    ) -> crate::Result<Option<i64>> {
+    fn get_table_row_count(&self, table_id: i64, snapshot_id: i64) -> crate::Result<Option<i64>> {
         let conn = self.connection()?;
         let row_count: Option<i64> = conn.query_row(
             SQL_GET_TABLE_ROW_COUNT,
-            params![
-                table_id, snapshot_id, snapshot_id, table_id, snapshot_id, snapshot_id
-            ],
+            params![table_id, snapshot_id, snapshot_id, table_id, snapshot_id, snapshot_id],
             |row| row.get(0),
         )?;
         Ok(row_count)
@@ -632,16 +626,13 @@ impl MetadataProvider for DuckdbMetadataProvider {
         let conn = self.connection()?;
         let mut stmt = conn.prepare(SQL_LIST_VIEWS)?;
         let views = stmt
-            .query_map(
-                params![schema_id, snapshot_id, snapshot_id],
-                |row| {
-                    Ok(ViewMetadata {
-                        view_id: row.get(0)?,
-                        view_name: row.get(1)?,
-                        sql: row.get(2)?,
-                    })
-                },
-            )?
+            .query_map(params![schema_id, snapshot_id, snapshot_id], |row| {
+                Ok(ViewMetadata {
+                    view_id: row.get(0)?,
+                    view_name: row.get(1)?,
+                    sql: row.get(2)?,
+                })
+            })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(views)
     }

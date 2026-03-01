@@ -12,8 +12,10 @@
 // Part 1: Type parser adversarial tests (pure unit-level, no DB needed)
 // ========================================================================
 
-use datafusion_ducklake::types::{build_arrow_schema, ducklake_to_arrow_type, arrow_to_ducklake_type};
 use datafusion_ducklake::metadata_provider::DuckLakeTableColumn;
+use datafusion_ducklake::types::{
+    arrow_to_ducklake_type, build_arrow_schema, ducklake_to_arrow_type,
+};
 
 // ---------- Empty and whitespace inputs ----------
 
@@ -72,7 +74,10 @@ fn attack_type_sql_injection_semicolon() {
     // Attack: type name containing SQL injection payload.
     // This should never reach SQL execution, just the type parser.
     let result = ducklake_to_arrow_type("int; DROP TABLE ducklake_column;--");
-    assert!(result.is_err(), "SQL injection payload should be rejected as unsupported type");
+    assert!(
+        result.is_err(),
+        "SQL injection payload should be rejected as unsupported type"
+    );
     // DEFENDED: type parser doesn't execute SQL
 }
 
@@ -98,10 +103,10 @@ fn attack_type_sql_injection_in_struct_field() {
             // The parser accepted it. The name will be used as a Field name.
             // Not a type parser bug per se, but potentially dangerous if the
             // field name reaches SQL in the metadata writer.
-        }
+        },
         Err(_) => {
             // Parser rejected it. Also fine.
-        }
+        },
     }
 }
 
@@ -110,7 +115,10 @@ fn attack_type_sql_injection_in_struct_field() {
 #[test]
 fn attack_type_unicode_type_name() {
     let result = ducklake_to_arrow_type("整数");
-    assert!(result.is_err(), "Chinese characters should be unsupported type");
+    assert!(
+        result.is_err(),
+        "Chinese characters should be unsupported type"
+    );
     // DEFENDED
 }
 
@@ -159,7 +167,11 @@ fn attack_type_deeply_nested_list_50() {
     // BUG: No depth limit! This could cause stack overflow with enough nesting.
     // With 50 levels it likely works, but there's no protection against
     // adversarial input with thousands of levels.
-    assert!(result.is_ok(), "50-level nesting should work (but no depth limit is a bug): {:?}", result);
+    assert!(
+        result.is_ok(),
+        "50-level nesting should work (but no depth limit is a bug): {:?}",
+        result
+    );
 }
 
 #[test]
@@ -175,11 +187,11 @@ fn attack_type_deeply_nested_list_500() {
     match result {
         Ok(_) => {
             // BUG: accepted 500-deep nesting with no limit
-        }
+        },
         Err(_) => {
             // Stack overflow would manifest as a panic, not an Err.
             // If we got here, something else went wrong.
-        }
+        },
     }
 }
 
@@ -193,11 +205,11 @@ fn attack_type_deeply_nested_struct_50() {
     let result = ducklake_to_arrow_type(&type_str);
     // BUG: No depth limit on struct nesting either.
     match result {
-        Ok(_) => { /* No depth limit bug */ }
+        Ok(_) => { /* No depth limit bug */ },
         Err(e) => {
             // Might fail for other reasons
             panic!("50-deep struct nesting failed: {}", e);
-        }
+        },
     }
 }
 
@@ -220,7 +232,10 @@ fn attack_type_unmatched_close_paren() {
 #[test]
 fn attack_type_extra_chars_after_close() {
     let result = ducklake_to_arrow_type("list(int32) EXTRA");
-    assert!(result.is_err(), "Extra chars after closing paren should fail");
+    assert!(
+        result.is_err(),
+        "Extra chars after closing paren should fail"
+    );
     // DEFENDED: extract_type_params checks i + 1 == bytes.len()
 }
 
@@ -261,10 +276,10 @@ fn attack_type_angle_bracket_nesting_mismatch() {
     // This is actually valid! The outer uses <>, the inner uses ().
     // extract_type_params only checks the outer pair.
     match result {
-        Ok(_) => { /* Mixed notation is supported */ }
+        Ok(_) => { /* Mixed notation is supported */ },
         Err(e) => {
             panic!("Mixed angle/paren notation should work: {}", e);
-        }
+        },
     }
 }
 
@@ -280,8 +295,8 @@ fn attack_type_decimal_zero_precision() {
         Ok(dt) => {
             // BUG: Creates Decimal128(0, 0) which is invalid
             assert_eq!(format!("{:?}", dt), "Decimal128(0, 0)");
-        }
-        Err(_) => { /* Would be correct to reject */ }
+        },
+        Err(_) => { /* Would be correct to reject */ },
     }
 }
 
@@ -295,8 +310,8 @@ fn attack_type_decimal_max_precision() {
         Ok(dt) => {
             // BUG: Creates Decimal256(255, 0) which exceeds Arrow's max precision
             assert_eq!(format!("{:?}", dt), "Decimal256(255, 0)");
-        }
-        Err(_) => { /* Would be correct to reject */ }
+        },
+        Err(_) => { /* Would be correct to reject */ },
     }
 }
 
@@ -308,8 +323,8 @@ fn attack_type_decimal_negative_scale() {
     match result {
         Ok(dt) => {
             assert_eq!(format!("{:?}", dt), "Decimal128(10, -5)");
-        }
-        Err(_) => { /* Rejected, also acceptable */ }
+        },
+        Err(_) => { /* Rejected, also acceptable */ },
     }
 }
 
@@ -419,8 +434,8 @@ fn attack_type_struct_quoted_empty_name() {
             if let arrow::datatypes::DataType::Struct(fields) = dt {
                 assert_eq!(fields[0].name(), "", "Empty field name was accepted (BUG)");
             }
-        }
-        Err(_) => { /* Would be correct to reject */ }
+        },
+        Err(_) => { /* Would be correct to reject */ },
     }
 }
 
@@ -442,7 +457,10 @@ fn attack_type_double_array_suffix() {
     // int32[][] should be list of list.
     let result = ducklake_to_arrow_type("int32[][]");
     // strip_suffix("[]") gives "int32[]", then recursion gives list(int32).
-    assert!(result.is_ok(), "Double array suffix should create nested list");
+    assert!(
+        result.is_ok(),
+        "Double array suffix should create nested list"
+    );
     // DEFENDED: recursive handling works correctly
 }
 
@@ -472,7 +490,10 @@ fn attack_type_very_long_struct_definition() {
     let fields: Vec<String> = (0..1000).map(|i| format!("f{} int32", i)).collect();
     let type_str = format!("struct({})", fields.join(", "));
     let result = ducklake_to_arrow_type(&type_str);
-    assert!(result.is_ok(), "1000-field struct should parse (no field count limit)");
+    assert!(
+        result.is_ok(),
+        "1000-field struct should parse (no field count limit)"
+    );
     // BUG: No limit on number of struct fields. Memory exhaustion possible.
 }
 
@@ -491,7 +512,11 @@ fn attack_type_mixed_case_struct() {
     assert!(result.is_ok(), "STRUCT should work case-insensitively");
     // Field name "Name" should be preserved.
     if let Ok(arrow::datatypes::DataType::Struct(fields)) = &result {
-        assert_eq!(fields[0].name(), "Name", "Field name case should be preserved");
+        assert_eq!(
+            fields[0].name(),
+            "Name",
+            "Field name case should be preserved"
+        );
     }
     // DEFENDED: lowercase check but preserves original case for field names
 }
@@ -501,8 +526,8 @@ fn attack_type_mixed_case_struct() {
 #[test]
 fn attack_type_roundtrip_large_list() {
     use arrow::datatypes::DataType;
-    use std::sync::Arc;
     use arrow::datatypes::Field;
+    use std::sync::Arc;
     // LargeList -> ducklake -> arrow should go through list notation
     let large_list = DataType::LargeList(Arc::new(Field::new("item", DataType::Int32, true)));
     let ducklake = arrow_to_ducklake_type(&large_list).unwrap();
@@ -510,7 +535,10 @@ fn attack_type_roundtrip_large_list() {
     let back = ducklake_to_arrow_type(&ducklake).unwrap();
     // BUG: LargeList -> "list(int32)" -> List (not LargeList!)
     // Information loss: LargeList becomes List on roundtrip.
-    assert_ne!(large_list, back, "LargeList != List after roundtrip (info loss BUG)");
+    assert_ne!(
+        large_list, back,
+        "LargeList != List after roundtrip (info loss BUG)"
+    );
 }
 
 #[test]
@@ -521,7 +549,11 @@ fn attack_type_roundtrip_large_utf8() {
     assert_eq!(ducklake, "varchar");
     let back = ducklake_to_arrow_type(&ducklake).unwrap();
     // BUG: LargeUtf8 -> "varchar" -> Utf8 (not LargeUtf8!)
-    assert_ne!(DataType::LargeUtf8, back, "LargeUtf8 != Utf8 after roundtrip (info loss BUG)");
+    assert_ne!(
+        DataType::LargeUtf8,
+        back,
+        "LargeUtf8 != Utf8 after roundtrip (info loss BUG)"
+    );
 }
 
 #[test]
@@ -532,7 +564,11 @@ fn attack_type_roundtrip_date64() {
     assert_eq!(ducklake, "date");
     let back = ducklake_to_arrow_type(&ducklake).unwrap();
     // BUG: Date64 -> "date" -> Date32 (not Date64!)
-    assert_ne!(DataType::Date64, back, "Date64 != Date32 after roundtrip (info loss BUG)");
+    assert_ne!(
+        DataType::Date64,
+        back,
+        "Date64 != Date32 after roundtrip (info loss BUG)"
+    );
 }
 
 #[test]
@@ -605,7 +641,10 @@ fn attack_schema_duplicate_column_names() {
     let schema = build_arrow_schema(&columns);
     // BUG: build_arrow_schema does NOT check for duplicate column names!
     // Arrow Schema allows duplicate field names, but it causes ambiguity in queries.
-    assert!(schema.is_ok(), "Duplicate column names accepted (no validation BUG)");
+    assert!(
+        schema.is_ok(),
+        "Duplicate column names accepted (no validation BUG)"
+    );
 }
 
 // ========================================================================
@@ -666,10 +705,10 @@ mod schema_evolution_tests {
                     empty_col.is_some(),
                     "BUG CONFIRMED: Column renamed to empty string exists in catalog"
                 );
-            }
+            },
             Err(_) => {
                 // Would be correct behavior to reject
-            }
+            },
         }
     }
 
@@ -687,7 +726,10 @@ mod schema_evolution_tests {
         };
         let result = writer.alter_table(table_id, &op);
         // No validation on SQL keywords. The column name is stored via parameterized query.
-        assert!(result.is_ok(), "Renaming to SQL keyword should work (parameterized queries protect against injection)");
+        assert!(
+            result.is_ok(),
+            "Renaming to SQL keyword should work (parameterized queries protect against injection)"
+        );
         // DEFENDED: parameterized queries prevent SQL injection.
         // But querying this column later may require quoting.
     }
@@ -704,7 +746,10 @@ mod schema_evolution_tests {
         };
         let result = writer.alter_table(table_id, &op);
         // Should succeed since parameterized queries handle quotes.
-        assert!(result.is_ok(), "Single quote in name should be handled by parameterized queries");
+        assert!(
+            result.is_ok(),
+            "Single quote in name should be handled by parameterized queries"
+        );
         // DEFENDED
     }
 
@@ -719,7 +764,10 @@ mod schema_evolution_tests {
         };
         let result = writer.alter_table(table_id, &op);
         // Parameterized queries protect against this.
-        assert!(result.is_ok(), "SQL injection via column name should be safe with parameterized queries");
+        assert!(
+            result.is_ok(),
+            "SQL injection via column name should be safe with parameterized queries"
+        );
         // DEFENDED: parameterized queries
     }
 
@@ -745,12 +793,14 @@ mod schema_evolution_tests {
             Ok(_) => {
                 // This would be a bug: it created a snapshot for nothing and
                 // ended+replaced the column row unnecessarily.
-                panic!("BUG: Rename to same name should have been rejected but succeeded, creating unnecessary snapshot");
-            }
+                panic!(
+                    "BUG: Rename to same name should have been rejected but succeeded, creating unnecessary snapshot"
+                );
+            },
             Err(e) => {
                 // Correct: validation catches that "name" already exists
                 assert!(e.to_string().contains("already exists"), "Error: {}", e);
-            }
+            },
         }
     }
 
@@ -767,7 +817,10 @@ mod schema_evolution_tests {
         };
         let result = writer.alter_table(table_id, &op);
         // BUG: No length limit on column names. 10000-char name accepted.
-        assert!(result.is_ok(), "10000-char column name accepted (no length limit)");
+        assert!(
+            result.is_ok(),
+            "10000-char column name accepted (no length limit)"
+        );
     }
 
     // ---------- Add column with empty name ----------
@@ -791,10 +844,10 @@ mod schema_evolution_tests {
                     empty_col.is_some(),
                     "BUG CONFIRMED: Empty column name added to table"
                 );
-            }
+            },
             Err(_) => {
                 // Would be correct
-            }
+            },
         }
     }
 
@@ -805,7 +858,10 @@ mod schema_evolution_tests {
         // ColumnDef::new now validates types at construction time, preventing invalid types
         // from ever reaching the catalog
         let result = ColumnDef::new("bad_col", "not_a_real_type", true);
-        assert!(result.is_err(), "Invalid type should be rejected at ColumnDef construction");
+        assert!(
+            result.is_err(),
+            "Invalid type should be rejected at ColumnDef construction"
+        );
     }
 
     // ---------- Drop all columns (one by one) ----------
@@ -820,17 +876,17 @@ mod schema_evolution_tests {
             column_name: "name".to_string(),
         };
         let result1 = writer.alter_table(table_id, &op1);
-        assert!(result1.is_ok(), "Dropping one of two columns should succeed");
+        assert!(
+            result1.is_ok(),
+            "Dropping one of two columns should succeed"
+        );
 
         // Now try to drop "id" (the last column).
         let op2 = AlterTableOp::DropColumn {
             column_name: "id".to_string(),
         };
         let result2 = writer.alter_table(table_id, &op2);
-        assert!(
-            result2.is_err(),
-            "Dropping last column should fail"
-        );
+        assert!(result2.is_err(), "Dropping last column should fail");
         // DEFENDED: "Cannot drop column: table only has one column remaining"
     }
 
@@ -863,7 +919,12 @@ mod schema_evolution_tests {
         });
         let result = writer.alter_table(table_id, &op);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("widening type promotions"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("widening type promotions")
+        );
         // DEFENDED
     }
 
@@ -926,13 +987,20 @@ mod schema_evolution_tests {
         let result = writer.alter_table(table_id, &readd_op);
         // This should succeed. The dropped column's end_snapshot is set,
         // so the validation only checks active columns.
-        assert!(result.is_ok(), "Re-adding previously dropped column should work");
+        assert!(
+            result.is_ok(),
+            "Re-adding previously dropped column should work"
+        );
 
         // Verify the re-added column has the new type.
         let cols = writer.get_active_columns(table_id).unwrap();
         let email_col = cols.iter().find(|(name, _, _)| name == "email");
         assert!(email_col.is_some());
-        assert_eq!(email_col.unwrap().1, "int64", "Re-added column should have new type");
+        assert_eq!(
+            email_col.unwrap().1,
+            "int64",
+            "Re-added column should have new type"
+        );
         // DEFENDED: works correctly with snapshot-based soft deletes
     }
 
@@ -952,7 +1020,11 @@ mod schema_evolution_tests {
         }
 
         let cols = writer.get_active_columns(table_id).unwrap();
-        assert_eq!(cols.len(), 102, "Should have 2 original + 100 added columns");
+        assert_eq!(
+            cols.len(),
+            102,
+            "Should have 2 original + 100 added columns"
+        );
         // DEFENDED: works but creates 100 snapshots (one per ALTER TABLE)
         // This is correct but expensive behavior.
     }
@@ -1017,11 +1089,14 @@ mod schema_evolution_tests {
         // BUG: Empty table name is accepted! No validation on table name.
         match result {
             Ok(setup) => {
-                assert_eq!(setup.table_id, 1, "BUG: Empty table name created successfully");
-            }
+                assert_eq!(
+                    setup.table_id, 1,
+                    "BUG: Empty table name created successfully"
+                );
+            },
             Err(_) => {
                 // Would be correct
-            }
+            },
         }
     }
 
@@ -1036,11 +1111,14 @@ mod schema_evolution_tests {
         // BUG: Empty schema name is accepted! No validation on schema name.
         match result {
             Ok(setup) => {
-                assert_eq!(setup.schema_id, 1, "BUG: Empty schema name created successfully");
-            }
+                assert_eq!(
+                    setup.schema_id, 1,
+                    "BUG: Empty schema name created successfully"
+                );
+            },
             Err(_) => {
                 // Would be correct
-            }
+            },
         }
     }
 
@@ -1051,18 +1129,22 @@ mod schema_evolution_tests {
         let (writer, _temp) = create_test_writer().await;
 
         let columns: Vec<ColumnDef> = vec![];
-        let result = writer.begin_write_transaction("main", "empty_cols", &columns, WriteMode::Replace);
+        let result =
+            writer.begin_write_transaction("main", "empty_cols", &columns, WriteMode::Replace);
         // BUG: Creating a table with zero columns SUCCEEDS!
         // This creates a table entry with no columns at all.
         match result {
             Ok(setup) => {
-                assert!(setup.column_ids.is_empty(), "BUG: Zero-column table created");
+                assert!(
+                    setup.column_ids.is_empty(),
+                    "BUG: Zero-column table created"
+                );
                 // The table exists but has no columns. Any query on it will
                 // produce an empty schema.
-            }
+            },
             Err(_) => {
                 // Would be correct
-            }
+            },
         }
     }
 
@@ -1076,9 +1158,15 @@ mod schema_evolution_tests {
             ColumnDef::new("id", "int32", false).unwrap(),
             ColumnDef::new("id", "varchar", true).unwrap(),
         ];
-        let result = writer.begin_write_transaction("main", "dup_test", &columns, WriteMode::Replace);
+        let result =
+            writer.begin_write_transaction("main", "dup_test", &columns, WriteMode::Replace);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Duplicate column name"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Duplicate column name")
+        );
         // DEFENDED
     }
 
@@ -1102,10 +1190,10 @@ mod schema_evolution_tests {
                     newline_col.is_some(),
                     "BUG: Newline in column name accepted"
                 );
-            }
+            },
             Err(_) => {
                 // Would be correct
-            }
+            },
         }
     }
 
@@ -1124,10 +1212,10 @@ mod schema_evolution_tests {
         match result {
             Ok(_) => {
                 // BUG: null byte in column name accepted
-            }
+            },
             Err(_) => {
                 // SQLite or the parameterized query layer rejected it
-            }
+            },
         }
     }
 
@@ -1155,14 +1243,14 @@ mod schema_evolution_tests {
         match result {
             Ok(_) => {
                 // Would mean the bug is fixed
-            }
+            },
             Err(e) => {
                 assert!(
                     e.to_string().contains("widening type promotions"),
                     "BUG CONFIRMED: type alias 'integer' not recognized for promotion: {}",
                     e
                 );
-            }
+            },
         }
     }
 
@@ -1187,14 +1275,14 @@ mod schema_evolution_tests {
         match result {
             Ok(_) => {
                 // Fixed
-            }
+            },
             Err(e) => {
                 assert!(
                     e.to_string().contains("widening type promotions"),
                     "BUG CONFIRMED: uppercase type 'INT32' not recognized for promotion: {}",
                     e
                 );
-            }
+            },
         }
     }
 
@@ -1212,7 +1300,10 @@ mod schema_evolution_tests {
             WriteMode::Replace,
         );
         // Should be safe due to parameterized queries.
-        assert!(result.is_ok(), "SQL injection in table name should be safe with parameterized queries");
+        assert!(
+            result.is_ok(),
+            "SQL injection in table name should be safe with parameterized queries"
+        );
         // DEFENDED: parameterized queries
     }
 
@@ -1229,7 +1320,10 @@ mod schema_evolution_tests {
             &columns,
             WriteMode::Replace,
         );
-        assert!(result.is_ok(), "SQL injection in schema name should be safe with parameterized queries");
+        assert!(
+            result.is_ok(),
+            "SQL injection in schema name should be safe with parameterized queries"
+        );
         // DEFENDED
     }
 

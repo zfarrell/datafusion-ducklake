@@ -264,7 +264,9 @@ pub fn join_paths(base_path: &str, relative_path: &str) -> Result<String> {
     validate_path(relative_path)?;
 
     if base_path.ends_with('/') || base_path.ends_with('\\') {
-        let trimmed = relative_path.trim_start_matches('/').trim_start_matches('\\');
+        let trimmed = relative_path
+            .trim_start_matches('/')
+            .trim_start_matches('\\');
         Ok(format!("{}{}", base_path, trimmed))
     } else {
         Ok(format!("{}/{}", base_path, relative_path))

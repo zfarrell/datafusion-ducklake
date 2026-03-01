@@ -28,10 +28,7 @@ use datafusion_ducklake::{
 /// Find the DuckDB CLI binary.
 fn find_duckdb() -> Option<PathBuf> {
     // Check common locations
-    let candidates = [
-        PathBuf::from("/tmp/duckdb"),
-        dirs_or_home().join(".local/bin/duckdb"),
-    ];
+    let candidates = [PathBuf::from("/tmp/duckdb"), dirs_or_home().join(".local/bin/duckdb")];
     for p in &candidates {
         if p.exists() {
             return Some(p.clone());
@@ -74,9 +71,7 @@ fn create_object_store() -> Arc<dyn object_store::ObjectStore> {
 }
 
 /// Create a DuckLake catalog using our SqliteMetadataWriter and write test data.
-async fn create_catalog_with_our_writer(
-    temp_dir: &TempDir,
-) -> (PathBuf, PathBuf) {
+async fn create_catalog_with_our_writer(temp_dir: &TempDir) -> (PathBuf, PathBuf) {
     let db_path = temp_dir.path().join("catalog.db");
     let data_path = temp_dir.path().join("data");
     std::fs::create_dir_all(&data_path).unwrap();
@@ -107,17 +102,12 @@ async fn create_catalog_with_our_writer(
                 Some("Bob"),
                 Some("Charlie"),
             ])),
-            Arc::new(Float64Array::from(vec![
-                Some(95.5),
-                Some(87.3),
-                Some(92.1),
-            ])),
+            Arc::new(Float64Array::from(vec![Some(95.5), Some(87.3), Some(92.1)])),
         ],
     )
     .unwrap();
 
-    let table_writer =
-        DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
+    let table_writer = DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
     let result = table_writer
         .write_table("main", "users", &[batch])
         .await
@@ -144,7 +134,7 @@ async fn test_datafusion_writes_duckdb_reads() {
         None => {
             eprintln!("SKIPPED: DuckDB CLI not found. Install it to run roundtrip tests.");
             return;
-        }
+        },
     };
 
     let temp_dir = TempDir::new().unwrap();
@@ -201,7 +191,7 @@ async fn test_datafusion_writes_duckdb_reads_count() {
         None => {
             eprintln!("SKIPPED: DuckDB CLI not found.");
             return;
-        }
+        },
     };
 
     let temp_dir = TempDir::new().unwrap();
@@ -241,7 +231,7 @@ async fn test_duckdb_writes_datafusion_reads() {
         None => {
             eprintln!("SKIPPED: DuckDB CLI not found.");
             return;
-        }
+        },
     };
 
     let temp_dir = TempDir::new().unwrap();
@@ -267,10 +257,8 @@ async fn test_duckdb_writes_datafusion_reads() {
     );
 
     // DataFusion reads it via DuckdbMetadataProvider
-    let provider = datafusion_ducklake::DuckdbMetadataProvider::new(
-        catalog_path.to_str().unwrap(),
-    )
-    .unwrap();
+    let provider =
+        datafusion_ducklake::DuckdbMetadataProvider::new(catalog_path.to_str().unwrap()).unwrap();
     let catalog = DuckLakeCatalog::new(provider).unwrap();
 
     let ctx = SessionContext::new();
@@ -314,7 +302,7 @@ async fn test_schema_evolution_roundtrip() {
         None => {
             eprintln!("SKIPPED: DuckDB CLI not found.");
             return;
-        }
+        },
     };
 
     let temp_dir = TempDir::new().unwrap();
@@ -347,8 +335,7 @@ async fn test_schema_evolution_roundtrip() {
     .unwrap();
 
     let writer_arc: Arc<dyn MetadataWriter> = Arc::new(writer);
-    let table_writer =
-        DuckLakeTableWriter::new(writer_arc.clone(), object_store.clone()).unwrap();
+    let table_writer = DuckLakeTableWriter::new(writer_arc.clone(), object_store.clone()).unwrap();
     let result1 = table_writer
         .write_table("main", "people", &[batch1])
         .await
@@ -356,12 +343,14 @@ async fn test_schema_evolution_roundtrip() {
     assert_eq!(result1.records_written, 2);
 
     // Phase 2: ALTER TABLE ADD COLUMN
-    use datafusion_ducklake::metadata_writer::AlterTableOp;
     use datafusion_ducklake::ColumnDef;
+    use datafusion_ducklake::metadata_writer::AlterTableOp;
     let add_col_op = AlterTableOp::AddColumn {
         column: ColumnDef::new("email", "varchar", true).unwrap(),
     };
-    writer_arc.alter_table(result1.table_id, &add_col_op).unwrap();
+    writer_arc
+        .alter_table(result1.table_id, &add_col_op)
+        .unwrap();
 
     // Phase 3: Write more data with the new column (id, name, email)
     let schema2 = Arc::new(Schema::new(vec![
@@ -380,8 +369,7 @@ async fn test_schema_evolution_roundtrip() {
     )
     .unwrap();
 
-    let table_writer2 =
-        DuckLakeTableWriter::new(writer_arc, object_store).unwrap();
+    let table_writer2 = DuckLakeTableWriter::new(writer_arc, object_store).unwrap();
     let result2 = table_writer2
         .append_table("main", "people", &[batch2])
         .await
@@ -444,7 +432,7 @@ async fn test_full_bidirectional_roundtrip() {
         None => {
             eprintln!("SKIPPED: DuckDB CLI not found.");
             return;
-        }
+        },
     };
 
     let temp_dir = TempDir::new().unwrap();
@@ -471,10 +459,9 @@ async fn test_full_bidirectional_roundtrip() {
 
     // Step 2: DataFusion reads it (scoped so provider is dropped before step 3)
     {
-        let provider = datafusion_ducklake::DuckdbMetadataProvider::new(
-            catalog_path.to_str().unwrap(),
-        )
-        .unwrap();
+        let provider =
+            datafusion_ducklake::DuckdbMetadataProvider::new(catalog_path.to_str().unwrap())
+                .unwrap();
         let catalog = DuckLakeCatalog::new(provider).unwrap();
 
         let ctx = SessionContext::new();
@@ -491,7 +478,10 @@ async fn test_full_bidirectional_roundtrip() {
             .downcast_ref::<arrow::array::Int64Array>()
             .unwrap()
             .value(0);
-        assert_eq!(count, 2, "DataFusion should see 2 rows from DuckDB-created catalog");
+        assert_eq!(
+            count, 2,
+            "DataFusion should see 2 rows from DuckDB-created catalog"
+        );
     }
 
     // Step 3: DuckDB adds more data
@@ -510,10 +500,8 @@ async fn test_full_bidirectional_roundtrip() {
     );
 
     // Step 4: DataFusion reads again (need fresh provider — snapshot may have changed)
-    let provider2 = datafusion_ducklake::DuckdbMetadataProvider::new(
-        catalog_path.to_str().unwrap(),
-    )
-    .unwrap();
+    let provider2 =
+        datafusion_ducklake::DuckdbMetadataProvider::new(catalog_path.to_str().unwrap()).unwrap();
     let catalog2 = DuckLakeCatalog::new(provider2).unwrap();
 
     let ctx2 = SessionContext::new();
@@ -541,7 +529,7 @@ async fn test_catalog_metadata_diagnostic() {
         None => {
             eprintln!("SKIPPED: DuckDB CLI not found.");
             return;
-        }
+        },
     };
 
     let temp_dir = TempDir::new().unwrap();

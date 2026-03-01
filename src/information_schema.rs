@@ -73,27 +73,53 @@ impl SnapshotsTable {
             snapshots.iter().map(|s| s.snapshot_id).collect::<Vec<_>>(),
         ));
         let snapshot_times: ArrayRef = Arc::new(StringArray::from(
-            snapshots.iter().map(|s| s.snapshot_time.as_deref()).collect::<Vec<_>>(),
+            snapshots
+                .iter()
+                .map(|s| s.snapshot_time.as_deref())
+                .collect::<Vec<_>>(),
         ));
         let schema_versions: ArrayRef = Arc::new(Int64Array::from(
-            snapshots.iter().map(|s| s.schema_version).collect::<Vec<_>>(),
+            snapshots
+                .iter()
+                .map(|s| s.schema_version)
+                .collect::<Vec<_>>(),
         ));
         let changes: ArrayRef = Arc::new(StringArray::from(
-            snapshots.iter().map(|s| s.changes.as_deref()).collect::<Vec<_>>(),
+            snapshots
+                .iter()
+                .map(|s| s.changes.as_deref())
+                .collect::<Vec<_>>(),
         ));
         let authors: ArrayRef = Arc::new(StringArray::from(
-            snapshots.iter().map(|s| s.author.as_deref()).collect::<Vec<_>>(),
+            snapshots
+                .iter()
+                .map(|s| s.author.as_deref())
+                .collect::<Vec<_>>(),
         ));
         let commit_messages: ArrayRef = Arc::new(StringArray::from(
-            snapshots.iter().map(|s| s.commit_message.as_deref()).collect::<Vec<_>>(),
+            snapshots
+                .iter()
+                .map(|s| s.commit_message.as_deref())
+                .collect::<Vec<_>>(),
         ));
         let commit_extra_infos: ArrayRef = Arc::new(StringArray::from(
-            snapshots.iter().map(|s| s.commit_extra_info.as_deref()).collect::<Vec<_>>(),
+            snapshots
+                .iter()
+                .map(|s| s.commit_extra_info.as_deref())
+                .collect::<Vec<_>>(),
         ));
 
         RecordBatch::try_new(
             self.schema.clone(),
-            vec![snapshot_ids, snapshot_times, schema_versions, changes, authors, commit_messages, commit_extra_infos],
+            vec![
+                snapshot_ids,
+                snapshot_times,
+                schema_versions,
+                changes,
+                authors,
+                commit_messages,
+                commit_extra_infos,
+            ],
         )
         .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
     }
@@ -534,9 +560,7 @@ impl TableInfoTable {
 
         // Convert to vector and sort for deterministic output
         let mut all_table_info: Vec<_> = table_stats.into_iter().collect();
-        all_table_info.sort_by(|a, b| {
-            a.0 .0.cmp(&b.0 .0).then_with(|| a.0 .1.cmp(&b.0 .1))
-        });
+        all_table_info.sort_by(|a, b| a.0.0.cmp(&b.0.0).then_with(|| a.0.1.cmp(&b.0.1)));
 
         // Build arrays in a single pass
         let mut table_names = Vec::with_capacity(all_table_info.len());
@@ -768,11 +792,26 @@ impl SchemaProvider for InformationSchemaProvider {
         // Create table provider on-demand - queries will be live
         let provider: Option<Arc<dyn TableProvider>> = match name {
             "snapshots" => Some(Arc::new(SnapshotsTable::new(self.provider.clone()))),
-            "schemata" => Some(Arc::new(SchemataTable::new(self.provider.clone(), self.snapshot_id))),
-            "tables" => Some(Arc::new(TablesTable::new(self.provider.clone(), self.snapshot_id))),
-            "table_info" => Some(Arc::new(TableInfoTable::new(self.provider.clone(), self.snapshot_id))),
-            "columns" => Some(Arc::new(ColumnsTable::new(self.provider.clone(), self.snapshot_id))),
-            "files" => Some(Arc::new(FilesTable::new(self.provider.clone(), self.snapshot_id))),
+            "schemata" => Some(Arc::new(SchemataTable::new(
+                self.provider.clone(),
+                self.snapshot_id,
+            ))),
+            "tables" => Some(Arc::new(TablesTable::new(
+                self.provider.clone(),
+                self.snapshot_id,
+            ))),
+            "table_info" => Some(Arc::new(TableInfoTable::new(
+                self.provider.clone(),
+                self.snapshot_id,
+            ))),
+            "columns" => Some(Arc::new(ColumnsTable::new(
+                self.provider.clone(),
+                self.snapshot_id,
+            ))),
+            "files" => Some(Arc::new(FilesTable::new(
+                self.provider.clone(),
+                self.snapshot_id,
+            ))),
             _ => None,
         };
         Ok(provider)

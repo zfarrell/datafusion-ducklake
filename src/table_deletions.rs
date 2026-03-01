@@ -453,7 +453,9 @@ enum StreamState {
 /// Represents current delete positions, avoiding large allocations for full-file deletes
 enum CurrentDeletePositions {
     /// All rows in the file are deleted (full-file delete)
-    All { record_count: i64 },
+    All {
+        record_count: i64,
+    },
     /// Only specific positions are deleted
     Partial(HashSet<i64>),
 }
@@ -511,14 +513,18 @@ impl DeletedRowsStream {
                 // Full file delete but has previous - need to subtract previous positions
                 (
                     StreamState::ReadingPreviousDelete,
-                    CurrentDeletePositions::All { record_count },
+                    CurrentDeletePositions::All {
+                        record_count,
+                    },
                     None,
                 )
             } else {
                 // Full file delete with no previous - all positions are deleted
                 (
                     StreamState::ReadingData,
-                    CurrentDeletePositions::All { record_count },
+                    CurrentDeletePositions::All {
+                        record_count,
+                    },
                     Some(DeltaPositions::All),
                 )
             };
@@ -548,9 +554,7 @@ impl DeletedRowsStream {
             .as_any()
             .downcast_ref::<Int64Array>()
             .ok_or_else(|| {
-                DataFusionError::Internal(
-                    "delete file pos column is not Int64".to_string(),
-                )
+                DataFusionError::Internal("delete file pos column is not Int64".to_string())
             })?;
 
         // Use .iter() to respect null bitmap; skip null entries
@@ -560,7 +564,9 @@ impl DeletedRowsStream {
     /// Compute the delta and sort it
     fn compute_deleted_positions(&mut self) {
         match &self.current_positions {
-            CurrentDeletePositions::All { record_count } => {
+            CurrentDeletePositions::All {
+                record_count,
+            } => {
                 if self.previous_positions.is_empty() {
                     self.deleted_positions = Some(DeltaPositions::All);
                 } else {

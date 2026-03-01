@@ -118,7 +118,10 @@ async fn test_sqli_schema_name_single_quote() {
     // Classic SQL injection: single quote to break out of string literal
     let result = writer.get_or_create_schema("'; DROP TABLE ducklake_schema; --", None, snap);
     // Should succeed (name stored as literal string, not interpolated)
-    assert!(result.is_ok(), "Parameterized query should handle single quotes safely");
+    assert!(
+        result.is_ok(),
+        "Parameterized query should handle single quotes safely"
+    );
 
     let (schema_id, created) = result.unwrap();
     assert!(created);
@@ -139,7 +142,10 @@ async fn test_sqli_table_name_union_select() {
         None,
         snap,
     );
-    assert!(result.is_ok(), "UNION injection should be treated as literal table name");
+    assert!(
+        result.is_ok(),
+        "UNION injection should be treated as literal table name"
+    );
 }
 
 /// VULN-NONE: Attempt SQL injection via column names in set_columns.
@@ -158,7 +164,10 @@ async fn test_sqli_column_name_injection() {
     ];
 
     let result = writer.set_columns(table_id, &malicious_columns, snap);
-    assert!(result.is_ok(), "Column name injection should be stored as literal");
+    assert!(
+        result.is_ok(),
+        "Column name injection should be stored as literal"
+    );
 }
 
 /// VULN-NONE: Attempt injection via column type string.
@@ -172,12 +181,11 @@ async fn test_sqli_column_type_injection() {
         .unwrap();
 
     // With type validation, the malicious type string is rejected at construction time
-    let result = ColumnDef::new(
-        "col",
-        "varchar'); DROP TABLE ducklake_data_file; --",
-        true,
+    let result = ColumnDef::new("col", "varchar'); DROP TABLE ducklake_data_file; --", true);
+    assert!(
+        result.is_err(),
+        "SQL injection type string should be rejected by validation"
     );
-    assert!(result.is_err(), "SQL injection type string should be rejected by validation");
 }
 
 /// VULN-NONE: SQL injection via begin_write_transaction (end-to-end write path).
@@ -192,7 +200,10 @@ async fn test_sqli_begin_write_transaction() {
         &columns,
         WriteMode::Replace,
     );
-    assert!(result.is_ok(), "Write transaction should handle injected schema name");
+    assert!(
+        result.is_ok(),
+        "Write transaction should handle injected schema name"
+    );
 }
 
 /// VULN-NONE: Stacked query injection attempt.
@@ -227,11 +238,17 @@ fn test_path_traversal_schema_name_dotdot() {
 
     let resolved = join_paths(base, &format!("{}/", malicious_schema));
     // Path traversal is now correctly rejected
-    assert!(resolved.is_err(), "join_paths should reject path traversal with '..' components");
+    assert!(
+        resolved.is_err(),
+        "join_paths should reject path traversal with '..' components"
+    );
 
     // In a child_resolver chain, this escapes the data directory
     let schema_path = resolve_path(base, &format!("{}/", malicious_schema), true);
-    assert!(schema_path.is_err(), "resolve_path should reject path traversal with '..' components");
+    assert!(
+        schema_path.is_err(),
+        "resolve_path should reject path traversal with '..' components"
+    );
 }
 
 /// VULN-001: Path traversal via table name.
@@ -241,7 +258,10 @@ fn test_path_traversal_table_name_dotdot() {
     let malicious_table = "../../../tmp/evil";
 
     let resolved = join_paths(schema_base, &format!("{}/", malicious_table));
-    assert!(resolved.is_err(), "join_paths should reject path traversal with '..' components");
+    assert!(
+        resolved.is_err(),
+        "join_paths should reject path traversal with '..' components"
+    );
 }
 
 /// VULN-001: Path traversal with backslashes (Windows-style).
@@ -252,7 +272,10 @@ fn test_path_traversal_backslash() {
 
     let resolved = join_paths(base, malicious);
     // join_paths now rejects paths with '..' traversal components (splits on both / and \)
-    assert!(resolved.is_err(), "join_paths should reject Windows-style path traversal with '..' components");
+    assert!(
+        resolved.is_err(),
+        "join_paths should reject Windows-style path traversal with '..' components"
+    );
 }
 
 /// VULN-001: Path traversal via file path in data file registration.
@@ -262,7 +285,10 @@ fn test_path_traversal_file_path() {
     let malicious_file = "../../../../etc/shadow";
 
     let resolved = resolve_path(table_base, malicious_file, true);
-    assert!(resolved.is_err(), "resolve_path should reject path traversal with '..' components");
+    assert!(
+        resolved.is_err(),
+        "resolve_path should reject path traversal with '..' components"
+    );
 }
 
 /// VULN-001: Null bytes in paths could truncate path on some OS layers.
@@ -273,7 +299,10 @@ fn test_path_null_byte_injection() {
 
     let resolved = join_paths(base, malicious);
     // Null bytes are now correctly rejected
-    assert!(resolved.is_err(), "join_paths should reject paths containing null bytes");
+    assert!(
+        resolved.is_err(),
+        "join_paths should reject paths containing null bytes"
+    );
 }
 
 /// VULN-001: URL-encoded path traversal — must be rejected.
@@ -285,7 +314,10 @@ fn test_path_traversal_url_encoded() {
     let malicious = "%2e%2e/%2e%2e/etc/passwd";
 
     let result = join_paths(base, malicious);
-    assert!(result.is_err(), "join_paths should reject URL-encoded path traversal (%2e%2e)");
+    assert!(
+        result.is_err(),
+        "join_paths should reject URL-encoded path traversal (%2e%2e)"
+    );
     assert!(result.unwrap_err().to_string().contains("Path traversal"));
 }
 
@@ -317,7 +349,10 @@ async fn test_path_traversal_e2e_schema_creation() {
 
     // Create schema with traversal name - this succeeds because no validation
     let result = writer.get_or_create_schema("../../etc", None, snap);
-    assert!(result.is_ok(), "Schema with ../ name should be creatable (no validation)");
+    assert!(
+        result.is_ok(),
+        "Schema with ../ name should be creatable (no validation)"
+    );
 
     let (schema_id, _) = result.unwrap();
 
@@ -327,10 +362,7 @@ async fn test_path_traversal_e2e_schema_creation() {
 
     // Now read - the schema name becomes a path component
     let ctx = create_read_ctx(&temp).await;
-    let schemas = ctx
-        .catalog("ducklake")
-        .unwrap()
-        .schema_names();
+    let schemas = ctx.catalog("ducklake").unwrap().schema_names();
     // The malicious schema name is stored and returned
     assert!(schemas.contains(&"../../etc".to_string()));
 }
@@ -422,7 +454,10 @@ async fn test_extremely_long_names() {
     // 10KB schema name
     let long_name = "a".repeat(10_000);
     let result = writer.get_or_create_schema(&long_name, None, snap);
-    assert!(result.is_ok(), "10KB schema name accepted (no length limit)");
+    assert!(
+        result.is_ok(),
+        "10KB schema name accepted (no length limit)"
+    );
 
     // 1MB schema name - tests memory and storage limits
     let very_long_name = "x".repeat(1_000_000);
@@ -439,19 +474,8 @@ async fn test_sql_keywords_as_names() {
     let snap = writer.create_snapshot().unwrap();
 
     for keyword in &[
-        "SELECT",
-        "DROP",
-        "TABLE",
-        "INSERT",
-        "DELETE",
-        "UPDATE",
-        "CREATE",
-        "ALTER",
-        "WHERE",
-        "FROM",
-        "NULL",
-        "TRUE",
-        "FALSE",
+        "SELECT", "DROP", "TABLE", "INSERT", "DELETE", "UPDATE", "CREATE", "ALTER", "WHERE",
+        "FROM", "NULL", "TRUE", "FALSE",
     ] {
         let result = writer.get_or_create_schema(keyword, None, snap);
         assert!(
@@ -545,7 +569,10 @@ async fn test_corrupt_catalog_invalid_column_type() {
     let ctx = create_read_ctx(&temp).await;
     let result = ctx.sql("SELECT * FROM ducklake.main.test").await;
     // This should produce an error about unsupported type, not panic
-    assert!(result.is_err(), "Query should fail with corrupted type, not panic");
+    assert!(
+        result.is_err(),
+        "Query should fail with corrupted type, not panic"
+    );
 }
 
 /// VULN-003: Corrupt catalog by setting negative file sizes.
@@ -698,7 +725,10 @@ async fn test_corrupt_catalog_missing_data_file() {
     let result = ctx.sql("SELECT * FROM ducklake.main.test").await;
     if let Ok(df) = result {
         let result = df.collect().await;
-        assert!(result.is_err(), "Reading missing file should error, not panic");
+        assert!(
+            result.is_err(),
+            "Reading missing file should error, not panic"
+        );
     }
 }
 
@@ -878,10 +908,7 @@ async fn test_e2e_sql_keyword_column_names() {
     ]));
     let batch = RecordBatch::try_new(
         schema,
-        vec![
-            Arc::new(Int32Array::from(vec![1])),
-            Arc::new(StringArray::from(vec![Some("test")])),
-        ],
+        vec![Arc::new(Int32Array::from(vec![1])), Arc::new(StringArray::from(vec![Some("test")]))],
     )
     .unwrap();
 
@@ -897,7 +924,10 @@ async fn test_e2e_sql_keyword_column_names() {
     let result = ctx
         .sql("SELECT \"select\", \"from\" FROM ducklake.main.keyword_test")
         .await;
-    assert!(result.is_ok(), "Querying SQL-keyword column names should work");
+    assert!(
+        result.is_ok(),
+        "Querying SQL-keyword column names should work"
+    );
 
     if let Ok(df) = result {
         let batches = df.collect().await.unwrap();
@@ -968,7 +998,10 @@ async fn test_boundary_record_count_values() {
         &DataFileInfo::new("neg.parquet", 100, -1),
     );
     // No validation - negative count accepted
-    assert!(result.is_ok(), "Negative record count accepted (no validation)");
+    assert!(
+        result.is_ok(),
+        "Negative record count accepted (no validation)"
+    );
 
     // MAX i64
     let result = writer.register_data_file(
@@ -988,7 +1021,10 @@ async fn test_boundary_snapshot_ids() {
     // Use invalid snapshot ID for schema creation
     let result = writer.get_or_create_schema("test", None, -1);
     // Negative snapshot ID - no validation
-    assert!(result.is_ok(), "Negative snapshot ID accepted (no validation)");
+    assert!(
+        result.is_ok(),
+        "Negative snapshot ID accepted (no validation)"
+    );
 
     let result = writer.get_or_create_schema("test2", None, i64::MAX);
     assert!(result.is_ok(), "i64::MAX snapshot ID accepted");

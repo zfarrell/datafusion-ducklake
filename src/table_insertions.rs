@@ -106,7 +106,7 @@ impl TableProvider for TableInsertionsTable {
                         .map(|&i| self.table_schema.field(i).clone())
                         .collect();
                     Arc::new(arrow::datatypes::Schema::new(fields))
-                }
+                },
                 None => self.table_schema.clone(),
             };
             return Ok(Arc::new(EmptyExec::new(output_schema)));
@@ -165,10 +165,8 @@ impl TableProvider for TableInsertionsTable {
             parquet_source
         };
 
-        let file_groups: Vec<FileGroup> = files
-            .into_iter()
-            .map(|f| FileGroup::new(vec![f]))
-            .collect();
+        let file_groups: Vec<FileGroup> =
+            files.into_iter().map(|f| FileGroup::new(vec![f])).collect();
 
         let mut builder = FileScanConfigBuilder::new(
             self.object_store_url.as_ref().clone(),

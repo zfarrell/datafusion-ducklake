@@ -202,14 +202,12 @@ impl HybridDuckLakeDB {
 
         // Create new session context with fresh catalog
         // If USE ducklake was executed, set default catalog/schema so bare table names resolve
-        let new_ctx =
-            if self.use_ducklake.load(std::sync::atomic::Ordering::Relaxed) {
-                let config = SessionConfig::new()
-                    .with_default_catalog_and_schema("ducklake", "main");
-                SessionContext::new_with_config(config)
-            } else {
-                SessionContext::new()
-            };
+        let new_ctx = if self.use_ducklake.load(std::sync::atomic::Ordering::Relaxed) {
+            let config = SessionConfig::new().with_default_catalog_and_schema("ducklake", "main");
+            SessionContext::new_with_config(config)
+        } else {
+            SessionContext::new()
+        };
         Self::register_compat_udfs(&new_ctx);
         let metadata_provider = DuckdbMetadataProvider::new(self.catalog_path.to_str().unwrap())?;
         let catalog = Arc::new(DuckLakeCatalog::new(metadata_provider)?);
@@ -243,7 +241,8 @@ impl HybridDuckLakeDB {
     }
 
     /// Virtual columns added by our extension that DuckDB's DuckLake doesn't include in SELECT *
-    const EXTENSION_VIRTUAL_COLS: &'static [&'static str] = &["filename", "file_row_number", "file_index"];
+    const EXTENSION_VIRTUAL_COLS: &'static [&'static str] =
+        &["filename", "file_row_number", "file_index"];
     /// DuckLake virtual columns that appear in SELECT * from our extension
     /// but not in DuckDB's SELECT *
     const DUCKLAKE_VIRTUAL_COLS: &'static [&'static str] = &["rowid", "snapshot_id"];
@@ -355,7 +354,10 @@ impl AsyncDB for HybridDuckLakeDB {
             let changed_rows = self.execute_write(sql)?;
 
             // Refresh catalog to pick up changes (skip during transactions - data not committed yet)
-            if !self.in_transaction.load(std::sync::atomic::Ordering::Relaxed) {
+            if !self
+                .in_transaction
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
                 self.refresh_catalog()?;
             }
 
@@ -373,7 +375,10 @@ impl AsyncDB for HybridDuckLakeDB {
             } else {
                 Ok(DBOutput::StatementComplete(changed_rows as u64))
             }
-        } else if self.in_transaction.load(std::sync::atomic::Ordering::Relaxed) {
+        } else if self
+            .in_transaction
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             // Inside a transaction: route reads to DuckDB since DataFusion can't see
             // uncommitted data (it uses a separate read-only connection)
             let conn = self.duckdb_conn.lock().unwrap();
@@ -437,9 +442,14 @@ impl AsyncDB for HybridDuckLakeDB {
                 .fields()
                 .iter()
                 .map(|f| match f.data_type() {
-                    DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
-                        DefaultColumnType::Integer
-                    },
+                    DataType::Int8
+                    | DataType::Int16
+                    | DataType::Int32
+                    | DataType::Int64
+                    | DataType::UInt8
+                    | DataType::UInt16
+                    | DataType::UInt32
+                    | DataType::UInt64 => DefaultColumnType::Integer,
                     DataType::Float32 | DataType::Float64 => DefaultColumnType::FloatingPoint,
                     DataType::Utf8 | DataType::LargeUtf8 => DefaultColumnType::Text,
                     _ => DefaultColumnType::Any,
@@ -552,7 +562,10 @@ fn convert_batch_to_strings(batch: &RecordBatch) -> Result<Vec<Vec<String>>, Hyb
                         let arr = column.as_any().downcast_ref::<BinaryArray>().unwrap();
                         let bytes = arr.value(row_idx);
                         // Format as hex string
-                        bytes.iter().map(|b| format!("{:02X}", b)).collect::<String>()
+                        bytes
+                            .iter()
+                            .map(|b| format!("{:02X}", b))
+                            .collect::<String>()
                     },
                     _ => {
                         // Use Arrow's built-in display formatting as fallback
@@ -628,9 +641,9 @@ impl datafusion::logical_expr::ScalarUDFImpl for DatePartAliasUdf {
     ) -> datafusion::error::Result<datafusion::physical_plan::ColumnarValue> {
         use datafusion::physical_plan::ColumnarValue;
         // Create the part name as a scalar
-        let part = ColumnarValue::Scalar(
-            datafusion::common::ScalarValue::Utf8(Some(self.part_name.clone())),
-        );
+        let part = ColumnarValue::Scalar(datafusion::common::ScalarValue::Utf8(Some(
+            self.part_name.clone(),
+        )));
         // Call the built-in date_part function
         let date_part_udf = datafusion::functions::datetime::date_part();
         let new_args = datafusion::logical_expr::ScalarFunctionArgs {
@@ -704,9 +717,10 @@ mod tests {
         assert_eq!(result, "SELECT * FROM ducklake.main.test");
 
         // Preserve 3-part names (ducklake.schema.table)
-        let result =
-            HybridDuckLakeDB::rewrite_table_references("SELECT * FROM ducklake.s1.v1");
-        assert_eq!(result, "SELECT * FROM ducklake.s1.v1",
-            "3-part name should not be rewritten");
+        let result = HybridDuckLakeDB::rewrite_table_references("SELECT * FROM ducklake.s1.v1");
+        assert_eq!(
+            result, "SELECT * FROM ducklake.s1.v1",
+            "3-part name should not be rewritten"
+        );
     }
 }

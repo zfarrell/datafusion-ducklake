@@ -173,7 +173,7 @@ impl DisplayAs for DuckLakeMergeExec {
                     self.table_files.len(),
                     self.source_batches.len()
                 )
-            }
+            },
         }
     }
 }
@@ -195,47 +195,47 @@ fn values_equal(
             let t = target_col.as_any().downcast_ref::<Int8Array>().unwrap();
             let s = source_col.as_any().downcast_ref::<Int8Array>().unwrap();
             t.value(target_row) == s.value(source_row)
-        }
+        },
         DataType::Int16 => {
             let t = target_col.as_any().downcast_ref::<Int16Array>().unwrap();
             let s = source_col.as_any().downcast_ref::<Int16Array>().unwrap();
             t.value(target_row) == s.value(source_row)
-        }
+        },
         DataType::Int32 => {
             let t = target_col.as_any().downcast_ref::<Int32Array>().unwrap();
             let s = source_col.as_any().downcast_ref::<Int32Array>().unwrap();
             t.value(target_row) == s.value(source_row)
-        }
+        },
         DataType::Int64 => {
             let t = target_col.as_any().downcast_ref::<Int64Array>().unwrap();
             let s = source_col.as_any().downcast_ref::<Int64Array>().unwrap();
             t.value(target_row) == s.value(source_row)
-        }
+        },
         DataType::UInt32 => {
             let t = target_col.as_any().downcast_ref::<UInt32Array>().unwrap();
             let s = source_col.as_any().downcast_ref::<UInt32Array>().unwrap();
             t.value(target_row) == s.value(source_row)
-        }
+        },
         DataType::UInt64 => {
             let t = target_col.as_any().downcast_ref::<UInt64Array>().unwrap();
             let s = source_col.as_any().downcast_ref::<UInt64Array>().unwrap();
             t.value(target_row) == s.value(source_row)
-        }
+        },
         DataType::Utf8 => {
             let t = target_col.as_any().downcast_ref::<StringArray>().unwrap();
             let s = source_col.as_any().downcast_ref::<StringArray>().unwrap();
             t.value(target_row) == s.value(source_row)
-        }
+        },
         DataType::Float32 => {
             let t = target_col.as_any().downcast_ref::<Float32Array>().unwrap();
             let s = source_col.as_any().downcast_ref::<Float32Array>().unwrap();
             t.value(target_row) == s.value(source_row)
-        }
+        },
         DataType::Float64 => {
             let t = target_col.as_any().downcast_ref::<Float64Array>().unwrap();
             let s = source_col.as_any().downcast_ref::<Float64Array>().unwrap();
             t.value(target_row) == s.value(source_row)
-        }
+        },
         _ => false, // unsupported type for join comparison
     }
 }
@@ -423,11 +423,8 @@ impl ExecutionPlan for DuckLakeMergeExec {
                     for (batch_idx, src_batch) in source_batches.iter().enumerate() {
                         let mask = BooleanArray::from(source_match_masks[batch_idx].clone());
                         if mask.true_count() > 0 {
-                            let filtered =
-                                compute::filter_record_batch(src_batch, &mask)
-                                    .map_err(|e| {
-                                        DataFusionError::ArrowError(Box::new(e), None)
-                                    })?;
+                            let filtered = compute::filter_record_batch(src_batch, &mask)
+                                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
                             matched_source_rows.push(filtered);
                         }
                     }
@@ -451,8 +448,7 @@ impl ExecutionPlan for DuckLakeMergeExec {
                     ObjectPath::from(delete_object_key.trim_start_matches('/'));
 
                 let del_schema = delete_file_schema();
-                let file_path_values: Vec<&str> =
-                    vec![&table_file.file.path; all_positions.len()];
+                let file_path_values: Vec<&str> = vec![&table_file.file.path; all_positions.len()];
                 let file_path_array: ArrayRef = Arc::new(StringArray::from(file_path_values));
                 let pos_array: ArrayRef = Arc::new(Int64Array::from(all_positions));
 
@@ -508,9 +504,8 @@ impl ExecutionPlan for DuckLakeMergeExec {
                     }
                     let unmatched_mask = BooleanArray::from(mask_values);
                     if unmatched_mask.true_count() > 0 {
-                        let filtered =
-                            compute::filter_record_batch(src_batch, &unmatched_mask)
-                                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+                        let filtered = compute::filter_record_batch(src_batch, &unmatched_mask)
+                            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
                         total_affected += filtered.num_rows() as u64;
                         new_data_batches.push(filtered);
                     }
@@ -567,9 +562,8 @@ impl ExecutionPlan for DuckLakeMergeExec {
                     .await
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-                let data_file_info =
-                    DataFileInfo::new(&data_file_name, file_size, total_records)
-                        .with_footer_size(footer_size);
+                let data_file_info = DataFileInfo::new(&data_file_name, file_size, total_records)
+                    .with_footer_size(footer_size);
 
                 writer
                     .register_data_file(table_id, snapshot_id, &data_file_info)

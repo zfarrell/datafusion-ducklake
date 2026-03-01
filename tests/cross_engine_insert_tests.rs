@@ -11,11 +11,7 @@
 //! 8. Multi-batch INSERT (verify row count accuracy)
 //! 9. Footer size stored correctly in metadata
 
-#![cfg(all(
-    feature = "write-sqlite",
-    feature = "metadata-duckdb",
-    feature = "metadata-sqlite"
-))]
+#![cfg(all(feature = "write-sqlite", feature = "metadata-duckdb", feature = "metadata-sqlite"))]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -51,9 +47,7 @@ async fn setup_ducklake_catalog() -> CrossEngineEnv {
         .await
         .expect("init sqlite catalog");
     let data_path_str = format!("{}/", data_path.display());
-    writer
-        .set_data_path(&data_path_str)
-        .expect("set data path");
+    writer.set_data_path(&data_path_str).expect("set data path");
 
     CrossEngineEnv {
         _temp_dir: temp_dir,
@@ -108,12 +102,11 @@ impl DuckDbConn {
             .expect("install ducklake");
         conn.execute("LOAD ducklake;", []).expect("load ducklake");
         let attach_path = format!("ducklake:sqlite:{}", catalog_db_path.display());
-        conn.execute(
-            &format!("ATTACH '{}' AS ducklake;", attach_path),
-            [],
-        )
-        .expect("attach ducklake catalog");
-        DuckDbConn { conn }
+        conn.execute(&format!("ATTACH '{}' AS ducklake;", attach_path), [])
+            .expect("attach ducklake catalog");
+        DuckDbConn {
+            conn,
+        }
     }
 
     fn open_with_data_path(catalog_path: &Path, data_path: &Path) -> Self {
@@ -131,7 +124,9 @@ impl DuckDbConn {
             [],
         )
         .expect("attach ducklake catalog with data path");
-        DuckDbConn { conn }
+        DuckDbConn {
+            conn,
+        }
     }
 
     fn execute(&self, sql: &str) {
@@ -177,30 +172,30 @@ fn duckdb_value_to_string(v: &duckdb::types::Value) -> String {
         duckdb::types::Value::Date32(days) => {
             let date = chrono::NaiveDate::from_num_days_from_ce_opt(days + 719_163).unwrap();
             date.format("%Y-%m-%d").to_string()
-        }
+        },
         duckdb::types::Value::Timestamp(unit, val) => {
             let (secs, nsecs) = match unit {
                 duckdb::types::TimeUnit::Second => (*val, 0u32),
                 duckdb::types::TimeUnit::Millisecond => {
                     (val / 1000, ((val % 1000) * 1_000_000) as u32)
-                }
+                },
                 duckdb::types::TimeUnit::Microsecond => {
                     (val / 1_000_000, ((val % 1_000_000) * 1_000) as u32)
-                }
+                },
                 duckdb::types::TimeUnit::Nanosecond => {
                     (val / 1_000_000_000, (val % 1_000_000_000) as u32)
-                }
+                },
             };
             let dt = chrono::DateTime::from_timestamp(secs, nsecs).unwrap();
             dt.format("%Y-%m-%d %H:%M:%S").to_string()
-        }
+        },
         _ => {
             let s = format!("{v:?}");
             if s.starts_with("Decimal(") && s.ends_with(')') {
                 return s[8..s.len() - 1].to_string();
             }
             s
-        }
+        },
     }
 }
 
@@ -235,31 +230,31 @@ fn arrow_value_to_string(array: &dyn Array, idx: usize) -> String {
         DataType::Boolean => {
             let a = array.as_any().downcast_ref::<BooleanArray>().unwrap();
             a.value(idx).to_string()
-        }
+        },
         DataType::Int32 => {
             let a = array.as_any().downcast_ref::<Int32Array>().unwrap();
             a.value(idx).to_string()
-        }
+        },
         DataType::Int64 => {
             let a = array.as_any().downcast_ref::<Int64Array>().unwrap();
             a.value(idx).to_string()
-        }
+        },
         DataType::UInt64 => {
             let a = array.as_any().downcast_ref::<UInt64Array>().unwrap();
             a.value(idx).to_string()
-        }
+        },
         DataType::Float64 => {
             let a = array.as_any().downcast_ref::<Float64Array>().unwrap();
             format!("{}", a.value(idx))
-        }
+        },
         DataType::Utf8 => {
             let a = array.as_any().downcast_ref::<StringArray>().unwrap();
             a.value(idx).to_string()
-        }
+        },
         DataType::LargeUtf8 => {
             let a = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
             a.value(idx).to_string()
-        }
+        },
         other => format!("<unsupported:{other:?}>"),
     }
 }
@@ -333,11 +328,7 @@ async fn cross_engine_insert_df_write_duckdb_read_types() {
         schema,
         vec![
             Arc::new(Int32Array::from(vec![1, 2, 3])),
-            Arc::new(StringArray::from(vec![
-                Some("Alice"),
-                Some("Bob"),
-                None,
-            ])),
+            Arc::new(StringArray::from(vec![Some("Alice"), Some("Bob"), None])),
             Arc::new(Float64Array::from(vec![
                 Some(95.5),
                 Some(87.3),
@@ -348,17 +339,12 @@ async fn cross_engine_insert_df_write_duckdb_read_types() {
                 Some(false),
                 Some(true),
             ])),
-            Arc::new(Int64Array::from(vec![
-                Some(10),
-                Some(20),
-                None,
-            ])),
+            Arc::new(Int64Array::from(vec![Some(10), Some(20), None])),
         ],
     )
     .unwrap();
 
-    let table_writer =
-        DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
+    let table_writer = DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
     let result = table_writer
         .write_table("main", "typed_data", &[batch])
         .await
@@ -367,9 +353,8 @@ async fn cross_engine_insert_df_write_duckdb_read_types() {
 
     // DuckDB reads and verifies
     let duckdb = DuckDbConn::open(&env.catalog_db_path);
-    let rows = duckdb.query(
-        "SELECT id, name, score, active, count FROM ducklake.main.typed_data ORDER BY id",
-    );
+    let rows = duckdb
+        .query("SELECT id, name, score, active, count FROM ducklake.main.typed_data ORDER BY id");
 
     assert_eq!(rows.len(), 3, "DuckDB should see 3 rows");
     assert_eq!(rows[0][0], "1");
@@ -417,9 +402,8 @@ async fn cross_engine_insert_duckdb_write_df_read() {
         );
 
         // Verify DuckDB sees the data
-        let rows = duckdb.query(
-            "SELECT id, name, price, in_stock FROM ducklake.main.products ORDER BY id",
-        );
+        let rows = duckdb
+            .query("SELECT id, name, price, in_stock FROM ducklake.main.products ORDER BY id");
         assert_eq!(rows.len(), 3);
     }
 
@@ -455,9 +439,9 @@ async fn cross_engine_insert_not_null_enforcement() {
 
     // Schema with a non-nullable column
     let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int32, false),    // NOT NULL
-        Field::new("name", DataType::Utf8, false),    // NOT NULL
-        Field::new("value", DataType::Int64, true),   // nullable
+        Field::new("id", DataType::Int32, false),   // NOT NULL
+        Field::new("name", DataType::Utf8, false),  // NOT NULL
+        Field::new("value", DataType::Int64, true), // nullable
     ]));
 
     // Valid batch: all non-nullable columns have values
@@ -471,8 +455,7 @@ async fn cross_engine_insert_not_null_enforcement() {
     )
     .unwrap();
 
-    let table_writer =
-        DuckLakeTableWriter::new(Arc::new(writer), object_store.clone()).unwrap();
+    let table_writer = DuckLakeTableWriter::new(Arc::new(writer), object_store.clone()).unwrap();
     let result = table_writer
         .write_table("main", "not_null_test", &[valid_batch])
         .await
@@ -481,9 +464,7 @@ async fn cross_engine_insert_not_null_enforcement() {
 
     // Verify via DuckDB
     let duckdb = DuckDbConn::open(&env.catalog_db_path);
-    let rows = duckdb.query(
-        "SELECT id, name, value FROM ducklake.main.not_null_test ORDER BY id",
-    );
+    let rows = duckdb.query("SELECT id, name, value FROM ducklake.main.not_null_test ORDER BY id");
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0], vec!["1", "Alice", "100"]);
     assert_eq!(rows[1], vec!["2", "Bob", "NULL"]);
@@ -510,15 +491,11 @@ async fn cross_engine_insert_into_select_from() {
 
     let batch = RecordBatch::try_new(
         schema.clone(),
-        vec![
-            Arc::new(Int32Array::from(vec![1, 2])),
-            Arc::new(StringArray::from(vec!["a", "b"])),
-        ],
+        vec![Arc::new(Int32Array::from(vec![1, 2])), Arc::new(StringArray::from(vec!["a", "b"]))],
     )
     .unwrap();
 
-    let table_writer =
-        DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
+    let table_writer = DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
     table_writer
         .write_table("main", "target_table", &[batch])
         .await
@@ -553,13 +530,17 @@ async fn cross_engine_insert_into_select_from() {
                 "SELECT id, value FROM ducklake.main.target_table ORDER BY id",
             )
             .await;
-            assert_eq!(df_rows.len(), 5, "Should have 5 rows (2 original + 3 inserted)");
+            assert_eq!(
+                df_rows.len(),
+                5,
+                "Should have 5 rows (2 original + 3 inserted)"
+            );
             assert_eq!(df_rows[0], vec!["1", "a"]);
             assert_eq!(df_rows[4], vec!["5", "e"]);
-        }
+        },
         Err(e) => {
             panic!("INSERT INTO ... SELECT FROM failed: {}", e);
-        }
+        },
     }
 }
 
@@ -575,9 +556,7 @@ async fn cross_engine_ctas() {
         .await
         .expect("create writer");
     let snap_id = writer.create_snapshot().unwrap();
-    writer
-        .get_or_create_schema("main", None, snap_id)
-        .unwrap();
+    writer.get_or_create_schema("main", None, snap_id).unwrap();
 
     let ctx = open_in_datafusion_writable(&env.catalog_db_path).await;
 
@@ -610,9 +589,8 @@ async fn cross_engine_ctas() {
 
             // Verify via DuckDB
             let duckdb = DuckDbConn::open(&env.catalog_db_path);
-            let rows = duckdb.query(
-                "SELECT id, label, amount FROM ducklake.main.ctas_table ORDER BY id",
-            );
+            let rows =
+                duckdb.query("SELECT id, label, amount FROM ducklake.main.ctas_table ORDER BY id");
             assert_eq!(rows.len(), 3, "CTAS should have created 3 rows");
             assert_eq!(rows[0][1], "X");
             assert_eq!(rows[2][1], "Z");
@@ -635,10 +613,10 @@ async fn cross_engine_ctas() {
                 ],
                 &df_rows,
             );
-        }
+        },
         Err(e) => {
             panic!("CTAS failed: {}", e);
-        }
+        },
     }
 }
 
@@ -696,8 +674,7 @@ async fn cross_engine_insert_with_defaults() {
     )
     .unwrap();
 
-    let table_writer2 =
-        DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
+    let table_writer2 = DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
     let result = table_writer2
         .append_table("main", "default_test", &[batch_partial])
         .await
@@ -762,8 +739,7 @@ async fn cross_engine_insert_replace_mode() {
     )
     .unwrap();
 
-    let table_writer2 =
-        DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
+    let table_writer2 = DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
     let result = table_writer2
         .write_table("main", "replace_test", &[batch2])
         .await
@@ -772,9 +748,7 @@ async fn cross_engine_insert_replace_mode() {
 
     // Verify via DuckDB: only new data should exist
     let duckdb = DuckDbConn::open(&env.catalog_db_path);
-    let rows = duckdb.query(
-        "SELECT id, value FROM ducklake.main.replace_test ORDER BY id",
-    );
+    let rows = duckdb.query("SELECT id, value FROM ducklake.main.replace_test ORDER BY id");
     assert_eq!(rows.len(), 2, "Replace should have only 2 rows");
     assert_eq!(rows[0], vec!["10", "new_x"]);
     assert_eq!(rows[1], vec!["20", "new_y"]);
@@ -789,10 +763,7 @@ async fn cross_engine_insert_replace_mode() {
     .await;
     assert_query_eq(
         "replace_mode_df_read",
-        &vec![
-            vec!["10".into(), "new_x".into()],
-            vec!["20".into(), "new_y".into()],
-        ],
+        &vec![vec!["10".into(), "new_x".into()], vec!["20".into(), "new_y".into()]],
         &df_rows,
     );
 }
@@ -827,10 +798,7 @@ async fn cross_engine_insert_multi_batch() {
 
     let batch2 = RecordBatch::try_new(
         schema.clone(),
-        vec![
-            Arc::new(Int32Array::from(vec![4, 5])),
-            Arc::new(Int64Array::from(vec![400, 500])),
-        ],
+        vec![Arc::new(Int32Array::from(vec![4, 5])), Arc::new(Int64Array::from(vec![400, 500]))],
     )
     .unwrap();
 
@@ -843,24 +811,24 @@ async fn cross_engine_insert_multi_batch() {
     )
     .unwrap();
 
-    let table_writer =
-        DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
+    let table_writer = DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
     let result = table_writer
         .write_table("main", "multi_batch", &[batch1, batch2, batch3])
         .await
         .unwrap();
 
     // Verify total record count
-    assert_eq!(result.records_written, 9, "Should have written 9 records across 3 batches");
+    assert_eq!(
+        result.records_written, 9,
+        "Should have written 9 records across 3 batches"
+    );
 
     // Verify via DuckDB
     let duckdb = DuckDbConn::open(&env.catalog_db_path);
     let count_rows = duckdb.query("SELECT COUNT(*) FROM ducklake.main.multi_batch");
     assert_eq!(count_rows[0][0], "9");
 
-    let rows = duckdb.query(
-        "SELECT id, value FROM ducklake.main.multi_batch ORDER BY id",
-    );
+    let rows = duckdb.query("SELECT id, value FROM ducklake.main.multi_batch ORDER BY id");
     assert_eq!(rows.len(), 9);
     assert_eq!(rows[0], vec!["1", "100"]);
     assert_eq!(rows[8], vec!["9", "900"]);
@@ -910,8 +878,7 @@ async fn cross_engine_insert_footer_size_in_metadata() {
     )
     .unwrap();
 
-    let table_writer =
-        DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
+    let table_writer = DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
     table_writer
         .write_table("main", "footer_test", &[batch])
         .await
@@ -929,10 +896,7 @@ async fn cross_engine_insert_footer_size_in_metadata() {
     .await
     .expect("query footer_size");
 
-    assert!(
-        row.0.is_some(),
-        "footer_size should be stored in metadata"
-    );
+    assert!(row.0.is_some(), "footer_size should be stored in metadata");
     let footer_size = row.0.unwrap();
     assert!(
         footer_size > 0,
@@ -977,10 +941,7 @@ async fn cross_engine_insert_write_append_replace() {
     // Write initial data (Replace mode = default for write_table)
     let batch1 = RecordBatch::try_new(
         schema.clone(),
-        vec![
-            Arc::new(Int32Array::from(vec![1, 2])),
-            Arc::new(StringArray::from(vec!["a", "b"])),
-        ],
+        vec![Arc::new(Int32Array::from(vec![1, 2])), Arc::new(StringArray::from(vec!["a", "b"]))],
     )
     .unwrap();
 
@@ -995,10 +956,7 @@ async fn cross_engine_insert_write_append_replace() {
     // Append more data
     let batch2 = RecordBatch::try_new(
         schema.clone(),
-        vec![
-            Arc::new(Int32Array::from(vec![3, 4])),
-            Arc::new(StringArray::from(vec!["c", "d"])),
-        ],
+        vec![Arc::new(Int32Array::from(vec![3, 4])), Arc::new(StringArray::from(vec!["c", "d"]))],
     )
     .unwrap();
 
@@ -1024,15 +982,11 @@ async fn cross_engine_insert_write_append_replace() {
     // Now replace all data
     let batch3 = RecordBatch::try_new(
         schema.clone(),
-        vec![
-            Arc::new(Int32Array::from(vec![99])),
-            Arc::new(StringArray::from(vec!["replaced"])),
-        ],
+        vec![Arc::new(Int32Array::from(vec![99])), Arc::new(StringArray::from(vec!["replaced"]))],
     )
     .unwrap();
 
-    let table_writer3 =
-        DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
+    let table_writer3 = DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
     let result3 = table_writer3
         .write_table("main", "mode_test", &[batch3])
         .await
@@ -1071,15 +1025,11 @@ async fn cross_engine_sql_insert_values_duckdb_verify() {
 
     let batch = RecordBatch::try_new(
         schema,
-        vec![
-            Arc::new(Int32Array::from(vec![1])),
-            Arc::new(StringArray::from(vec!["initial"])),
-        ],
+        vec![Arc::new(Int32Array::from(vec![1])), Arc::new(StringArray::from(vec!["initial"]))],
     )
     .unwrap();
 
-    let table_writer =
-        DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
+    let table_writer = DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
     table_writer
         .write_table("main", "sql_values_test", &[batch])
         .await
@@ -1104,14 +1054,18 @@ async fn cross_engine_sql_insert_values_duckdb_verify() {
                 "SELECT id, name FROM ducklake.main.sql_values_test ORDER BY id",
             )
             .await;
-            assert_eq!(df_rows.len(), 3, "Should have 3 rows (1 initial + 2 inserted)");
+            assert_eq!(
+                df_rows.len(),
+                3,
+                "Should have 3 rows (1 initial + 2 inserted)"
+            );
             assert_eq!(df_rows[0], vec!["1", "initial"]);
             assert_eq!(df_rows[1], vec!["2", "second"]);
             assert_eq!(df_rows[2], vec!["3", "third"]);
-        }
+        },
         Err(e) => {
             panic!("SQL INSERT INTO ... VALUES failed: {}", e);
-        }
+        },
     }
 }
 
@@ -1142,7 +1096,11 @@ async fn cross_engine_duckdb_multiple_inserts_df_read() {
     )
     .await;
 
-    assert_eq!(actual.len(), 4, "Should see all 4 rows from multiple inserts");
+    assert_eq!(
+        actual.len(),
+        4,
+        "Should see all 4 rows from multiple inserts"
+    );
     assert_eq!(actual[0], vec!["1", "click"]);
     assert_eq!(actual[1], vec!["2", "scroll"]);
     assert_eq!(actual[2], vec!["3", "hover"]);
@@ -1176,8 +1134,7 @@ async fn cross_engine_insert_overwrite() {
     )
     .unwrap();
 
-    let table_writer =
-        DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
+    let table_writer = DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
     table_writer
         .write_table("main", "overwrite_cross", &[batch])
         .await
@@ -1189,13 +1146,11 @@ async fn cross_engine_insert_overwrite() {
     // Register source for overwrite
     let overwrite_batch = RecordBatch::try_new(
         schema.clone(),
-        vec![
-            Arc::new(Int32Array::from(vec![10, 20])),
-            Arc::new(StringArray::from(vec!["x", "y"])),
-        ],
+        vec![Arc::new(Int32Array::from(vec![10, 20])), Arc::new(StringArray::from(vec!["x", "y"]))],
     )
     .unwrap();
-    ctx.register_batch("overwrite_src", overwrite_batch).unwrap();
+    ctx.register_batch("overwrite_src", overwrite_batch)
+        .unwrap();
 
     // INSERT OVERWRITE (explicit column list to avoid virtual column count mismatch)
     let result = ctx
@@ -1208,16 +1163,15 @@ async fn cross_engine_insert_overwrite() {
 
             // Verify via DuckDB: should only have replacement data
             let duckdb = DuckDbConn::open(&env.catalog_db_path);
-            let rows = duckdb.query(
-                "SELECT id, val FROM ducklake.main.overwrite_cross ORDER BY id",
-            );
+            let rows =
+                duckdb.query("SELECT id, val FROM ducklake.main.overwrite_cross ORDER BY id");
             assert_eq!(rows.len(), 2, "Overwrite should leave only 2 rows");
             assert_eq!(rows[0], vec!["10", "x"]);
             assert_eq!(rows[1], vec!["20", "y"]);
-        }
+        },
         Err(e) => {
             panic!("INSERT OVERWRITE failed: {}", e);
-        }
+        },
     }
 }
 
@@ -1248,8 +1202,7 @@ async fn cross_engine_insert_parquet_files_exist() {
     )
     .unwrap();
 
-    let table_writer =
-        DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
+    let table_writer = DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
     let result = table_writer
         .write_table("main", "file_check", &[batch])
         .await
@@ -1270,11 +1223,7 @@ async fn cross_engine_insert_parquet_files_exist() {
         .filter(|e| e.path().extension().is_some_and(|ext| ext == "parquet"))
         .collect();
 
-    assert_eq!(
-        parquet_files.len(),
-        1,
-        "Should have exactly 1 Parquet file"
-    );
+    assert_eq!(parquet_files.len(), 1, "Should have exactly 1 Parquet file");
 
     // Verify it's a valid Parquet file by reading its metadata
     let file_path = parquet_files[0].path();

@@ -479,7 +479,6 @@ mod integration_tests {
     /// 3. Query the table — should error, NOT silently return deleted rows
     #[tokio::test]
     async fn test_missing_delete_file_returns_error() -> DataFusionResult<()> {
-
         let temp_dir = TempDir::new()
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
         let catalog_path = temp_dir.path().join("missing_delete.ducklake");
@@ -536,7 +535,6 @@ mod integration_tests {
     /// when delete files are missing from storage.
     #[tokio::test]
     async fn test_missing_delete_file_count_also_errors() -> DataFusionResult<()> {
-
         let temp_dir = TempDir::new()
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
         let catalog_path = temp_dir.path().join("missing_delete_count.ducklake");

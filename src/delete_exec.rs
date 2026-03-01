@@ -364,7 +364,9 @@ impl ExecutionPlan for DuckLakeDeleteExec {
                     DeleteFileInfo::new(data_file_id, &delete_file_name, file_size, delete_count)
                         .with_footer_size(footer_size);
 
-                if let Err(e) = writer.register_delete_file(table_id, snapshot_id, &delete_file_info) {
+                if let Err(e) =
+                    writer.register_delete_file(table_id, snapshot_id, &delete_file_info)
+                {
                     cleanup_orphaned_files(&*object_store, &uploaded_files).await;
                     return Err(DataFusionError::External(Box::new(e)));
                 }

@@ -425,10 +425,11 @@ impl MySqlMetadataWriter {
             if let Some(row) = existing {
                 row.try_get(0)?
             } else {
-                let next_tid_row =
-                    sqlx::query("SELECT COALESCE(MAX(table_id), 0) + 1 FROM ducklake_table FOR UPDATE")
-                        .fetch_one(&mut *tx)
-                        .await?;
+                let next_tid_row = sqlx::query(
+                    "SELECT COALESCE(MAX(table_id), 0) + 1 FROM ducklake_table FOR UPDATE",
+                )
+                .fetch_one(&mut *tx)
+                .await?;
                 let next_table_id: i64 = next_tid_row.try_get(0)?;
 
                 let table_path = format!("{}/", table_name);
@@ -991,9 +992,11 @@ impl MetadataWriter for MySqlMetadataWriter {
             sqlx::query("SET @old_sql_mode = @@SESSION.sql_mode")
                 .execute(&mut *conn)
                 .await?;
-            sqlx::query("SET SESSION sql_mode = CONCAT(@@SESSION.sql_mode, ',NO_AUTO_VALUE_ON_ZERO')")
-                .execute(&mut *conn)
-                .await?;
+            sqlx::query(
+                "SET SESSION sql_mode = CONCAT(@@SESSION.sql_mode, ',NO_AUTO_VALUE_ON_ZERO')",
+            )
+            .execute(&mut *conn)
+            .await?;
             sqlx::query(
                 "INSERT IGNORE INTO ducklake_snapshot (snapshot_id, snapshot_time, schema_version, next_catalog_id, next_file_id)
                  VALUES (0, NOW(6), 0, 0, 0)",
@@ -1223,9 +1226,10 @@ impl MetadataWriter for MySqlMetadataWriter {
                 .await?;
             let snapshot_id = last_insert_id(&mut tx).await?;
 
-            let vid_row = sqlx::query("SELECT COALESCE(MAX(view_id), 0) + 1 FROM ducklake_view FOR UPDATE")
-                .fetch_one(&mut *tx)
-                .await?;
+            let vid_row =
+                sqlx::query("SELECT COALESCE(MAX(view_id), 0) + 1 FROM ducklake_view FOR UPDATE")
+                    .fetch_one(&mut *tx)
+                    .await?;
             let view_id: i64 = vid_row.try_get(0)?;
 
             sqlx::query(
@@ -1707,12 +1711,7 @@ impl MetadataWriter for MySqlMetadataWriter {
         })
     }
 
-    fn set_column_comment(
-        &self,
-        table_id: i64,
-        column_name: &str,
-        comment: &str,
-    ) -> Result<i64> {
+    fn set_column_comment(&self, table_id: i64, column_name: &str, comment: &str) -> Result<i64> {
         block_on(async {
             let mut tx = self.pool.begin().await?;
 

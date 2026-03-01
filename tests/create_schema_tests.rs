@@ -354,7 +354,10 @@ async fn test_create_schema_if_not_exists_information_schema_is_noop() {
         .await;
 
     match result {
-        Err(e) => panic!("IF NOT EXISTS should not error for existing virtual schema: {}", e),
+        Err(e) => panic!(
+            "IF NOT EXISTS should not error for existing virtual schema: {}",
+            e
+        ),
         Ok(df) => {
             let collect_result = df.collect().await;
             assert!(
@@ -362,7 +365,7 @@ async fn test_create_schema_if_not_exists_information_schema_is_noop() {
                 "IF NOT EXISTS should silently succeed: {:?}",
                 collect_result.err()
             );
-        }
+        },
     }
 }
 

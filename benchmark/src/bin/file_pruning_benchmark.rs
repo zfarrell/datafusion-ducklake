@@ -123,7 +123,10 @@ async fn main() -> Result<()> {
 
     let ctx = create_context(&temp_dir).await?;
 
-    println!("Benchmarks ({} iterations, {} warmup):", BENCH_ITERS, WARMUP_ITERS);
+    println!(
+        "Benchmarks ({} iterations, {} warmup):",
+        BENCH_ITERS, WARMUP_ITERS
+    );
 
     // 1. Full table scan (no pruning)
     bench_query(

@@ -98,10 +98,7 @@ async fn test_zero_footer_size_skipped() -> DataFusionResult<()> {
     let results = df.collect().await?;
 
     let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(
-        total_rows, 4,
-        "Should have 4 rows despite zero footer_size"
-    );
+    assert_eq!(total_rows, 4, "Should have 4 rows despite zero footer_size");
 
     Ok(())
 }

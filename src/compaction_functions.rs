@@ -49,11 +49,7 @@ fn expire_snapshots_schema() -> SchemaRef {
 
 /// Return schema for cleanup_old_files and delete_orphaned_files: `(path: Utf8)`
 fn path_schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![Field::new(
-        "path",
-        DataType::Utf8,
-        true,
-    )]))
+    Arc::new(Schema::new(vec![Field::new("path", DataType::Utf8, true)]))
 }
 
 // ==================== Helper: DuckDB connection ====================
@@ -176,21 +172,19 @@ impl TableFunctionImpl for DucklakeMergeAdjacentFilesFunction {
         let conn = open_compaction_connection(&self.catalog_path)?;
 
         let sql = match exprs.len() {
-            0 => {
-                "SELECT * FROM ducklake_merge_adjacent_files('__compaction')".to_string()
-            }
+            0 => "SELECT * FROM ducklake_merge_adjacent_files('__compaction')".to_string(),
             1 => {
                 let table_name = extract_string_arg(&exprs[0], "ducklake_merge_adjacent_files", 1)?;
                 format!(
                     "SELECT * FROM ducklake_merge_adjacent_files('__compaction', '{}')",
                     table_name.replace('\'', "''")
                 )
-            }
+            },
             _ => {
                 return plan_err!(
                     "ducklake_merge_adjacent_files() takes 0 or 1 arguments (optional table_name)"
                 );
-            }
+            },
         };
 
         execute_success_query(&conn, &sql)
@@ -228,30 +222,27 @@ impl TableFunctionImpl for DucklakeRewriteDataFilesFunction {
         let sql = match exprs.len() {
             1 => {
                 // rewrite_data_files(delete_threshold) — all tables
-                let threshold =
-                    extract_float_arg(&exprs[0], "ducklake_rewrite_data_files", 1)?;
+                let threshold = extract_float_arg(&exprs[0], "ducklake_rewrite_data_files", 1)?;
                 format!(
                     "SELECT * FROM ducklake_rewrite_data_files('__compaction', delete_threshold := {})",
                     threshold
                 )
-            }
+            },
             2 => {
                 // rewrite_data_files('table_name', delete_threshold)
-                let table_name =
-                    extract_string_arg(&exprs[0], "ducklake_rewrite_data_files", 1)?;
-                let threshold =
-                    extract_float_arg(&exprs[1], "ducklake_rewrite_data_files", 2)?;
+                let table_name = extract_string_arg(&exprs[0], "ducklake_rewrite_data_files", 1)?;
+                let threshold = extract_float_arg(&exprs[1], "ducklake_rewrite_data_files", 2)?;
                 format!(
                     "SELECT * FROM ducklake_rewrite_data_files('__compaction', '{}', delete_threshold := {})",
                     table_name.replace('\'', "''"),
                     threshold
                 )
-            }
+            },
             _ => {
                 return plan_err!(
                     "ducklake_rewrite_data_files() requires 1-2 arguments: (optional table_name, delete_threshold)"
                 );
-            }
+            },
         };
 
         execute_success_query(&conn, &sql)
@@ -399,19 +390,19 @@ impl TableFunctionImpl for DucklakeCleanupOldFilesFunction {
                 // Use a far-future timestamp to avoid TIMESTAMPTZ arithmetic issues
                 // in some DuckDB versions. Equivalent to "clean up everything eligible".
                 "SELECT * FROM ducklake_cleanup_old_files('__compaction', older_than := '2099-01-01'::TIMESTAMP)".to_string()
-            }
+            },
             1 => {
                 let older_than = extract_string_arg(&exprs[0], "ducklake_cleanup_old_files", 1)?;
                 format!(
                     "SELECT * FROM ducklake_cleanup_old_files('__compaction', older_than := '{}'::TIMESTAMP)",
                     older_than.replace('\'', "''")
                 )
-            }
+            },
             _ => {
                 return plan_err!(
                     "ducklake_cleanup_old_files() takes 0 or 1 arguments (optional older_than_timestamp)"
                 );
-            }
+            },
         };
 
         execute_path_query(&conn, &sql)
@@ -561,11 +552,26 @@ impl TableFunctionImpl for DucklakeOptionsFunction {
             .next()
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?
         {
-            option_names.push(row.get(0).map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?);
-            descriptions.push(row.get(1).map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?);
-            values.push(row.get(2).map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?);
-            scopes.push(row.get(3).map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?);
-            scope_entries.push(row.get(4).map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?);
+            option_names.push(
+                row.get(0)
+                    .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?,
+            );
+            descriptions.push(
+                row.get(1)
+                    .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?,
+            );
+            values.push(
+                row.get(2)
+                    .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?,
+            );
+            scopes.push(
+                row.get(3)
+                    .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?,
+            );
+            scope_entries.push(
+                row.get(4)
+                    .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?,
+            );
         }
 
         let batch = if option_names.is_empty() {
@@ -654,7 +660,10 @@ impl TableFunctionImpl for DucklakeAddDataFilesFunction {
             .next()
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?
         {
-            filenames.push(row.get(0).map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?);
+            filenames.push(
+                row.get(0)
+                    .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?,
+            );
         }
 
         let batch = if filenames.is_empty() {
@@ -694,9 +703,7 @@ impl DucklakeSetOptionFunction {
 impl TableFunctionImpl for DucklakeSetOptionFunction {
     fn call(&self, exprs: &[Expr]) -> DataFusionResult<Arc<dyn TableProvider>> {
         if exprs.len() != 2 {
-            return plan_err!(
-                "ducklake_set_option() requires 2 arguments: (option_name, value)"
-            );
+            return plan_err!("ducklake_set_option() requires 2 arguments: (option_name, value)");
         }
 
         let option_name = extract_string_arg(&exprs[0], "ducklake_set_option", 1)?;

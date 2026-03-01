@@ -4,11 +4,7 @@
 //! These tests verify that features work correctly across DataFusion and DuckDB engines,
 //! using the cross-engine test infrastructure patterns.
 
-#![cfg(all(
-    feature = "write-sqlite",
-    feature = "metadata-duckdb",
-    feature = "metadata-sqlite"
-))]
+#![cfg(all(feature = "write-sqlite", feature = "metadata-duckdb", feature = "metadata-sqlite"))]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -102,7 +98,9 @@ impl DuckDbConn {
         let attach_path = format!("ducklake:sqlite:{}", catalog_db_path.display());
         conn.execute(&format!("ATTACH '{}' AS ducklake;", attach_path), [])
             .expect("attach ducklake catalog");
-        DuckDbConn { conn }
+        DuckDbConn {
+            conn,
+        }
     }
 
     fn open_with_data_path(catalog_path: &Path, data_path: &Path) -> Self {
@@ -120,7 +118,9 @@ impl DuckDbConn {
             [],
         )
         .expect("attach ducklake catalog with data path");
-        DuckDbConn { conn }
+        DuckDbConn {
+            conn,
+        }
     }
 
     fn execute(&self, sql: &str) {
@@ -197,31 +197,31 @@ fn arrow_value_to_string(array: &dyn Array, idx: usize) -> String {
         DataType::Int32 => {
             let a = array.as_any().downcast_ref::<Int32Array>().unwrap();
             a.value(idx).to_string()
-        }
+        },
         DataType::Int64 => {
             let a = array.as_any().downcast_ref::<Int64Array>().unwrap();
             a.value(idx).to_string()
-        }
+        },
         DataType::UInt64 => {
             let a = array.as_any().downcast_ref::<UInt64Array>().unwrap();
             a.value(idx).to_string()
-        }
+        },
         DataType::Float64 => {
             let a = array.as_any().downcast_ref::<Float64Array>().unwrap();
             format!("{}", a.value(idx))
-        }
+        },
         DataType::Utf8 => {
             let a = array.as_any().downcast_ref::<StringArray>().unwrap();
             a.value(idx).to_string()
-        }
+        },
         DataType::LargeUtf8 => {
             let a = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
             a.value(idx).to_string()
-        }
+        },
         DataType::Boolean => {
             let a = array.as_any().downcast_ref::<BooleanArray>().unwrap();
             a.value(idx).to_string()
-        }
+        },
         other => format!("<unsupported:{other:?}>"),
     }
 }
@@ -279,9 +279,7 @@ async fn cross_engine_virtual_col_row_numbers_sequential() {
     let conn_str = format!("sqlite:{}?mode=rwc", env.catalog_db_path.display());
     let writer = SqliteMetadataWriter::new(&conn_str).await.unwrap();
 
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int32, false),
-    ]));
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
 
     let batch = RecordBatch::try_new(
         schema,
@@ -319,9 +317,7 @@ async fn cross_engine_duckdb_write_df_read_virtual_columns() {
     // DuckDB writes data
     {
         let duckdb = DuckDbConn::open_with_data_path(&catalog_path, &data_path);
-        duckdb.execute(
-            "CREATE TABLE ducklake.main.items (id INT, name VARCHAR)",
-        );
+        duckdb.execute("CREATE TABLE ducklake.main.items (id INT, name VARCHAR)");
         duckdb.execute(
             "INSERT INTO ducklake.main.items VALUES (1, 'Widget'), (2, 'Gadget'), (3, 'Doohickey')",
         );
@@ -342,10 +338,7 @@ async fn cross_engine_duckdb_write_df_read_virtual_columns() {
     // Verify real data + virtual columns have values
     assert_eq!(rows[0][0], "1");
     assert_eq!(rows[0][1], "Widget");
-    assert!(
-        !rows[0][2].is_empty(),
-        "filename should not be empty"
-    );
+    assert!(!rows[0][2].is_empty(), "filename should not be empty");
 
     // file_row_number values should be 0, 1, 2
     let mut row_numbers: Vec<i64> = rows.iter().map(|r| r[3].parse().unwrap()).collect();
@@ -581,8 +574,7 @@ async fn cross_engine_planner_update_and_duckdb_verify() {
 
     // Also verify total row count via DuckDB (basic interop check)
     let duckdb = DuckDbConn::open(&env.catalog_db_path);
-    let duckdb_count =
-        duckdb.query("SELECT COUNT(*) FROM ducklake.main.planner_upd");
+    let duckdb_count = duckdb.query("SELECT COUNT(*) FROM ducklake.main.planner_upd");
     assert_eq!(duckdb_count[0][0], "3", "DuckDB should see 3 total rows");
 }
 
@@ -651,8 +643,7 @@ async fn cross_engine_planner_insert_via_sql() {
 
     // Also verify total row count via DuckDB (basic interop check)
     let duckdb = DuckDbConn::open(&env.catalog_db_path);
-    let duckdb_count =
-        duckdb.query("SELECT COUNT(*) FROM ducklake.main.planner_ins");
+    let duckdb_count = duckdb.query("SELECT COUNT(*) FROM ducklake.main.planner_ins");
     assert_eq!(duckdb_count[0][0], "4", "DuckDB should see 4 total rows");
 }
 
@@ -720,7 +711,11 @@ async fn cross_engine_stats_df_write_duckdb_read() {
         schema,
         vec![
             Arc::new(Int32Array::from(vec![10, 20, 30])),
-            Arc::new(StringArray::from(vec![Some("Alice"), None, Some("Charlie")])),
+            Arc::new(StringArray::from(vec![
+                Some("Alice"),
+                None,
+                Some("Charlie"),
+            ])),
             Arc::new(Float64Array::from(vec![Some(95.5), Some(87.3), Some(92.1)])),
         ],
     )
@@ -785,15 +780,10 @@ async fn cross_engine_stats_stored_in_metadata_table() {
     let conn_str = format!("sqlite:{}?mode=rwc", env.catalog_db_path.display());
     let writer = SqliteMetadataWriter::new(&conn_str).await.unwrap();
 
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("val", DataType::Int32, false),
-    ]));
+    let schema = Arc::new(Schema::new(vec![Field::new("val", DataType::Int32, false)]));
 
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![Arc::new(Int32Array::from(vec![5, 15, 25]))],
-    )
-    .unwrap();
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![5, 15, 25]))]).unwrap();
 
     let table_writer = DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
     table_writer
@@ -802,9 +792,10 @@ async fn cross_engine_stats_stored_in_metadata_table() {
         .unwrap();
 
     // Read stats directly from the metadata provider
-    let provider = SqliteMetadataProvider::new(&format!("sqlite:{}", env.catalog_db_path.display()))
-        .await
-        .unwrap();
+    let provider =
+        SqliteMetadataProvider::new(&format!("sqlite:{}", env.catalog_db_path.display()))
+            .await
+            .unwrap();
     let snapshot_id = provider.get_current_snapshot().unwrap();
     let schema_meta = provider
         .get_schema_by_name("main", snapshot_id)
@@ -848,7 +839,12 @@ async fn cross_engine_conflict_insert_after_drop() {
 
     // Create table
     let setup = writer
-        .begin_write_transaction("main", "conflict_test", &columns, datafusion_ducklake::WriteMode::Replace)
+        .begin_write_transaction(
+            "main",
+            "conflict_test",
+            &columns,
+            datafusion_ducklake::WriteMode::Replace,
+        )
         .unwrap();
     let stale_snapshot = setup.snapshot_id;
 
@@ -867,7 +863,10 @@ async fn cross_engine_conflict_insert_after_drop() {
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(
-        matches!(&err, datafusion_ducklake::DuckLakeError::TransactionConflict(_)),
+        matches!(
+            &err,
+            datafusion_ducklake::DuckLakeError::TransactionConflict(_)
+        ),
         "Expected TransactionConflict, got: {err}"
     );
 }
@@ -880,19 +879,27 @@ async fn cross_engine_conflict_independent_tables_no_conflict() {
     let conn_str = format!("sqlite:{}?mode=rwc", env.catalog_db_path.display());
     let writer = SqliteMetadataWriter::new(&conn_str).await.unwrap();
 
-    let columns = vec![
-        datafusion_ducklake::ColumnDef::new("id", "int32", false).unwrap(),
-    ];
+    let columns = vec![datafusion_ducklake::ColumnDef::new("id", "int32", false).unwrap()];
 
     // Create table A
     let setup_a = writer
-        .begin_write_transaction("main", "table_a", &columns, datafusion_ducklake::WriteMode::Replace)
+        .begin_write_transaction(
+            "main",
+            "table_a",
+            &columns,
+            datafusion_ducklake::WriteMode::Replace,
+        )
         .unwrap();
     let snapshot_after_a = setup_a.snapshot_id;
 
     // Create and drop table B
     let setup_b = writer
-        .begin_write_transaction("main", "table_b", &columns, datafusion_ducklake::WriteMode::Replace)
+        .begin_write_transaction(
+            "main",
+            "table_b",
+            &columns,
+            datafusion_ducklake::WriteMode::Replace,
+        )
         .unwrap();
     writer.drop_table(setup_b.table_id).unwrap();
 
@@ -916,12 +923,15 @@ async fn cross_engine_conflict_error_messages() {
     let conn_str = format!("sqlite:{}?mode=rwc", env.catalog_db_path.display());
     let writer = SqliteMetadataWriter::new(&conn_str).await.unwrap();
 
-    let columns = vec![
-        datafusion_ducklake::ColumnDef::new("id", "int32", false).unwrap(),
-    ];
+    let columns = vec![datafusion_ducklake::ColumnDef::new("id", "int32", false).unwrap()];
 
     let setup = writer
-        .begin_write_transaction("main", "msg_test", &columns, datafusion_ducklake::WriteMode::Replace)
+        .begin_write_transaction(
+            "main",
+            "msg_test",
+            &columns,
+            datafusion_ducklake::WriteMode::Replace,
+        )
         .unwrap();
     let stale = setup.snapshot_id;
     writer.drop_table(setup.table_id).unwrap();

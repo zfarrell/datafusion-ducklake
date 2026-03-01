@@ -31,8 +31,7 @@ impl DuckDbHelper {
         let conn = duckdb::Connection::open_in_memory().expect("open in-memory duckdb");
         conn.execute("INSTALL ducklake;", [])
             .expect("install ducklake");
-        conn.execute("LOAD ducklake;", [])
-            .expect("load ducklake");
+        conn.execute("LOAD ducklake;", []).expect("load ducklake");
         let attach_path = format!("ducklake:{}", catalog_path.display());
         conn.execute(
             &format!(
@@ -43,22 +42,22 @@ impl DuckDbHelper {
             [],
         )
         .expect("attach ducklake catalog with data path");
-        DuckDbHelper { conn }
+        DuckDbHelper {
+            conn,
+        }
     }
 
     fn open(catalog_path: &Path) -> Self {
         let conn = duckdb::Connection::open_in_memory().expect("open in-memory duckdb");
         conn.execute("INSTALL ducklake;", [])
             .expect("install ducklake");
-        conn.execute("LOAD ducklake;", [])
-            .expect("load ducklake");
+        conn.execute("LOAD ducklake;", []).expect("load ducklake");
         let attach_path = format!("ducklake:{}", catalog_path.display());
-        conn.execute(
-            &format!("ATTACH '{}' AS dl;", attach_path),
-            [],
-        )
-        .expect("attach ducklake catalog");
-        DuckDbHelper { conn }
+        conn.execute(&format!("ATTACH '{}' AS dl;", attach_path), [])
+            .expect("attach ducklake catalog");
+        DuckDbHelper {
+            conn,
+        }
     }
 
     fn execute(&self, sql: &str) {
@@ -152,10 +151,11 @@ async fn test_merge_adjacent_files() {
         db.execute("INSERT INTO dl.main.t1 VALUES (5, 'e')");
 
         // Verify 5+ files exist (one per INSERT)
-        let file_count = db.query_count(
-            "SELECT COUNT(*) FROM ducklake_list_files('dl', 't1')",
+        let file_count = db.query_count("SELECT COUNT(*) FROM ducklake_list_files('dl', 't1')");
+        assert!(
+            file_count >= 5,
+            "Expected at least 5 files before merge, got {file_count}"
         );
-        assert!(file_count >= 5, "Expected at least 5 files before merge, got {file_count}");
     }
 
     // Run merge via DataFusion
@@ -167,10 +167,11 @@ async fn test_merge_adjacent_files() {
     // Verify: files are merged and data is preserved
     {
         let db = DuckDbHelper::open(&env.catalog_path);
-        let file_count = db.query_count(
-            "SELECT COUNT(*) FROM ducklake_list_files('dl', 't1')",
+        let file_count = db.query_count("SELECT COUNT(*) FROM ducklake_list_files('dl', 't1')");
+        assert!(
+            file_count < 5,
+            "Expected fewer files after merge, got {file_count}"
         );
-        assert!(file_count < 5, "Expected fewer files after merge, got {file_count}");
 
         let row_count = db.query_count("SELECT COUNT(*) FROM dl.main.t1");
         assert_eq!(row_count, 5, "Data should be preserved after merge");
@@ -179,11 +180,7 @@ async fn test_merge_adjacent_files() {
     // Also verify DataFusion can read the merged data
     {
         let ctx = open_df_with_compaction(&env.catalog_path);
-        let rows = df_query(
-            &ctx,
-            "SELECT id, name FROM ducklake.main.t1 ORDER BY id",
-        )
-        .await;
+        let rows = df_query(&ctx, "SELECT id, name FROM ducklake.main.t1 ORDER BY id").await;
         assert_eq!(rows.len(), 5, "DataFusion should see 5 rows after merge");
         assert_eq!(rows[0], vec!["1", "a"]);
         assert_eq!(rows[4], vec!["5", "e"]);
@@ -248,11 +245,7 @@ async fn test_rewrite_data_files() {
     // Rewrite via DataFusion with threshold 0 (rewrite any file with deletes)
     {
         let ctx = open_df_with_compaction(&env.catalog_path);
-        df_query(
-            &ctx,
-            "SELECT * FROM ducklake_rewrite_data_files('t1', 0.0)",
-        )
-        .await;
+        df_query(&ctx, "SELECT * FROM ducklake_rewrite_data_files('t1', 0.0)").await;
     }
 
     // Verify: no more delete files, correct data
@@ -261,10 +254,7 @@ async fn test_rewrite_data_files() {
         let delete_count = db.query_count(
             "SELECT COUNT(*) FROM ducklake_list_files('dl', 't1') WHERE delete_file IS NOT NULL",
         );
-        assert_eq!(
-            delete_count, 0,
-            "Should have no delete files after rewrite"
-        );
+        assert_eq!(delete_count, 0, "Should have no delete files after rewrite");
 
         let row_count = db.query_count("SELECT COUNT(*) FROM dl.main.t1");
         assert_eq!(row_count, 3, "Should have 3 rows (1, 3, 5) after rewrite");
@@ -273,11 +263,7 @@ async fn test_rewrite_data_files() {
     // DataFusion reads the rewritten data correctly
     {
         let ctx = open_df_with_compaction(&env.catalog_path);
-        let rows = df_query(
-            &ctx,
-            "SELECT id, name FROM ducklake.main.t1 ORDER BY id",
-        )
-        .await;
+        let rows = df_query(&ctx, "SELECT id, name FROM ducklake.main.t1 ORDER BY id").await;
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0], vec!["1", "a"]);
         assert_eq!(rows[1], vec!["3", "c"]);
@@ -326,11 +312,7 @@ async fn test_expire_snapshots() {
     // DataFusion reads correctly after expire
     {
         let ctx = open_df_with_compaction(&env.catalog_path);
-        let rows = df_query(
-            &ctx,
-            "SELECT id FROM ducklake.main.t1 ORDER BY id",
-        )
-        .await;
+        let rows = df_query(&ctx, "SELECT id FROM ducklake.main.t1 ORDER BY id").await;
         assert_eq!(rows.len(), 4);
     }
 }
@@ -348,7 +330,9 @@ async fn test_cleanup_old_files() {
         db.execute("DELETE FROM dl.main.t1 WHERE id = 2");
 
         // Rewrite to create orphaned old files
-        db.execute("SELECT * FROM ducklake_rewrite_data_files('dl', 't1', delete_threshold := 0.0)");
+        db.execute(
+            "SELECT * FROM ducklake_rewrite_data_files('dl', 't1', delete_threshold := 0.0)",
+        );
         // Expire all snapshots
         db.execute("SELECT * FROM ducklake_expire_snapshots('dl', older_than := '2099-01-01'::TIMESTAMPTZ)");
     }
@@ -363,11 +347,7 @@ async fn test_cleanup_old_files() {
     // Verify data is still accessible
     {
         let ctx = open_df_with_compaction(&env.catalog_path);
-        let rows = df_query(
-            &ctx,
-            "SELECT id FROM ducklake.main.t1 ORDER BY id",
-        )
-        .await;
+        let rows = df_query(&ctx, "SELECT id FROM ducklake.main.t1 ORDER BY id").await;
         assert_eq!(rows.len(), 4, "Data should be intact after cleanup");
     }
 }
@@ -386,11 +366,7 @@ async fn test_delete_orphaned_files_dry_run() {
     // Run orphan check with dry_run=true via DataFusion
     {
         let ctx = open_df_with_compaction(&env.catalog_path);
-        let result = df_query(
-            &ctx,
-            "SELECT * FROM ducklake_delete_orphaned_files(true)",
-        )
-        .await;
+        let result = df_query(&ctx, "SELECT * FROM ducklake_delete_orphaned_files(true)").await;
         // In a clean catalog, there should be no orphans
         assert!(
             result.is_empty(),
@@ -401,11 +377,7 @@ async fn test_delete_orphaned_files_dry_run() {
     // Verify data is still fine
     {
         let ctx = open_df_with_compaction(&env.catalog_path);
-        let count = df_row_count(
-            &ctx,
-            "SELECT * FROM ducklake.main.t1",
-        )
-        .await;
+        let count = df_row_count(&ctx, "SELECT * FROM ducklake.main.t1").await;
         assert_eq!(count, 3);
     }
 }
@@ -438,9 +410,7 @@ async fn test_cross_engine_df_compaction_duckdb_read() {
         let row_count = db.query_count("SELECT COUNT(*) FROM dl.main.t1");
         assert_eq!(row_count, 5, "DuckDB should see all 5 rows after DF merge");
 
-        let file_count = db.query_count(
-            "SELECT COUNT(*) FROM ducklake_list_files('dl', 't1')",
-        );
+        let file_count = db.query_count("SELECT COUNT(*) FROM ducklake_list_files('dl', 't1')");
         assert!(file_count < 5, "DuckDB should see fewer files after merge");
     }
 }
@@ -456,18 +426,20 @@ async fn test_cross_engine_duckdb_compaction_df_read() {
         db.execute("CREATE TABLE dl.main.t1 (id INTEGER, name VARCHAR)");
         db.execute("INSERT INTO dl.main.t1 VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')");
         db.execute("DELETE FROM dl.main.t1 WHERE id IN (2, 4)");
-        db.execute("SELECT * FROM ducklake_rewrite_data_files('dl', 't1', delete_threshold := 0.0)");
+        db.execute(
+            "SELECT * FROM ducklake_rewrite_data_files('dl', 't1', delete_threshold := 0.0)",
+        );
     }
 
     // DataFusion reads the compacted catalog
     {
         let ctx = open_df_with_compaction(&env.catalog_path);
-        let rows = df_query(
-            &ctx,
-            "SELECT id, name FROM ducklake.main.t1 ORDER BY id",
-        )
-        .await;
-        assert_eq!(rows.len(), 2, "DataFusion should see 2 rows after DuckDB rewrite");
+        let rows = df_query(&ctx, "SELECT id, name FROM ducklake.main.t1 ORDER BY id").await;
+        assert_eq!(
+            rows.len(),
+            2,
+            "DataFusion should see 2 rows after DuckDB rewrite"
+        );
         assert_eq!(rows[0], vec!["1", "a"]);
         assert_eq!(rows[1], vec!["3", "c"]);
     }
@@ -530,12 +502,8 @@ async fn test_cross_engine_full_compaction_lifecycle() {
     }
 
     // Step 3: Both engines verify final state
-    let expected_data: Vec<Vec<&str>> = vec![
-        vec!["1", "Alice"],
-        vec!["2", "Bob"],
-        vec!["4", "Diana"],
-        vec!["5", "Eve"],
-    ];
+    let expected_data: Vec<Vec<&str>> =
+        vec![vec!["1", "Alice"], vec!["2", "Bob"], vec!["4", "Diana"], vec!["5", "Eve"]];
 
     // DuckDB verifies
     {
@@ -559,11 +527,7 @@ async fn test_cross_engine_full_compaction_lifecycle() {
     // DataFusion verifies
     {
         let ctx = open_df_with_compaction(&env.catalog_path);
-        let rows = df_query(
-            &ctx,
-            "SELECT id, name FROM ducklake.main.users ORDER BY id",
-        )
-        .await;
+        let rows = df_query(&ctx, "SELECT id, name FROM ducklake.main.users ORDER BY id").await;
         assert_eq!(rows.len(), expected_data.len());
         for (i, expected) in expected_data.iter().enumerate() {
             assert_eq!(
@@ -590,14 +554,16 @@ async fn test_compaction_invalid_arguments() {
     let ctx = open_df_with_compaction(&env.catalog_path);
 
     // expire_snapshots with no args should fail
-    let result = ctx
-        .sql("SELECT * FROM ducklake_expire_snapshots()")
-        .await;
-    assert!(result.is_err(), "expire_snapshots() with no args should fail");
+    let result = ctx.sql("SELECT * FROM ducklake_expire_snapshots()").await;
+    assert!(
+        result.is_err(),
+        "expire_snapshots() with no args should fail"
+    );
 
     // rewrite_data_files with no args should fail
-    let result = ctx
-        .sql("SELECT * FROM ducklake_rewrite_data_files()")
-        .await;
-    assert!(result.is_err(), "rewrite_data_files() with no args should fail");
+    let result = ctx.sql("SELECT * FROM ducklake_rewrite_data_files()").await;
+    assert!(
+        result.is_err(),
+        "rewrite_data_files() with no args should fail"
+    );
 }

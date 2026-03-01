@@ -3,7 +3,7 @@
 //! Requires multi-threaded Tokio runtime (`#[tokio::test(flavor = "multi_thread")]`).
 
 use crate::Result;
-use crate::metadata_provider::block_on;
+use crate::metadata_provider::{InlinedDataRow, block_on};
 use crate::metadata_writer::{
     AlterTableOp, ColumnDef, ColumnStatInfo, DataFileInfo, DeleteFileInfo, MetadataWriter,
     WriteMode, WriteSetupResult,
@@ -1438,6 +1438,54 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .execute(&mut *tx)
                     .await?;
                 },
+                AlterTableAction::SetPartitionedBy {
+                    partition_columns,
+                } => {
+                    // End any existing partition info
+                    sqlx::query(
+                        "UPDATE ducklake_partition_info SET end_snapshot = ?
+                         WHERE table_id = ? AND end_snapshot IS NULL",
+                    )
+                    .bind(snapshot_id)
+                    .bind(table_id)
+                    .execute(&mut *tx)
+                    .await?;
+
+                    // Create new partition_info entry
+                    let pid_row = sqlx::query(
+                        "SELECT COALESCE(MAX(partition_id), 0) + 1 FROM ducklake_partition_info",
+                    )
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    let partition_id: i64 = pid_row.try_get(0)?;
+
+                    sqlx::query(
+                        "INSERT INTO ducklake_partition_info (partition_id, table_id, begin_snapshot)
+                         VALUES (?, ?, ?)",
+                    )
+                    .bind(partition_id)
+                    .bind(table_id)
+                    .bind(snapshot_id)
+                    .execute(&mut *tx)
+                    .await?;
+
+                    // Create partition_column entries
+                    for (key_index, (column_id, _column_name, transform)) in
+                        partition_columns.iter().enumerate()
+                    {
+                        sqlx::query(
+                            "INSERT INTO ducklake_partition_column (partition_id, table_id, partition_key_index, column_id, transform)
+                             VALUES (?, ?, ?, ?, ?)",
+                        )
+                        .bind(partition_id)
+                        .bind(table_id)
+                        .bind(key_index as i64)
+                        .bind(column_id)
+                        .bind(transform.as_deref().unwrap_or("identity"))
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                },
             }
 
             // Record change for conflict detection
@@ -1485,6 +1533,26 @@ impl MetadataWriter for SqliteMetadataWriter {
                 columns.push((name, col_type, nullable));
             }
             Ok(columns)
+        })
+    }
+
+    fn find_table_id(&self, schema_name: &str, table_name: &str) -> Result<Option<i64>> {
+        block_on(async {
+            let row = sqlx::query(
+                "SELECT t.table_id FROM ducklake_table t
+                 JOIN ducklake_schema s ON t.schema_id = s.schema_id
+                 WHERE s.schema_name = ? AND s.end_snapshot IS NULL
+                   AND t.table_name = ? AND t.end_snapshot IS NULL",
+            )
+            .bind(schema_name)
+            .bind(table_name)
+            .fetch_optional(&self.pool)
+            .await?;
+
+            match row {
+                Some(r) => Ok(Some(r.try_get(0)?)),
+                None => Ok(None),
+            }
         })
     }
 
@@ -1630,12 +1698,7 @@ impl MetadataWriter for SqliteMetadataWriter {
         })
     }
 
-    fn set_column_comment(
-        &self,
-        table_id: i64,
-        column_name: &str,
-        comment: &str,
-    ) -> Result<i64> {
+    fn set_column_comment(&self, table_id: i64, column_name: &str, comment: &str) -> Result<i64> {
         block_on(async {
             let mut tx = self.pool.begin().await?;
 
@@ -1710,6 +1773,311 @@ impl MetadataWriter for SqliteMetadataWriter {
 
             tx.commit().await?;
             Ok(snapshot_id)
+        })
+    }
+
+    fn get_data_inlining_row_limit(&self) -> Result<Option<i64>> {
+        block_on(async {
+            let row = sqlx::query(
+                "SELECT value FROM ducklake_metadata WHERE key = 'data_inlining_row_limit' AND scope IS NULL",
+            )
+            .fetch_optional(&self.pool)
+            .await?;
+
+            match row {
+                Some(r) => {
+                    let val: String = r.try_get(0)?;
+                    match val.parse::<i64>() {
+                        Ok(limit) if limit > 0 => Ok(Some(limit)),
+                        _ => Ok(None),
+                    }
+                },
+                None => Ok(None),
+            }
+        })
+    }
+
+    fn get_inlined_row_count(&self, table_id: i64) -> Result<i64> {
+        block_on(async {
+            let table_info = sqlx::query(
+                "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?",
+            )
+            .bind(table_id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+            let Some(info_row) = table_info else {
+                return Ok(0);
+            };
+
+            let inlined_table_name: String = info_row.try_get(0)?;
+
+            // Check if table exists
+            let exists =
+                sqlx::query("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?")
+                    .bind(&inlined_table_name)
+                    .fetch_one(&self.pool)
+                    .await?;
+            let count: i64 = exists.try_get(0)?;
+            if count == 0 {
+                return Ok(0);
+            }
+
+            let count_sql = format!(
+                "SELECT COUNT(*) FROM \"{}\" WHERE end_snapshot IS NULL",
+                inlined_table_name
+            );
+            let row = sqlx::query(&count_sql).fetch_one(&self.pool).await?;
+            Ok(row.try_get(0)?)
+        })
+    }
+
+    fn store_inlined_data(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        columns: &[ColumnDef],
+        rows: &[InlinedDataRow],
+    ) -> Result<i64> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+
+            let inlined_table_name = format!("ducklake_inlined_data_{}", table_id);
+
+            // Check if inline data table exists; create if not
+            let exists =
+                sqlx::query("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?")
+                    .bind(&inlined_table_name)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            let table_exists: i64 = exists.try_get(0)?;
+
+            if table_exists == 0 {
+                // Create the inline data table matching DuckDB's layout:
+                // row_id, begin_snapshot, end_snapshot, then user columns
+                let mut create_sql = format!(
+                    "CREATE TABLE \"{}\" (row_id INTEGER, begin_snapshot INTEGER, end_snapshot INTEGER",
+                    inlined_table_name
+                );
+                for col in columns {
+                    // Use TEXT for all columns in SQLite (dynamic typing)
+                    create_sql.push_str(&format!(", \"{}\" TEXT", col.name()));
+                }
+                create_sql.push(')');
+                sqlx::query(&create_sql).execute(&mut *tx).await?;
+
+                // Register in ducklake_inlined_data_tables
+                sqlx::query(
+                    "INSERT INTO ducklake_inlined_data_tables (table_id, table_name, schema_version) VALUES (?, ?, 1)",
+                )
+                .bind(table_id)
+                .bind(&inlined_table_name)
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            // Get next row_id
+            let next_row_id_sql = format!(
+                "SELECT COALESCE(MAX(row_id), -1) + 1 FROM \"{}\"",
+                inlined_table_name
+            );
+            let next_row_id_row = sqlx::query(&next_row_id_sql).fetch_one(&mut *tx).await?;
+            let mut row_id: i64 = next_row_id_row.try_get(0)?;
+
+            // Build column names for the INSERT
+            let col_names: Vec<String> = columns
+                .iter()
+                .map(|c| format!("\"{}\"", c.name()))
+                .collect();
+            let placeholders: Vec<&str> = (0..columns.len()).map(|_| "?").collect();
+            let insert_sql = format!(
+                "INSERT INTO \"{}\" (row_id, begin_snapshot, {}) VALUES (?, ?, {})",
+                inlined_table_name,
+                col_names.join(", "),
+                placeholders.join(", ")
+            );
+
+            let mut total_rows: i64 = 0;
+            for inlined_row in rows {
+                let mut query = sqlx::query(&insert_sql).bind(row_id).bind(snapshot_id);
+
+                // Bind each column value
+                for col in columns {
+                    let value = inlined_row
+                        .column_names
+                        .iter()
+                        .position(|n| n == col.name())
+                        .and_then(|pos| inlined_row.values.get(pos))
+                        .and_then(|v| v.clone());
+                    query = query.bind(value);
+                }
+
+                query.execute(&mut *tx).await?;
+                row_id += 1;
+                total_rows += 1;
+            }
+
+            tx.commit().await?;
+            Ok(total_rows)
+        })
+    }
+
+    fn read_inlined_data(&self, table_id: i64) -> Result<Vec<InlinedDataRow>> {
+        block_on(async {
+            let table_info = sqlx::query(
+                "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?",
+            )
+            .bind(table_id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+            let Some(info_row) = table_info else {
+                return Ok(Vec::new());
+            };
+
+            let inlined_table_name: String = info_row.try_get(0)?;
+
+            // Check if table exists
+            let exists =
+                sqlx::query("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?")
+                    .bind(&inlined_table_name)
+                    .fetch_one(&self.pool)
+                    .await?;
+            let count: i64 = exists.try_get(0)?;
+            if count == 0 {
+                return Ok(Vec::new());
+            }
+
+            // Get column names
+            let pragma_query = format!("PRAGMA table_info('{}')", inlined_table_name);
+            let columns = sqlx::query(&pragma_query).fetch_all(&self.pool).await?;
+
+            let user_columns: Vec<String> = columns
+                .iter()
+                .filter_map(|row| {
+                    let name: String = row.try_get::<String, _>(1).ok()?;
+                    if name == "row_id" || name == "begin_snapshot" || name == "end_snapshot" {
+                        None
+                    } else {
+                        Some(name)
+                    }
+                })
+                .collect();
+
+            if user_columns.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            // Query active rows
+            let col_list: Vec<String> = user_columns
+                .iter()
+                .map(|c| format!("CAST(\"{}\" AS TEXT)", c))
+                .collect();
+            let select_sql = format!(
+                "SELECT {} FROM \"{}\" WHERE end_snapshot IS NULL",
+                col_list.join(", "),
+                inlined_table_name,
+            );
+
+            let rows = sqlx::query(&select_sql).fetch_all(&self.pool).await?;
+
+            let mut result = Vec::new();
+            for row in &rows {
+                let mut values = Vec::new();
+                for i in 0..user_columns.len() {
+                    let val: Option<String> = row.try_get(i)?;
+                    values.push(val);
+                }
+                result.push(InlinedDataRow {
+                    column_names: user_columns.clone(),
+                    values,
+                });
+            }
+
+            Ok(result)
+        })
+    }
+
+    fn clear_inlined_data(&self, table_id: i64, snapshot_id: i64) -> Result<()> {
+        block_on(async {
+            let table_info = sqlx::query(
+                "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?",
+            )
+            .bind(table_id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+            let Some(info_row) = table_info else {
+                return Ok(());
+            };
+
+            let inlined_table_name: String = info_row.try_get(0)?;
+
+            // Set end_snapshot on all active rows
+            let update_sql = format!(
+                "UPDATE \"{}\" SET end_snapshot = ? WHERE end_snapshot IS NULL",
+                inlined_table_name
+            );
+            sqlx::query(&update_sql)
+                .bind(snapshot_id)
+                .execute(&self.pool)
+                .await?;
+
+            Ok(())
+        })
+    }
+
+    fn register_file_partition_value(
+        &self,
+        data_file_id: i64,
+        table_id: i64,
+        partition_key_index: i32,
+        partition_value: Option<&str>,
+    ) -> Result<()> {
+        block_on(async {
+            sqlx::query(
+                "INSERT INTO ducklake_file_partition_value (data_file_id, table_id, partition_key_index, partition_value)
+                 VALUES (?, ?, ?, ?)",
+            )
+            .bind(data_file_id)
+            .bind(table_id)
+            .bind(partition_key_index as i64)
+            .bind(partition_value)
+            .execute(&self.pool)
+            .await?;
+            Ok(())
+        })
+    }
+
+    fn get_active_partition_columns(
+        &self,
+        table_id: i64,
+    ) -> Result<Vec<(String, i64, Option<String>)>> {
+        block_on(async {
+            let rows = sqlx::query(
+                "SELECT c.column_name, pc.column_id, pc.transform
+                 FROM ducklake_partition_info pi
+                 JOIN ducklake_partition_column pc
+                     ON pi.partition_id = pc.partition_id AND pi.table_id = pc.table_id
+                 JOIN ducklake_column c ON pc.column_id = c.column_id AND c.end_snapshot IS NULL
+                 WHERE pi.table_id = ? AND pi.end_snapshot IS NULL
+                 ORDER BY pc.partition_key_index",
+            )
+            .bind(table_id)
+            .fetch_all(&self.pool)
+            .await?;
+
+            let mut result = Vec::with_capacity(rows.len());
+            for row in rows {
+                let name: String = row.try_get(0)?;
+                let col_id: i64 = row.try_get(1)?;
+                let transform: Option<String> = row.try_get(2)?;
+                result.push((name, col_id, transform));
+            }
+            Ok(result)
         })
     }
 }
@@ -1882,8 +2250,10 @@ mod tests {
             .unwrap();
 
         // Create columns: id (column_id=1), name (column_id=2)
-        let columns =
-            vec![ColumnDef::new("id", "int64", false).unwrap(), ColumnDef::new("name", "varchar", true).unwrap()];
+        let columns = vec![
+            ColumnDef::new("id", "int64", false).unwrap(),
+            ColumnDef::new("name", "varchar", true).unwrap(),
+        ];
         let column_ids = writer.set_columns(table_id, &columns, snapshot_id).unwrap();
         assert_eq!(column_ids, vec![1, 2]);
 
@@ -1962,8 +2332,10 @@ mod tests {
             .unwrap();
 
         // Create columns: id (1), name (2)
-        let columns =
-            vec![ColumnDef::new("id", "int64", false).unwrap(), ColumnDef::new("name", "varchar", true).unwrap()];
+        let columns = vec![
+            ColumnDef::new("id", "int64", false).unwrap(),
+            ColumnDef::new("name", "varchar", true).unwrap(),
+        ];
         writer.set_columns(table_id, &columns, snapshot_id).unwrap();
 
         // Add a new column
@@ -2086,7 +2458,12 @@ mod tests {
 
         let result = writer.set_columns(table_id, &columns, snapshot_id);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Duplicate column name"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Duplicate column name")
+        );
     }
 
     /// P1-3: Column stats row should be initialized after ALTER TABLE AddColumn.
@@ -2101,8 +2478,10 @@ mod tests {
             .get_or_create_table(schema_id, "users", None, snapshot_id)
             .unwrap();
 
-        let columns =
-            vec![ColumnDef::new("id", "int64", false).unwrap(), ColumnDef::new("name", "varchar", true).unwrap()];
+        let columns = vec![
+            ColumnDef::new("id", "int64", false).unwrap(),
+            ColumnDef::new("name", "varchar", true).unwrap(),
+        ];
         writer.set_columns(table_id, &columns, snapshot_id).unwrap();
 
         // Add a new column
@@ -2152,8 +2531,10 @@ mod tests {
             .get_or_create_table(schema_id, "users", None, snapshot_id)
             .unwrap();
 
-        let columns =
-            vec![ColumnDef::new("id", "int64", false).unwrap(), ColumnDef::new("name", "varchar", true).unwrap()];
+        let columns = vec![
+            ColumnDef::new("id", "int64", false).unwrap(),
+            ColumnDef::new("name", "varchar", true).unwrap(),
+        ];
         let col_ids = writer.set_columns(table_id, &columns, snapshot_id).unwrap();
         assert_eq!(col_ids, vec![1, 2]);
 
@@ -2201,10 +2582,7 @@ mod tests {
             .await
             .unwrap()
         });
-        let names: Vec<String> = active_rows
-            .iter()
-            .map(|r| r.try_get(0).unwrap())
-            .collect();
+        let names: Vec<String> = active_rows.iter().map(|r| r.try_get(0).unwrap()).collect();
         assert_eq!(names, vec!["id", "name", "contact_email"]);
 
         // Verify column_id stability: email was added as id=3, renamed column should reuse id=3
@@ -2286,9 +2664,7 @@ mod tests {
         writer.set_columns(table_id, &columns, snapshot_id).unwrap();
 
         // Set a comment
-        let snap1 = writer
-            .set_table_comment(table_id, "First comment")
-            .unwrap();
+        let snap1 = writer.set_table_comment(table_id, "First comment").unwrap();
         assert!(snap1 > snapshot_id);
 
         // Verify

@@ -353,10 +353,9 @@ impl PostgresMetadataWriter {
             if let Some(row) = existing {
                 row.try_get(0)?
             } else {
-                let next_tid_row =
-                    sqlx::query("SELECT nextval('ducklake_table_id_seq')")
-                        .fetch_one(&mut *tx)
-                        .await?;
+                let next_tid_row = sqlx::query("SELECT nextval('ducklake_table_id_seq')")
+                    .fetch_one(&mut *tx)
+                    .await?;
                 let next_table_id: i64 = next_tid_row.try_get(0)?;
 
                 let table_path = format!("{}/", table_name);
@@ -651,10 +650,9 @@ impl MetadataWriter for PostgresMetadataWriter {
             } else {
                 format!("{}/", base_path)
             };
-            let next_tid_row =
-                sqlx::query("SELECT nextval('ducklake_table_id_seq')")
-                    .fetch_one(&mut *tx)
-                    .await?;
+            let next_tid_row = sqlx::query("SELECT nextval('ducklake_table_id_seq')")
+                .fetch_one(&mut *tx)
+                .await?;
             let next_table_id: i64 = next_tid_row.try_get(0)?;
 
             sqlx::query(
@@ -1599,12 +1597,7 @@ impl MetadataWriter for PostgresMetadataWriter {
         })
     }
 
-    fn set_column_comment(
-        &self,
-        table_id: i64,
-        column_name: &str,
-        comment: &str,
-    ) -> Result<i64> {
+    fn set_column_comment(&self, table_id: i64, column_name: &str, comment: &str) -> Result<i64> {
         block_on(async {
             let mut tx = self.pool.begin().await?;
 

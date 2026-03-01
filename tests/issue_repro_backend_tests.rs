@@ -43,10 +43,7 @@ mod postgres_tests {
     // Postgres ALTER TABLE tries to add already-existing columns during migration.
     // Test: call initialize_schema() twice on the same Postgres DB.
     #[tokio::test(flavor = "multi_thread")]
-    #[cfg_attr(
-        all(feature = "skip-tests-with-docker", target_os = "macos"),
-        ignore
-    )]
+    #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
     async fn test_issue_147_postgres_double_init_migration() {
         let (writer, _container) = create_writer().await;
 
@@ -77,10 +74,7 @@ mod postgres_tests {
     //
     // Two threads calling initialize_schema() simultaneously on Postgres can deadlock.
     #[tokio::test(flavor = "multi_thread")]
-    #[cfg_attr(
-        all(feature = "skip-tests-with-docker", target_os = "macos"),
-        ignore
-    )]
+    #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
     async fn test_issue_240_postgres_concurrent_init_deadlock() {
         let container = Postgres::default().start().await.unwrap();
         let host = "127.0.0.1";
@@ -94,13 +88,15 @@ mod postgres_tests {
         // Run initialize_schema() concurrently using spawn_blocking (needs Tokio runtime)
         let handle1 = tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Handle::current();
-            let writer = rt.block_on(PostgresMetadataWriter::new(&conn_str1))
+            let writer = rt
+                .block_on(PostgresMetadataWriter::new(&conn_str1))
                 .expect("Failed to create writer1");
             writer.initialize_schema()
         });
         let handle2 = tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Handle::current();
-            let writer = rt.block_on(PostgresMetadataWriter::new(&conn_str2))
+            let writer = rt
+                .block_on(PostgresMetadataWriter::new(&conn_str2))
                 .expect("Failed to create writer2");
             writer.initialize_schema()
         });
@@ -144,10 +140,7 @@ mod postgres_tests {
     // The DuckLake column_type is stored as a string — verify these complex type
     // strings round-trip correctly through Postgres.
     #[tokio::test(flavor = "multi_thread")]
-    #[cfg_attr(
-        all(feature = "skip-tests-with-docker", target_os = "macos"),
-        ignore
-    )]
+    #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
     async fn test_issue_591_postgres_complex_types() {
         let (writer, _container) = create_writer().await;
 
@@ -156,10 +149,16 @@ mod postgres_tests {
             ColumnDef::new("metadata", "STRUCT(name VARCHAR, age INTEGER)", true).unwrap(),
             ColumnDef::new("tags", "VARCHAR[]", true).unwrap(),
             ColumnDef::new("properties", "MAP(VARCHAR, VARCHAR)", true).unwrap(),
-            ColumnDef::new("nested", "STRUCT(items STRUCT(name VARCHAR, value DOUBLE)[])", true).unwrap(),
+            ColumnDef::new(
+                "nested",
+                "STRUCT(items STRUCT(name VARCHAR, value DOUBLE)[])",
+                true,
+            )
+            .unwrap(),
         ];
 
-        let result = writer.begin_write_transaction("main", "complex_table", &columns, WriteMode::Replace);
+        let result =
+            writer.begin_write_transaction("main", "complex_table", &columns, WriteMode::Replace);
         match &result {
             Ok(r) => {
                 assert_eq!(r.column_ids.len(), 5);
@@ -176,12 +175,18 @@ mod postgres_tests {
                 assert_eq!(active[3].0, "properties");
                 assert_eq!(active[3].1, "MAP(VARCHAR, VARCHAR)");
                 assert_eq!(active[4].0, "nested");
-                assert_eq!(active[4].1, "STRUCT(items STRUCT(name VARCHAR, value DOUBLE)[])");
+                assert_eq!(
+                    active[4].1,
+                    "STRUCT(items STRUCT(name VARCHAR, value DOUBLE)[])"
+                );
                 println!("Issue #591: Complex types stored and retrieved correctly from Postgres");
-            }
+            },
             Err(e) => {
-                panic!("Issue #591: Failed to create table with complex types on Postgres: {}", e);
-            }
+                panic!(
+                    "Issue #591: Failed to create table with complex types on Postgres: {}",
+                    e
+                );
+            },
         }
     }
 
@@ -192,10 +197,7 @@ mod postgres_tests {
     // DuckLake stores column names as VARCHAR values (not identifiers), so they
     // should not be truncated. Verify a 100-char column name is preserved.
     #[tokio::test(flavor = "multi_thread")]
-    #[cfg_attr(
-        all(feature = "skip-tests-with-docker", target_os = "macos"),
-        ignore
-    )]
+    #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
     async fn test_issue_619_postgres_long_column_names() {
         let (writer, _container) = create_writer().await;
 
@@ -208,13 +210,15 @@ mod postgres_tests {
             ColumnDef::new(&long_name, "varchar", true).unwrap(),
         ];
 
-        let result = writer.begin_write_transaction("main", "long_cols", &columns, WriteMode::Replace);
+        let result =
+            writer.begin_write_transaction("main", "long_cols", &columns, WriteMode::Replace);
         match &result {
             Ok(r) => {
                 let active = writer.get_active_columns(r.table_id).unwrap();
                 assert_eq!(active.len(), 2);
                 assert_eq!(
-                    active[1].0, long_name,
+                    active[1].0,
+                    long_name,
                     "Issue #619: Column name was truncated! Expected {} chars, got {} chars",
                     long_name.len(),
                     active[1].0.len()
@@ -223,10 +227,13 @@ mod postgres_tests {
                     "Issue #619: 100-char column name preserved correctly in Postgres (length={})",
                     active[1].0.len()
                 );
-            }
+            },
             Err(e) => {
-                panic!("Issue #619: Failed to create table with long column name on Postgres: {}", e);
-            }
+                panic!(
+                    "Issue #619: Failed to create table with long column name on Postgres: {}",
+                    e
+                );
+            },
         }
     }
 
@@ -238,10 +245,7 @@ mod postgres_tests {
     // VARCHAR string, so it should work. Verify "double" and "DOUBLE" type strings
     // round-trip correctly.
     #[tokio::test(flavor = "multi_thread")]
-    #[cfg_attr(
-        all(feature = "skip-tests-with-docker", target_os = "macos"),
-        ignore
-    )]
+    #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
     async fn test_issue_637_postgres_double_column_type() {
         let (writer, _container) = create_writer().await;
 
@@ -253,7 +257,8 @@ mod postgres_tests {
             ColumnDef::new("amount", "DOUBLE PRECISION", true).unwrap(),
         ];
 
-        let result = writer.begin_write_transaction("main", "doubles_table", &columns, WriteMode::Replace);
+        let result =
+            writer.begin_write_transaction("main", "doubles_table", &columns, WriteMode::Replace);
         match &result {
             Ok(r) => {
                 let active = writer.get_active_columns(r.table_id).unwrap();
@@ -267,10 +272,13 @@ mod postgres_tests {
                 assert_eq!(active[4].0, "amount");
                 assert_eq!(active[4].1, "DOUBLE PRECISION");
                 println!("Issue #637: DOUBLE type strings stored correctly in Postgres catalog");
-            }
+            },
             Err(e) => {
-                panic!("Issue #637: Failed to create table with DOUBLE columns on Postgres: {}", e);
-            }
+                panic!(
+                    "Issue #637: Failed to create table with DOUBLE columns on Postgres: {}",
+                    e
+                );
+            },
         }
     }
 
@@ -281,10 +289,7 @@ mod postgres_tests {
     // The original issue was about inlined data with Postgres catalog — we test that
     // metadata operations (multiple file registrations + stats) work correctly.
     #[tokio::test(flavor = "multi_thread")]
-    #[cfg_attr(
-        all(feature = "skip-tests-with-docker", target_os = "macos"),
-        ignore
-    )]
+    #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
     async fn test_issue_644_postgres_multiple_files_with_stats() {
         let (writer, _container) = create_writer().await;
 
@@ -403,10 +408,7 @@ mod mysql_tests {
     // If CREATE TABLE lacks IF NOT EXISTS, the second call to initialize_schema()
     // fails on MySQL.
     #[tokio::test(flavor = "multi_thread")]
-    #[cfg_attr(
-        all(feature = "skip-tests-with-docker", target_os = "macos"),
-        ignore
-    )]
+    #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
     async fn test_issue_214_mysql_second_init_fails() {
         let (writer, _container) = create_mysql_writer().await.unwrap();
 
@@ -429,7 +431,10 @@ mod mysql_tests {
         // Verify DB still works
         let snap = writer.create_snapshot().unwrap();
         assert!(snap >= 1);
-        println!("Issue #214: MySQL re-initialization succeeded (snapshot={})", snap);
+        println!(
+            "Issue #214: MySQL re-initialization succeeded (snapshot={})",
+            snap
+        );
     }
 
     // ==================== #288: Stats update fails on insert ====================
@@ -440,10 +445,7 @@ mod mysql_tests {
     // We test that our writer can register multiple data files with column stats
     // and that stats upserts work correctly on MySQL.
     #[tokio::test(flavor = "multi_thread")]
-    #[cfg_attr(
-        all(feature = "skip-tests-with-docker", target_os = "macos"),
-        ignore
-    )]
+    #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
     async fn test_issue_288_mysql_stats_update_on_insert() {
         let (writer, _container) = create_mysql_writer().await.unwrap();
 

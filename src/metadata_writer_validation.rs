@@ -5,7 +5,9 @@
 
 use crate::Result;
 use crate::error::DuckLakeError;
-use crate::metadata_writer::{AlterTableOp, ColumnDef, WriteMode, is_type_promotion_allowed};
+use crate::metadata_writer::{
+    AlterTableOp, ColumnDef, PartitionColumnDef, WriteMode, is_type_promotion_allowed,
+};
 
 /// DB-independent parsed column row for validation.
 #[derive(Debug, Clone)]
@@ -49,6 +51,11 @@ pub(crate) enum AlterTableAction {
         parent_column: Option<i64>,
         default_value_type: Option<String>,
         default_value_dialect: Option<String>,
+    },
+    /// Set partition columns (validated column references + column_ids).
+    SetPartitionedBy {
+        /// (column_id, column_name, transform) for each partition column
+        partition_columns: Vec<(i64, String, Option<String>)>,
     },
 }
 
@@ -152,6 +159,9 @@ pub(crate) fn validate_alter_table(
         AlterTableOp::DropNotNull {
             column_name,
         } => validate_drop_not_null(columns, column_name),
+        AlterTableOp::SetPartitionedBy {
+            partition_columns,
+        } => validate_set_partitioned_by(columns, partition_columns),
     }
 }
 
@@ -390,6 +400,37 @@ fn validate_drop_not_null(
     })
 }
 
+fn validate_set_partitioned_by(
+    columns: &[ActiveColumnInfo],
+    partition_columns: &[PartitionColumnDef],
+) -> Result<AlterTableAction> {
+    if partition_columns.is_empty() {
+        return Err(DuckLakeError::InvalidConfig(
+            "SET PARTITIONED BY requires at least one column".to_string(),
+        ));
+    }
+
+    let mut validated = Vec::with_capacity(partition_columns.len());
+    for pc in partition_columns {
+        let target = columns.iter().find(|c| c.column_name == pc.column_name);
+        let Some(target_col) = target else {
+            return Err(DuckLakeError::InvalidConfig(format!(
+                "Partition column '{}' not found in table",
+                pc.column_name
+            )));
+        };
+        validated.push((
+            target_col.column_id,
+            target_col.column_name.clone(),
+            pc.transform.clone(),
+        ));
+    }
+
+    Ok(AlterTableAction::SetPartitionedBy {
+        partition_columns: validated,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,16 +487,20 @@ mod tests {
     #[test]
     fn test_schema_evolution_new_nullable_column_ok() {
         let existing = vec![("id".into(), "int64".into(), false)];
-        let new =
-            vec![ColumnDef::new("id", "int64", false).unwrap(), ColumnDef::new("name", "varchar", true).unwrap()];
+        let new = vec![
+            ColumnDef::new("id", "int64", false).unwrap(),
+            ColumnDef::new("name", "varchar", true).unwrap(),
+        ];
         assert!(validate_schema_evolution(&existing, &new, WriteMode::Append).is_ok());
     }
 
     #[test]
     fn test_schema_evolution_new_non_nullable_column_fails() {
         let existing = vec![("id".into(), "int64".into(), false)];
-        let new =
-            vec![ColumnDef::new("id", "int64", false).unwrap(), ColumnDef::new("name", "varchar", false).unwrap()];
+        let new = vec![
+            ColumnDef::new("id", "int64", false).unwrap(),
+            ColumnDef::new("name", "varchar", false).unwrap(),
+        ];
         let err = validate_schema_evolution(&existing, &new, WriteMode::Append).unwrap_err();
         assert!(err.to_string().contains("must be nullable"));
     }

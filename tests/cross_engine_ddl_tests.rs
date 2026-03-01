@@ -12,11 +12,7 @@
 //!
 //! Requires features: `write-sqlite`, `metadata-duckdb`, `metadata-sqlite`
 
-#![cfg(all(
-    feature = "write-sqlite",
-    feature = "metadata-duckdb",
-    feature = "metadata-sqlite"
-))]
+#![cfg(all(feature = "write-sqlite", feature = "metadata-duckdb", feature = "metadata-sqlite"))]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -29,8 +25,8 @@ use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 
 use datafusion_ducklake::{
-    DuckLakeCatalog, DuckLakeTableWriter, DuckdbMetadataProvider, MetadataProvider,
-    MetadataWriter, SqliteMetadataProvider, SqliteMetadataWriter,
+    DuckLakeCatalog, DuckLakeTableWriter, DuckdbMetadataProvider, MetadataProvider, MetadataWriter,
+    SqliteMetadataProvider, SqliteMetadataWriter,
 };
 
 // ==================== Setup helpers ====================
@@ -164,7 +160,9 @@ impl DuckDbConn {
         let attach_path = format!("ducklake:{}", catalog_path.display());
         conn.execute(&format!("ATTACH '{}' AS ducklake;", attach_path), [])
             .unwrap();
-        DuckDbConn { conn }
+        DuckDbConn {
+            conn,
+        }
     }
 
     fn open_with_data_path(catalog_path: &Path, data_path: &Path) -> Self {
@@ -181,7 +179,9 @@ impl DuckDbConn {
             [],
         )
         .unwrap();
-        DuckDbConn { conn }
+        DuckDbConn {
+            conn,
+        }
     }
 
     fn execute(&self, sql: &str) {
@@ -315,7 +315,7 @@ fn arrow_value_to_string(array: &dyn Array, idx: usize) -> String {
                 .unwrap()
                 .value(idx);
             format!("{val}")
-        }
+        },
         DataType::Utf8 => array
             .as_any()
             .downcast_ref::<StringArray>()
@@ -439,11 +439,7 @@ async fn cross_engine_view_create_drop_lifecycle() {
         .unwrap()
         .unwrap();
     let (view_id, _) = writer
-        .create_view(
-            schema_meta.schema_id,
-            "temp_view",
-            "SELECT id FROM users",
-        )
+        .create_view(schema_meta.schema_id, "temp_view", "SELECT id FROM users")
         .unwrap();
 
     // Verify view exists
@@ -626,7 +622,11 @@ async fn cross_engine_duckdb_creates_view_df_renames() {
 
     // DF reads the renamed view
     let ctx = open_readonly_df_sqlite(&env.catalog_db_path).await;
-    let rows = df_query(&ctx, "SELECT name FROM ducklake.main.renamed_view ORDER BY name").await;
+    let rows = df_query(
+        &ctx,
+        "SELECT name FROM ducklake.main.renamed_view ORDER BY name",
+    )
+    .await;
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[0][0], "Alice");
 
@@ -711,11 +711,7 @@ async fn cross_engine_df_drops_table_df_confirms() {
 
     // Verify table exists
     let ctx = open_readonly_df_sqlite(&env.catalog_db_path).await;
-    let rows = df_query(
-        &ctx,
-        "SELECT COUNT(*) FROM ducklake.main.to_drop",
-    )
-    .await;
+    let rows = df_query(&ctx, "SELECT COUNT(*) FROM ducklake.main.to_drop").await;
     assert_eq!(rows[0][0], "3");
 
     // DataFusion drops the table
@@ -908,7 +904,7 @@ async fn cross_engine_drop_nonempty_schema_without_cascade_fails() {
                 "Error should mention CASCADE or dependencies, got: {}",
                 err_msg
             );
-        }
+        },
         Err(e) => {
             let err_msg = e.to_string();
             assert!(
@@ -918,7 +914,7 @@ async fn cross_engine_drop_nonempty_schema_without_cascade_fails() {
                 "Error should mention CASCADE or dependencies, got: {}",
                 err_msg
             );
-        }
+        },
     }
 
     // Schema should still exist
@@ -1054,7 +1050,12 @@ async fn cross_engine_duckdb_create_drop_schema_roundtrip() {
 
     // DF confirms schema exists
     let ctx = open_readonly_df_duckdb(&env.catalog_path);
-    assert!(ctx.catalog("ducklake").unwrap().schema("temp_schema").is_some());
+    assert!(
+        ctx.catalog("ducklake")
+            .unwrap()
+            .schema("temp_schema")
+            .is_some()
+    );
 
     // DuckDB drops the schema
     duckdb.execute("DROP SCHEMA ducklake.temp_schema CASCADE");
@@ -1062,7 +1063,12 @@ async fn cross_engine_duckdb_create_drop_schema_roundtrip() {
 
     // DF confirms it's gone
     let ctx2 = open_readonly_df_duckdb(&env.catalog_path);
-    assert!(ctx2.catalog("ducklake").unwrap().schema("temp_schema").is_none());
+    assert!(
+        ctx2.catalog("ducklake")
+            .unwrap()
+            .schema("temp_schema")
+            .is_none()
+    );
 }
 
 /// Schema name validation rejects empty names.
@@ -1077,10 +1083,10 @@ async fn cross_engine_create_schema_empty_name_fails() {
         Ok(df) => {
             let exec = df.collect().await;
             assert!(exec.is_err(), "Empty schema name should fail");
-        }
+        },
         Err(_) => {
             // Parse-time failure is expected
-        }
+        },
     }
 }
 
@@ -1125,9 +1131,7 @@ async fn cross_engine_full_ddl_lifecycle_native() {
     // Step 1: DuckDB creates a schema with tables and views
     let duckdb = DuckDbConn::open_native(&env.catalog_path);
     duckdb.execute("CREATE SCHEMA ducklake.lifecycle");
-    duckdb.execute(
-        "CREATE TABLE ducklake.lifecycle.products (id INT, name VARCHAR, price DOUBLE)",
-    );
+    duckdb.execute("CREATE TABLE ducklake.lifecycle.products (id INT, name VARCHAR, price DOUBLE)");
     duckdb.execute(
         "INSERT INTO ducklake.lifecycle.products VALUES (1, 'Widget', 9.99), (2, 'Gadget', 19.99)",
     );

@@ -9,11 +9,7 @@
 //!
 //! Requires features: `write-sqlite`, `metadata-duckdb`, `metadata-sqlite`
 
-#![cfg(all(
-    feature = "write-sqlite",
-    feature = "metadata-duckdb",
-    feature = "metadata-sqlite"
-))]
+#![cfg(all(feature = "write-sqlite", feature = "metadata-duckdb", feature = "metadata-sqlite"))]
 
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
@@ -145,12 +141,11 @@ impl DuckDbConn {
         conn.execute("INSTALL ducklake;", []).unwrap();
         conn.execute("LOAD ducklake;", []).unwrap();
         let attach_path = format!("ducklake:sqlite:{}", catalog_db_path.display());
-        conn.execute(
-            &format!("ATTACH '{}' AS ducklake;", attach_path),
-            [],
-        )
-        .unwrap();
-        DuckDbConn { conn }
+        conn.execute(&format!("ATTACH '{}' AS ducklake;", attach_path), [])
+            .unwrap();
+        DuckDbConn {
+            conn,
+        }
     }
 
     fn open_native(catalog_path: &Path) -> Self {
@@ -158,12 +153,11 @@ impl DuckDbConn {
         conn.execute("INSTALL ducklake;", []).unwrap();
         conn.execute("LOAD ducklake;", []).unwrap();
         let attach_path = format!("ducklake:{}", catalog_path.display());
-        conn.execute(
-            &format!("ATTACH '{}' AS ducklake;", attach_path),
-            [],
-        )
-        .unwrap();
-        DuckDbConn { conn }
+        conn.execute(&format!("ATTACH '{}' AS ducklake;", attach_path), [])
+            .unwrap();
+        DuckDbConn {
+            conn,
+        }
     }
 
     fn open_with_data_path(catalog_path: &Path, data_path: &Path) -> Self {
@@ -180,7 +174,9 @@ impl DuckDbConn {
             [],
         )
         .unwrap();
-        DuckDbConn { conn }
+        DuckDbConn {
+            conn,
+        }
     }
 
     fn execute(&self, sql: &str) {
@@ -493,11 +489,7 @@ async fn test_duckdb_drop_not_null_df_reads() {
 
     // DataFusion should see the NULL row
     let ctx = open_df_duckdb(&env.catalog_path);
-    let rows = df_query(
-        &ctx,
-        "SELECT name FROM ducklake.main.people WHERE id = 4",
-    )
-    .await;
+    let rows = df_query(&ctx, "SELECT name FROM ducklake.main.people WHERE id = 4").await;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][0], "NULL");
 }
@@ -517,8 +509,7 @@ async fn test_df_set_table_comment_duckdb_reads() {
 
     // DuckDB should see the comment
     let duckdb = DuckDbConn::open(&env.catalog_db_path);
-    let rows =
-        duckdb.query("SELECT comment FROM duckdb_tables() WHERE table_name = 'people'");
+    let rows = duckdb.query("SELECT comment FROM duckdb_tables() WHERE table_name = 'people'");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][0], "A table of people");
 }
@@ -533,8 +524,7 @@ async fn test_duckdb_set_table_comment_df_reads() {
     duckdb.execute("COMMENT ON TABLE ducklake.main.people IS 'People directory'");
 
     // Re-read from DuckDB to confirm
-    let rows =
-        duckdb.query("SELECT comment FROM duckdb_tables() WHERE table_name = 'people'");
+    let rows = duckdb.query("SELECT comment FROM duckdb_tables() WHERE table_name = 'people'");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][0], "People directory");
 }
@@ -606,9 +596,7 @@ async fn test_multiple_alter_operations_data_intact() {
             },
         )
         .unwrap();
-    writer
-        .set_table_comment(table_id, "People table")
-        .unwrap();
+    writer.set_table_comment(table_id, "People table").unwrap();
     writer
         .set_column_comment(table_id, "id", "Primary key")
         .unwrap();

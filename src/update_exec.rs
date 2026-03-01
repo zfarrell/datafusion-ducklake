@@ -41,7 +41,9 @@ use crate::metadata_provider::DuckLakeTableFile;
 use crate::metadata_writer::{DataFileInfo, DeleteFileInfo, MetadataWriter};
 use crate::path_resolver::join_paths;
 use crate::table::delete_file_schema;
-use crate::table_writer::{build_schema_with_field_ids, calculate_footer_size_from_bytes, cleanup_orphaned_files};
+use crate::table_writer::{
+    build_schema_with_field_ids, calculate_footer_size_from_bytes, cleanup_orphaned_files,
+};
 
 /// Schema for the output of update operations (count of rows updated)
 fn make_update_count_schema() -> SchemaRef {
@@ -430,7 +432,9 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                     DeleteFileInfo::new(data_file_id, &delete_file_name, file_size, update_count)
                         .with_footer_size(footer_size);
 
-                if let Err(e) = writer.register_delete_file(table_id, snapshot_id, &delete_file_info) {
+                if let Err(e) =
+                    writer.register_delete_file(table_id, snapshot_id, &delete_file_info)
+                {
                     cleanup_orphaned_files(&*object_store, &uploaded_files).await;
                     return Err(DataFusionError::External(Box::new(e)));
                 }
@@ -448,12 +452,14 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                     crate::path_resolver::parse_object_store_url(&data_path_str)
                         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-                let table_key = join_paths(&join_paths(&base_key_path, &schema_name)?, &table_name)?;
+                let table_key =
+                    join_paths(&join_paths(&base_key_path, &schema_name)?, &table_name)?;
                 let object_key = join_paths(&table_key, &data_file_name)?;
                 let data_object_path = ObjectPath::from(object_key.trim_start_matches('/'));
 
                 // Build schema with field IDs for DuckDB compatibility
-                let write_schema = Arc::new(build_schema_with_field_ids(&table_schema, &column_ids));
+                let write_schema =
+                    Arc::new(build_schema_with_field_ids(&table_schema, &column_ids));
 
                 // Write all updated rows to a single Parquet file
                 let props = WriterProperties::builder()
@@ -465,7 +471,8 @@ impl ExecutionPlan for DuckLakeUpdateExec {
 
                 let mut total_records: i64 = 0;
                 for batch in &updated_batches {
-                    let batch_with_ids = RecordBatch::try_new(write_schema.clone(), batch.columns().to_vec())?;
+                    let batch_with_ids =
+                        RecordBatch::try_new(write_schema.clone(), batch.columns().to_vec())?;
                     total_records += batch_with_ids.num_rows() as i64;
                     arrow_writer
                         .write(&batch_with_ids)

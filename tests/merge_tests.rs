@@ -11,11 +11,7 @@
 //!
 //! Requires features: `write-sqlite`, `metadata-duckdb`, `metadata-sqlite`
 
-#![cfg(all(
-    feature = "write-sqlite",
-    feature = "metadata-duckdb",
-    feature = "metadata-sqlite"
-))]
+#![cfg(all(feature = "write-sqlite", feature = "metadata-duckdb", feature = "metadata-sqlite"))]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -43,10 +39,7 @@ struct MergeTestEnv {
 }
 
 /// Create a fresh SQLite-backed DuckLake catalog with initial data.
-async fn setup_merge_env(
-    batches: &[RecordBatch],
-    table_name: &str,
-) -> MergeTestEnv {
+async fn setup_merge_env(batches: &[RecordBatch], table_name: &str) -> MergeTestEnv {
     let temp_dir = TempDir::new().expect("create temp dir");
     let catalog_db_path = temp_dir.path().join("catalog.db");
     let data_path = temp_dir.path().join("data");
@@ -132,23 +125,23 @@ fn arrow_value_to_string(array: &dyn arrow::array::Array, idx: usize) -> String 
         DataType::Int32 => {
             let a = array.as_any().downcast_ref::<Int32Array>().unwrap();
             a.value(idx).to_string()
-        }
+        },
         DataType::Int64 => {
             let a = array.as_any().downcast_ref::<Int64Array>().unwrap();
             a.value(idx).to_string()
-        }
+        },
         DataType::UInt64 => {
             let a = array.as_any().downcast_ref::<UInt64Array>().unwrap();
             a.value(idx).to_string()
-        }
+        },
         DataType::Utf8 => {
             let a = array.as_any().downcast_ref::<StringArray>().unwrap();
             a.value(idx).to_string()
-        }
+        },
         DataType::Float64 => {
             let a = array.as_any().downcast_ref::<Float64Array>().unwrap();
             format!("{}", a.value(idx))
-        }
+        },
         other => format!("<unsupported:{other:?}>"),
     }
 }
@@ -232,7 +225,13 @@ async fn merge_upsert() {
     // Execute merge
     let state = ctx.state();
     let plan = ducklake_table
-        .merge(&state, vec![source.clone()], join_keys, matched_action, true)
+        .merge(
+            &state,
+            vec![source.clone()],
+            join_keys,
+            matched_action,
+            true,
+        )
         .await
         .expect("merge should succeed");
 
@@ -459,7 +458,9 @@ impl DuckDbConn {
             [],
         )
         .expect("attach ducklake catalog with data path");
-        DuckDbConn { conn }
+        DuckDbConn {
+            conn,
+        }
     }
 
     fn execute(&self, sql: &str) {
@@ -514,20 +515,14 @@ async fn cross_engine_duckdb_merge_df_read() {
 
     // DuckDB creates and populates the catalog
     let duckdb = DuckDbConn::open_with_data_path(&catalog_path, &data_path);
-    duckdb.execute(
-        "CREATE TABLE ducklake.main.target (id INTEGER, name VARCHAR, value INTEGER)",
-    );
+    duckdb.execute("CREATE TABLE ducklake.main.target (id INTEGER, name VARCHAR, value INTEGER)");
     duckdb.execute(
         "INSERT INTO ducklake.main.target VALUES (1, 'Alice', 100), (2, 'Bob', 200), (3, 'Charlie', 300)",
     );
 
     // Create a source table for MERGE
-    duckdb.execute(
-        "CREATE TABLE ducklake.main.source (id INTEGER, name VARCHAR, value INTEGER)",
-    );
-    duckdb.execute(
-        "INSERT INTO ducklake.main.source VALUES (2, 'Bob', 250), (4, 'Dave', 400)",
-    );
+    duckdb.execute("CREATE TABLE ducklake.main.source (id INTEGER, name VARCHAR, value INTEGER)");
+    duckdb.execute("INSERT INTO ducklake.main.source VALUES (2, 'Bob', 250), (4, 'Dave', 400)");
 
     // Execute MERGE in DuckDB
     duckdb.execute(
@@ -581,19 +576,14 @@ async fn cross_engine_duckdb_merge_delete_df_read() {
     std::fs::create_dir_all(&data_path).unwrap();
 
     let duckdb = DuckDbConn::open_with_data_path(&catalog_path, &data_path);
-    duckdb.execute(
-        "CREATE TABLE ducklake.main.target (id INTEGER, name VARCHAR, value INTEGER)",
-    );
+    duckdb.execute("CREATE TABLE ducklake.main.target (id INTEGER, name VARCHAR, value INTEGER)");
     duckdb.execute(
         "INSERT INTO ducklake.main.target VALUES (1, 'Alice', 100), (2, 'Bob', 200), (3, 'Charlie', 300)",
     );
 
-    duckdb.execute(
-        "CREATE TABLE ducklake.main.to_delete (id INTEGER, name VARCHAR, value INTEGER)",
-    );
-    duckdb.execute(
-        "INSERT INTO ducklake.main.to_delete VALUES (2, 'Bob', 0)",
-    );
+    duckdb
+        .execute("CREATE TABLE ducklake.main.to_delete (id INTEGER, name VARCHAR, value INTEGER)");
+    duckdb.execute("INSERT INTO ducklake.main.to_delete VALUES (2, 'Bob', 0)");
 
     // MERGE with DELETE for matched rows
     duckdb.execute(
@@ -603,8 +593,8 @@ async fn cross_engine_duckdb_merge_delete_df_read() {
     );
 
     // Read via DataFusion
-    let provider = DuckdbMetadataProvider::new(catalog_path.to_str().unwrap())
-        .expect("create provider");
+    let provider =
+        DuckdbMetadataProvider::new(catalog_path.to_str().unwrap()).expect("create provider");
     let catalog = DuckLakeCatalog::new(provider).expect("create catalog");
     let ctx = SessionContext::new();
     ctx.register_catalog("ducklake", Arc::new(catalog));

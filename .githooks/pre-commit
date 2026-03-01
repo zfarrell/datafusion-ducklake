@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Pre-commit hook: ensure all committed code is rustfmt-formatted.
+
+CARGO_FMT="/home/zac/.cargo/bin/cargo fmt"
+
+# Check if code is already formatted
+if $CARGO_FMT -- --check >/dev/null 2>&1; then
+    exit 0
+fi
+
+# Auto-fix formatting and re-stage changed files
+echo "pre-commit: rustfmt found unformatted code, fixing..."
+$CARGO_FMT
+git add -u
+echo "pre-commit: formatted and re-staged."

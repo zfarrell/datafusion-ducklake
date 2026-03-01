@@ -41,6 +41,7 @@ use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
 
 use crate::Result;
+use crate::metadata_provider::InlinedDataRow;
 use crate::metadata_writer::{
     ColumnDef, ColumnStatInfo, DataFileInfo, MetadataWriter, WriteMode, WriteResult,
 };
@@ -88,6 +89,35 @@ impl DuckLakeTableWriter {
             table_key,
             file_name.clone(),
             file_name,
+            true,
+            mode,
+        )
+    }
+
+    /// Begin a streaming write session for a specific partition using Hive-style paths.
+    ///
+    /// Creates a file at `<table_key>/<partition_dir>/<uuid>.parquet` where
+    /// `partition_dir` is a Hive-style path like `category=A/year=2024`.
+    pub fn begin_write_partitioned(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        arrow_schema: &Schema,
+        partition_dir: &str,
+        mode: WriteMode,
+    ) -> Result<TableWriteSession> {
+        let table_key = join_paths(&join_paths(&self.base_key_path, schema_name)?, table_name)?;
+        let partition_key = join_paths(&table_key, partition_dir)?;
+        let file_name = format!("{}.parquet", Uuid::new_v4());
+        // Catalog path includes the partition directory
+        let catalog_path = join_paths(partition_dir, &file_name)?;
+        self.begin_write_internal(
+            schema_name,
+            table_name,
+            arrow_schema,
+            partition_key,
+            file_name,
+            catalog_path,
             true,
             mode,
         )
@@ -206,6 +236,258 @@ impl DuckLakeTableWriter {
         }
 
         session.finish().await
+    }
+
+    /// Write data, inlining small inserts into the catalog database when possible.
+    ///
+    /// If the `data_inlining_row_limit` option is set and the total row count
+    /// (existing inlined + new rows) is within the limit, data is stored directly
+    /// in the catalog database. Otherwise, any existing inlined data is flushed
+    /// to Parquet and the new data is also written to Parquet.
+    pub async fn write_or_inline(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        arrow_schema: &Schema,
+        batches: &[RecordBatch],
+        mode: WriteMode,
+    ) -> Result<WriteResult> {
+        if batches.is_empty() {
+            return Err(crate::error::DuckLakeError::InvalidConfig(
+                "No batches to write".to_string(),
+            ));
+        }
+
+        let total_new_rows: i64 = batches.iter().map(|b| b.num_rows() as i64).sum();
+
+        // Only try inlining for Append mode
+        if mode == WriteMode::Append {
+            if let Some(limit) = self.metadata.get_data_inlining_row_limit()? {
+                if limit > 0 {
+                    let columns = arrow_schema_to_column_defs(arrow_schema)?;
+                    let setup = self.metadata.begin_write_transaction(
+                        schema_name,
+                        table_name,
+                        &columns,
+                        mode,
+                    )?;
+
+                    let current_inline = self.metadata.get_inlined_row_count(setup.table_id)?;
+
+                    if current_inline + total_new_rows <= limit {
+                        // Inline path: store data directly in catalog
+                        let rows = batches_to_inlined_rows(batches, arrow_schema);
+                        let stored = self.metadata.store_inlined_data(
+                            setup.table_id,
+                            setup.snapshot_id,
+                            &columns,
+                            &rows,
+                        )?;
+                        return Ok(WriteResult {
+                            snapshot_id: setup.snapshot_id,
+                            table_id: setup.table_id,
+                            schema_id: setup.schema_id,
+                            files_written: 0,
+                            records_written: stored,
+                            last_data_file_id: -1,
+                        });
+                    }
+
+                    // Threshold exceeded: flush existing inline data + write new data to Parquet.
+                    // Use the setup we already have (snapshot, table, columns created).
+                    let schema_with_ids =
+                        Arc::new(build_schema_with_field_ids(arrow_schema, &setup.column_ids));
+
+                    // Collect all data: existing inline + new batches
+                    let mut all_batches: Vec<RecordBatch> = Vec::new();
+
+                    if current_inline > 0 {
+                        // Get existing inline data and convert to RecordBatch
+                        if let Ok(inline_rows) = self.get_inlined_data_as_batch(
+                            setup.table_id,
+                            setup.snapshot_id,
+                            arrow_schema,
+                        ) {
+                            all_batches.push(inline_rows);
+                        }
+                        // Clear the inlined data
+                        self.metadata
+                            .clear_inlined_data(setup.table_id, setup.snapshot_id)?;
+                    }
+
+                    all_batches.extend(batches.iter().cloned());
+
+                    // Write combined data to Parquet using the existing setup
+                    return self
+                        .write_parquet_with_setup(
+                            schema_name,
+                            &all_batches,
+                            &schema_with_ids,
+                            setup,
+                        )
+                        .await;
+                }
+            }
+        }
+
+        // Normal path (no inlining)
+        match mode {
+            WriteMode::Replace => self.write_table(schema_name, table_name, batches).await,
+            WriteMode::Append => self.append_table(schema_name, table_name, batches).await,
+        }
+    }
+
+    /// Force-flush inlined data for a table to Parquet.
+    ///
+    /// Reads all inlined rows from the catalog, writes them to a Parquet file,
+    /// and clears the inline data from the catalog database.
+    ///
+    /// Returns `WriteResult` with `records_written = 0` and `files_written = 0`
+    /// if the table has no inlined data.
+    pub async fn flush_inlined_data(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+    ) -> Result<WriteResult> {
+        // Look up the table to check if it has inlined data
+        let table_id = self
+            .metadata
+            .find_table_id(schema_name, table_name)?
+            .ok_or_else(|| {
+                crate::error::DuckLakeError::InvalidConfig(format!(
+                    "Table {}.{} not found",
+                    schema_name, table_name
+                ))
+            })?;
+
+        let inline_rows = self.metadata.read_inlined_data(table_id)?;
+        if inline_rows.is_empty() {
+            return Ok(WriteResult {
+                snapshot_id: -1,
+                table_id,
+                schema_id: -1,
+                files_written: 0,
+                records_written: 0,
+                last_data_file_id: -1,
+            });
+        }
+
+        // Get the table's column schema
+        let active_columns = self.metadata.get_active_columns(table_id)?;
+        let column_defs: Vec<ColumnDef> = active_columns
+            .iter()
+            .map(|(name, dtype, nullable)| ColumnDef::new(name, dtype, *nullable))
+            .collect::<Result<Vec<_>>>()?;
+
+        let arrow_fields: Vec<Field> = active_columns
+            .iter()
+            .map(|(name, dtype, nullable)| {
+                let arrow_type = crate::types::ducklake_to_arrow_type(dtype)
+                    .unwrap_or(arrow::datatypes::DataType::Utf8);
+                Field::new(name, arrow_type, *nullable)
+            })
+            .collect();
+        let arrow_schema = Schema::new(arrow_fields);
+
+        // Begin a write transaction with the proper columns
+        let setup = self.metadata.begin_write_transaction(
+            schema_name,
+            table_name,
+            &column_defs,
+            WriteMode::Append,
+        )?;
+
+        // Convert inline rows to RecordBatch
+        let batch = inlined_rows_to_batch(&inline_rows, &arrow_schema)?;
+        let schema_with_ids = Arc::new(build_schema_with_field_ids(
+            &arrow_schema,
+            &setup.column_ids,
+        ));
+
+        // Clear the inlined data
+        self.metadata
+            .clear_inlined_data(setup.table_id, setup.snapshot_id)?;
+
+        // Write to Parquet
+        self.write_parquet_with_setup(schema_name, &[batch], &schema_with_ids, setup)
+            .await
+    }
+
+    /// Get inlined data from the catalog and convert to a RecordBatch.
+    fn get_inlined_data_as_batch(
+        &self,
+        table_id: i64,
+        _snapshot_id: i64,
+        arrow_schema: &Schema,
+    ) -> Result<RecordBatch> {
+        let rows = self.metadata.read_inlined_data(table_id)?;
+        if rows.is_empty() {
+            return Ok(RecordBatch::new_empty(Arc::new(arrow_schema.clone())));
+        }
+
+        inlined_rows_to_batch(&rows, arrow_schema)
+    }
+
+    /// Write batches to Parquet using an already-created write setup.
+    async fn write_parquet_with_setup(
+        &self,
+        schema_name: &str,
+        batches: &[RecordBatch],
+        schema_with_ids: &SchemaRef,
+        setup: crate::metadata_writer::WriteSetupResult,
+    ) -> Result<WriteResult> {
+        let table_key = join_paths(
+            &join_paths(&self.base_key_path, schema_name)?,
+            // Use table_id-based path since we don't have table_name separately
+            &format!("t{}/", setup.table_id),
+        )?;
+        let file_name = format!("{}.parquet", Uuid::new_v4());
+        let object_path_str = join_paths(&table_key, &file_name)?;
+        let object_path = ObjectPath::from(object_path_str.trim_start_matches('/'));
+
+        let props = WriterProperties::builder()
+            .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
+            .build();
+        let mut writer = ArrowWriter::try_new(Vec::new(), schema_with_ids.clone(), Some(props))?;
+
+        let mut row_count: i64 = 0;
+        for batch in batches {
+            let batch_with_ids =
+                RecordBatch::try_new(schema_with_ids.clone(), batch.columns().to_vec())?;
+            writer.write(&batch_with_ids)?;
+            row_count += batch.num_rows() as i64;
+        }
+
+        writer.flush()?;
+        let column_stats = extract_column_stats(writer.flushed_row_groups(), &setup.column_ids);
+        let buffer = writer.into_inner()?;
+
+        let file_size = buffer.len() as i64;
+        let footer_size = calculate_footer_size_from_bytes(&buffer)?;
+
+        self.object_store
+            .put(&object_path, PutPayload::from(buffer))
+            .await?;
+
+        let file_info =
+            DataFileInfo::new(&file_name, file_size, row_count).with_footer_size(footer_size);
+        let data_file_id =
+            self.metadata
+                .register_data_file(setup.table_id, setup.snapshot_id, &file_info)?;
+
+        if !column_stats.is_empty() {
+            self.metadata
+                .register_column_stats(data_file_id, setup.table_id, &column_stats)?;
+        }
+
+        Ok(WriteResult {
+            snapshot_id: setup.snapshot_id,
+            table_id: setup.table_id,
+            schema_id: setup.schema_id,
+            files_written: 1,
+            records_written: row_count,
+            last_data_file_id: data_file_id,
+        })
     }
 }
 
@@ -371,11 +653,254 @@ impl TableWriteSession {
             schema_id: self.schema_id,
             files_written: 1,
             records_written: self.row_count,
+            last_data_file_id: data_file_id,
         })
     }
 }
 
 // Drop is a no-op: buffer is simply dropped, nothing was uploaded to the store.
+
+/// Convert RecordBatches to InlinedDataRow format for catalog storage.
+pub(crate) fn batches_to_inlined_rows(
+    batches: &[RecordBatch],
+    schema: &Schema,
+) -> Vec<InlinedDataRow> {
+    let column_names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+    let mut rows = Vec::new();
+
+    for batch in batches {
+        for row_idx in 0..batch.num_rows() {
+            let mut values = Vec::with_capacity(batch.num_columns());
+            for col_idx in 0..batch.num_columns() {
+                let col = batch.column(col_idx);
+                if col.is_null(row_idx) {
+                    values.push(None);
+                } else {
+                    values.push(Some(arrow_array_value_to_string(col.as_ref(), row_idx)));
+                }
+            }
+            rows.push(InlinedDataRow {
+                column_names: column_names.clone(),
+                values,
+            });
+        }
+    }
+
+    rows
+}
+
+/// Convert an Arrow array value at a given index to a string representation.
+///
+/// This produces strings compatible with the `parse_inlined_column` function
+/// in `table.rs` for round-tripping through the catalog database.
+fn arrow_array_value_to_string(array: &dyn arrow::array::Array, idx: usize) -> String {
+    use arrow::array::*;
+    use arrow::datatypes::DataType;
+
+    match array.data_type() {
+        DataType::Boolean => {
+            let a = array.as_any().downcast_ref::<BooleanArray>().unwrap();
+            if a.value(idx) {
+                "true"
+            } else {
+                "false"
+            }
+            .to_string()
+        },
+        DataType::Int8 => {
+            let a = array.as_any().downcast_ref::<Int8Array>().unwrap();
+            a.value(idx).to_string()
+        },
+        DataType::Int16 => {
+            let a = array.as_any().downcast_ref::<Int16Array>().unwrap();
+            a.value(idx).to_string()
+        },
+        DataType::Int32 => {
+            let a = array.as_any().downcast_ref::<Int32Array>().unwrap();
+            a.value(idx).to_string()
+        },
+        DataType::Int64 => {
+            let a = array.as_any().downcast_ref::<Int64Array>().unwrap();
+            a.value(idx).to_string()
+        },
+        DataType::UInt8 => {
+            let a = array.as_any().downcast_ref::<UInt8Array>().unwrap();
+            a.value(idx).to_string()
+        },
+        DataType::UInt16 => {
+            let a = array.as_any().downcast_ref::<UInt16Array>().unwrap();
+            a.value(idx).to_string()
+        },
+        DataType::UInt32 => {
+            let a = array.as_any().downcast_ref::<UInt32Array>().unwrap();
+            a.value(idx).to_string()
+        },
+        DataType::UInt64 => {
+            let a = array.as_any().downcast_ref::<UInt64Array>().unwrap();
+            a.value(idx).to_string()
+        },
+        DataType::Float32 => {
+            let a = array.as_any().downcast_ref::<Float32Array>().unwrap();
+            a.value(idx).to_string()
+        },
+        DataType::Float64 => {
+            let a = array.as_any().downcast_ref::<Float64Array>().unwrap();
+            a.value(idx).to_string()
+        },
+        DataType::Utf8 => {
+            let a = array.as_any().downcast_ref::<StringArray>().unwrap();
+            a.value(idx).to_string()
+        },
+        DataType::LargeUtf8 => {
+            let a = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
+            a.value(idx).to_string()
+        },
+        DataType::Date32 => {
+            let a = array.as_any().downcast_ref::<Date32Array>().unwrap();
+            a.value(idx).to_string()
+        },
+        DataType::Date64 => {
+            let a = array.as_any().downcast_ref::<Date64Array>().unwrap();
+            a.value(idx).to_string()
+        },
+        _ => {
+            // Fallback: use Arrow's default display
+            let formatter = arrow::util::display::ArrayFormatter::try_new(
+                array,
+                &arrow::util::display::FormatOptions::default(),
+            );
+            match formatter {
+                Ok(f) => f.value(idx).to_string(),
+                Err(_) => String::new(),
+            }
+        },
+    }
+}
+
+/// Convert InlinedDataRow values back to a RecordBatch.
+///
+/// Used when flushing inlined data to Parquet. Re-uses the same parsing
+/// logic as the read-side `parse_inlined_column` in `table.rs`.
+pub(crate) fn inlined_rows_to_batch(
+    rows: &[InlinedDataRow],
+    schema: &Schema,
+) -> Result<RecordBatch> {
+    let num_rows = rows.len();
+    let mut column_arrays: Vec<Arc<dyn arrow::array::Array>> = Vec::new();
+
+    for field in schema.fields().iter() {
+        let col_name = field.name();
+        let data_type = field.data_type();
+
+        // Collect values for this column from all rows
+        let mut string_values: Vec<Option<String>> = Vec::with_capacity(num_rows);
+        for row in rows {
+            let value = row
+                .column_names
+                .iter()
+                .position(|n| n == col_name)
+                .and_then(|pos| row.values.get(pos))
+                .and_then(|v| v.clone());
+            string_values.push(value);
+        }
+
+        // Parse string values into the appropriate Arrow array type
+        let array = parse_string_to_array(&string_values, data_type)?;
+        column_arrays.push(array);
+    }
+
+    Ok(RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        column_arrays,
+    )?)
+}
+
+/// Parse string values into an Arrow array of the given data type.
+fn parse_string_to_array(
+    values: &[Option<String>],
+    data_type: &arrow::datatypes::DataType,
+) -> Result<Arc<dyn arrow::array::Array>> {
+    use arrow::array::*;
+    use arrow::datatypes::DataType;
+
+    macro_rules! parse_primitive {
+        ($builder_ty:ty, $values:expr) => {{
+            let mut builder = <$builder_ty>::with_capacity($values.len());
+            for val in $values {
+                match val {
+                    Some(s) => match s.parse() {
+                        Ok(v) => builder.append_value(v),
+                        Err(_) => builder.append_null(),
+                    },
+                    None => builder.append_null(),
+                }
+            }
+            Arc::new(builder.finish()) as Arc<dyn Array>
+        }};
+    }
+
+    let array: Arc<dyn arrow::array::Array> = match data_type {
+        DataType::Boolean => {
+            let mut builder = BooleanBuilder::with_capacity(values.len());
+            for val in values {
+                match val {
+                    Some(s) => match s.to_lowercase().as_str() {
+                        "true" | "1" | "t" => builder.append_value(true),
+                        "false" | "0" | "f" => builder.append_value(false),
+                        _ => builder.append_null(),
+                    },
+                    None => builder.append_null(),
+                }
+            }
+            Arc::new(builder.finish())
+        },
+        DataType::Int8 => parse_primitive!(Int8Builder, values),
+        DataType::Int16 => parse_primitive!(Int16Builder, values),
+        DataType::Int32 => parse_primitive!(Int32Builder, values),
+        DataType::Int64 => parse_primitive!(Int64Builder, values),
+        DataType::UInt8 => parse_primitive!(UInt8Builder, values),
+        DataType::UInt16 => parse_primitive!(UInt16Builder, values),
+        DataType::UInt32 => parse_primitive!(UInt32Builder, values),
+        DataType::UInt64 => parse_primitive!(UInt64Builder, values),
+        DataType::Float32 => parse_primitive!(Float32Builder, values),
+        DataType::Float64 => parse_primitive!(Float64Builder, values),
+        DataType::Utf8 => {
+            let mut builder = StringBuilder::new();
+            for val in values {
+                match val {
+                    Some(s) => builder.append_value(s),
+                    None => builder.append_null(),
+                }
+            }
+            Arc::new(builder.finish())
+        },
+        DataType::LargeUtf8 => {
+            let mut builder = LargeStringBuilder::new();
+            for val in values {
+                match val {
+                    Some(s) => builder.append_value(s),
+                    None => builder.append_null(),
+                }
+            }
+            Arc::new(builder.finish())
+        },
+        DataType::Date32 => parse_primitive!(Date32Builder, values),
+        DataType::Date64 => parse_primitive!(Date64Builder, values),
+        _ => {
+            // Fallback: store as strings
+            let mut builder = StringBuilder::new();
+            for val in values {
+                match val {
+                    Some(s) => builder.append_value(s),
+                    None => builder.append_null(),
+                }
+            }
+            Arc::new(builder.finish())
+        },
+    };
+
+    Ok(array)
+}
 
 fn arrow_schema_to_column_defs(schema: &Schema) -> Result<Vec<ColumnDef>> {
     schema
@@ -579,10 +1104,7 @@ pub(crate) fn calculate_footer_size_from_bytes(buffer: &[u8]) -> Result<i64> {
 /// Attempts to delete each file from the object store. If any deletion fails,
 /// a warning is logged but the error is not propagated — the caller should
 /// propagate the original commit error instead.
-pub async fn cleanup_orphaned_files(
-    object_store: &dyn ObjectStore,
-    paths: &[ObjectPath],
-) {
+pub async fn cleanup_orphaned_files(object_store: &dyn ObjectStore, paths: &[ObjectPath]) {
     for path in paths {
         if let Err(e) = object_store.delete(path).await {
             tracing::warn!(
@@ -591,6 +1113,94 @@ pub async fn cleanup_orphaned_files(
                 "Failed to clean up orphaned file after metadata commit failure"
             );
         }
+    }
+}
+
+// ==================== ducklake_flush_inlined_data table function ====================
+
+use datafusion::catalog::TableFunctionImpl;
+use datafusion::common::{Result as DataFusionResult, ScalarValue, plan_err};
+use datafusion::datasource::TableProvider;
+use datafusion::logical_expr::Expr;
+
+/// Table function to force-flush inlined data to Parquet files.
+///
+/// Usage:
+///   `SELECT * FROM ducklake_flush_inlined_data('schema_name', 'table_name')`
+///
+/// Returns: `(rows_flushed: Int64, files_written: Int64)`
+#[derive(Debug)]
+pub struct DucklakeFlushInlinedDataFunction {
+    table_writer: Arc<DuckLakeTableWriter>,
+}
+
+impl DucklakeFlushInlinedDataFunction {
+    pub fn new(table_writer: Arc<DuckLakeTableWriter>) -> Self {
+        Self {
+            table_writer,
+        }
+    }
+}
+
+impl TableFunctionImpl for DucklakeFlushInlinedDataFunction {
+    fn call(&self, exprs: &[Expr]) -> DataFusionResult<Arc<dyn TableProvider>> {
+        let (schema_name, table_name) = match exprs.len() {
+            1 => {
+                let table_name =
+                    extract_string_literal(&exprs[0], "ducklake_flush_inlined_data", 1)?;
+                ("main".to_string(), table_name)
+            },
+            2 => {
+                let schema_name =
+                    extract_string_literal(&exprs[0], "ducklake_flush_inlined_data", 1)?;
+                let table_name =
+                    extract_string_literal(&exprs[1], "ducklake_flush_inlined_data", 2)?;
+                (schema_name, table_name)
+            },
+            _ => {
+                return plan_err!(
+                    "ducklake_flush_inlined_data() requires 1-2 arguments: (table_name) or (schema_name, table_name)"
+                );
+            },
+        };
+
+        // Use block_on to bridge async object store operations
+        let result = crate::metadata_provider::block_on(
+            self.table_writer
+                .flush_inlined_data(&schema_name, &table_name),
+        )
+        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+
+        // Build result table
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("rows_flushed", arrow::datatypes::DataType::Int64, false),
+            arrow::datatypes::Field::new("files_written", arrow::datatypes::DataType::Int64, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow::array::Int64Array::from(vec![result.records_written])),
+                Arc::new(arrow::array::Int64Array::from(vec![
+                    result.files_written as i64,
+                ])),
+            ],
+        )
+        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+
+        let mem = datafusion::datasource::memory::MemTable::try_new(schema, vec![vec![batch]])?;
+        Ok(Arc::new(mem))
+    }
+}
+
+fn extract_string_literal(expr: &Expr, func_name: &str, pos: usize) -> DataFusionResult<String> {
+    match expr {
+        Expr::Literal(ScalarValue::Utf8(Some(s)), _) => Ok(s.clone()),
+        _ => plan_err!(
+            "Argument {} to {}() must be a string literal",
+            pos,
+            func_name
+        ),
     }
 }
 

@@ -127,10 +127,7 @@ fn id_name_schema() -> Arc<Schema> {
 fn make_batch(ids: Vec<i32>, names: Vec<&str>) -> RecordBatch {
     RecordBatch::try_new(
         id_name_schema(),
-        vec![
-            Arc::new(Int32Array::from(ids)),
-            Arc::new(StringArray::from(names)),
-        ],
+        vec![Arc::new(Int32Array::from(ids)), Arc::new(StringArray::from(names))],
     )
     .unwrap()
 }
@@ -206,7 +203,9 @@ async fn test_rename_column_to_same_name() {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test.db");
         let conn_str = format!("sqlite:{}?mode=rwc", db_path.display());
-        let w = SqliteMetadataWriter::new_with_init(&conn_str).await.unwrap();
+        let w = SqliteMetadataWriter::new_with_init(&conn_str)
+            .await
+            .unwrap();
         w.set_data_path(temp_dir.path().to_str().unwrap()).unwrap();
 
         let columns = vec![
@@ -244,7 +243,9 @@ async fn test_drop_and_readd_same_column_name() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("test.db");
     let conn_str = format!("sqlite:{}?mode=rwc", db_path.display());
-    let w = SqliteMetadataWriter::new_with_init(&conn_str).await.unwrap();
+    let w = SqliteMetadataWriter::new_with_init(&conn_str)
+        .await
+        .unwrap();
     w.set_data_path(temp_dir.path().to_str().unwrap()).unwrap();
 
     let columns = vec![
@@ -295,7 +296,9 @@ async fn test_alter_column_type_to_same_type() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("test.db");
     let conn_str = format!("sqlite:{}?mode=rwc", db_path.display());
-    let w = SqliteMetadataWriter::new_with_init(&conn_str).await.unwrap();
+    let w = SqliteMetadataWriter::new_with_init(&conn_str)
+        .await
+        .unwrap();
     w.set_data_path(temp_dir.path().to_str().unwrap()).unwrap();
 
     let columns = vec![ColumnDef::new("value", "int32", true).unwrap()];
@@ -335,7 +338,11 @@ async fn test_type_decimal_max_precision() {
 
     // Test Decimal256 (precision > 38)
     let result = ducklake_to_arrow_type("decimal(39, 10)");
-    assert!(result.is_ok(), "decimal(39,10) should use Decimal256: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "decimal(39,10) should use Decimal256: {:?}",
+        result
+    );
     assert_eq!(result.unwrap(), DataType::Decimal256(39, 10));
 }
 
@@ -354,8 +361,8 @@ async fn test_type_decimal_zero_precision() {
             DataType::Decimal128(p, _) => {
                 // Arrow will likely reject this later, but we at least don't panic
                 assert_eq!(p, 0);
-            }
-            _ => {}
+            },
+            _ => {},
         }
     }
 }
@@ -370,7 +377,7 @@ async fn test_type_decimal_negative_scale() {
     if result.is_ok() {
         let dt = result.unwrap();
         match dt {
-            DataType::Decimal128(5, -2) => {} // Good
+            DataType::Decimal128(5, -2) => {}, // Good
             other => panic!("Expected Decimal128(5, -2), got {:?}", other),
         }
     }
@@ -398,7 +405,11 @@ async fn test_type_numeric_alias() {
 
     // "numeric" is an alias for "decimal" in many SQL databases
     let result = ducklake_to_arrow_type("numeric(10, 2)");
-    assert!(result.is_ok(), "numeric(10,2) should parse like decimal: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "numeric(10,2) should parse like decimal: {:?}",
+        result
+    );
     assert_eq!(result.unwrap(), DataType::Decimal128(10, 2));
 }
 
@@ -426,7 +437,10 @@ async fn test_type_varchar_with_length() {
     if result.is_err() {
         // BUG: VARCHAR(N) from DuckDB catalogs will fail type parsing!
         // DuckDB stores "VARCHAR" but some catalogs store "VARCHAR(255)"
-        eprintln!("FINDING: VARCHAR(N) with length specifier is not handled: {:?}", result.err());
+        eprintln!(
+            "FINDING: VARCHAR(N) with length specifier is not handled: {:?}",
+            result.err()
+        );
     }
 }
 
@@ -497,10 +511,10 @@ async fn test_view_on_dropped_table() {
                     total_rows
                 );
             }
-        }
+        },
         Err(_) => {
             // Good - planning correctly failed
-        }
+        },
     }
 }
 
@@ -585,20 +599,18 @@ async fn test_schema_name_with_spaces() {
 
     // Create schema with spaces in name
     let ctx = create_writable_ctx(&temp_dir).await;
-    let result = ctx
-        .sql("CREATE SCHEMA ducklake.\"my schema\"")
-        .await;
+    let result = ctx.sql("CREATE SCHEMA ducklake.\"my schema\"").await;
 
     // DataFusion may or may not support quoted identifiers here
     // Just verify no panic
     match result {
         Ok(df) => {
             let _ = df.collect().await;
-        }
+        },
         Err(e) => {
             // Expected if DataFusion doesn't support this syntax
             eprintln!("Schema with spaces not supported: {}", e);
-        }
+        },
     }
 }
 
@@ -736,10 +748,7 @@ async fn test_column_with_very_long_name() {
 
     let batch = RecordBatch::try_new(
         schema,
-        vec![
-            Arc::new(Int32Array::from(vec![1])),
-            Arc::new(StringArray::from(vec![Some("value")])),
-        ],
+        vec![Arc::new(Int32Array::from(vec![1])), Arc::new(StringArray::from(vec![Some("value")]))],
     )
     .unwrap();
 
@@ -793,7 +802,9 @@ async fn test_snapshot_ids_always_increase() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("test.db");
     let conn_str = format!("sqlite:{}?mode=rwc", db_path.display());
-    let w = SqliteMetadataWriter::new_with_init(&conn_str).await.unwrap();
+    let w = SqliteMetadataWriter::new_with_init(&conn_str)
+        .await
+        .unwrap();
     w.set_data_path(temp_dir.path().to_str().unwrap()).unwrap();
 
     let mut prev_snapshot = 0i64;
@@ -867,10 +878,7 @@ async fn test_append_with_type_mismatch_fails() {
     ]));
     let batch2 = RecordBatch::try_new(
         schema_wrong,
-        vec![
-            Arc::new(Int64Array::from(vec![2])),
-            Arc::new(StringArray::from(vec![Some("b")])),
-        ],
+        vec![Arc::new(Int64Array::from(vec![2])), Arc::new(StringArray::from(vec![Some("b")]))],
     )
     .unwrap();
 
@@ -934,8 +942,8 @@ async fn test_append_with_non_nullable_new_column_fails() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_type_roundtrip_interval() {
-    use datafusion_ducklake::types::{arrow_to_ducklake_type, ducklake_to_arrow_type};
     use arrow::datatypes::IntervalUnit;
+    use datafusion_ducklake::types::{arrow_to_ducklake_type, ducklake_to_arrow_type};
 
     let arrow_type = DataType::Interval(IntervalUnit::MonthDayNano);
     let ducklake = arrow_to_ducklake_type(&arrow_type).unwrap();
@@ -965,7 +973,10 @@ async fn test_type_json_roundtrip_lossy() {
     assert_eq!(json_arrow, DataType::Utf8);
 
     let back = arrow_to_ducklake_type(&json_arrow).unwrap();
-    assert_eq!(back, "varchar", "JSON type is lost in roundtrip (expected behavior)");
+    assert_eq!(
+        back, "varchar",
+        "JSON type is lost in roundtrip (expected behavior)"
+    );
 }
 
 // ============================================================================
@@ -1003,10 +1014,10 @@ async fn test_delete_from_table_with_no_data_files() {
                 .unwrap()
                 .value(0);
             assert_eq!(count, 0, "Deleting from empty table should delete 0 rows");
-        }
+        },
         Err(e) => {
             eprintln!("FINDING: DELETE from already-empty table failed: {}", e);
-        }
+        },
     }
 }
 
@@ -1046,10 +1057,10 @@ async fn test_update_on_empty_table() {
                 .unwrap()
                 .value(0);
             assert_eq!(count, 0, "Updating empty table should update 0 rows");
-        }
+        },
         Err(e) => {
             eprintln!("FINDING: UPDATE on empty table failed: {}", e);
-        }
+        },
     }
 }
 
@@ -1065,7 +1076,10 @@ async fn test_struct_field_names_with_spaces() {
     let result = ducklake_to_arrow_type("struct(\"first name\" varchar, age int32)");
     // The parser splits on space after removing quotes... this may fail
     if result.is_err() {
-        eprintln!("FINDING: Struct field names with spaces are not supported: {:?}", result.err());
+        eprintln!(
+            "FINDING: Struct field names with spaces are not supported: {:?}",
+            result.err()
+        );
     }
 }
 
@@ -1079,15 +1093,15 @@ async fn test_malformed_complex_types_no_panic() {
 
     // These should all error gracefully, never panic
     let malformed = vec![
-        "list(",          // unclosed paren
-        "list<",          // unclosed angle bracket
-        "struct()",       // empty struct
-        "struct(,)",      // empty field
-        "map(varchar)",   // only one type param
-        "map(,,)",        // too many params
-        "list<>",         // empty list type
-        "struct(a)",      // field without type
-        "list(list(list(list(list(list(list(int32)))))))",  // deeply nested
+        "list(",                                           // unclosed paren
+        "list<",                                           // unclosed angle bracket
+        "struct()",                                        // empty struct
+        "struct(,)",                                       // empty field
+        "map(varchar)",                                    // only one type param
+        "map(,,)",                                         // too many params
+        "list<>",                                          // empty list type
+        "struct(a)",                                       // field without type
+        "list(list(list(list(list(list(list(int32)))))))", // deeply nested
     ];
 
     for input in malformed {
@@ -1097,10 +1111,10 @@ async fn test_malformed_complex_types_no_panic() {
             Ok(dt) => {
                 // Some of these may actually parse (like deeply nested)
                 eprintln!("Unexpectedly parsed '{}': {:?}", input, dt);
-            }
+            },
             Err(_) => {
                 // Expected
-            }
+            },
         }
     }
 }
@@ -1121,18 +1135,13 @@ async fn test_write_table_with_duplicate_column_names() {
 
     let batch = RecordBatch::try_new(
         schema,
-        vec![
-            Arc::new(Int32Array::from(vec![1])),
-            Arc::new(Int32Array::from(vec![2])),
-        ],
+        vec![Arc::new(Int32Array::from(vec![1])), Arc::new(Int32Array::from(vec![2]))],
     )
     .unwrap();
 
     let object_store = create_object_store();
     let table_writer = DuckLakeTableWriter::new(writer, object_store).unwrap();
-    let result = table_writer
-        .write_table("main", "dup_cols", &[batch])
-        .await;
+    let result = table_writer.write_table("main", "dup_cols", &[batch]).await;
 
     // This should ideally fail, but may silently create ambiguous schema
     match result {
@@ -1146,22 +1155,24 @@ async fn test_write_table_with_duplicate_column_names() {
                     let exec_result = df.collect().await;
                     match exec_result {
                         Ok(batches) => {
-                            eprintln!("  Read back {} rows with duplicate column names",
-                                batches.iter().map(|b| b.num_rows()).sum::<usize>());
-                        }
+                            eprintln!(
+                                "  Read back {} rows with duplicate column names",
+                                batches.iter().map(|b| b.num_rows()).sum::<usize>()
+                            );
+                        },
                         Err(e) => {
                             eprintln!("  Read-back execution failed: {}", e);
-                        }
+                        },
                     }
-                }
+                },
                 Err(e) => {
                     eprintln!("  Read-back planning failed: {}", e);
-                }
+                },
             }
-        }
+        },
         Err(_) => {
             // Good - rejected duplicate columns
-        }
+        },
     }
 }
 
@@ -1177,10 +1188,7 @@ async fn test_write_table_no_batches() {
     let table_writer = DuckLakeTableWriter::new(writer, object_store).unwrap();
     let result = table_writer.write_table("main", "no_data", &[]).await;
 
-    assert!(
-        result.is_err(),
-        "Writing with no batches should fail"
-    );
+    assert!(result.is_err(), "Writing with no batches should fail");
 }
 
 // ============================================================================
@@ -1192,7 +1200,9 @@ async fn test_get_data_path_before_setting() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("test.db");
     let conn_str = format!("sqlite:{}?mode=rwc", db_path.display());
-    let w = SqliteMetadataWriter::new_with_init(&conn_str).await.unwrap();
+    let w = SqliteMetadataWriter::new_with_init(&conn_str)
+        .await
+        .unwrap();
     // Don't call set_data_path
 
     let result = w.get_data_path();

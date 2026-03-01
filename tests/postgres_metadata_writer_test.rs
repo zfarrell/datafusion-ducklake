@@ -97,8 +97,10 @@ async fn test_set_columns() {
         .get_or_create_table(schema_id, "users", None, snapshot_id)
         .unwrap();
 
-    let columns =
-        vec![ColumnDef::new("id", "int64", false).unwrap(), ColumnDef::new("name", "varchar", true).unwrap()];
+    let columns = vec![
+        ColumnDef::new("id", "int64", false).unwrap(),
+        ColumnDef::new("name", "varchar", true).unwrap(),
+    ];
 
     let column_ids = writer.set_columns(table_id, &columns, snapshot_id).unwrap();
     assert_eq!(column_ids.len(), 2);
@@ -171,8 +173,10 @@ async fn test_data_path() {
 async fn test_begin_write_transaction() {
     let (writer, _container) = create_writer().await;
 
-    let columns =
-        vec![ColumnDef::new("id", "int64", false).unwrap(), ColumnDef::new("name", "varchar", true).unwrap()];
+    let columns = vec![
+        ColumnDef::new("id", "int64", false).unwrap(),
+        ColumnDef::new("name", "varchar", true).unwrap(),
+    ];
 
     let result = writer
         .begin_write_transaction("main", "users", &columns, WriteMode::Replace)
@@ -337,8 +341,10 @@ async fn test_get_active_columns() {
         .get_or_create_table(schema_id, "users", None, snapshot_id)
         .unwrap();
 
-    let columns =
-        vec![ColumnDef::new("id", "int64", false).unwrap(), ColumnDef::new("name", "varchar", true).unwrap()];
+    let columns = vec![
+        ColumnDef::new("id", "int64", false).unwrap(),
+        ColumnDef::new("name", "varchar", true).unwrap(),
+    ];
     writer.set_columns(table_id, &columns, snapshot_id).unwrap();
 
     let active = writer.get_active_columns(table_id).unwrap();
@@ -408,8 +414,10 @@ async fn test_alter_table_drop_column() {
         .get_or_create_table(schema_id, "users", None, snapshot_id)
         .unwrap();
 
-    let columns =
-        vec![ColumnDef::new("id", "int64", false).unwrap(), ColumnDef::new("name", "varchar", true).unwrap()];
+    let columns = vec![
+        ColumnDef::new("id", "int64", false).unwrap(),
+        ColumnDef::new("name", "varchar", true).unwrap(),
+    ];
     writer.set_columns(table_id, &columns, snapshot_id).unwrap();
 
     writer
@@ -620,8 +628,10 @@ async fn test_set_column_comment() {
         .get_or_create_table(schema_id, "users", None, snapshot_id)
         .unwrap();
 
-    let columns =
-        vec![ColumnDef::new("id", "int64", false).unwrap(), ColumnDef::new("name", "varchar", true).unwrap()];
+    let columns = vec![
+        ColumnDef::new("id", "int64", false).unwrap(),
+        ColumnDef::new("name", "varchar", true).unwrap(),
+    ];
     writer.set_columns(table_id, &columns, snapshot_id).unwrap();
 
     let comment_snap = writer

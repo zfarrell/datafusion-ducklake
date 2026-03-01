@@ -4,6 +4,7 @@
 //! along with helper types for column definitions and data file registration.
 
 use crate::Result;
+use crate::metadata_provider::InlinedDataRow;
 
 /// Write mode for table operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +52,20 @@ pub enum AlterTableOp {
     DropNotNull {
         column_name: String,
     },
+    /// Set partition columns for a table.
+    SetPartitionedBy {
+        /// Column names and optional transforms
+        partition_columns: Vec<PartitionColumnDef>,
+    },
+}
+
+/// Definition of a partition column for SET PARTITIONED BY.
+#[derive(Debug, Clone)]
+pub struct PartitionColumnDef {
+    /// Name of the source column
+    pub column_name: String,
+    /// Optional transform (e.g., "year", "month", "day", "hour", "identity")
+    pub transform: Option<String>,
 }
 
 /// Parameters for ALTER COLUMN TYPE operation.
@@ -298,6 +313,8 @@ pub struct WriteResult {
     pub files_written: usize,
     /// Total records written
     pub records_written: i64,
+    /// ID of the last data file registered (used for partition value registration)
+    pub last_data_file_id: i64,
 }
 
 /// Result of a transactional write setup operation.
@@ -490,12 +507,7 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// Stores the comment in `ducklake_column_tag` with key='comment'.
     /// If a comment already exists, it is ended and replaced.
     /// Returns the snapshot_id created for the comment.
-    fn set_column_comment(
-        &self,
-        table_id: i64,
-        column_name: &str,
-        comment: &str,
-    ) -> Result<i64>;
+    fn set_column_comment(&self, table_id: i64, column_name: &str, comment: &str) -> Result<i64>;
 
     /// Create a view in the catalog.
     /// Creates a new snapshot, stores the view SQL definition, and returns (view_id, snapshot_id).
@@ -512,6 +524,86 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// with the updated name. The view's SQL definition does NOT change.
     /// Returns the snapshot_id created for the rename.
     fn rename_view(&self, view_id: i64, new_name: &str) -> Result<i64>;
+
+    /// Register a partition value for a data file.
+    ///
+    /// Records that a specific data file has a given partition value at the
+    /// specified partition key index. Called after writing each partitioned file.
+    fn register_file_partition_value(
+        &self,
+        data_file_id: i64,
+        table_id: i64,
+        partition_key_index: i32,
+        partition_value: Option<&str>,
+    ) -> Result<()> {
+        let _ = (data_file_id, table_id, partition_key_index, partition_value);
+        Ok(())
+    }
+
+    /// Get the active partition columns for a table.
+    ///
+    /// Returns (column_name, column_id, transform) tuples for all active
+    /// partition columns, ordered by partition_key_index.
+    fn get_active_partition_columns(
+        &self,
+        _table_id: i64,
+    ) -> Result<Vec<(String, i64, Option<String>)>> {
+        Ok(Vec::new())
+    }
+
+    /// Look up a table by schema and table name, returning its table_id.
+    ///
+    /// Returns `None` if the table does not exist.
+    fn find_table_id(&self, _schema_name: &str, _table_name: &str) -> Result<Option<i64>> {
+        Ok(None)
+    }
+
+    // ==================== Data inlining methods ====================
+
+    /// Get the data inlining row limit from catalog metadata.
+    ///
+    /// Returns `Some(limit)` if inlining is enabled (limit > 0),
+    /// `None` if inlining is not configured.
+    fn get_data_inlining_row_limit(&self) -> Result<Option<i64>> {
+        Ok(None)
+    }
+
+    /// Get the current number of inlined rows for a table.
+    fn get_inlined_row_count(&self, _table_id: i64) -> Result<i64> {
+        Ok(0)
+    }
+
+    /// Store data inline in the catalog database.
+    ///
+    /// Creates the inlined data table if needed, registers it in
+    /// `ducklake_inlined_data_tables`, and inserts the rows.
+    /// Returns the number of rows stored.
+    fn store_inlined_data(
+        &self,
+        _table_id: i64,
+        _snapshot_id: i64,
+        _columns: &[ColumnDef],
+        _rows: &[InlinedDataRow],
+    ) -> Result<i64> {
+        Err(crate::DuckLakeError::Unsupported(
+            "Inlined data storage not supported by this backend".into(),
+        ))
+    }
+
+    /// Read all active inlined data rows for a table.
+    ///
+    /// Returns the same format as `MetadataProvider::get_inlined_data`.
+    /// Used when flushing inlined data to Parquet.
+    fn read_inlined_data(&self, _table_id: i64) -> Result<Vec<InlinedDataRow>> {
+        Ok(Vec::new())
+    }
+
+    /// Remove all active inlined data for a table (set end_snapshot).
+    ///
+    /// Called after flushing inlined data to Parquet.
+    fn clear_inlined_data(&self, _table_id: i64, _snapshot_id: i64) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

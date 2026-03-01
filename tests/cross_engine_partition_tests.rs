@@ -3,11 +3,7 @@
 //! Tests that DataFusion can correctly read partitioned DuckLake tables
 //! created by DuckDB, including partition pruning and hive-style directories.
 
-#![cfg(all(
-    feature = "write-sqlite",
-    feature = "metadata-duckdb",
-    feature = "metadata-sqlite"
-))]
+#![cfg(all(feature = "write-sqlite", feature = "metadata-duckdb", feature = "metadata-sqlite"))]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -48,7 +44,9 @@ impl DuckDbConn {
             [],
         )
         .expect("attach ducklake catalog with data path");
-        DuckDbConn { conn }
+        DuckDbConn {
+            conn,
+        }
     }
 
     fn execute(&self, sql: &str) {
@@ -125,25 +123,25 @@ fn arrow_value_to_string(array: &dyn Array, idx: usize) -> String {
         DataType::Int32 => {
             let a = array.as_any().downcast_ref::<Int32Array>().unwrap();
             a.value(idx).to_string()
-        }
+        },
         DataType::Int64 => {
             let a = array.as_any().downcast_ref::<Int64Array>().unwrap();
             a.value(idx).to_string()
-        }
+        },
         DataType::Float64 => {
             let a = array.as_any().downcast_ref::<Float64Array>().unwrap();
             format!("{}", a.value(idx))
-        }
+        },
         DataType::Utf8 => {
             let a = array.as_any().downcast_ref::<StringArray>().unwrap();
             a.value(idx).to_string()
-        }
+        },
         DataType::Date32 => {
             let a = array.as_any().downcast_ref::<Date32Array>().unwrap();
             let days = a.value(idx);
             let date = chrono::NaiveDate::from_num_days_from_ce_opt(days + 719_163).unwrap();
             date.format("%Y-%m-%d").to_string()
-        }
+        },
         _ => format!("{:?}", array),
     }
 }
@@ -307,9 +305,7 @@ async fn test_duckdb_month_partition_transform() {
     std::fs::create_dir_all(&data_path).unwrap();
 
     let ddb = DuckDbConn::open_with_data_path(&catalog_path, &data_path);
-    ddb.execute(
-        "CREATE TABLE ducklake.main.events (id INTEGER, event_date DATE, value DOUBLE)",
-    );
+    ddb.execute("CREATE TABLE ducklake.main.events (id INTEGER, event_date DATE, value DOUBLE)");
     ddb.execute("ALTER TABLE ducklake.main.events SET PARTITIONED BY (MONTH(event_date))");
     ddb.execute("INSERT INTO ducklake.main.events VALUES (1, '2024-01-15', 10.0), (2, '2024-02-20', 20.0), (3, '2024-01-25', 30.0)");
     drop(ddb);
@@ -371,10 +367,7 @@ async fn test_duckdb_empty_partitioned_table() {
     drop(ddb);
 
     let ctx = open_in_datafusion_duckdb(&catalog_path);
-    let df = ctx
-        .sql("SELECT * FROM ducklake.main.events")
-        .await
-        .unwrap();
+    let df = ctx.sql("SELECT * FROM ducklake.main.events").await.unwrap();
     let batches = df.collect().await.unwrap();
     let rows = batches_to_strings(&batches);
     assert_eq!(rows.len(), 0);

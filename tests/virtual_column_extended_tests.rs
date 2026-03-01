@@ -3,11 +3,7 @@
 //! Tests cover individual virtual columns, multi-file scenarios, cross-engine
 //! value matching, and WHERE clause filtering.
 
-#![cfg(all(
-    feature = "write-sqlite",
-    feature = "metadata-sqlite",
-    feature = "metadata-duckdb"
-))]
+#![cfg(all(feature = "write-sqlite", feature = "metadata-sqlite", feature = "metadata-duckdb"))]
 
 use std::sync::Arc;
 
@@ -37,7 +33,9 @@ impl DuckDbConn {
             [],
         )
         .unwrap();
-        Self { conn }
+        Self {
+            conn,
+        }
     }
 
     fn execute(&self, sql: &str) {
@@ -56,8 +54,9 @@ async fn setup_multi_file_catalog() -> (SessionContext, TempDir) {
     {
         let duckdb = DuckDbConn::open_with_data_path(&catalog_path, &data_path);
         duckdb.execute("CREATE TABLE ducklake.main.people (id INT, name VARCHAR)");
-        duckdb
-            .execute("INSERT INTO ducklake.main.people VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie')");
+        duckdb.execute(
+            "INSERT INTO ducklake.main.people VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie')",
+        );
         duckdb.execute("INSERT INTO ducklake.main.people VALUES (4, 'Dave'), (5, 'Eve')");
     }
 
@@ -154,7 +153,10 @@ async fn test_snapshot_id_column() {
     let snap_file2 = pairs[3].1;
 
     assert!(snap_file1 > 0, "snapshot_id should be positive");
-    assert!(snap_file2 > snap_file1, "second file's snapshot should be greater");
+    assert!(
+        snap_file2 > snap_file1,
+        "second file's snapshot should be greater"
+    );
 
     // All rows from same file should have same snapshot_id
     assert_eq!(pairs[1].1, snap_file1);

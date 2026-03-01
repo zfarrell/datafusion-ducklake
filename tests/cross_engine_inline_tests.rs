@@ -3,11 +3,7 @@
 //! Tests that DataFusion can correctly read inlined data (stored directly in
 //! the catalog database) from DuckLake catalogs created by DuckDB.
 
-#![cfg(all(
-    feature = "write-sqlite",
-    feature = "metadata-duckdb",
-    feature = "metadata-sqlite"
-))]
+#![cfg(all(feature = "write-sqlite", feature = "metadata-duckdb", feature = "metadata-sqlite"))]
 
 use std::path::Path;
 use std::sync::Arc;
@@ -44,7 +40,9 @@ impl DuckDbConn {
             [],
         )
         .expect("attach ducklake catalog with data path");
-        DuckDbConn { conn }
+        DuckDbConn {
+            conn,
+        }
     }
 
     fn open_sqlite(catalog_path: &Path) -> Self {
@@ -53,12 +51,11 @@ impl DuckDbConn {
             .expect("install ducklake");
         conn.execute("LOAD ducklake;", []).expect("load ducklake");
         let attach_path = format!("ducklake:sqlite:{}", catalog_path.display());
-        conn.execute(
-            &format!("ATTACH '{}' AS ducklake;", attach_path),
-            [],
-        )
-        .expect("attach ducklake catalog");
-        DuckDbConn { conn }
+        conn.execute(&format!("ATTACH '{}' AS ducklake;", attach_path), [])
+            .expect("attach ducklake catalog");
+        DuckDbConn {
+            conn,
+        }
     }
 
     fn execute(&self, sql: &str) {
@@ -134,19 +131,19 @@ fn arrow_value_to_string(array: &dyn Array, idx: usize) -> String {
         DataType::Int32 => {
             let a = array.as_any().downcast_ref::<Int32Array>().unwrap();
             a.value(idx).to_string()
-        }
+        },
         DataType::Int64 => {
             let a = array.as_any().downcast_ref::<Int64Array>().unwrap();
             a.value(idx).to_string()
-        }
+        },
         DataType::Float64 => {
             let a = array.as_any().downcast_ref::<Float64Array>().unwrap();
             format!("{}", a.value(idx))
-        }
+        },
         DataType::Utf8 => {
             let a = array.as_any().downcast_ref::<StringArray>().unwrap();
             a.value(idx).to_string()
-        }
+        },
         _ => format!("{:?}", array),
     }
 }
@@ -430,10 +427,7 @@ async fn test_duckdb_empty_inlined_table() {
     drop(ddb);
 
     let ctx = open_in_datafusion_duckdb(&catalog_path);
-    let df = ctx
-        .sql("SELECT * FROM ducklake.main.t1")
-        .await
-        .unwrap();
+    let df = ctx.sql("SELECT * FROM ducklake.main.t1").await.unwrap();
     let batches = df.collect().await.unwrap();
     let rows = batches_to_strings(&batches);
     assert_eq!(rows.len(), 0);

@@ -71,8 +71,8 @@ fn collect_i32_col(batches: &[RecordBatch], col_idx: usize) -> Vec<i32> {
 // ============================================================================
 #[tokio::test]
 async fn test_issue_84_missing_data_file_after_deletion() -> DataFusionResult<()> {
-    let temp_dir = TempDir::new()
-        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+    let temp_dir =
+        TempDir::new().map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
     let catalog_path = temp_dir.path().join("issue84.ducklake");
 
     common::create_catalog_no_deletes(&catalog_path).map_err(common::to_datafusion_error)?;
@@ -131,8 +131,11 @@ async fn test_issue_84_missing_data_file_after_deletion() -> DataFusionResult<()
 
     // The error should be IO-related, not a panic or internal error
     assert!(
-        err_msg.contains("Object") || err_msg.contains("not found") || err_msg.contains("No such file")
-            || err_msg.contains("IO") || err_msg.contains("Execution"),
+        err_msg.contains("Object")
+            || err_msg.contains("not found")
+            || err_msg.contains("No such file")
+            || err_msg.contains("IO")
+            || err_msg.contains("Execution"),
         "Expected file-not-found error, got: {}",
         err_msg
     );
@@ -152,8 +155,8 @@ async fn test_issue_84_missing_data_file_after_deletion() -> DataFusionResult<()
 // ============================================================================
 #[tokio::test]
 async fn test_issue_189_deleted_record_after_merge() -> DataFusionResult<()> {
-    let temp_dir = TempDir::new()
-        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+    let temp_dir =
+        TempDir::new().map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
     let catalog_path = temp_dir.path().join("issue189.ducklake");
 
     // Create catalog with specific merge scenario from the issue
@@ -264,8 +267,8 @@ async fn test_issue_198_backslash_path_resolution() -> DataFusionResult<()> {
 
     // Case 4: Test via actual DuckLake catalog with a table
     // Even though this is on Linux, we verify our resolver doesn't choke on backslashes
-    let temp_dir = TempDir::new()
-        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+    let temp_dir =
+        TempDir::new().map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
     let catalog_path = temp_dir.path().join("issue198.ducklake");
 
     common::create_catalog_no_deletes(&catalog_path).map_err(common::to_datafusion_error)?;
@@ -275,11 +278,7 @@ async fn test_issue_198_backslash_path_resolution() -> DataFusionResult<()> {
     ctx.register_catalog("test", catalog);
 
     // Basic query should work (verifies path resolution with local paths)
-    let batches = query_batches(
-        &ctx,
-        "SELECT COUNT(*) as cnt FROM test.main.users",
-    )
-    .await?;
+    let batches = query_batches(&ctx, "SELECT COUNT(*) as cnt FROM test.main.users").await?;
 
     let count = batches[0]
         .column(0)
@@ -304,7 +303,7 @@ async fn test_issue_198_backslash_path_resolution() -> DataFusionResult<()> {
 // ============================================================================
 #[tokio::test]
 async fn test_issue_255_s3_bucket_root_data_path() -> DataFusionResult<()> {
-    use datafusion_ducklake::path_resolver::{parse_object_store_url, PathResolver};
+    use datafusion_ducklake::path_resolver::{PathResolver, parse_object_store_url};
 
     // Test 1: Parse S3 URL with just bucket name (no trailing path)
     let (url, path) = parse_object_store_url("s3://aggregate.lake")
@@ -340,7 +339,9 @@ async fn test_issue_255_s3_bucket_root_data_path() -> DataFusionResult<()> {
     let file_path = table_resolver.resolve("data.parquet", true).unwrap();
     eprintln!("Issue #255 test 4 file_path: {}", file_path);
     assert!(
-        file_path.contains("main") && file_path.contains("my_table") && file_path.contains("data.parquet"),
+        file_path.contains("main")
+            && file_path.contains("my_table")
+            && file_path.contains("data.parquet"),
         "Issue #255: Full path from bucket root should contain all components. Got: {}",
         file_path
     );
@@ -360,8 +361,8 @@ async fn test_issue_255_s3_bucket_root_data_path() -> DataFusionResult<()> {
 // ============================================================================
 #[tokio::test]
 async fn test_issue_373_table_rename_path_resolution() -> DataFusionResult<()> {
-    let temp_dir = TempDir::new()
-        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+    let temp_dir =
+        TempDir::new().map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
     let catalog_path = temp_dir.path().join("issue373.ducklake");
 
     // Create table, insert data, rename, insert more data
@@ -429,11 +430,7 @@ async fn test_issue_373_table_rename_path_resolution() -> DataFusionResult<()> {
     );
 
     // The old name should NOT be accessible
-    let old_result = query_batches(
-        &ctx,
-        "SELECT * FROM test.main.original_name",
-    )
-    .await;
+    let old_result = query_batches(&ctx, "SELECT * FROM test.main.original_name").await;
     assert!(
         old_result.is_err(),
         "Issue #373: Old table name should not be accessible after rename"
@@ -456,8 +453,8 @@ async fn test_issue_373_table_rename_path_resolution() -> DataFusionResult<()> {
 // ============================================================================
 #[tokio::test]
 async fn test_issue_378_delete_file_field_ids() -> DataFusionResult<()> {
-    let temp_dir = TempDir::new()
-        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+    let temp_dir =
+        TempDir::new().map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
     let catalog_path = temp_dir.path().join("issue378.ducklake");
 
     // Create catalog with deletes (DuckDB will write delete files with "wrong" field IDs)
@@ -468,11 +465,7 @@ async fn test_issue_378_delete_file_field_ids() -> DataFusionResult<()> {
     ctx.register_catalog("test", catalog);
 
     // Query should work despite potentially wrong field IDs in delete files
-    let batches = query_batches(
-        &ctx,
-        "SELECT id FROM test.main.products ORDER BY id",
-    )
-    .await?;
+    let batches = query_batches(&ctx, "SELECT id FROM test.main.products ORDER BY id").await?;
 
     let ids = collect_i32_col(&batches, 0);
     eprintln!("Issue #378: ids = {:?}", ids);
@@ -487,11 +480,7 @@ async fn test_issue_378_delete_file_field_ids() -> DataFusionResult<()> {
     );
 
     // Also verify COUNT(*) works
-    let batches = query_batches(
-        &ctx,
-        "SELECT COUNT(*) as cnt FROM test.main.products",
-    )
-    .await?;
+    let batches = query_batches(&ctx, "SELECT COUNT(*) as cnt FROM test.main.products").await?;
     let count = batches[0]
         .column(0)
         .as_any()
@@ -517,8 +506,8 @@ async fn test_issue_378_delete_file_field_ids() -> DataFusionResult<()> {
 // ============================================================================
 #[tokio::test]
 async fn test_issue_605_full_table_scan_multiple_files() -> DataFusionResult<()> {
-    let temp_dir = TempDir::new()
-        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+    let temp_dir =
+        TempDir::new().map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
     let catalog_path = temp_dir.path().join("issue605.ducklake");
 
     // Create catalog with multiple separate inserts to generate multiple data files
@@ -567,11 +556,7 @@ async fn test_issue_605_full_table_scan_multiple_files() -> DataFusionResult<()>
     ctx.register_catalog("test", catalog);
 
     // Test 1: Full table scan (this is what fails in the issue)
-    let batches = query_batches(
-        &ctx,
-        "SELECT * FROM test.main.events ORDER BY id",
-    )
-    .await?;
+    let batches = query_batches(&ctx, "SELECT * FROM test.main.events ORDER BY id").await?;
 
     let total = total_rows(&batches);
     eprintln!("Issue #605 test 1: {} rows from full scan", total);
@@ -587,28 +572,24 @@ async fn test_issue_605_full_table_scan_multiple_files() -> DataFusionResult<()>
     )
     .await?;
     let filtered_count = total_rows(&batches);
-    eprintln!("Issue #605 test 2: {} rows from filtered scan", filtered_count);
+    eprintln!(
+        "Issue #605 test 2: {} rows from filtered scan",
+        filtered_count
+    );
     assert!(
         filtered_count > 0,
         "Issue #605: Filtered query should return some rows"
     );
 
     // Test 3: COUNT(*) across all files
-    let batches = query_batches(
-        &ctx,
-        "SELECT COUNT(*) as cnt FROM test.main.events",
-    )
-    .await?;
+    let batches = query_batches(&ctx, "SELECT COUNT(*) as cnt FROM test.main.events").await?;
     let count = batches[0]
         .column(0)
         .as_any()
         .downcast_ref::<Int64Array>()
         .unwrap()
         .value(0);
-    assert_eq!(
-        count, 10,
-        "Issue #605: COUNT(*) should return 10"
-    );
+    assert_eq!(count, 10, "Issue #605: COUNT(*) should return 10");
 
     Ok(())
 }
@@ -625,8 +606,8 @@ async fn test_issue_605_full_table_scan_multiple_files() -> DataFusionResult<()>
 // ============================================================================
 #[tokio::test]
 async fn test_issue_680_corrupted_parquet_no_magic_bytes() -> DataFusionResult<()> {
-    let temp_dir = TempDir::new()
-        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+    let temp_dir =
+        TempDir::new().map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
     let catalog_path = temp_dir.path().join("issue680.ducklake");
 
     common::create_catalog_no_deletes(&catalog_path).map_err(common::to_datafusion_error)?;
@@ -671,9 +652,12 @@ async fn test_issue_680_corrupted_parquet_no_magic_bytes() -> DataFusionResult<(
 
     // Error should mention parquet parsing/magic bytes issues
     assert!(
-        err_msg.contains("Parquet") || err_msg.contains("parquet")
-            || err_msg.contains("magic") || err_msg.contains("EOF")
-            || err_msg.contains("External") || err_msg.contains("Execution"),
+        err_msg.contains("Parquet")
+            || err_msg.contains("parquet")
+            || err_msg.contains("magic")
+            || err_msg.contains("EOF")
+            || err_msg.contains("External")
+            || err_msg.contains("Execution"),
         "Issue #680: Error should be about corrupted parquet, got: {}",
         err_msg
     );
@@ -686,23 +670,28 @@ async fn test_issue_680_corrupted_parquet_no_magic_bytes() -> DataFusionResult<(
 // ============================================================================
 #[tokio::test]
 async fn test_path_resolver_edge_cases_for_storage_issues() -> DataFusionResult<()> {
-    use datafusion_ducklake::path_resolver::{
-        parse_object_store_url, resolve_path, PathResolver,
-    };
+    use datafusion_ducklake::path_resolver::{PathResolver, parse_object_store_url, resolve_path};
 
     // Edge case from #198: ABFSS-style paths
     // abfss://container@account.dfs.core.windows.net/path
     // Our resolver currently doesn't handle abfss:// but should not panic
-    let abfss_result = parse_object_store_url("abfss://container@account.dfs.core.windows.net/data");
+    let abfss_result =
+        parse_object_store_url("abfss://container@account.dfs.core.windows.net/data");
     eprintln!("ABFSS parse result: {:?}", abfss_result.is_ok());
     // Currently this will fail (unsupported scheme) - document behavior
     if abfss_result.is_err() {
-        eprintln!("ABFSS scheme not supported (expected for now): {:?}", abfss_result.err());
+        eprintln!(
+            "ABFSS scheme not supported (expected for now): {:?}",
+            abfss_result.err()
+        );
     }
 
     // Edge case from #217: Empty relative path
     let resolved = resolve_path("/data/", "", true).unwrap();
-    assert_eq!(resolved, "/data/", "Empty relative path should return base path");
+    assert_eq!(
+        resolved, "/data/",
+        "Empty relative path should return base path"
+    );
 
     // Edge case from #255: Resolve with empty base path
     let resolved = resolve_path("", "schema/table/file.parquet", true).unwrap();

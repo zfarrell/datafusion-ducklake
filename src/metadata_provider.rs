@@ -744,11 +744,7 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
     /// end_snapshot is NULL or > snapshot_id).
     ///
     /// Returns empty vec if the table has no inlined data.
-    fn get_inlined_data(
-        &self,
-        _table_id: i64,
-        _snapshot_id: i64,
-    ) -> Result<Vec<InlinedDataRow>> {
+    fn get_inlined_data(&self, _table_id: i64, _snapshot_id: i64) -> Result<Vec<InlinedDataRow>> {
         Ok(Vec::new())
     }
 

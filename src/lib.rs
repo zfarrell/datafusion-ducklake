@@ -125,6 +125,8 @@ pub use delete_exec::DuckLakeDeleteExec;
 #[cfg(feature = "write")]
 pub use insert_exec::DuckLakeInsertExec;
 #[cfg(feature = "write")]
+pub use merge_exec::{DuckLakeMergeExec, MergeMatchedAction};
+#[cfg(feature = "write")]
 pub use metadata_writer::{
     ColumnDef, ColumnStatInfo, DataFileInfo, DeleteFileInfo, MetadataWriter, WriteMode,
     WriteResult, WriteSetupResult,
@@ -138,8 +140,9 @@ pub use metadata_writer_sqlite::SqliteMetadataWriter;
 #[cfg(feature = "write")]
 pub use query_planner::DuckLakeQueryPlanner;
 #[cfg(feature = "write")]
-pub use table_writer::{DuckLakeTableWriter, TableWriteSession, cleanup_orphaned_files};
-#[cfg(feature = "write")]
-pub use merge_exec::{DuckLakeMergeExec, MergeMatchedAction};
+pub use table_writer::{
+    DuckLakeTableWriter, DucklakeFlushInlinedDataFunction, TableWriteSession,
+    cleanup_orphaned_files,
+};
 #[cfg(feature = "write")]
 pub use update_exec::{DuckLakeUpdateExec, UpdateAssignment};

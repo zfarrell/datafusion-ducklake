@@ -632,8 +632,7 @@ mod tests {
 
         let parquet_field_ids = HashMap::new();
 
-        let result =
-            build_read_schema_with_field_id_mapping(&current_columns, &parquet_field_ids);
+        let result = build_read_schema_with_field_id_mapping(&current_columns, &parquet_field_ids);
         assert!(result.is_err(), "should reject column_id > i32::MAX");
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -659,9 +658,11 @@ mod tests {
         let parquet_field_ids = HashMap::new();
 
         // Negative i64 values fit in i32 range (down to i32::MIN), so -1 should succeed
-        let result =
-            build_read_schema_with_field_id_mapping(&current_columns, &parquet_field_ids);
-        assert!(result.is_ok(), "negative i64 within i32 range should succeed");
+        let result = build_read_schema_with_field_id_mapping(&current_columns, &parquet_field_ids);
+        assert!(
+            result.is_ok(),
+            "negative i64 within i32 range should succeed"
+        );
     }
 
     #[test]
@@ -677,8 +678,7 @@ mod tests {
         let mut parquet_field_ids = HashMap::new();
         parquet_field_ids.insert(i32::MAX, "max_col".to_string());
 
-        let result =
-            build_read_schema_with_field_id_mapping(&current_columns, &parquet_field_ids);
+        let result = build_read_schema_with_field_id_mapping(&current_columns, &parquet_field_ids);
         assert!(result.is_ok(), "column_id == i32::MAX should succeed");
     }
 
@@ -930,16 +930,28 @@ mod tests {
 
     #[test]
     fn test_varchar_with_length() {
-        assert_eq!(ducklake_to_arrow_type("varchar(255)").unwrap(), DataType::Utf8);
-        assert_eq!(ducklake_to_arrow_type("VARCHAR(100)").unwrap(), DataType::Utf8);
-        assert_eq!(ducklake_to_arrow_type("varchar(1)").unwrap(), DataType::Utf8);
+        assert_eq!(
+            ducklake_to_arrow_type("varchar(255)").unwrap(),
+            DataType::Utf8
+        );
+        assert_eq!(
+            ducklake_to_arrow_type("VARCHAR(100)").unwrap(),
+            DataType::Utf8
+        );
+        assert_eq!(
+            ducklake_to_arrow_type("varchar(1)").unwrap(),
+            DataType::Utf8
+        );
     }
 
     #[test]
     fn test_char_with_length() {
         assert_eq!(ducklake_to_arrow_type("char(10)").unwrap(), DataType::Utf8);
         assert_eq!(ducklake_to_arrow_type("CHAR(1)").unwrap(), DataType::Utf8);
-        assert_eq!(ducklake_to_arrow_type("character(50)").unwrap(), DataType::Utf8);
+        assert_eq!(
+            ducklake_to_arrow_type("character(50)").unwrap(),
+            DataType::Utf8
+        );
     }
 
     #[test]
@@ -956,7 +968,10 @@ mod tests {
 
     #[test]
     fn test_nvarchar_with_length() {
-        assert_eq!(ducklake_to_arrow_type("nvarchar(255)").unwrap(), DataType::Utf8);
+        assert_eq!(
+            ducklake_to_arrow_type("nvarchar(255)").unwrap(),
+            DataType::Utf8
+        );
         assert_eq!(ducklake_to_arrow_type("nchar(10)").unwrap(), DataType::Utf8);
     }
 
@@ -979,8 +994,7 @@ mod tests {
 
     #[test]
     fn test_struct_mixed_quoted_and_unquoted() {
-        let result =
-            ducklake_to_arrow_type(r#"STRUCT("my field" VARCHAR, name VARCHAR)"#).unwrap();
+        let result = ducklake_to_arrow_type(r#"STRUCT("my field" VARCHAR, name VARCHAR)"#).unwrap();
         if let DataType::Struct(fields) = &result {
             assert_eq!(fields.len(), 2);
             assert_eq!(fields[0].name(), "my field");

@@ -26,7 +26,10 @@ async fn create_test_writer() -> (SqliteMetadataWriter, TempDir) {
 }
 
 fn test_columns() -> Vec<ColumnDef> {
-    vec![ColumnDef::new("id", "int32", false).unwrap(), ColumnDef::new("name", "varchar", true).unwrap()]
+    vec![
+        ColumnDef::new("id", "int32", false).unwrap(),
+        ColumnDef::new("name", "varchar", true).unwrap(),
+    ]
 }
 
 /// Helper: create a table and return (table_id, schema_id, snapshot_id)
@@ -304,8 +307,10 @@ async fn test_alter_column_type_widening() {
     let (writer, _temp) = create_test_writer().await;
 
     // Create table with int32 column
-    let columns =
-        vec![ColumnDef::new("id", "int32", false).unwrap(), ColumnDef::new("value", "int32", true).unwrap()];
+    let columns = vec![
+        ColumnDef::new("id", "int32", false).unwrap(),
+        ColumnDef::new("value", "int32", true).unwrap(),
+    ];
     let setup = writer
         .begin_write_transaction("main", "data", &columns, WriteMode::Replace)
         .unwrap();
@@ -674,7 +679,11 @@ async fn test_compound_alter_add_rename_drop() {
         .unwrap();
 
     let columns = writer.get_active_columns(table_id).unwrap();
-    assert_eq!(columns.len(), 3, "Expected 3 columns after compound ALTER: {columns:?}");
+    assert_eq!(
+        columns.len(),
+        3,
+        "Expected 3 columns after compound ALTER: {columns:?}"
+    );
     assert_eq!(columns[0].0, "id");
     assert_eq!(columns[0].1, "int64"); // widened
     assert_eq!(columns[1].0, "full_name"); // renamed
@@ -693,7 +702,8 @@ async fn test_write_with_duplicate_columns_fails() {
         ColumnDef::new("id", "int32", false).unwrap(), // duplicate
     ];
 
-    let result = writer.begin_write_transaction("main", "bad_table", &dup_columns, WriteMode::Replace);
+    let result =
+        writer.begin_write_transaction("main", "bad_table", &dup_columns, WriteMode::Replace);
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(

@@ -2,8 +2,8 @@
 
 use datafusion::catalog::TableFunctionImpl;
 use datafusion::common::{Result as DataFusionResult, ScalarValue, plan_err};
-use datafusion::error::DataFusionError;
 use datafusion::datasource::TableProvider;
+use datafusion::error::DataFusionError;
 use datafusion::logical_expr::Expr;
 use std::sync::Arc;
 
@@ -64,7 +64,10 @@ impl TableFunctionImpl for DucklakeTableInfoFunction {
             .provider
             .get_current_snapshot()
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        Ok(Arc::new(TableInfoTable::new(self.provider.clone(), snapshot_id)))
+        Ok(Arc::new(TableInfoTable::new(
+            self.provider.clone(),
+            snapshot_id,
+        )))
     }
 }
 
@@ -95,14 +98,11 @@ impl TableFunctionImpl for DucklakeListFilesFunction {
                 return plan_err!(
                     "First argument to ducklake_list_files() must be a string literal"
                 );
-            }
+            },
         };
 
-        let resolved = resolve_table_for_function(
-            &*self.provider,
-            &table_name,
-            "ducklake_list_files",
-        )?;
+        let resolved =
+            resolve_table_for_function(&*self.provider, &table_name, "ducklake_list_files")?;
 
         let snapshot_id = self
             .provider
@@ -151,10 +151,9 @@ impl TableFunctionImpl for DucklakeListFilesFunction {
             };
 
             // Strip the data_path prefix if the file path starts with the base URL path
-            let display_path = file_path.strip_prefix(&data_path).map_or_else(
-                || file_path.clone(),
-                |stripped| stripped.to_string(),
-            );
+            let display_path = file_path
+                .strip_prefix(&data_path)
+                .map_or_else(|| file_path.clone(), |stripped| stripped.to_string());
 
             data_file_paths.push(display_path);
             data_file_sizes.push(f.file.file_size_bytes);
@@ -168,10 +167,9 @@ impl TableFunctionImpl for DucklakeListFilesFunction {
                 } else {
                     del.path.clone()
                 };
-                let display_del = del_path.strip_prefix(&data_path).map_or_else(
-                    || del_path.clone(),
-                    |stripped| stripped.to_string(),
-                );
+                let display_del = del_path
+                    .strip_prefix(&data_path)
+                    .map_or_else(|| del_path.clone(), |stripped| stripped.to_string());
                 delete_file_paths.push(Some(display_del));
                 delete_file_sizes.push(Some(del.file_size_bytes));
                 delete_file_footer_sizes.push(del.footer_size);
@@ -212,7 +210,9 @@ pub struct DucklakeTableChangesFunction {
 
 impl DucklakeTableChangesFunction {
     pub fn new(provider: Arc<dyn MetadataProvider>) -> Self {
-        Self { provider }
+        Self {
+            provider,
+        }
     }
 }
 
@@ -243,7 +243,9 @@ pub struct DucklakeTableDeletionsFunction {
 
 impl DucklakeTableDeletionsFunction {
     pub fn new(provider: Arc<dyn MetadataProvider>) -> Self {
-        Self { provider }
+        Self {
+            provider,
+        }
     }
 }
 
@@ -366,7 +368,7 @@ fn parse_change_function_args(
                 "First argument to {}() must be a string literal (e.g., 'main.users' or 'users')",
                 func_name
             );
-        }
+        },
     };
 
     let start_snapshot = match &exprs[1] {
@@ -377,7 +379,7 @@ fn parse_change_function_args(
                 "Second argument to {}() must be an integer (start_snapshot)",
                 func_name
             );
-        }
+        },
     };
 
     let end_snapshot = match &exprs[2] {
@@ -388,7 +390,7 @@ fn parse_change_function_args(
                 "Third argument to {}() must be an integer (end_snapshot)",
                 func_name
             );
-        }
+        },
     };
 
     if start_snapshot > end_snapshot {
@@ -409,7 +411,9 @@ pub struct DucklakeTableInsertionsFunction {
 
 impl DucklakeTableInsertionsFunction {
     pub fn new(provider: Arc<dyn MetadataProvider>) -> Self {
-        Self { provider }
+        Self {
+            provider,
+        }
     }
 }
 
@@ -443,7 +447,10 @@ struct SingleValueTable {
 impl SingleValueTable {
     fn new(value: i64) -> Self {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        Self { schema, value }
+        Self {
+            schema,
+            value,
+        }
     }
 }
 
@@ -471,8 +478,10 @@ impl TableProvider for SingleValueTable {
         let id_array: ArrayRef = Arc::new(Int64Array::from(vec![self.value]));
         let batch = RecordBatch::try_new(self.schema.clone(), vec![id_array])
             .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
-        let mem_table =
-            datafusion::datasource::memory::MemTable::try_new(self.schema.clone(), vec![vec![batch]])?;
+        let mem_table = datafusion::datasource::memory::MemTable::try_new(
+            self.schema.clone(),
+            vec![vec![batch]],
+        )?;
         mem_table.scan(state, projection, filters, limit).await
     }
 }
@@ -484,7 +493,9 @@ pub struct DucklakeCurrentSnapshotFunction {
 
 impl DucklakeCurrentSnapshotFunction {
     pub fn new(provider: Arc<dyn MetadataProvider>) -> Self {
-        Self { provider }
+        Self {
+            provider,
+        }
     }
 }
 
@@ -510,7 +521,9 @@ pub struct DucklakeLastCommittedSnapshotFunction {
 
 impl DucklakeLastCommittedSnapshotFunction {
     pub fn new(provider: Arc<dyn MetadataProvider>) -> Self {
-        Self { provider }
+        Self {
+            provider,
+        }
     }
 }
 

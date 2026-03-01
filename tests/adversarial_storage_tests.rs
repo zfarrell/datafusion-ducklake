@@ -40,10 +40,7 @@ fn collect_int_values(results: &[RecordBatch], col_idx: usize) -> Vec<i32> {
                     values.push(array.value(i));
                 }
             }
-        } else if let Some(array) = column
-            .as_any()
-            .downcast_ref::<arrow::array::Int64Array>()
-        {
+        } else if let Some(array) = column.as_any().downcast_ref::<arrow::array::Int64Array>() {
             for i in 0..array.len() {
                 if !array.is_null(i) {
                     values.push(array.value(i) as i32);
@@ -122,7 +119,10 @@ fn test_path_with_unicode_special_chars() {
 fn test_path_with_url_encoding() {
     // URL-encoded path traversal sequences are now caught by validation
     let result = join_paths("/data/", "file%2F..%2F..%2Fetc%2Fpasswd");
-    assert!(result.is_err(), "URL-encoded path traversal should be rejected");
+    assert!(
+        result.is_err(),
+        "URL-encoded path traversal should be rejected"
+    );
 }
 
 #[test]
@@ -158,7 +158,10 @@ fn test_double_slash_in_various_positions() {
     // Let's verify all edge cases.
 
     // Base with trailing slash + relative with leading slash (the fixed case)
-    assert_eq!(join_paths("/data/", "/file.parquet").unwrap(), "/data/file.parquet");
+    assert_eq!(
+        join_paths("/data/", "/file.parquet").unwrap(),
+        "/data/file.parquet"
+    );
 
     // Multiple leading slashes on relative path
     assert_eq!(
@@ -176,7 +179,10 @@ fn test_double_slash_in_various_positions() {
     // pass through uncleaned.
 
     // Base without trailing slash (adds one via format!)
-    assert_eq!(join_paths("/data", "/file.parquet").unwrap(), "/data//file.parquet");
+    assert_eq!(
+        join_paths("/data", "/file.parquet").unwrap(),
+        "/data//file.parquet"
+    );
     // FINDING: When base has NO trailing slash but relative has leading slash,
     // we get a double slash! The fix only covers the case where base ends with '/'.
 }
@@ -235,7 +241,10 @@ fn test_parse_relative_path_outside_cwd() {
     // Relative path to non-existent location — parse_object_store_url only
     // parses the URL structure, it does not check file existence.
     let result = parse_object_store_url("nonexistent_dir_12345/data");
-    assert!(result.is_ok(), "URL parsing succeeds regardless of path existence");
+    assert!(
+        result.is_ok(),
+        "URL parsing succeeds regardless of path existence"
+    );
 }
 
 #[test]
@@ -470,7 +479,7 @@ async fn test_query_after_delete_file_deleted() -> DataFusionResult<()> {
                     ids
                 );
             }
-        }
+        },
         Err(e) => {
             // Expected: error when delete file is missing
             let err_str = e.to_string();
@@ -481,7 +490,7 @@ async fn test_query_after_delete_file_deleted() -> DataFusionResult<()> {
                 "Unexpected error: {}",
                 err_str
             );
-        }
+        },
     }
 
     Ok(())
@@ -826,11 +835,14 @@ async fn test_footer_size_zero() -> DataFusionResult<()> {
                 .downcast_ref::<arrow::array::Int64Array>()
                 .unwrap()
                 .value(0);
-            assert_eq!(count, 4, "Should still get correct count with footer_size=0");
-        }
+            assert_eq!(
+                count, 4,
+                "Should still get correct count with footer_size=0"
+            );
+        },
         Err(e) => {
             println!("FINDING: footer_size=0 caused error: {}", e);
-        }
+        },
     }
 
     Ok(())
@@ -879,14 +891,14 @@ async fn test_footer_size_negative() -> DataFusionResult<()> {
                 count
             );
             // FINDING: If this succeeds, DataFusion silently ignores the absurd hint.
-        }
+        },
         Err(e) => {
             println!(
                 "FINDING: footer_size=-1 (cast to usize::MAX) caused error: {}",
                 e
             );
             // Expected: some kind of allocation or I/O error
-        }
+        },
     }
 
     Ok(())
@@ -904,11 +916,8 @@ async fn test_footer_size_larger_than_file() -> DataFusionResult<()> {
     {
         let conn = duckdb::Connection::open(&catalog_path)
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
-        conn.execute(
-            "UPDATE ducklake_data_file SET footer_size = 999999999;",
-            [],
-        )
-        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        conn.execute("UPDATE ducklake_data_file SET footer_size = 999999999;", [])
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
     }
 
     let catalog = create_catalog(&catalog_path.to_string_lossy())?;
@@ -936,10 +945,10 @@ async fn test_footer_size_larger_than_file() -> DataFusionResult<()> {
                 "footer_size > file_size: query succeeded with count={}",
                 count
             );
-        }
+        },
         Err(e) => {
             println!("footer_size > file_size caused error: {}", e);
-        }
+        },
     }
 
     Ok(())
@@ -957,11 +966,8 @@ async fn test_file_size_bytes_zero_in_metadata() -> DataFusionResult<()> {
     {
         let conn = duckdb::Connection::open(&catalog_path)
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
-        conn.execute(
-            "UPDATE ducklake_data_file SET file_size_bytes = 0;",
-            [],
-        )
-        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        conn.execute("UPDATE ducklake_data_file SET file_size_bytes = 0;", [])
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
     }
 
     let catalog = create_catalog(&catalog_path.to_string_lossy())?;
@@ -985,14 +991,11 @@ async fn test_file_size_bytes_zero_in_metadata() -> DataFusionResult<()> {
                 .downcast_ref::<arrow::array::Int64Array>()
                 .unwrap()
                 .value(0);
-            println!(
-                "file_size_bytes=0 in metadata: query got count={}",
-                count
-            );
-        }
+            println!("file_size_bytes=0 in metadata: query got count={}", count);
+        },
         Err(e) => {
             println!("file_size_bytes=0 caused error: {}", e);
-        }
+        },
     }
 
     Ok(())
@@ -1010,11 +1013,8 @@ async fn test_file_size_bytes_negative() -> DataFusionResult<()> {
     {
         let conn = duckdb::Connection::open(&catalog_path)
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
-        conn.execute(
-            "UPDATE ducklake_data_file SET file_size_bytes = -1;",
-            [],
-        )
-        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        conn.execute("UPDATE ducklake_data_file SET file_size_bytes = -1;", [])
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
     }
 
     let catalog = create_catalog(&catalog_path.to_string_lossy())?;
@@ -1042,10 +1042,10 @@ async fn test_file_size_bytes_negative() -> DataFusionResult<()> {
                 "WARNING: file_size_bytes=-1 (u64::MAX) succeeded with count={}",
                 count
             );
-        }
+        },
         Err(e) => {
             println!("file_size_bytes=-1 caused error: {}", e);
-        }
+        },
     }
 
     Ok(())
@@ -1084,10 +1084,7 @@ async fn test_table_with_no_data_files() -> DataFusionResult<()> {
         .await?;
 
     let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(
-        total_rows, 0,
-        "Table with no files should return 0 rows"
-    );
+    assert_eq!(total_rows, 0, "Table with no files should return 0 rows");
 
     // COUNT(*) should also work
     let count_results = ctx
@@ -1149,10 +1146,10 @@ async fn test_data_path_modified_to_traversal() -> DataFusionResult<()> {
                 query_result.is_err(),
                 "FINDING: Traversal path in data_path accepted, query should fail"
             );
-        }
+        },
         Err(_) => {
             // This is acceptable — rejecting the traversal path at catalog creation
-        }
+        },
     }
 
     Ok(())
@@ -1216,11 +1213,7 @@ async fn test_file_deleted_during_scan() -> DataFusionResult<()> {
         // Insert multiple batches to create multiple files
         for i in 0..5 {
             conn.execute(
-                &format!(
-                    "INSERT INTO test.data VALUES ({}, 'batch{}');",
-                    i,
-                    i
-                ),
+                &format!("INSERT INTO test.data VALUES ({}, 'batch{}');", i, i),
                 [],
             )
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
@@ -1253,7 +1246,7 @@ async fn test_file_deleted_during_scan() -> DataFusionResult<()> {
                 "WARNING: Query succeeded with {} rows even though a file was deleted",
                 total
             );
-        }
+        },
         Err(e) => {
             // Expected
             assert!(
@@ -1263,7 +1256,7 @@ async fn test_file_deleted_during_scan() -> DataFusionResult<()> {
                 "Got unexpected error: {}",
                 e
             );
-        }
+        },
     }
 
     Ok(())
@@ -1300,7 +1293,10 @@ async fn test_parquet_file_replaced_with_directory() -> DataFusionResult<()> {
         .await;
 
     // FINDING: Replacing a file with a directory should cause an error
-    assert!(result.is_err(), "Should error when parquet path is a directory");
+    assert!(
+        result.is_err(),
+        "Should error when parquet path is a directory"
+    );
 
     Ok(())
 }
@@ -1370,10 +1366,7 @@ async fn test_parquet_file_is_symlink_to_self() -> DataFusionResult<()> {
         .await;
 
     // FINDING: Circular symlink should cause an error (ELOOP or similar)
-    assert!(
-        result.is_err(),
-        "Should error on circular symlink"
-    );
+    assert!(result.is_err(), "Should error on circular symlink");
 
     Ok(())
 }
@@ -1530,10 +1523,7 @@ async fn test_parquet_file_truncated_mid_content() -> DataFusionResult<()> {
         .collect()
         .await;
 
-    assert!(
-        result.is_err(),
-        "Should error on truncated parquet file"
-    );
+    assert!(result.is_err(), "Should error on truncated parquet file");
 
     Ok(())
 }
@@ -1548,8 +1538,7 @@ async fn test_complex_delete_insert_pattern() -> DataFusionResult<()> {
         TempDir::new().map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
     let catalog_path = temp_dir.path().join("complex_deletes.ducklake");
 
-    common::create_catalog_complex_deletions(&catalog_path)
-        .map_err(common::to_datafusion_error)?;
+    common::create_catalog_complex_deletions(&catalog_path).map_err(common::to_datafusion_error)?;
 
     let catalog = create_catalog(&catalog_path.to_string_lossy())?;
     let ctx = SessionContext::new();
@@ -1605,11 +1594,8 @@ async fn test_record_count_mismatch_in_metadata() -> DataFusionResult<()> {
     {
         let conn = duckdb::Connection::open(&catalog_path)
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
-        conn.execute(
-            "UPDATE ducklake_data_file SET record_count = 1000000;",
-            [],
-        )
-        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        conn.execute("UPDATE ducklake_data_file SET record_count = 1000000;", [])
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
     }
 
     let catalog = create_catalog(&catalog_path.to_string_lossy())?;
@@ -1742,8 +1728,7 @@ impl DeleteFilterStreamWrapper {
                 .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None));
         }
 
-        let indices =
-            UInt32Array::from(keep_indices.iter().map(|&i| i as u32).collect::<Vec<_>>());
+        let indices = UInt32Array::from(keep_indices.iter().map(|&i| i as u32).collect::<Vec<_>>());
 
         let filtered_columns: DataFusionResult<Vec<_>> = batch
             .columns()

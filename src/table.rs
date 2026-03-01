@@ -190,7 +190,10 @@ impl DuckLakeTable {
         let table_files = provider.get_table_files_for_select(table_id, snapshot_id)?;
 
         // Load row count from metadata for COUNT(*) optimization
-        let cached_row_count = provider.get_table_row_count(table_id, snapshot_id).ok().flatten();
+        let cached_row_count = provider
+            .get_table_row_count(table_id, snapshot_id)
+            .ok()
+            .flatten();
 
         // Load partition metadata for partition pruning
         let partition_columns = provider
@@ -881,7 +884,8 @@ impl DuckLakeTable {
         }
 
         // Extract equality constraints on partition columns from filters
-        let partition_filters = extract_partition_equality_filters(filters, &self.partition_columns);
+        let partition_filters =
+            extract_partition_equality_filters(filters, &self.partition_columns);
         if partition_filters.is_empty() {
             return files.iter().collect();
         }
@@ -921,7 +925,13 @@ impl DuckLakeTable {
 /// Per-file column statistics for pruning decisions
 struct FileStats {
     /// column_name -> (min_value, max_value)
-    columns: HashMap<String, (Option<datafusion::common::ScalarValue>, Option<datafusion::common::ScalarValue>)>,
+    columns: HashMap<
+        String,
+        (
+            Option<datafusion::common::ScalarValue>,
+            Option<datafusion::common::ScalarValue>,
+        ),
+    >,
 }
 
 impl DuckLakeTable {
@@ -1038,7 +1048,7 @@ fn extract_pruning_predicates(filters: &[Expr]) -> Vec<PruningPredicate> {
                 | Operator::Lt
                 | Operator::LtEq
                 | Operator::Gt
-                | Operator::GtEq => {}
+                | Operator::GtEq => {},
                 _ => continue,
             }
 
@@ -1103,7 +1113,7 @@ fn file_definitely_excluded(stats: &FileStats, pred: &PruningPredicate) -> bool 
                 }
             }
             false
-        }
+        },
         // column != value: exclude only if min == max == value (all rows have this value)
         Operator::NotEq => {
             if let (Some(min), Some(max)) = (min_val, max_val) {
@@ -1111,7 +1121,7 @@ fn file_definitely_excluded(stats: &FileStats, pred: &PruningPredicate) -> bool 
             } else {
                 false
             }
-        }
+        },
         // column < value: exclude if min >= value
         Operator::Lt => {
             if let Some(min) = min_val {
@@ -1119,7 +1129,7 @@ fn file_definitely_excluded(stats: &FileStats, pred: &PruningPredicate) -> bool 
             } else {
                 false
             }
-        }
+        },
         // column <= value: exclude if min > value
         Operator::LtEq => {
             if let Some(min) = min_val {
@@ -1127,7 +1137,7 @@ fn file_definitely_excluded(stats: &FileStats, pred: &PruningPredicate) -> bool 
             } else {
                 false
             }
-        }
+        },
         // column > value: exclude if max <= value
         Operator::Gt => {
             if let Some(max) = max_val {
@@ -1135,7 +1145,7 @@ fn file_definitely_excluded(stats: &FileStats, pred: &PruningPredicate) -> bool 
             } else {
                 false
             }
-        }
+        },
         // column >= value: exclude if max < value
         Operator::GtEq => {
             if let Some(max) = max_val {
@@ -1143,7 +1153,7 @@ fn file_definitely_excluded(stats: &FileStats, pred: &PruningPredicate) -> bool 
             } else {
                 false
             }
-        }
+        },
         _ => false,
     }
 }
@@ -1171,17 +1181,16 @@ fn extract_partition_equality_filters(
 
             // Try both orderings: column = literal and literal = column
             let (col_name, lit_value) = match (binary.left.as_ref(), binary.right.as_ref()) {
-                (Expr::Column(col), Expr::Literal(scalar, _)) => {
-                    (&col.name, scalar)
-                },
-                (Expr::Literal(scalar, _), Expr::Column(col)) => {
-                    (&col.name, scalar)
-                },
+                (Expr::Column(col), Expr::Literal(scalar, _)) => (&col.name, scalar),
+                (Expr::Literal(scalar, _), Expr::Column(col)) => (&col.name, scalar),
                 _ => continue,
             };
 
             // Check if this column is a partition column with identity transform
-            if let Some(pc) = partition_columns.iter().find(|pc| &pc.column_name == col_name) {
+            if let Some(pc) = partition_columns
+                .iter()
+                .find(|pc| &pc.column_name == col_name)
+            {
                 let is_identity = pc.transform.is_none()
                     || pc
                         .transform
@@ -1205,9 +1214,7 @@ fn extract_partition_equality_filters(
 /// Convert a DataFusion ScalarValue to a string for partition value comparison.
 ///
 /// Returns None for null values or unsupported types.
-fn scalar_value_to_partition_string(
-    value: &datafusion::common::ScalarValue,
-) -> Option<String> {
+fn scalar_value_to_partition_string(value: &datafusion::common::ScalarValue) -> Option<String> {
     use datafusion::common::ScalarValue;
 
     match value {
@@ -1396,7 +1403,10 @@ impl TableProvider for DuckLakeTable {
 
         if !needs_virtual {
             // No virtual columns — use optimized grouped scan path
-            let (files_with_deletes, files_without_deletes): (Vec<&DuckLakeTableFile>, Vec<&DuckLakeTableFile>) = active_files
+            let (files_with_deletes, files_without_deletes): (
+                Vec<&DuckLakeTableFile>,
+                Vec<&DuckLakeTableFile>,
+            ) = active_files
                 .iter()
                 .copied()
                 .partition(|tf| tf.delete_file.is_some());
@@ -1659,7 +1669,25 @@ impl TableProvider for DuckLakeTable {
             input
         };
 
-        Ok(Arc::new(DuckLakeInsertExec::new(
+        // Build write-side partition columns from the table's partition metadata
+        let write_partition_cols: Vec<crate::insert_exec::WritePartitionColumn> = self
+            .partition_columns
+            .iter()
+            .filter_map(|pc| {
+                let col_idx = self
+                    .schema
+                    .fields()
+                    .iter()
+                    .position(|f| f.name() == &pc.column_name)?;
+                Some(crate::insert_exec::WritePartitionColumn {
+                    column_name: pc.column_name.clone(),
+                    column_index: col_idx,
+                    transform: pc.transform.clone(),
+                })
+            })
+            .collect();
+
+        let exec = DuckLakeInsertExec::new(
             actual_input,
             Arc::clone(writer),
             schema_name.clone(),
@@ -1667,7 +1695,10 @@ impl TableProvider for DuckLakeTable {
             Arc::clone(&self.schema),
             write_mode,
             self.object_store_url.clone(),
-        )))
+        )
+        .with_partition_columns(write_partition_cols);
+
+        Ok(Arc::new(exec))
     }
 }
 
@@ -1786,7 +1817,7 @@ fn parse_inlined_column(
                 }
             }
             Arc::new(builder.finish())
-        }
+        },
         DataType::Int8 => parse_primitive!(Int8Builder, values),
         DataType::Int16 => parse_primitive!(Int16Builder, values),
         DataType::Int32 => parse_primitive!(Int32Builder, values),
@@ -1806,7 +1837,7 @@ fn parse_inlined_column(
                 }
             }
             Arc::new(builder.finish())
-        }
+        },
         DataType::LargeUtf8 => {
             let mut builder = LargeStringBuilder::new();
             for val in values {
@@ -1816,7 +1847,7 @@ fn parse_inlined_column(
                 }
             }
             Arc::new(builder.finish())
-        }
+        },
         DataType::Date32 => parse_primitive!(Date32Builder, values),
         DataType::Date64 => parse_primitive!(Date64Builder, values),
         DataType::Timestamp(_, _) => parse_primitive!(Int64Builder, values),
@@ -1830,7 +1861,7 @@ fn parse_inlined_column(
                 }
             }
             Arc::new(builder.finish())
-        }
+        },
     };
 
     Ok(array)

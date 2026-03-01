@@ -75,20 +75,24 @@ mod type_patterns {
             "struct()",
             "struct<>",
             "struct<:>",
-            "struct(name)",  // field without type
+            "struct(name)", // field without type
             "map(varchar, int32, extra)",
-            "list(int32, varchar)",  // list with multiple types
-            "[]",  // empty array suffix
+            "list(int32, varchar)", // list with multiple types
+            "[]",                   // empty array suffix
         ];
         for type_str in malformed_types {
             let result = ducklake_to_arrow_type(type_str);
             // Should either parse correctly or return a clean error - never panic/crash
             match result {
-                Ok(_) => {} // Some of these might parse fine
+                Ok(_) => {}, // Some of these might parse fine
                 Err(e) => {
                     // Error message should not be empty
-                    assert!(!e.to_string().is_empty(), "Error for '{}' was empty", type_str);
-                }
+                    assert!(
+                        !e.to_string().is_empty(),
+                        "Error for '{}' was empty",
+                        type_str
+                    );
+                },
             }
         }
     }
@@ -107,7 +111,12 @@ mod type_patterns {
         for type_str in nested_types {
             let result = ducklake_to_arrow_type(type_str);
             // Should succeed without panicking
-            assert!(result.is_ok(), "Deep nesting should be handled: '{}' -> {:?}", type_str, result);
+            assert!(
+                result.is_ok(),
+                "Deep nesting should be handled: '{}' -> {:?}",
+                type_str,
+                result
+            );
         }
     }
 
@@ -120,16 +129,36 @@ mod type_patterns {
 
         // All timestamp variants should parse
         let timestamp_types = vec![
-            ("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None)),
-            ("timestamptz", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))),
-            ("timestamp with time zone", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))),
+            (
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+            ),
+            (
+                "timestamptz",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            ),
+            (
+                "timestamp with time zone",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            ),
             ("timestamp_s", DataType::Timestamp(TimeUnit::Second, None)),
-            ("timestamp_ms", DataType::Timestamp(TimeUnit::Millisecond, None)),
-            ("timestamp_ns", DataType::Timestamp(TimeUnit::Nanosecond, None)),
+            (
+                "timestamp_ms",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+            ),
+            (
+                "timestamp_ns",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+            ),
         ];
         for (type_str, expected) in timestamp_types {
             let result = ducklake_to_arrow_type(type_str);
-            assert!(result.is_ok(), "Failed to parse '{}': {:?}", type_str, result);
+            assert!(
+                result.is_ok(),
+                "Failed to parse '{}': {:?}",
+                type_str,
+                result
+            );
             assert_eq!(result.unwrap(), expected, "Wrong type for '{}'", type_str);
         }
     }
@@ -157,7 +186,12 @@ mod type_patterns {
         ];
         for (type_str, expected) in cases {
             let result = ducklake_to_arrow_type(type_str);
-            assert!(result.is_ok(), "Failed to parse '{}': {:?}", type_str, result);
+            assert!(
+                result.is_ok(),
+                "Failed to parse '{}': {:?}",
+                type_str,
+                result
+            );
             assert_eq!(result.unwrap(), expected, "Wrong type for '{}'", type_str);
         }
     }
@@ -171,18 +205,33 @@ mod type_patterns {
 
         // Leading/trailing whitespace
         let result = ducklake_to_arrow_type("  varchar  ");
-        assert_eq!(result.unwrap(), DataType::Utf8, "Leading/trailing whitespace should be trimmed");
+        assert_eq!(
+            result.unwrap(),
+            DataType::Utf8,
+            "Leading/trailing whitespace should be trimmed"
+        );
 
         let result = ducklake_to_arrow_type("\tint32\n");
-        assert_eq!(result.unwrap(), DataType::Int32, "Tab/newline whitespace should be trimmed");
+        assert_eq!(
+            result.unwrap(),
+            DataType::Int32,
+            "Tab/newline whitespace should be trimmed"
+        );
 
         // Whitespace inside decimal
         let result = ducklake_to_arrow_type("decimal( 10 , 2 )");
-        assert!(result.is_ok(), "Whitespace inside decimal params should be handled");
+        assert!(
+            result.is_ok(),
+            "Whitespace inside decimal params should be handled"
+        );
 
         // Whitespace inside parameterized varchar
         let result = ducklake_to_arrow_type("varchar( 255 )");
-        assert_eq!(result.unwrap(), DataType::Utf8, "Whitespace inside varchar(N) should be handled");
+        assert_eq!(
+            result.unwrap(),
+            DataType::Utf8,
+            "Whitespace inside varchar(N) should be handled"
+        );
     }
 
     // Pattern from issue #120: Query results incorrect with complex filters.
@@ -206,13 +255,17 @@ mod type_patterns {
 
         // Negative scale
         let result = ducklake_to_arrow_type("decimal(10, -2)");
-        assert!(result.is_ok(), "Negative scale should be handled: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "Negative scale should be handled: {:?}",
+            result
+        );
 
         // Zero precision should either work or give clear error
         let result = ducklake_to_arrow_type("decimal(0, 0)");
         // Arrow may reject this, but we shouldn't crash
         match result {
-            Ok(_) => {}
+            Ok(_) => {},
             Err(e) => assert!(!e.to_string().is_empty()),
         }
     }
@@ -222,8 +275,8 @@ mod type_patterns {
     // ANALOGOUS CODE: Our arrow_to_ducklake_type round-trip for edge types.
     #[test]
     fn test_pattern_288_type_roundtrip_consistency() {
-        use datafusion_ducklake::types::arrow_to_ducklake_type;
         use arrow::datatypes::{DataType, TimeUnit};
+        use datafusion_ducklake::types::arrow_to_ducklake_type;
 
         // Test that arrow -> ducklake -> arrow is identity for all supported types
         let types = vec![
@@ -300,8 +353,18 @@ mod type_patterns {
         ];
         for (alias, expected) in aliases {
             let result = ducklake_to_arrow_type(alias);
-            assert!(result.is_ok(), "Alias '{}' should be supported: {:?}", alias, result);
-            assert_eq!(result.unwrap(), expected, "Wrong type for alias '{}'", alias);
+            assert!(
+                result.is_ok(),
+                "Alias '{}' should be supported: {:?}",
+                alias,
+                result
+            );
+            assert_eq!(
+                result.unwrap(),
+                expected,
+                "Wrong type for alias '{}'",
+                alias
+            );
         }
     }
 }
@@ -311,8 +374,10 @@ mod type_patterns {
 // ============================================================================
 
 mod path_patterns {
-    use datafusion_ducklake::path_resolver::{join_paths, parse_object_store_url, resolve_path, PathResolver};
     use datafusion::datasource::object_store::ObjectStoreUrl;
+    use datafusion_ducklake::path_resolver::{
+        PathResolver, join_paths, parse_object_store_url, resolve_path,
+    };
     use std::sync::Arc;
 
     // Pattern from issue #217: Double slash "//" in S3 URL from MinIO.
@@ -322,8 +387,11 @@ mod path_patterns {
     fn test_pattern_217_double_slash_in_paths() {
         // join_paths with base ending in / and relative starting with /
         let result = join_paths("/data/", "/subdir/file.parquet").unwrap();
-        assert!(!result.contains("//") || result.starts_with("//"),
-            "Double slash should be prevented: '{}'", result);
+        assert!(
+            !result.contains("//") || result.starts_with("//"),
+            "Double slash should be prevented: '{}'",
+            result
+        );
 
         // PathResolver creating child with trailing slash + relative starting with /
         let resolver = PathResolver::new(
@@ -332,8 +400,11 @@ mod path_patterns {
         );
         let child = resolver.child_resolver("/", true).unwrap();
         // When base ends with / and child is just /, we get /data/ which is fine
-        assert!(child.base_path() == "/data/" || !child.base_path().contains("//"),
-            "Double slash in child resolver: '{}'", child.base_path());
+        assert!(
+            child.base_path() == "/data/" || !child.base_path().contains("//"),
+            "Double slash in child resolver: '{}'",
+            child.base_path()
+        );
     }
 
     // Pattern from issue #217: Path resolution when data_path ends with /.
@@ -352,7 +423,11 @@ mod path_patterns {
 
         assert_eq!(file, "/prefix/schema/table/data.parquet");
         // Check no double slashes
-        assert!(!file.contains("//"), "Double slash in resolved path: '{}'", file);
+        assert!(
+            !file.contains("//"),
+            "Double slash in resolved path: '{}'",
+            file
+        );
     }
 
     // Pattern from issue #198: Wrong path separator (backslash instead of forward slash).
@@ -363,7 +438,10 @@ mod path_patterns {
         // If metadata contains backslash paths (Windows-created catalogs)
         let result = resolve_path("/data/", "schema\\table\\file.parquet", true).unwrap();
         // At minimum, should not crash. The path will contain backslashes since we don't normalize.
-        assert!(!result.is_empty(), "Path resolution with backslash should not produce empty result");
+        assert!(
+            !result.is_empty(),
+            "Path resolution with backslash should not produce empty result"
+        );
 
         // join_paths with backslash base
         let result = join_paths("C:\\data\\", "table\\file.parquet").unwrap();
@@ -379,8 +457,11 @@ mod path_patterns {
         let (url, path) = parse_object_store_url("s3://bucket").unwrap();
         assert_eq!(url, ObjectStoreUrl::parse("s3://bucket/").unwrap());
         // Path should be empty or "/"
-        assert!(path.is_empty() || path == "/",
-            "Bucket-only URL path should be empty or '/': '{}'", path);
+        assert!(
+            path.is_empty() || path == "/",
+            "Bucket-only URL path should be empty or '/': '{}'",
+            path
+        );
 
         // S3 bucket with trailing slash
         let (_, path) = parse_object_store_url("s3://bucket/").unwrap();
@@ -392,7 +473,10 @@ mod path_patterns {
             path.clone(),
         );
         let resolved = resolver.resolve("schema/table/file.parquet", true).unwrap();
-        assert!(!resolved.is_empty(), "Resolution from bucket root should work");
+        assert!(
+            !resolved.is_empty(),
+            "Resolution from bucket root should work"
+        );
     }
 
     // Pattern from issue #255: Dots in bucket names (e.g., "aggregate.lake").
@@ -412,17 +496,26 @@ mod path_patterns {
     fn test_pattern_217_empty_path_components() {
         // Empty base path
         let result = resolve_path("", "file.parquet", true).unwrap();
-        assert!(!result.is_empty(), "Empty base with relative should still produce a path");
+        assert!(
+            !result.is_empty(),
+            "Empty base with relative should still produce a path"
+        );
 
         // Empty relative path
         let result = resolve_path("/data/", "", true).unwrap();
-        assert!(result == "/data/" || result == "/data",
-            "Empty relative path should return base: '{}'", result);
+        assert!(
+            result == "/data/" || result == "/data",
+            "Empty relative path should return base: '{}'",
+            result
+        );
 
         // Both empty
         let result = resolve_path("", "", true).unwrap();
-        assert!(result == "/" || result.is_empty(),
-            "Both empty should produce root or empty: '{}'", result);
+        assert!(
+            result == "/" || result.is_empty(),
+            "Both empty should produce root or empty: '{}'",
+            result
+        );
     }
 
     // Pattern from issue #198: Path normalization with parent references.
@@ -432,8 +525,10 @@ mod path_patterns {
     fn test_pattern_198_path_traversal_in_metadata() {
         // Path traversal with ".." is now rejected as a security measure
         let result = join_paths("/data/schema/", "../../etc/passwd");
-        assert!(result.is_err(),
-            "join_paths should reject paths containing '..' traversal");
+        assert!(
+            result.is_err(),
+            "join_paths should reject paths containing '..' traversal"
+        );
 
         // resolve_path with absolute path (should be returned as-is even if sketchy)
         let result = resolve_path("/data/", "/etc/passwd", false).unwrap();
@@ -455,8 +550,11 @@ mod path_patterns {
         // e.g., "données" becomes "donn%C3%A9es"
         let (_, path) = parse_object_store_url("s3://bucket/données/table").unwrap();
         // Document: url::Url normalizes unicode to percent-encoding
-        assert!(path.contains("donn") && path.contains("es/table"),
-            "Unicode path should be parseable (may be percent-encoded): '{}'", path);
+        assert!(
+            path.contains("donn") && path.contains("es/table"),
+            "Unicode path should be parseable (may be percent-encoded): '{}'",
+            path
+        );
     }
 
     // Pattern from issue #255: S3 URL with no trailing slash on data_path.
@@ -466,16 +564,21 @@ mod path_patterns {
     fn test_pattern_255_no_trailing_slash_on_base_path() {
         let resolver = PathResolver::new(
             Arc::new(ObjectStoreUrl::parse("s3://bucket/").unwrap()),
-            "/data".to_string(),  // No trailing slash!
+            "/data".to_string(), // No trailing slash!
         );
 
         let child = resolver.child_resolver("schema/", true).unwrap();
-        assert_eq!(child.base_path(), "/data/schema/",
-            "Should insert / between base and child");
+        assert_eq!(
+            child.base_path(),
+            "/data/schema/",
+            "Should insert / between base and child"
+        );
 
         let resolved = resolver.resolve("file.parquet", true).unwrap();
-        assert_eq!(resolved, "/data/file.parquet",
-            "Should insert / before file name");
+        assert_eq!(
+            resolved, "/data/file.parquet",
+            "Should insert / before file name"
+        );
     }
 }
 
@@ -528,7 +631,8 @@ mod delete_filter_patterns {
                     .map_err(|e| DataFusionError::ArrowError(Box::new(e), None));
             }
 
-            let indices = UInt32Array::from(keep_indices.iter().map(|&i| i as u32).collect::<Vec<_>>());
+            let indices =
+                UInt32Array::from(keep_indices.iter().map(|&i| i as u32).collect::<Vec<_>>());
             let filtered_columns: DataFusionResult<Vec<_>> = batch
                 .columns()
                 .iter()
@@ -554,12 +658,14 @@ mod delete_filter_patterns {
         let batch1 = RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])) as Arc<dyn Array>],
-        ).unwrap();
+        )
+        .unwrap();
 
         let batch2 = RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(Int32Array::from(vec![6, 7, 8, 9, 10])) as Arc<dyn Array>],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Delete positions: 2 (id=3 in batch1), 7 (id=8 in batch2)
         let deleted: HashSet<i64> = [2, 7].into_iter().collect();
@@ -581,10 +687,22 @@ mod delete_filter_patterns {
         assert_eq!(filtered2.num_rows(), 4);
 
         // Verify correct rows filtered
-        let ids1: Vec<i32> = filtered1.column(0).as_any().downcast_ref::<Int32Array>().unwrap().values().to_vec();
+        let ids1: Vec<i32> = filtered1
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values()
+            .to_vec();
         assert_eq!(ids1, vec![1, 2, 4, 5]); // id=3 at pos 2 deleted
 
-        let ids2: Vec<i32> = filtered2.column(0).as_any().downcast_ref::<Int32Array>().unwrap().values().to_vec();
+        let ids2: Vec<i32> = filtered2
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values()
+            .to_vec();
         assert_eq!(ids2, vec![6, 7, 9, 10]); // id=8 at pos 7 deleted
     }
 
@@ -598,7 +716,8 @@ mod delete_filter_patterns {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(Int32Array::from(vec![1, 2, 3])) as Arc<dyn Array>],
-        ).unwrap();
+        )
+        .unwrap();
 
         let deleted: HashSet<i64> = [0, 1, 2].into_iter().collect();
         let stream = TestFilterStream {
@@ -608,7 +727,11 @@ mod delete_filter_patterns {
 
         let filtered = stream.filter_batch(&batch).unwrap();
         assert_eq!(filtered.num_rows(), 0, "All rows should be deleted");
-        assert_eq!(filtered.num_columns(), 1, "Schema should be preserved even with 0 rows");
+        assert_eq!(
+            filtered.num_columns(),
+            1,
+            "Schema should be preserved even with 0 rows"
+        );
     }
 
     // Pattern from issue #189: COUNT(*) with deletes (zero-column batch).
@@ -631,7 +754,11 @@ mod delete_filter_patterns {
         };
 
         let filtered = stream.filter_batch(&batch).unwrap();
-        assert_eq!(filtered.num_rows(), 3, "COUNT(*) should account for deletes");
+        assert_eq!(
+            filtered.num_rows(),
+            3,
+            "COUNT(*) should account for deletes"
+        );
     }
 
     // Pattern from issue #284: Data from wrong table loaded.
@@ -644,7 +771,8 @@ mod delete_filter_patterns {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(Int32Array::from(vec![1, 2, 3])) as Arc<dyn Array>],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Negative positions should never match (positions are 0-based unsigned)
         let deleted: HashSet<i64> = [-1, -100, i64::MIN].into_iter().collect();
@@ -654,7 +782,11 @@ mod delete_filter_patterns {
         };
 
         let filtered = stream.filter_batch(&batch).unwrap();
-        assert_eq!(filtered.num_rows(), 3, "Negative positions should not match any rows");
+        assert_eq!(
+            filtered.num_rows(),
+            3,
+            "Negative positions should not match any rows"
+        );
     }
 
     // Pattern from issue #284: i64::MAX as position.
@@ -667,7 +799,8 @@ mod delete_filter_patterns {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(Int32Array::from(vec![1, 2, 3])) as Arc<dyn Array>],
-        ).unwrap();
+        )
+        .unwrap();
 
         let deleted: HashSet<i64> = [i64::MAX, i64::MAX - 1].into_iter().collect();
         let stream = TestFilterStream {
@@ -676,7 +809,11 @@ mod delete_filter_patterns {
         };
 
         let filtered = stream.filter_batch(&batch).unwrap();
-        assert_eq!(filtered.num_rows(), 3, "Extreme positions should not match in small file");
+        assert_eq!(
+            filtered.num_rows(),
+            3,
+            "Extreme positions should not match in small file"
+        );
     }
 
     // Pattern from issue #189: Empty delete file (0 positions).
@@ -689,7 +826,8 @@ mod delete_filter_patterns {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(Int32Array::from(vec![1, 2, 3])) as Arc<dyn Array>],
-        ).unwrap();
+        )
+        .unwrap();
 
         let deleted: HashSet<i64> = HashSet::new();
         let stream = TestFilterStream {
@@ -698,7 +836,11 @@ mod delete_filter_patterns {
         };
 
         let filtered = stream.filter_batch(&batch).unwrap();
-        assert_eq!(filtered.num_rows(), 3, "Empty delete set should keep all rows");
+        assert_eq!(
+            filtered.num_rows(),
+            3,
+            "Empty delete set should keep all rows"
+        );
     }
 }
 
@@ -717,7 +859,11 @@ mod metadata_patterns {
     fn test_pattern_268_empty_column_list() {
         let columns: Vec<DuckLakeTableColumn> = vec![];
         let schema = build_arrow_schema(&columns).unwrap();
-        assert_eq!(schema.fields().len(), 0, "Empty columns should produce empty schema");
+        assert_eq!(
+            schema.fields().len(),
+            0,
+            "Empty columns should produce empty schema"
+        );
     }
 
     // Pattern from issue #268: Duplicate column names in metadata.
@@ -759,11 +905,12 @@ mod metadata_patterns {
         // A deeply nested type could produce a very long type string
         let long_type = format!(
             "struct({})",
-            (0..100).map(|i| format!("field_{} int32", i)).collect::<Vec<_>>().join(", ")
+            (0..100)
+                .map(|i| format!("field_{} int32", i))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
-        let columns = vec![
-            DuckLakeTableColumn::new(1, "data".to_string(), long_type, true),
-        ];
+        let columns = vec![DuckLakeTableColumn::new(1, "data".to_string(), long_type, true)];
         let result = build_arrow_schema(&columns);
         assert!(result.is_ok(), "Very long struct type should be handled");
         assert_eq!(result.unwrap().fields().len(), 1);
@@ -774,17 +921,22 @@ mod metadata_patterns {
     // ANALOGOUS CODE: Column with empty or whitespace-only name.
     #[test]
     fn test_pattern_230_empty_column_names() {
-        let columns = vec![
-            DuckLakeTableColumn::new(1, "".to_string(), "int32".to_string(), false),
-        ];
+        let columns = vec![DuckLakeTableColumn::new(1, "".to_string(), "int32".to_string(), false)];
         let schema = build_arrow_schema(&columns).unwrap();
-        assert_eq!(schema.field(0).name(), "", "Empty column name should not crash");
+        assert_eq!(
+            schema.field(0).name(),
+            "",
+            "Empty column name should not crash"
+        );
 
-        let columns2 = vec![
-            DuckLakeTableColumn::new(1, "  ".to_string(), "int32".to_string(), false),
-        ];
+        let columns2 =
+            vec![DuckLakeTableColumn::new(1, "  ".to_string(), "int32".to_string(), false)];
         let schema2 = build_arrow_schema(&columns2).unwrap();
-        assert_eq!(schema2.field(0).name(), "  ", "Whitespace column name should not crash");
+        assert_eq!(
+            schema2.field(0).name(),
+            "  ",
+            "Whitespace column name should not crash"
+        );
     }
 
     // Pattern from issue #297: Default value limitations.
@@ -798,7 +950,10 @@ mod metadata_patterns {
         assert!(result.is_err(), "Empty type string should return error");
 
         let result = ducklake_to_arrow_type("   ");
-        assert!(result.is_err(), "Whitespace-only type string should return error");
+        assert!(
+            result.is_err(),
+            "Whitespace-only type string should return error"
+        );
     }
 }
 
@@ -816,12 +971,18 @@ mod catalog_patterns {
     fn test_pattern_69_empty_paths_after_drop() {
         // If a table's path is "" after being dropped/corrupted
         let result = resolve_path("/data/schema/", "", true).unwrap();
-        assert!(result == "/data/schema/" || result == "/data/schema",
-            "Empty table path should resolve to schema path: '{}'", result);
+        assert!(
+            result == "/data/schema/" || result == "/data/schema",
+            "Empty table path should resolve to schema path: '{}'",
+            result
+        );
 
         let result = resolve_path("", "", false).unwrap();
-        assert!(result.is_empty(),
-            "Empty absolute path should be empty: '{}'", result);
+        assert!(
+            result.is_empty(),
+            "Empty absolute path should be empty: '{}'",
+            result
+        );
     }
 
     // Pattern from issue #197: Two ducklakes sharing one catalog.
@@ -887,10 +1048,22 @@ mod type_promotion_patterns {
         assert!(is_type_promotion_allowed("uint32", "int64"));
 
         // These should NOT be allowed (potential data loss)
-        assert!(!is_type_promotion_allowed("int64", "int32"), "Narrowing should fail");
-        assert!(!is_type_promotion_allowed("double", "float"), "Float narrowing should fail");
-        assert!(!is_type_promotion_allowed("varchar", "int32"), "String to int should fail");
-        assert!(!is_type_promotion_allowed("int32", "varchar"), "Int to string should fail");
+        assert!(
+            !is_type_promotion_allowed("int64", "int32"),
+            "Narrowing should fail"
+        );
+        assert!(
+            !is_type_promotion_allowed("double", "float"),
+            "Float narrowing should fail"
+        );
+        assert!(
+            !is_type_promotion_allowed("varchar", "int32"),
+            "String to int should fail"
+        );
+        assert!(
+            !is_type_promotion_allowed("int32", "varchar"),
+            "Int to string should fail"
+        );
     }
 
     // Pattern from issue #288: Same-type "promotion" (no-op).
@@ -913,18 +1086,26 @@ mod type_promotion_patterns {
     fn test_pattern_288_missing_promotions() {
         // float32 -> float64 — same as float->double but using our internal names
         // Note: DuckLake uses "float" and "double", not "float32" and "float64"
-        assert!(!is_type_promotion_allowed("float32", "float64"),
-            "BUG? float32->float64 not in promotion matrix (only float->double)");
+        assert!(
+            !is_type_promotion_allowed("float32", "float64"),
+            "BUG? float32->float64 not in promotion matrix (only float->double)"
+        );
 
         // Timestamp promotion
-        assert!(is_type_promotion_allowed("timestamp", "timestamptz"),
-            "timestamp->timestamptz should be allowed");
+        assert!(
+            is_type_promotion_allowed("timestamp", "timestamptz"),
+            "timestamp->timestamptz should be allowed"
+        );
 
         // But other timestamp promotions?
-        assert!(!is_type_promotion_allowed("timestamp_s", "timestamp"),
-            "timestamp_s->timestamp promotion not in matrix");
-        assert!(!is_type_promotion_allowed("timestamp_ms", "timestamp"),
-            "timestamp_ms->timestamp promotion not in matrix");
+        assert!(
+            !is_type_promotion_allowed("timestamp_s", "timestamp"),
+            "timestamp_s->timestamp promotion not in matrix"
+        );
+        assert!(
+            !is_type_promotion_allowed("timestamp_ms", "timestamp"),
+            "timestamp_ms->timestamp promotion not in matrix"
+        );
     }
 
     // Pattern from issue #297: Limitations in default values.
@@ -934,12 +1115,18 @@ mod type_promotion_patterns {
     fn test_pattern_297_promotion_with_type_aliases() {
         // Our promotion function uses internal type names, not SQL aliases
         // If metadata stores "integer" instead of "int32", promotion check may fail
-        assert!(!is_type_promotion_allowed("integer", "int64"),
-            "BUG? 'integer' alias not recognized by promotion function");
-        assert!(!is_type_promotion_allowed("bigint", "int64"),
-            "'bigint' alias not recognized (same type, not a promotion)");
-        assert!(!is_type_promotion_allowed("tinyint", "int32"),
-            "BUG? 'tinyint' alias not recognized by promotion function");
+        assert!(
+            !is_type_promotion_allowed("integer", "int64"),
+            "BUG? 'integer' alias not recognized by promotion function"
+        );
+        assert!(
+            !is_type_promotion_allowed("bigint", "int64"),
+            "'bigint' alias not recognized (same type, not a promotion)"
+        );
+        assert!(
+            !is_type_promotion_allowed("tinyint", "int32"),
+            "BUG? 'tinyint' alias not recognized by promotion function"
+        );
     }
 }
 
@@ -961,12 +1148,19 @@ mod validation_patterns {
         // Case-sensitive: "ID" and "id" are different columns in the ColumnDef API
         let col1 = ColumnDef::new("id", "int64", false).unwrap();
         let col2 = ColumnDef::new("ID", "int64", false).unwrap();
-        assert_ne!(col1.name(), col2.name(), "Case-sensitive: 'id' and 'ID' should be different");
+        assert_ne!(
+            col1.name(),
+            col2.name(),
+            "Case-sensitive: 'id' and 'ID' should be different"
+        );
 
         // Verify ColumnDef::from_arrow handles edge types
         use arrow::datatypes::DataType;
         let result = ColumnDef::from_arrow("test", &DataType::Null, true);
-        assert!(result.is_ok(), "Null type should be convertible to ColumnDef");
+        assert!(
+            result.is_ok(),
+            "Null type should be convertible to ColumnDef"
+        );
     }
 
     // Pattern from issue #268: ColumnDef with empty name.
@@ -975,10 +1169,18 @@ mod validation_patterns {
     #[test]
     fn test_pattern_268_empty_column_name() {
         let col = ColumnDef::new("", "int64", false).unwrap();
-        assert_eq!(col.name(), "", "Empty column name is allowed at ColumnDef level");
+        assert_eq!(
+            col.name(),
+            "",
+            "Empty column name is allowed at ColumnDef level"
+        );
 
         let col2 = ColumnDef::new("  ", "int64", false).unwrap();
-        assert_eq!(col2.name(), "  ", "Whitespace column name is allowed at ColumnDef level");
+        assert_eq!(
+            col2.name(),
+            "  ",
+            "Whitespace column name is allowed at ColumnDef level"
+        );
     }
 
     // Pattern from issue #297: Default values.
@@ -990,7 +1192,11 @@ mod validation_patterns {
         use datafusion_ducklake::types::arrow_to_ducklake_type;
 
         // List type
-        let list_type = DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new("item", DataType::Int32, true)));
+        let list_type = DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new(
+            "item",
+            DataType::Int32,
+            true,
+        )));
         let ducklake_str = arrow_to_ducklake_type(&list_type).unwrap();
         assert_eq!(ducklake_str, "list(int32)");
 
@@ -1036,16 +1242,28 @@ mod sql_query_patterns {
     fn test_pattern_120_sql_parameter_count_consistency() {
         // Count ? placeholders in key queries
         let schema_count = SQL_LIST_SCHEMAS.matches('?').count();
-        assert_eq!(schema_count, 2, "SQL_LIST_SCHEMAS should have 2 snapshot params");
+        assert_eq!(
+            schema_count, 2,
+            "SQL_LIST_SCHEMAS should have 2 snapshot params"
+        );
 
         let table_count = SQL_LIST_TABLES.matches('?').count();
-        assert_eq!(table_count, 3, "SQL_LIST_TABLES should have 3 params (schema_id + 2 snapshot)");
+        assert_eq!(
+            table_count, 3,
+            "SQL_LIST_TABLES should have 3 params (schema_id + 2 snapshot)"
+        );
 
         let data_files_count = SQL_GET_DATA_FILES.matches('?').count();
-        assert_eq!(data_files_count, 6, "SQL_GET_DATA_FILES should have 6 params (3 for delete + 3 for data)");
+        assert_eq!(
+            data_files_count, 6,
+            "SQL_GET_DATA_FILES should have 6 params (3 for delete + 3 for data)"
+        );
 
         let schema_by_name_count = SQL_GET_SCHEMA_BY_NAME.matches('?').count();
-        assert_eq!(schema_by_name_count, 3, "SQL_GET_SCHEMA_BY_NAME should have 3 params (name + 2 snapshot)");
+        assert_eq!(
+            schema_by_name_count, 3,
+            "SQL_GET_SCHEMA_BY_NAME should have 3 params (name + 2 snapshot)"
+        );
     }
 
     // Pattern from issue #197: Two ducklakes sharing one catalog.
@@ -1054,14 +1272,20 @@ mod sql_query_patterns {
     #[test]
     fn test_pattern_197_table_id_filters_in_queries() {
         // Ensure data file queries filter by table_id
-        assert!(SQL_GET_DATA_FILES.contains("data.table_id = ?"),
-            "Data file query must filter by table_id");
-        assert!(SQL_GET_DATA_FILES.contains("del.table_id = ?"),
-            "Delete file join must filter by table_id");
+        assert!(
+            SQL_GET_DATA_FILES.contains("data.table_id = ?"),
+            "Data file query must filter by table_id"
+        );
+        assert!(
+            SQL_GET_DATA_FILES.contains("del.table_id = ?"),
+            "Delete file join must filter by table_id"
+        );
 
         // Ensure column query filters by table_id
-        assert!(SQL_GET_TABLE_COLUMNS.contains("table_id = ?"),
-            "Column query must filter by table_id");
+        assert!(
+            SQL_GET_TABLE_COLUMNS.contains("table_id = ?"),
+            "Column query must filter by table_id"
+        );
     }
 
     // Pattern from issue #84: Unexpected parquet file deletions.
@@ -1071,10 +1295,14 @@ mod sql_query_patterns {
     fn test_pattern_84_delete_file_scoped_to_table() {
         // The LEFT JOIN for delete files must include table_id
         // to prevent loading delete files from other tables
-        assert!(SQL_GET_DATA_FILES.contains("del.table_id = ?"),
-            "Delete file join must be scoped to table_id");
-        assert!(SQL_GET_DATA_FILES.contains("data.data_file_id = del.data_file_id"),
-            "Delete file must match data_file_id");
+        assert!(
+            SQL_GET_DATA_FILES.contains("del.table_id = ?"),
+            "Delete file join must be scoped to table_id"
+        );
+        assert!(
+            SQL_GET_DATA_FILES.contains("data.data_file_id = del.data_file_id"),
+            "Delete file must match data_file_id"
+        );
     }
 
     // Pattern from issue #101: Dropping partitioned table breaks metadata.
@@ -1082,10 +1310,14 @@ mod sql_query_patterns {
     // ANALOGOUS CODE: SQL_GET_TABLE_ROW_COUNT uses COALESCE for safety.
     #[test]
     fn test_pattern_101_row_count_handles_nulls() {
-        assert!(SQL_GET_TABLE_ROW_COUNT.contains("COALESCE(SUM(data.record_count), 0)"),
-            "Row count should handle NULL record_count");
-        assert!(SQL_GET_TABLE_ROW_COUNT.contains("COALESCE(SUM(del.delete_count), 0)"),
-            "Row count should handle NULL delete_count");
+        assert!(
+            SQL_GET_TABLE_ROW_COUNT.contains("COALESCE(SUM(data.record_count), 0)"),
+            "Row count should handle NULL record_count"
+        );
+        assert!(
+            SQL_GET_TABLE_ROW_COUNT.contains("COALESCE(SUM(del.delete_count), 0)"),
+            "Row count should handle NULL delete_count"
+        );
     }
 
     // Pattern from issue #240: Migration error with deadlock.
@@ -1095,8 +1327,10 @@ mod sql_query_patterns {
     fn test_pattern_240_column_query_uses_end_snapshot() {
         // Columns don't use begin/end snapshot range like other entities
         // They use "end_snapshot IS NULL" for current active columns
-        assert!(SQL_GET_TABLE_COLUMNS.contains("end_snapshot IS NULL"),
-            "Column query should filter by end_snapshot IS NULL");
+        assert!(
+            SQL_GET_TABLE_COLUMNS.contains("end_snapshot IS NULL"),
+            "Column query should filter by end_snapshot IS NULL"
+        );
         // Column query should NOT have snapshot range params
         // (columns are not versioned the same way as schemas/tables)
     }
@@ -1107,8 +1341,8 @@ mod sql_query_patterns {
 // ============================================================================
 
 mod edge_case_patterns {
-    use datafusion_ducklake::types::ducklake_to_arrow_type;
     use datafusion_ducklake::path_resolver::join_paths;
+    use datafusion_ducklake::types::ducklake_to_arrow_type;
 
     // Pattern from issue #44 + #157: Unicode in identifiers.
     // ROOT CAUSE: Non-ASCII characters in column names, schema names, etc.
@@ -1153,7 +1387,10 @@ mod edge_case_patterns {
         // Very long type string
         let long_type = "a".repeat(10000);
         let result = ducklake_to_arrow_type(&long_type);
-        assert!(result.is_err(), "Very long unknown type should return error");
+        assert!(
+            result.is_err(),
+            "Very long unknown type should return error"
+        );
 
         // Very long path
         let long_path = "/".to_string() + &"a/".repeat(1000) + "file.parquet";
@@ -1190,7 +1427,10 @@ mod edge_case_patterns {
         let result = parse_object_store_url("s3://bucket/data  ");
         assert!(result.is_ok());
         let (_, path) = result.unwrap();
-        assert!(!path.ends_with(' '), "Trailing whitespace should be trimmed");
+        assert!(
+            !path.ends_with(' '),
+            "Trailing whitespace should be trimmed"
+        );
     }
 
     // Pattern from issue #44: Empty string inputs.
@@ -1204,8 +1444,11 @@ mod edge_case_patterns {
 
         // Empty path components
         let result = join_paths("", "").unwrap();
-        assert!(result == "/" || result.is_empty(),
-            "Both empty should not crash: '{}'", result);
+        assert!(
+            result == "/" || result.is_empty(),
+            "Both empty should not crash: '{}'",
+            result
+        );
     }
 
     // Pattern from issue #217: File URL with extra slashes.
@@ -1224,12 +1467,15 @@ mod edge_case_patterns {
         match result {
             Ok((_, path)) => {
                 // Should still give us a valid path
-                assert!(path.contains("tmp/data"),
-                    "Extra slashes should not corrupt path: '{}'", path);
-            }
+                assert!(
+                    path.contains("tmp/data"),
+                    "Extra slashes should not corrupt path: '{}'",
+                    path
+                );
+            },
             Err(_) => {
                 // Acceptable — extra slashes cause parse error
-            }
+            },
         }
     }
 }

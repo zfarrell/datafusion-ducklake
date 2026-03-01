@@ -141,12 +141,10 @@ impl Stream for DeleteFilterStream {
                         let num_rows = match i64::try_from(batch.num_rows()) {
                             Ok(n) => n,
                             Err(_) => {
-                                return Poll::Ready(Some(Err(DataFusionError::Internal(
-                                    format!(
-                                        "batch row count {} exceeds i64::MAX",
-                                        batch.num_rows()
-                                    ),
-                                ))));
+                                return Poll::Ready(Some(Err(DataFusionError::Internal(format!(
+                                    "batch row count {} exceeds i64::MAX",
+                                    batch.num_rows()
+                                )))));
                             },
                         };
                         self.row_offset += num_rows;

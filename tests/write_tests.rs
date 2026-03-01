@@ -917,8 +917,8 @@ async fn test_append_reorder_columns() {
 /// DuckLakeDeleteExec, and DuckLakeUpdateExec when metadata commits fail.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_orphaned_file_cleanup() {
-    use object_store::path::Path as ObjectPath;
     use object_store::PutPayload;
+    use object_store::path::Path as ObjectPath;
 
     let temp_dir = TempDir::new().unwrap();
     let data_dir = temp_dir.path().join("cleanup_test");

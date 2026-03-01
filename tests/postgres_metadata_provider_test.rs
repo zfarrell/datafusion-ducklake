@@ -1283,7 +1283,10 @@ async fn test_get_table_row_count() {
 
     // The test data has 2 data files without record_count set, so result should be None
     let count = provider.get_table_row_count(1, 1).unwrap();
-    assert!(count.is_none(), "Should be None when files lack record_count");
+    assert!(
+        count.is_none(),
+        "Should be None when files lack record_count"
+    );
 
     // Set record_count on both data files
     sqlx::query("UPDATE ducklake_data_file SET record_count = $1 WHERE data_file_id = $2")

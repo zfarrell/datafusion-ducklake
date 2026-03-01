@@ -290,9 +290,12 @@ fn preprocess_test_file(content: &str, test_dir: &str) -> String {
                 // Skip remaining SQL lines
                 while let Some(peek) = lines.peek() {
                     let t = peek.trim();
-                    if t == "----" || t.is_empty()
-                        || t.starts_with("statement") || t.starts_with("query")
-                        || t.starts_with("halt") || t.starts_with("#")
+                    if t == "----"
+                        || t.is_empty()
+                        || t.starts_with("statement")
+                        || t.starts_with("query")
+                        || t.starts_with("halt")
+                        || t.starts_with("#")
                     {
                         break;
                     }
@@ -620,9 +623,12 @@ fn has_virtual_column_star_conflict(sql_upper: &str) -> bool {
     let virtual_cols = ["ROWID", "SNAPSHOT_ID", "FILE_INDEX", "FILENAME", "FILE_ROW_NUMBER"];
     // Look for patterns like "SELECT rowid, *" or "SELECT *, snapshot_id"
     // The * must be in a SELECT context (not in COUNT(*) or similar)
-    let has_select_star = sql_upper.contains(" * ") || sql_upper.contains(",*")
-        || sql_upper.contains("* ,") || sql_upper.contains(", *")
-        || sql_upper.ends_with(" *") || sql_upper.contains("SELECT *");
+    let has_select_star = sql_upper.contains(" * ")
+        || sql_upper.contains(",*")
+        || sql_upper.contains("* ,")
+        || sql_upper.contains(", *")
+        || sql_upper.ends_with(" *")
+        || sql_upper.contains("SELECT *");
 
     if !has_select_star {
         return false;
@@ -711,7 +717,7 @@ fn is_hybrid_incompatible_error(error_upper: &str) -> bool {
     // Missing extension: parquet is always loaded in hybrid mode
     || error_upper.contains("MISSING EXTENSION ERROR")
     || error_upper.contains("COULD NOT LOAD THE COPY FUNCTION")
-    // Transaction-local inlined data: only relevant for DuckDB internal handling
+    // Transaction-local inlined data: DuckDB version may not enforce this constraint
     || error_upper.contains("TRANSACTION-LOCAL INLINED DATA")
 }
 

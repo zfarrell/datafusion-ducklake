@@ -158,14 +158,15 @@ async fn test_issue_297_function_default_values() {
         vec![
             Arc::new(Int32Array::from(vec![1])),
             Arc::new(StringArray::from(vec![Some("test")])),
-            Arc::new(TimestampMicrosecondArray::from(vec![Some(1704067200000000)])), // 2024-01-01
+            Arc::new(TimestampMicrosecondArray::from(vec![Some(
+                1704067200000000,
+            )])), // 2024-01-01
         ],
     )
     .unwrap();
 
     let object_store = create_object_store();
-    let table_writer =
-        DuckLakeTableWriter::new(writer.clone(), object_store).unwrap();
+    let table_writer = DuckLakeTableWriter::new(writer.clone(), object_store).unwrap();
     table_writer
         .write_table("main", "defaults_test", &[batch])
         .await
@@ -273,17 +274,11 @@ async fn test_issue_794_schema_evolution_with_defaults() {
 
     // Get the table info
     let schemas = provider.list_schemas(snapshot_id).unwrap();
-    let main_schema = schemas
-        .iter()
-        .find(|s| s.schema_name == "main")
-        .unwrap();
+    let main_schema = schemas.iter().find(|s| s.schema_name == "main").unwrap();
     let tables = provider
         .list_tables(main_schema.schema_id, snapshot_id)
         .unwrap();
-    let table = tables
-        .iter()
-        .find(|t| t.table_name == "evolving")
-        .unwrap();
+    let table = tables.iter().find(|t| t.table_name == "evolving").unwrap();
 
     // Add column with default (use lowercase to match Arrow type mapping)
     let mut new_col = ColumnDef::new("status", "varchar", true).unwrap();
@@ -293,7 +288,9 @@ async fn test_issue_794_schema_evolution_with_defaults() {
     writer
         .alter_table(
             table.table_id,
-            &AlterTableOp::AddColumn { column: new_col },
+            &AlterTableOp::AddColumn {
+                column: new_col,
+            },
         )
         .unwrap();
 
@@ -392,7 +389,9 @@ async fn test_issue_795_version_metadata_accuracy() {
     assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
 
     // Re-init and verify version hasn't been corrupted
-    let writer2 = SqliteMetadataWriter::new_with_init(&conn_str).await.unwrap();
+    let writer2 = SqliteMetadataWriter::new_with_init(&conn_str)
+        .await
+        .unwrap();
     let snap = writer2.create_snapshot().unwrap();
     assert!(snap > 0, "Snapshot ID should be positive after re-init");
 

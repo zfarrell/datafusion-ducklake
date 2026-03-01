@@ -276,8 +276,12 @@ async fn test_rename_view() {
     let batch = make_batch(vec![1, 2, 3], vec!["alice", "bob", "charlie"]);
     write_test_data(writer, &[batch]).await;
 
-    let (view_id, _snapshot_id) =
-        create_view(&temp_dir, "old_name", "SELECT id, name FROM test_table WHERE id > 1").await;
+    let (view_id, _snapshot_id) = create_view(
+        &temp_dir,
+        "old_name",
+        "SELECT id, name FROM test_table WHERE id > 1",
+    )
+    .await;
 
     // Verify the view is accessible under old name
     let ctx = create_read_context(&temp_dir).await;
@@ -288,8 +292,16 @@ async fn test_rename_view() {
     let batches = df.collect().await.unwrap();
     let mut rows = Vec::new();
     for batch in &batches {
-        let ids = batch.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-        let names = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let names = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         for i in 0..batch.num_rows() {
             rows.push((ids.value(i), names.value(i).to_string()));
         }
@@ -314,8 +326,16 @@ async fn test_rename_view() {
     let batches2 = df2.collect().await.unwrap();
     let mut rows2 = Vec::new();
     for batch in &batches2 {
-        let ids = batch.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-        let names = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let names = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         for i in 0..batch.num_rows() {
             rows2.push((ids.value(i), names.value(i).to_string()));
         }

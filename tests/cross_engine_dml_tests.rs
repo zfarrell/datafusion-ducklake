@@ -11,11 +11,7 @@
 //!
 //! Requires features: `write-sqlite`, `metadata-duckdb`, `metadata-sqlite`
 
-#![cfg(all(
-    feature = "write-sqlite",
-    feature = "metadata-duckdb",
-    feature = "metadata-sqlite"
-))]
+#![cfg(all(feature = "write-sqlite", feature = "metadata-duckdb", feature = "metadata-sqlite"))]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -87,10 +83,7 @@ struct DuckDbDmlTestEnv {
 }
 
 /// Creates a DuckLake catalog via DuckDB with initial data.
-fn setup_duckdb_env_with_data(
-    create_sql: &str,
-    insert_sql: &str,
-) -> DuckDbDmlTestEnv {
+fn setup_duckdb_env_with_data(create_sql: &str, insert_sql: &str) -> DuckDbDmlTestEnv {
     let temp_dir = TempDir::new().unwrap();
     let catalog_path = temp_dir.path().join("test.ducklake");
     let data_path = temp_dir.path().join("data");
@@ -137,8 +130,7 @@ async fn open_readonly_df_sqlite(catalog_path: &Path) -> SessionContext {
 
 /// Open a read-only DataFusion context using DuckdbMetadataProvider.
 fn open_readonly_df_duckdb(catalog_path: &Path) -> SessionContext {
-    let provider =
-        DuckdbMetadataProvider::new(catalog_path.to_str().unwrap()).unwrap();
+    let provider = DuckdbMetadataProvider::new(catalog_path.to_str().unwrap()).unwrap();
     let catalog = DuckLakeCatalog::new(provider).unwrap();
     let ctx = SessionContext::new();
     ctx.register_catalog("ducklake", Arc::new(catalog));
@@ -159,7 +151,9 @@ impl DuckDbConn {
         let attach_path = format!("ducklake:sqlite:{}", catalog_db_path.display());
         conn.execute(&format!("ATTACH '{}' AS ducklake;", attach_path), [])
             .unwrap();
-        DuckDbConn { conn }
+        DuckDbConn {
+            conn,
+        }
     }
 
     fn open_native(catalog_path: &Path) -> Self {
@@ -169,7 +163,9 @@ impl DuckDbConn {
         let attach_path = format!("ducklake:{}", catalog_path.display());
         conn.execute(&format!("ATTACH '{}' AS ducklake;", attach_path), [])
             .unwrap();
-        DuckDbConn { conn }
+        DuckDbConn {
+            conn,
+        }
     }
 
     fn open_with_data_path(catalog_path: &Path, data_path: &Path) -> Self {
@@ -186,7 +182,9 @@ impl DuckDbConn {
             [],
         )
         .unwrap();
-        DuckDbConn { conn }
+        DuckDbConn {
+            conn,
+        }
     }
 
     fn execute(&self, sql: &str) {
@@ -272,27 +270,27 @@ fn arrow_value_to_string(array: &dyn Array, idx: usize) -> String {
         DataType::Int32 => {
             let a = array.as_any().downcast_ref::<Int32Array>().unwrap();
             a.value(idx).to_string()
-        }
+        },
         DataType::Int64 => {
             let a = array.as_any().downcast_ref::<Int64Array>().unwrap();
             a.value(idx).to_string()
-        }
+        },
         DataType::UInt64 => {
             let a = array.as_any().downcast_ref::<UInt64Array>().unwrap();
             a.value(idx).to_string()
-        }
+        },
         DataType::Float64 => {
             let a = array.as_any().downcast_ref::<Float64Array>().unwrap();
             format!("{}", a.value(idx))
-        }
+        },
         DataType::Utf8 => {
             let a = array.as_any().downcast_ref::<StringArray>().unwrap();
             a.value(idx).to_string()
-        }
+        },
         DataType::LargeUtf8 => {
             let a = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
             a.value(idx).to_string()
-        }
+        },
         other => format!("<unsupported:{other:?}>"),
     }
 }
@@ -326,7 +324,9 @@ fn assert_results_eq(scenario: &str, expected: &[Vec<String>], actual: &[Vec<Str
 
 /// Assert a string value equals a float (handles DuckDB returning "10" for 10.0).
 fn assert_float_eq(actual: &str, expected: f64, msg: &str) {
-    let actual_f: f64 = actual.parse().unwrap_or_else(|_| panic!("{msg}: cannot parse '{actual}' as f64"));
+    let actual_f: f64 = actual
+        .parse()
+        .unwrap_or_else(|_| panic!("{msg}: cannot parse '{actual}' as f64"));
     assert!(
         (actual_f - expected).abs() < 0.01,
         "{msg}: expected {expected}, got {actual_f} (raw: '{actual}')"
@@ -475,7 +475,11 @@ async fn cross_engine_delete_simple_where() {
     drop(duckdb);
 
     let df_ctx = open_readonly_df_sqlite(&env.catalog_db_path).await;
-    let df_rows = df_query(&df_ctx, "SELECT id FROM ducklake.main.employees ORDER BY id").await;
+    let df_rows = df_query(
+        &df_ctx,
+        "SELECT id FROM ducklake.main.employees ORDER BY id",
+    )
+    .await;
     assert_eq!(
         df_rows.iter().map(|r| &r[0]).collect::<Vec<_>>(),
         vec!["1", "3", "4", "5"]
@@ -670,8 +674,7 @@ async fn cross_engine_delete_file_schema_matches_spec() {
 
     for delete_file_path in &delete_files {
         let file = std::fs::File::open(delete_file_path).unwrap();
-        let reader =
-            parquet::file::serialized_reader::SerializedFileReader::new(file).unwrap();
+        let reader = parquet::file::serialized_reader::SerializedFileReader::new(file).unwrap();
         let schema = reader.metadata().file_metadata().schema();
         let fields = schema.get_fields();
 
@@ -681,11 +684,7 @@ async fn cross_engine_delete_file_schema_matches_spec() {
             "file_path",
             "First column should be 'file_path'"
         );
-        assert_eq!(
-            fields[1].name(),
-            "pos",
-            "Second column should be 'pos'"
-        );
+        assert_eq!(fields[1].name(), "pos", "Second column should be 'pos'");
 
         // Verify types
         use parquet::basic::Type as PhysicalType;
@@ -726,10 +725,7 @@ async fn cross_engine_fully_deleted_file() {
 
     // Delete all rows
     let ctx = open_writable_df_context(&env.catalog_db_path).await;
-    let df = ctx
-        .sql("DELETE FROM ducklake.main.tiny")
-        .await
-        .unwrap();
+    let df = ctx.sql("DELETE FROM ducklake.main.tiny").await.unwrap();
     let count = collect_dml_count(df).await;
     assert_eq!(count, 2);
 
@@ -741,7 +737,10 @@ async fn cross_engine_fully_deleted_file() {
 
     let df_ctx = open_readonly_df_sqlite(&env.catalog_db_path).await;
     let df_cnt = df_query(&df_ctx, "SELECT COUNT(*) FROM ducklake.main.tiny").await;
-    assert_eq!(df_cnt[0][0], "0", "DF: fully-deleted file should show 0 rows");
+    assert_eq!(
+        df_cnt[0][0], "0",
+        "DF: fully-deleted file should show 0 rows"
+    );
 }
 
 // ============================================================================
@@ -1031,10 +1030,7 @@ async fn cross_engine_duckdb_update_df_aggregation() {
 
     // 100 + 250 + 300 = 650
     let sum: f64 = rows[0][0].parse().unwrap();
-    assert!(
-        (sum - 650.0).abs() < 0.01,
-        "SUM should be 650.0, got {sum}"
-    );
+    assert!((sum - 650.0).abs() < 0.01, "SUM should be 650.0, got {sum}");
 }
 
 // ============================================================================

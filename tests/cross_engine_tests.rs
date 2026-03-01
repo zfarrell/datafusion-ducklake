@@ -9,11 +9,7 @@
 //!
 //! Requires features: `write-sqlite`, `metadata-duckdb`, `metadata-sqlite`
 
-#![cfg(all(
-    feature = "write-sqlite",
-    feature = "metadata-duckdb",
-    feature = "metadata-sqlite"
-))]
+#![cfg(all(feature = "write-sqlite", feature = "metadata-duckdb", feature = "metadata-sqlite"))]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -59,9 +55,7 @@ async fn setup_ducklake_catalog() -> CrossEngineEnv {
         .expect("init sqlite catalog");
     // data_path must end with "/" for DuckDB compatibility
     let data_path_str = format!("{}/", data_path.display());
-    writer
-        .set_data_path(&data_path_str)
-        .expect("set data path");
+    writer.set_data_path(&data_path_str).expect("set data path");
 
     CrossEngineEnv {
         _temp_dir: temp_dir,
@@ -74,8 +68,7 @@ async fn setup_ducklake_catalog() -> CrossEngineEnv {
 fn open_in_datafusion_duckdb(catalog_path: &Path) -> SessionContext {
     let provider = DuckdbMetadataProvider::new(catalog_path.to_str().unwrap())
         .expect("create DuckdbMetadataProvider");
-    let catalog =
-        DuckLakeCatalog::new(provider).expect("create DuckLakeCatalog");
+    let catalog = DuckLakeCatalog::new(provider).expect("create DuckLakeCatalog");
     let ctx = SessionContext::new();
     ctx.register_catalog("ducklake", Arc::new(catalog));
     ctx
@@ -87,8 +80,7 @@ async fn open_in_datafusion_sqlite(catalog_path: &Path) -> SessionContext {
     let provider = SqliteMetadataProvider::new(&conn_str)
         .await
         .expect("create SqliteMetadataProvider");
-    let catalog =
-        DuckLakeCatalog::new(provider).expect("create DuckLakeCatalog");
+    let catalog = DuckLakeCatalog::new(provider).expect("create DuckLakeCatalog");
     let ctx = SessionContext::new();
     ctx.register_catalog("ducklake", Arc::new(catalog));
     ctx
@@ -123,16 +115,12 @@ impl DuckDbConn {
         conn.execute("INSTALL ducklake;", [])
             .expect("install ducklake");
         conn.execute("LOAD ducklake;", []).expect("load ducklake");
-        let attach_path = format!(
-            "ducklake:sqlite:{}",
-            catalog_db_path.display()
-        );
-        conn.execute(
-            &format!("ATTACH '{}' AS ducklake;", attach_path),
-            [],
-        )
-        .expect("attach ducklake catalog");
-        DuckDbConn { conn }
+        let attach_path = format!("ducklake:sqlite:{}", catalog_db_path.display());
+        conn.execute(&format!("ATTACH '{}' AS ducklake;", attach_path), [])
+            .expect("attach ducklake catalog");
+        DuckDbConn {
+            conn,
+        }
     }
 
     /// Open a DuckLake catalog in DuckDB using the native DuckDB backend (read-only re-attach).
@@ -143,12 +131,11 @@ impl DuckDbConn {
             .expect("install ducklake");
         conn.execute("LOAD ducklake;", []).expect("load ducklake");
         let attach_path = format!("ducklake:{}", catalog_path.display());
-        conn.execute(
-            &format!("ATTACH '{}' AS ducklake;", attach_path),
-            [],
-        )
-        .expect("attach ducklake catalog");
-        DuckDbConn { conn }
+        conn.execute(&format!("ATTACH '{}' AS ducklake;", attach_path), [])
+            .expect("attach ducklake catalog");
+        DuckDbConn {
+            conn,
+        }
     }
 
     /// Open/create a DuckLake catalog in DuckDB with a specified DATA_PATH.
@@ -168,7 +155,9 @@ impl DuckDbConn {
             [],
         )
         .expect("attach ducklake catalog with data path");
-        DuckDbConn { conn }
+        DuckDbConn {
+            conn,
+        }
     }
 
     /// Execute a SQL statement (no results expected).
@@ -218,30 +207,30 @@ fn duckdb_value_to_string(v: &duckdb::types::Value) -> String {
         duckdb::types::Value::Date32(days) => {
             let date = chrono::NaiveDate::from_num_days_from_ce_opt(days + 719_163).unwrap();
             date.format("%Y-%m-%d").to_string()
-        }
+        },
         duckdb::types::Value::Timestamp(unit, val) => {
             let (secs, nsecs) = match unit {
                 duckdb::types::TimeUnit::Second => (*val, 0u32),
                 duckdb::types::TimeUnit::Millisecond => {
                     (val / 1000, ((val % 1000) * 1_000_000) as u32)
-                }
+                },
                 duckdb::types::TimeUnit::Microsecond => {
                     (val / 1_000_000, ((val % 1_000_000) * 1_000) as u32)
-                }
+                },
                 duckdb::types::TimeUnit::Nanosecond => {
                     (val / 1_000_000_000, (val % 1_000_000_000) as u32)
-                }
+                },
             };
             let dt = chrono::DateTime::from_timestamp(secs, nsecs).unwrap();
             dt.format("%Y-%m-%d %H:%M:%S").to_string()
-        }
+        },
         _ => {
             let s = format!("{v:?}");
             if s.starts_with("Decimal(") && s.ends_with(')') {
                 return s[8..s.len() - 1].to_string();
             }
             s
-        }
+        },
     }
 }
 
@@ -277,49 +266,49 @@ fn arrow_value_to_string(array: &dyn Array, idx: usize) -> String {
         DataType::Boolean => {
             let a = array.as_any().downcast_ref::<BooleanArray>().unwrap();
             a.value(idx).to_string()
-        }
+        },
         DataType::Int8 => {
             let a = array.as_any().downcast_ref::<Int8Array>().unwrap();
             a.value(idx).to_string()
-        }
+        },
         DataType::Int16 => {
             let a = array.as_any().downcast_ref::<Int16Array>().unwrap();
             a.value(idx).to_string()
-        }
+        },
         DataType::Int32 => {
             let a = array.as_any().downcast_ref::<Int32Array>().unwrap();
             a.value(idx).to_string()
-        }
+        },
         DataType::Int64 => {
             let a = array.as_any().downcast_ref::<Int64Array>().unwrap();
             a.value(idx).to_string()
-        }
+        },
         DataType::UInt64 => {
             let a = array.as_any().downcast_ref::<UInt64Array>().unwrap();
             a.value(idx).to_string()
-        }
+        },
         DataType::Float32 => {
             let a = array.as_any().downcast_ref::<Float32Array>().unwrap();
             format!("{}", a.value(idx))
-        }
+        },
         DataType::Float64 => {
             let a = array.as_any().downcast_ref::<Float64Array>().unwrap();
             format!("{}", a.value(idx))
-        }
+        },
         DataType::Utf8 => {
             let a = array.as_any().downcast_ref::<StringArray>().unwrap();
             a.value(idx).to_string()
-        }
+        },
         DataType::LargeUtf8 => {
             let a = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
             a.value(idx).to_string()
-        }
+        },
         DataType::Date32 => {
             let a = array.as_any().downcast_ref::<Date32Array>().unwrap();
             let days = a.value(idx);
             let date = chrono::NaiveDate::from_num_days_from_ce_opt(days + 719_163).unwrap();
             date.format("%Y-%m-%d").to_string()
-        }
+        },
         DataType::Timestamp(unit, _) => match unit {
             arrow::datatypes::TimeUnit::Microsecond => {
                 let a = array
@@ -331,7 +320,7 @@ fn arrow_value_to_string(array: &dyn Array, idx: usize) -> String {
                 let subsec_us = (us % 1_000_000) as u32;
                 let dt = chrono::DateTime::from_timestamp(secs, subsec_us * 1000).unwrap();
                 dt.format("%Y-%m-%d %H:%M:%S").to_string()
-            }
+            },
             arrow::datatypes::TimeUnit::Nanosecond => {
                 let a = array
                     .as_any()
@@ -342,7 +331,7 @@ fn arrow_value_to_string(array: &dyn Array, idx: usize) -> String {
                 let subsec_ns = (ns % 1_000_000_000) as u32;
                 let dt = chrono::DateTime::from_timestamp(secs, subsec_ns).unwrap();
                 dt.format("%Y-%m-%d %H:%M:%S").to_string()
-            }
+            },
             arrow::datatypes::TimeUnit::Millisecond => {
                 let a = array
                     .as_any()
@@ -351,10 +340,9 @@ fn arrow_value_to_string(array: &dyn Array, idx: usize) -> String {
                 let ms = a.value(idx);
                 let secs = ms / 1_000;
                 let subsec_ms = (ms % 1_000) as u32;
-                let dt =
-                    chrono::DateTime::from_timestamp(secs, subsec_ms * 1_000_000).unwrap();
+                let dt = chrono::DateTime::from_timestamp(secs, subsec_ms * 1_000_000).unwrap();
                 dt.format("%Y-%m-%d %H:%M:%S").to_string()
-            }
+            },
             arrow::datatypes::TimeUnit::Second => {
                 let a = array
                     .as_any()
@@ -363,7 +351,7 @@ fn arrow_value_to_string(array: &dyn Array, idx: usize) -> String {
                 let s = a.value(idx);
                 let dt = chrono::DateTime::from_timestamp(s, 0).unwrap();
                 dt.format("%Y-%m-%d %H:%M:%S").to_string()
-            }
+            },
         },
         DataType::Decimal128(_, scale) => {
             let a = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
@@ -373,7 +361,7 @@ fn arrow_value_to_string(array: &dyn Array, idx: usize) -> String {
             let whole = raw / divisor;
             let frac = (raw % divisor).unsigned_abs();
             format!("{whole}.{frac:0>width$}", width = scale as usize)
-        }
+        },
         other => format!("<unsupported:{other:?}>"),
     }
 }
@@ -455,17 +443,12 @@ async fn cross_engine_df_write_df_read() {
                 Some("Bob"),
                 Some("Charlie"),
             ])),
-            Arc::new(Float64Array::from(vec![
-                Some(10.5),
-                Some(20.0),
-                Some(30.5),
-            ])),
+            Arc::new(Float64Array::from(vec![Some(10.5), Some(20.0), Some(30.5)])),
         ],
     )
     .unwrap();
 
-    let table_writer =
-        DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
+    let table_writer = DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
     let result = table_writer
         .write_table("main", "test_table", &[batch])
         .await
@@ -513,22 +496,13 @@ async fn cross_engine_df_write_duckdb_read() {
         schema,
         vec![
             Arc::new(Int32Array::from(vec![10, 20, 30])),
-            Arc::new(StringArray::from(vec![
-                Some("Xena"),
-                Some("Yuri"),
-                None,
-            ])),
-            Arc::new(Float64Array::from(vec![
-                Some(95.5),
-                Some(87.3),
-                Some(92.1),
-            ])),
+            Arc::new(StringArray::from(vec![Some("Xena"), Some("Yuri"), None])),
+            Arc::new(Float64Array::from(vec![Some(95.5), Some(87.3), Some(92.1)])),
         ],
     )
     .unwrap();
 
-    let table_writer =
-        DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
+    let table_writer = DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
     let result = table_writer
         .write_table("main", "scores", &[batch])
         .await
@@ -712,9 +686,8 @@ async fn cross_engine_assert_query_eq_both_engines() {
     );
 
     // Query DuckDB for expected results
-    let duckdb_results = duckdb.query(
-        "SELECT id, name, price, active FROM ducklake.main.items ORDER BY id",
-    );
+    let duckdb_results =
+        duckdb.query("SELECT id, name, price, active FROM ducklake.main.items ORDER BY id");
     drop(duckdb);
 
     // Query DataFusion for actual results
@@ -726,11 +699,7 @@ async fn cross_engine_assert_query_eq_both_engines() {
     .await;
 
     // Compare
-    assert_query_eq(
-        "both_engines_full_comparison",
-        &duckdb_results,
-        &df_results,
-    );
+    assert_query_eq("both_engines_full_comparison", &duckdb_results, &df_results);
 }
 
 // ==================== Validation: NULL handling roundtrip ====================
@@ -756,14 +725,17 @@ async fn cross_engine_null_handling() {
         schema,
         vec![
             Arc::new(Int32Array::from(vec![1, 2, 3])),
-            Arc::new(StringArray::from(vec![Some("Alice"), None, Some("Charlie")])),
+            Arc::new(StringArray::from(vec![
+                Some("Alice"),
+                None,
+                Some("Charlie"),
+            ])),
             Arc::new(Int64Array::from(vec![Some(100), Some(200), None])),
         ],
     )
     .unwrap();
 
-    let table_writer =
-        DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
+    let table_writer = DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
     table_writer
         .write_table("main", "nulls_test", &[batch])
         .await
@@ -771,9 +743,7 @@ async fn cross_engine_null_handling() {
 
     // DuckDB verifies NULLs
     let duckdb = DuckDbConn::open(&env.catalog_db_path);
-    let rows = duckdb.query(
-        "SELECT id, name, value FROM ducklake.main.nulls_test ORDER BY id",
-    );
+    let rows = duckdb.query("SELECT id, name, value FROM ducklake.main.nulls_test ORDER BY id");
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[0], vec!["1", "Alice", "100"]);
     assert_eq!(rows[1], vec!["2", "NULL", "200"]);

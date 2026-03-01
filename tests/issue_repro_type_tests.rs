@@ -199,18 +199,14 @@ async fn test_issue_479_boolean_default_column_read() {
     )
     .unwrap();
 
-    let table_writer =
-        DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
+    let table_writer = DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
     table_writer
         .write_table("main", "timeseries", &[batch])
         .await
         .unwrap();
 
     let ctx = create_read_context(&temp_dir).await;
-    let df = ctx
-        .sql("SELECT * FROM test.main.timeseries")
-        .await
-        .unwrap();
+    let df = ctx.sql("SELECT * FROM test.main.timeseries").await.unwrap();
     let batches = df.collect().await.unwrap();
     assert_eq!(batches.len(), 1);
     assert_eq!(batches[0].num_rows(), 2);
@@ -279,8 +275,7 @@ async fn test_issue_517_json_column_with_nulls() {
     )
     .unwrap();
 
-    let table_writer =
-        DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
+    let table_writer = DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
     table_writer
         .write_table("main", "users_with_json", &[batch])
         .await
@@ -353,8 +348,7 @@ async fn test_issue_534_enum_as_varchar_read() {
     )
     .unwrap();
 
-    let table_writer =
-        DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
+    let table_writer = DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
     table_writer
         .write_table("main", "ship", &[batch])
         .await
@@ -378,4 +372,3 @@ async fn test_issue_534_enum_as_varchar_read() {
     assert_eq!(dir_col.value(1), "reverse");
     assert_eq!(dir_col.value(2), "forward");
 }
-

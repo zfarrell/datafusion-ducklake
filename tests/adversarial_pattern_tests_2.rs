@@ -17,7 +17,7 @@ use datafusion::catalog::CatalogProvider;
 use datafusion::common::DataFusionError;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::prelude::*;
-use datafusion_ducklake::path_resolver::{join_paths, resolve_path, PathResolver};
+use datafusion_ducklake::path_resolver::{PathResolver, join_paths, resolve_path};
 use datafusion_ducklake::types::{
     arrow_to_ducklake_type, build_arrow_schema, build_read_schema_with_field_id_mapping,
     ducklake_to_arrow_type,
@@ -26,7 +26,10 @@ use datafusion_ducklake::{DuckLakeCatalog, DuckdbMetadataProvider, MetadataProvi
 use tempfile::TempDir;
 
 /// Recursively find files matching a predicate
-fn find_files_recursive(dir: &std::path::Path, pred: &dyn Fn(&std::path::Path) -> bool) -> Vec<std::path::PathBuf> {
+fn find_files_recursive(
+    dir: &std::path::Path,
+    pred: &dyn Fn(&std::path::Path) -> bool,
+) -> Vec<std::path::PathBuf> {
     let mut results = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
@@ -50,10 +53,7 @@ fn setup_ducklake_catalog(catalog_path: &std::path::Path) -> anyhow::Result<()> 
     conn.execute("INSTALL ducklake;", [])?;
     conn.execute("LOAD ducklake;", [])?;
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
-    conn.execute(
-        &format!("ATTACH '{}' AS test_catalog;", ducklake_path),
-        [],
-    )?;
+    conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;
     conn.execute(
         "CREATE TABLE test_catalog.users (id INT, name VARCHAR);",
         [],
@@ -75,10 +75,7 @@ fn setup_catalog_with_types(
     conn.execute("INSTALL ducklake;", [])?;
     conn.execute("LOAD ducklake;", [])?;
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
-    conn.execute(
-        &format!("ATTACH '{}' AS test_catalog;", ducklake_path),
-        [],
-    )?;
+    conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;
     conn.execute(ddl, [])?;
     for insert in inserts {
         conn.execute(insert, [])?;
@@ -129,8 +126,8 @@ async fn test_orphaned_file_reference_missing_from_disk() -> DataFusionResult<()
 
     let provider = DuckdbMetadataProvider::new(catalog_path.to_string_lossy().to_string())
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
-    let catalog = DuckLakeCatalog::new(provider)
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let catalog =
+        DuckLakeCatalog::new(provider).map_err(|e| DataFusionError::External(Box::new(e)))?;
     let ctx = SessionContext::new();
     ctx.register_catalog("ducklake", Arc::new(catalog));
 
@@ -166,18 +163,15 @@ async fn test_delete_position_correctness_multi_batch_insert() -> DataFusionResu
     let catalog_path = temp_dir.path().join("multi_batch.ducklake");
 
     // Insert data in multiple batches, then delete specific rows
-    let conn = duckdb::Connection::open_in_memory()
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let conn =
+        duckdb::Connection::open_in_memory().map_err(|e| DataFusionError::External(Box::new(e)))?;
     conn.execute("INSTALL ducklake;", [])
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     conn.execute("LOAD ducklake;", [])
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
-    conn.execute(
-        &format!("ATTACH '{}' AS test_catalog;", ducklake_path),
-        [],
-    )
-    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
     conn.execute(
         "CREATE TABLE test_catalog.data (id INT, value VARCHAR);",
         [],
@@ -211,8 +205,8 @@ async fn test_delete_position_correctness_multi_batch_insert() -> DataFusionResu
     // Now query via our extension
     let provider = DuckdbMetadataProvider::new(catalog_path.to_string_lossy().to_string())
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
-    let catalog = DuckLakeCatalog::new(provider)
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let catalog =
+        DuckLakeCatalog::new(provider).map_err(|e| DataFusionError::External(Box::new(e)))?;
     let ctx = SessionContext::new();
     ctx.register_catalog("ducklake", Arc::new(catalog));
 
@@ -262,18 +256,15 @@ async fn test_statistics_after_column_drop_via_metadata() -> DataFusionResult<()
     let temp_dir = TempDir::new()?;
     let catalog_path = temp_dir.path().join("stats_drop.ducklake");
 
-    let conn = duckdb::Connection::open_in_memory()
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let conn =
+        duckdb::Connection::open_in_memory().map_err(|e| DataFusionError::External(Box::new(e)))?;
     conn.execute("INSTALL ducklake;", [])
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     conn.execute("LOAD ducklake;", [])
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
-    conn.execute(
-        &format!("ATTACH '{}' AS test_catalog;", ducklake_path),
-        [],
-    )
-    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
     conn.execute(
         "CREATE TABLE test_catalog.t1 (id INT, name VARCHAR, extra VARCHAR);",
@@ -294,8 +285,8 @@ async fn test_statistics_after_column_drop_via_metadata() -> DataFusionResult<()
     // Query after column drop — should work without errors
     let provider = DuckdbMetadataProvider::new(catalog_path.to_string_lossy().to_string())
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
-    let catalog = DuckLakeCatalog::new(provider)
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let catalog =
+        DuckLakeCatalog::new(provider).map_err(|e| DataFusionError::External(Box::new(e)))?;
     let ctx = SessionContext::new();
     ctx.register_catalog("ducklake", Arc::new(catalog));
 
@@ -312,13 +303,13 @@ async fn test_statistics_after_column_drop_via_metadata() -> DataFusionResult<()
                 "[#625 stats after drop] Query after column drop succeeded, {} rows",
                 total
             );
-        }
+        },
         Err(e) => {
             eprintln!(
                 "[#625 stats after drop] FINDING: Query failed after column drop: {}",
                 e
             );
-        }
+        },
     }
 
     Ok(())
@@ -335,18 +326,15 @@ async fn test_add_column_then_rename_sequence() -> DataFusionResult<()> {
     let temp_dir = TempDir::new()?;
     let catalog_path = temp_dir.path().join("ddl_seq.ducklake");
 
-    let conn = duckdb::Connection::open_in_memory()
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let conn =
+        duckdb::Connection::open_in_memory().map_err(|e| DataFusionError::External(Box::new(e)))?;
     conn.execute("INSTALL ducklake;", [])
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     conn.execute("LOAD ducklake;", [])
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
-    conn.execute(
-        &format!("ATTACH '{}' AS test_catalog;", ducklake_path),
-        [],
-    )
-    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
     // Create table
     conn.execute("CREATE TABLE test_catalog.t1 (id INT, name VARCHAR);", [])
@@ -358,8 +346,11 @@ async fn test_add_column_then_rename_sequence() -> DataFusionResult<()> {
     .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
     // Add column, then rename it — this is the problematic pattern from #683/#740
-    conn.execute("ALTER TABLE test_catalog.t1 ADD COLUMN temp_col VARCHAR;", [])
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    conn.execute(
+        "ALTER TABLE test_catalog.t1 ADD COLUMN temp_col VARCHAR;",
+        [],
+    )
+    .map_err(|e| DataFusionError::External(Box::new(e)))?;
     conn.execute(
         "ALTER TABLE test_catalog.t1 RENAME COLUMN temp_col TO description;",
         [],
@@ -371,8 +362,8 @@ async fn test_add_column_then_rename_sequence() -> DataFusionResult<()> {
     // Query via our extension — column ordering should be [id, name, description]
     let provider = DuckdbMetadataProvider::new(catalog_path.to_string_lossy().to_string())
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
-    let catalog = DuckLakeCatalog::new(provider)
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let catalog =
+        DuckLakeCatalog::new(provider).map_err(|e| DataFusionError::External(Box::new(e)))?;
     let ctx = SessionContext::new();
     ctx.register_catalog("ducklake", Arc::new(catalog));
 
@@ -402,13 +393,13 @@ async fn test_add_column_then_rename_sequence() -> DataFusionResult<()> {
                     "temp_col should not appear after rename"
                 );
             }
-        }
+        },
         Err(e) => {
             eprintln!(
                 "[#683 DDL sequence] FINDING: Query failed after add+rename: {}",
                 e
             );
-        }
+        },
     }
 
     Ok(())
@@ -425,18 +416,15 @@ async fn test_read_parquet_with_more_columns_than_schema() -> DataFusionResult<(
     let temp_dir = TempDir::new()?;
     let catalog_path = temp_dir.path().join("extra_col.ducklake");
 
-    let conn = duckdb::Connection::open_in_memory()
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let conn =
+        duckdb::Connection::open_in_memory().map_err(|e| DataFusionError::External(Box::new(e)))?;
     conn.execute("INSTALL ducklake;", [])
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     conn.execute("LOAD ducklake;", [])
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
-    conn.execute(
-        &format!("ATTACH '{}' AS test_catalog;", ducklake_path),
-        [],
-    )
-    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
     // Create table with 3 columns, write data
     conn.execute(
@@ -458,8 +446,8 @@ async fn test_read_parquet_with_more_columns_than_schema() -> DataFusionResult<(
 
     let provider = DuckdbMetadataProvider::new(catalog_path.to_string_lossy().to_string())
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
-    let catalog = DuckLakeCatalog::new(provider)
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let catalog =
+        DuckLakeCatalog::new(provider).map_err(|e| DataFusionError::External(Box::new(e)))?;
     let ctx = SessionContext::new();
     ctx.register_catalog("ducklake", Arc::new(catalog));
 
@@ -498,13 +486,13 @@ async fn test_read_parquet_with_more_columns_than_schema() -> DataFusionResult<(
                     "Should only see columns a, b after dropping c"
                 );
             }
-        }
+        },
         Err(e) => {
             eprintln!(
                 "[#704 column drop read] FINDING: Read failed after column drop: {}",
                 e
             );
-        }
+        },
     }
 
     Ok(())
@@ -522,18 +510,15 @@ async fn test_row_count_matches_actual_count() -> DataFusionResult<()> {
     let temp_dir = TempDir::new()?;
     let catalog_path = temp_dir.path().join("rowcount.ducklake");
 
-    let conn = duckdb::Connection::open_in_memory()
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let conn =
+        duckdb::Connection::open_in_memory().map_err(|e| DataFusionError::External(Box::new(e)))?;
     conn.execute("INSTALL ducklake;", [])
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     conn.execute("LOAD ducklake;", [])
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
-    conn.execute(
-        &format!("ATTACH '{}' AS test_catalog;", ducklake_path),
-        [],
-    )
-    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
     conn.execute("CREATE TABLE test_catalog.t1 (id INT);", [])
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -552,20 +537,22 @@ async fn test_row_count_matches_actual_count() -> DataFusionResult<()> {
 
     let provider = DuckdbMetadataProvider::new(catalog_path.to_string_lossy().to_string())
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
-    let catalog = DuckLakeCatalog::new(provider)
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let catalog =
+        DuckLakeCatalog::new(provider).map_err(|e| DataFusionError::External(Box::new(e)))?;
     let ctx = SessionContext::new();
     ctx.register_catalog("ducklake", Arc::new(catalog));
 
     // Get actual count via query
-    let actual_count =
-        query_count(&ctx, "SELECT COUNT(*) FROM ducklake.main.t1").await?;
+    let actual_count = query_count(&ctx, "SELECT COUNT(*) FROM ducklake.main.t1").await?;
 
     eprintln!(
         "[#709 row count] Actual COUNT(*): {} (expected 3)",
         actual_count
     );
-    assert_eq!(actual_count, 3, "Expected 3 rows after deleting ids 2 and 4");
+    assert_eq!(
+        actual_count, 3,
+        "Expected 3 rows after deleting ids 2 and 4"
+    );
 
     Ok(())
 }
@@ -581,18 +568,15 @@ async fn test_partition_pruning_identity_transform_correctness() -> DataFusionRe
     let temp_dir = TempDir::new()?;
     let catalog_path = temp_dir.path().join("partition.ducklake");
 
-    let conn = duckdb::Connection::open_in_memory()
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let conn =
+        duckdb::Connection::open_in_memory().map_err(|e| DataFusionError::External(Box::new(e)))?;
     conn.execute("INSTALL ducklake;", [])
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     conn.execute("LOAD ducklake;", [])
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
-    conn.execute(
-        &format!("ATTACH '{}' AS test_catalog;", ducklake_path),
-        [],
-    )
-    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
     // Create partitioned table
     conn.execute(
@@ -621,8 +605,8 @@ async fn test_partition_pruning_identity_transform_correctness() -> DataFusionRe
 
     let provider = DuckdbMetadataProvider::new(catalog_path.to_string_lossy().to_string())
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
-    let catalog = DuckLakeCatalog::new(provider)
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let catalog =
+        DuckLakeCatalog::new(provider).map_err(|e| DataFusionError::External(Box::new(e)))?;
     let ctx = SessionContext::new();
     ctx.register_catalog("ducklake", Arc::new(catalog));
 
@@ -634,8 +618,7 @@ async fn test_partition_pruning_identity_transform_correctness() -> DataFusionRe
     .await?;
 
     // Total count (no filter)
-    let total_count =
-        query_count(&ctx, "SELECT COUNT(*) FROM ducklake.main.events").await?;
+    let total_count = query_count(&ctx, "SELECT COUNT(*) FROM ducklake.main.events").await?;
 
     eprintln!(
         "[#643 partition pruning] Total: {}, Filtered (sales): {} (expected 4 total, 2 sales)",
@@ -670,8 +653,8 @@ async fn test_corrupted_parquet_file_graceful_error() -> DataFusionResult<()> {
 
     let provider = DuckdbMetadataProvider::new(catalog_path.to_string_lossy().to_string())
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
-    let catalog = DuckLakeCatalog::new(provider)
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let catalog =
+        DuckLakeCatalog::new(provider).map_err(|e| DataFusionError::External(Box::new(e)))?;
     let ctx = SessionContext::new();
     ctx.register_catalog("ducklake", Arc::new(catalog));
 
@@ -737,13 +720,13 @@ async fn test_extreme_snapshot_id_values() -> DataFusionResult<()> {
                     count
                 );
             }
-        }
+        },
         Err(e) => {
             eprintln!(
                 "[#652 extreme snapshot] FINDING: Query at MAX snapshot failed: {}",
                 e
             );
-        }
+        },
     }
 
     // Bind to negative snapshot
@@ -752,9 +735,7 @@ async fn test_extreme_snapshot_id_values() -> DataFusionResult<()> {
     let ctx2 = SessionContext::new();
     ctx2.register_catalog("ducklake", Arc::new(catalog_neg));
 
-    let result2 = ctx2
-        .sql("SELECT COUNT(*) FROM ducklake.main.users")
-        .await;
+    let result2 = ctx2.sql("SELECT COUNT(*) FROM ducklake.main.users").await;
 
     match result2 {
         Ok(df) => {
@@ -763,13 +744,13 @@ async fn test_extreme_snapshot_id_values() -> DataFusionResult<()> {
                 "[#652 negative snapshot] Query at snapshot -1: {:?}",
                 batches.is_ok()
             );
-        }
+        },
         Err(e) => {
             eprintln!(
                 "[#652 negative snapshot] Query plan at snapshot -1 failed: {}",
                 e
             );
-        }
+        },
     }
 
     Ok(())
@@ -814,18 +795,13 @@ fn test_field_id_mapping_with_added_and_renamed_columns() {
     parquet_field_ids.insert(1, "id".to_string());
     parquet_field_ids.insert(2, "name".to_string());
 
-    let result =
-        build_read_schema_with_field_id_mapping(&current_columns, &parquet_field_ids);
+    let result = build_read_schema_with_field_id_mapping(&current_columns, &parquet_field_ids);
 
     match result {
         Ok((schema, name_mapping)) => {
             eprintln!(
                 "[#740 add+rename] Schema fields: {:?}",
-                schema
-                    .fields()
-                    .iter()
-                    .map(|f| f.name())
-                    .collect::<Vec<_>>()
+                schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>()
             );
             eprintln!("[#740 add+rename] Name mapping: {:?}", name_mapping);
             // Key question: does the schema include the new column "description"
@@ -836,13 +812,10 @@ fn test_field_id_mapping_with_added_and_renamed_columns() {
                 3,
                 "Schema should include all 3 current columns"
             );
-        }
+        },
         Err(e) => {
-            eprintln!(
-                "[#740 add+rename] FINDING: build_read_schema failed: {}",
-                e
-            );
-        }
+            eprintln!("[#740 add+rename] FINDING: build_read_schema failed: {}", e);
+        },
     }
 }
 
@@ -857,24 +830,18 @@ async fn test_snapshot_consistency_after_updates() -> DataFusionResult<()> {
     let temp_dir = TempDir::new()?;
     let catalog_path = temp_dir.path().join("snap_update.ducklake");
 
-    let conn = duckdb::Connection::open_in_memory()
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let conn =
+        duckdb::Connection::open_in_memory().map_err(|e| DataFusionError::External(Box::new(e)))?;
     conn.execute("INSTALL ducklake;", [])
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     conn.execute("LOAD ducklake;", [])
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
-    conn.execute(
-        &format!("ATTACH '{}' AS test_catalog;", ducklake_path),
-        [],
-    )
-    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-    conn.execute(
-        "CREATE TABLE test_catalog.data (id INT, val INT);",
-        [],
-    )
-    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    conn.execute("CREATE TABLE test_catalog.data (id INT, val INT);", [])
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
     conn.execute(
         "INSERT INTO test_catalog.data VALUES (1, 10), (2, 20), (3, 30);",
         [],
@@ -898,8 +865,8 @@ async fn test_snapshot_consistency_after_updates() -> DataFusionResult<()> {
     // Query should see the latest state
     let provider = DuckdbMetadataProvider::new(catalog_path.to_string_lossy().to_string())
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
-    let catalog = DuckLakeCatalog::new(provider)
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let catalog =
+        DuckLakeCatalog::new(provider).map_err(|e| DataFusionError::External(Box::new(e)))?;
     let ctx = SessionContext::new();
     ctx.register_catalog("ducklake", Arc::new(catalog));
 
@@ -941,18 +908,15 @@ async fn test_filter_pushdown_with_limit_and_deletes() -> DataFusionResult<()> {
     let temp_dir = TempDir::new()?;
     let catalog_path = temp_dir.path().join("filter_limit.ducklake");
 
-    let conn = duckdb::Connection::open_in_memory()
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let conn =
+        duckdb::Connection::open_in_memory().map_err(|e| DataFusionError::External(Box::new(e)))?;
     conn.execute("INSTALL ducklake;", [])
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     conn.execute("LOAD ducklake;", [])
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
-    conn.execute(
-        &format!("ATTACH '{}' AS test_catalog;", ducklake_path),
-        [],
-    )
-    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
     conn.execute(
         "CREATE TABLE test_catalog.items (id INT, category VARCHAR, value INT);",
@@ -974,18 +938,15 @@ async fn test_filter_pushdown_with_limit_and_deletes() -> DataFusionResult<()> {
     .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
     // Delete some rows in category A
-    conn.execute(
-        "DELETE FROM test_catalog.items WHERE id IN (2, 6);",
-        [],
-    )
-    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    conn.execute("DELETE FROM test_catalog.items WHERE id IN (2, 6);", [])
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
     drop(conn);
 
     let provider = DuckdbMetadataProvider::new(catalog_path.to_string_lossy().to_string())
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
-    let catalog = DuckLakeCatalog::new(provider)
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let catalog =
+        DuckLakeCatalog::new(provider).map_err(|e| DataFusionError::External(Box::new(e)))?;
     let ctx = SessionContext::new();
     ctx.register_catalog("ducklake", Arc::new(catalog));
 
@@ -1013,7 +974,11 @@ async fn test_filter_pushdown_with_limit_and_deletes() -> DataFusionResult<()> {
     );
     // After deleting ids 2 and 6, remaining A rows are: 1(10), 4(40), 8(80)
     // Top 2 by value DESC: 8(80), 4(40)
-    assert_eq!(ids, vec![8, 4], "Wrong rows returned with filter+limit+deletes");
+    assert_eq!(
+        ids,
+        vec![8, 4],
+        "Wrong rows returned with filter+limit+deletes"
+    );
 
     Ok(())
 }
@@ -1028,18 +993,15 @@ async fn test_all_rows_deleted_leaves_empty_result() -> DataFusionResult<()> {
     let temp_dir = TempDir::new()?;
     let catalog_path = temp_dir.path().join("all_deleted.ducklake");
 
-    let conn = duckdb::Connection::open_in_memory()
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let conn =
+        duckdb::Connection::open_in_memory().map_err(|e| DataFusionError::External(Box::new(e)))?;
     conn.execute("INSTALL ducklake;", [])
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     conn.execute("LOAD ducklake;", [])
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
-    conn.execute(
-        &format!("ATTACH '{}' AS test_catalog;", ducklake_path),
-        [],
-    )
-    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
     conn.execute("CREATE TABLE test_catalog.t1 (id INT, name VARCHAR);", [])
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -1057,8 +1019,8 @@ async fn test_all_rows_deleted_leaves_empty_result() -> DataFusionResult<()> {
 
     let provider = DuckdbMetadataProvider::new(catalog_path.to_string_lossy().to_string())
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
-    let catalog = DuckLakeCatalog::new(provider)
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let catalog =
+        DuckLakeCatalog::new(provider).map_err(|e| DataFusionError::External(Box::new(e)))?;
     let ctx = SessionContext::new();
     ctx.register_catalog("ducklake", Arc::new(catalog));
 
@@ -1103,10 +1065,7 @@ fn test_path_resolution_pathological_cases() {
 
     // Path with .. components (potential traversal) — now rejected
     let result3 = resolve_path("/data/schema/", "../other/file.parquet", true);
-    eprintln!(
-        "[#606 path edge] resolve_path with .. = {:?}",
-        result3
-    );
+    eprintln!("[#606 path edge] resolve_path with .. = {:?}", result3);
     // resolve_path now rejects paths containing '..' as a standalone component
     assert!(
         result3.is_err(),
@@ -1127,10 +1086,7 @@ fn test_path_resolution_pathological_cases() {
 
     // Unicode in paths
     let result5 = resolve_path("/data/日本語/", "テーブル/file.parquet", true).unwrap();
-    eprintln!(
-        "[#606 path edge] Unicode path resolution = {:?}",
-        result5
-    );
+    eprintln!("[#606 path edge] Unicode path resolution = {:?}", result5);
     assert!(result5.contains("日本語"));
     assert!(result5.contains("テーブル"));
 }
@@ -1168,10 +1124,7 @@ fn test_s3_url_edge_cases() {
 
     // Empty bucket name
     let result4 = parse_object_store_url("s3:///path");
-    assert!(
-        result4.is_err(),
-        "s3:///path should error (missing bucket)"
-    );
+    assert!(result4.is_err(), "s3:///path should error (missing bucket)");
 }
 
 // ============================================================================
@@ -1250,13 +1203,13 @@ fn test_type_aliases_from_duckdb() {
                     "Alias '{}' mapped to {:?}, expected {:?}",
                     alias, dt, expected
                 );
-            }
+            },
             Err(e) => {
                 eprintln!(
                     "[#637 type alias] FINDING: Alias '{}' not recognized: {}",
                     alias, e
                 );
-            }
+            },
         }
     }
 
@@ -1267,7 +1220,10 @@ fn test_type_aliases_from_duckdb() {
         eprintln!(
             "[#637 type alias] '{}' -> {:?}",
             t,
-            result.as_ref().map(|d| format!("{:?}", d)).unwrap_or_else(|e| format!("Err({})", e))
+            result
+                .as_ref()
+                .map(|d| format!("{:?}", d))
+                .unwrap_or_else(|e| format!("Err({})", e))
         );
     }
 }
@@ -1342,10 +1298,10 @@ fn test_very_long_column_names() {
         Ok(s) => {
             assert_eq!(s.field(0).name(), &long_name);
             eprintln!("[#619 long names] 200-char column name accepted");
-        }
+        },
         Err(e) => {
             eprintln!("[#619 long names] FINDING: Long column name failed: {}", e);
-        }
+        },
     }
 }
 
@@ -1447,8 +1403,8 @@ async fn test_catalog_with_empty_metadata_tables() -> DataFusionResult<()> {
     // This should work with 0 schemas/tables/snapshots
     let provider = DuckdbMetadataProvider::new(catalog_path.to_string_lossy().to_string())
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
-    let catalog = DuckLakeCatalog::new(provider)
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let catalog =
+        DuckLakeCatalog::new(provider).map_err(|e| DataFusionError::External(Box::new(e)))?;
 
     let schema_names = catalog.schema_names();
     eprintln!(
@@ -1477,18 +1433,15 @@ async fn test_time_travel_snapshot_isolation() -> DataFusionResult<()> {
     let temp_dir = TempDir::new()?;
     let catalog_path = temp_dir.path().join("time_travel.ducklake");
 
-    let conn = duckdb::Connection::open_in_memory()
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let conn =
+        duckdb::Connection::open_in_memory().map_err(|e| DataFusionError::External(Box::new(e)))?;
     conn.execute("INSTALL ducklake;", [])
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     conn.execute("LOAD ducklake;", [])
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
-    conn.execute(
-        &format!("ATTACH '{}' AS test_catalog;", ducklake_path),
-        [],
-    )
-    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
     // Snapshot 1: Create table + insert
     conn.execute("CREATE TABLE test_catalog.t1 (id INT);", [])
@@ -1522,8 +1475,7 @@ async fn test_time_travel_snapshot_isolation() -> DataFusionResult<()> {
     let ctx_current = SessionContext::new();
     ctx_current.register_catalog("ducklake", Arc::new(catalog_current));
 
-    let count_current =
-        query_count(&ctx_current, "SELECT COUNT(*) FROM ducklake.main.t1").await?;
+    let count_current = query_count(&ctx_current, "SELECT COUNT(*) FROM ducklake.main.t1").await?;
     eprintln!(
         "[#673 time travel] Count at current snapshot: {} (expected 3)",
         count_current
@@ -1566,18 +1518,15 @@ async fn test_limit_with_partitioned_table() -> DataFusionResult<()> {
     let temp_dir = TempDir::new()?;
     let catalog_path = temp_dir.path().join("limit_part.ducklake");
 
-    let conn = duckdb::Connection::open_in_memory()
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let conn =
+        duckdb::Connection::open_in_memory().map_err(|e| DataFusionError::External(Box::new(e)))?;
     conn.execute("INSTALL ducklake;", [])
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     conn.execute("LOAD ducklake;", [])
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
-    conn.execute(
-        &format!("ATTACH '{}' AS test_catalog;", ducklake_path),
-        [],
-    )
-    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
     conn.execute(
         "CREATE TABLE test_catalog.logs (id INT, level VARCHAR, msg VARCHAR);",
@@ -1606,15 +1555,13 @@ async fn test_limit_with_partitioned_table() -> DataFusionResult<()> {
 
     let provider = DuckdbMetadataProvider::new(catalog_path.to_string_lossy().to_string())
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
-    let catalog = DuckLakeCatalog::new(provider)
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let catalog =
+        DuckLakeCatalog::new(provider).map_err(|e| DataFusionError::External(Box::new(e)))?;
     let ctx = SessionContext::new();
     ctx.register_catalog("ducklake", Arc::new(catalog));
 
     // LIMIT should return exactly the requested number of rows
-    let df = ctx
-        .sql("SELECT id FROM ducklake.main.logs LIMIT 3")
-        .await?;
+    let df = ctx.sql("SELECT id FROM ducklake.main.logs LIMIT 3").await?;
     let batches = df.collect().await?;
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
     eprintln!(
@@ -1633,7 +1580,10 @@ async fn test_limit_with_partitioned_table() -> DataFusionResult<()> {
         "[#745 limit+partition] ERROR filter LIMIT 1: {} rows (expected 1)",
         total2
     );
-    assert_eq!(total2, 1, "LIMIT 1 with partition filter should return 1 row");
+    assert_eq!(
+        total2, 1,
+        "LIMIT 1 with partition filter should return 1 row"
+    );
 
     Ok(())
 }
@@ -1692,10 +1642,7 @@ async fn test_concurrent_reads_snapshot_consistency() -> DataFusionResult<()> {
         results.push(result);
     }
 
-    eprintln!(
-        "[#650 concurrent reads] Results: {:?}",
-        results
-    );
+    eprintln!("[#650 concurrent reads] Results: {:?}", results);
     // All concurrent reads should see the same count
     assert!(
         results.iter().all(|&c| c == results[0]),
@@ -1715,18 +1662,15 @@ async fn test_projection_at_schema_boundary() -> DataFusionResult<()> {
     let temp_dir = TempDir::new()?;
     let catalog_path = temp_dir.path().join("proj_bound.ducklake");
 
-    let conn = duckdb::Connection::open_in_memory()
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let conn =
+        duckdb::Connection::open_in_memory().map_err(|e| DataFusionError::External(Box::new(e)))?;
     conn.execute("INSTALL ducklake;", [])
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     conn.execute("LOAD ducklake;", [])
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
-    conn.execute(
-        &format!("ATTACH '{}' AS test_catalog;", ducklake_path),
-        [],
-    )
-    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
     // Table with many columns
     conn.execute(
@@ -1734,25 +1678,20 @@ async fn test_projection_at_schema_boundary() -> DataFusionResult<()> {
         [],
     )
     .map_err(|e| DataFusionError::External(Box::new(e)))?;
-    conn.execute(
-        "INSERT INTO test_catalog.wide VALUES (1, 2, 3, 4, 5);",
-        [],
-    )
-    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    conn.execute("INSERT INTO test_catalog.wide VALUES (1, 2, 3, 4, 5);", [])
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
     drop(conn);
 
     let provider = DuckdbMetadataProvider::new(catalog_path.to_string_lossy().to_string())
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
-    let catalog = DuckLakeCatalog::new(provider)
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let catalog =
+        DuckLakeCatalog::new(provider).map_err(|e| DataFusionError::External(Box::new(e)))?;
     let ctx = SessionContext::new();
     ctx.register_catalog("ducklake", Arc::new(catalog));
 
     // Select only the last column
-    let df = ctx
-        .sql("SELECT c5 FROM ducklake.main.wide")
-        .await?;
+    let df = ctx.sql("SELECT c5 FROM ducklake.main.wide").await?;
     let batches = df.collect().await?;
     assert!(!batches.is_empty());
     let val = batches[0]
@@ -1767,9 +1706,7 @@ async fn test_projection_at_schema_boundary() -> DataFusionResult<()> {
     assert_eq!(val.value(0), 5);
 
     // Select first and last column (skip middle)
-    let df2 = ctx
-        .sql("SELECT c1, c5 FROM ducklake.main.wide")
-        .await?;
+    let df2 = ctx.sql("SELECT c1, c5 FROM ducklake.main.wide").await?;
     let batches2 = df2.collect().await?;
     assert!(!batches2.is_empty());
     let c1 = batches2[0]
@@ -1804,26 +1741,20 @@ async fn test_information_schema_listing() -> DataFusionResult<()> {
     let temp_dir = TempDir::new()?;
     let catalog_path = temp_dir.path().join("infoschema.ducklake");
 
-    let conn = duckdb::Connection::open_in_memory()
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let conn =
+        duckdb::Connection::open_in_memory().map_err(|e| DataFusionError::External(Box::new(e)))?;
     conn.execute("INSTALL ducklake;", [])
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     conn.execute("LOAD ducklake;", [])
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
-    conn.execute(
-        &format!("ATTACH '{}' AS test_catalog;", ducklake_path),
-        [],
-    )
-    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
     // Create multiple tables with data so the files directory is created
     for i in 0..5 {
         conn.execute(
-            &format!(
-                "CREATE TABLE test_catalog.t{} AS SELECT {} AS id;",
-                i, i
-            ),
+            &format!("CREATE TABLE test_catalog.t{} AS SELECT {} AS id;", i, i),
             [],
         )
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -1833,8 +1764,8 @@ async fn test_information_schema_listing() -> DataFusionResult<()> {
 
     let provider = DuckdbMetadataProvider::new(catalog_path.to_string_lossy().to_string())
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
-    let catalog = DuckLakeCatalog::new(provider)
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let catalog =
+        DuckLakeCatalog::new(provider).map_err(|e| DataFusionError::External(Box::new(e)))?;
     let ctx = SessionContext::new();
     ctx.register_catalog("ducklake", Arc::new(catalog));
 
@@ -1875,8 +1806,8 @@ async fn test_sequential_queries_same_table() -> DataFusionResult<()> {
 
     let provider = DuckdbMetadataProvider::new(catalog_path.to_string_lossy().to_string())
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
-    let catalog = DuckLakeCatalog::new(provider)
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let catalog =
+        DuckLakeCatalog::new(provider).map_err(|e| DataFusionError::External(Box::new(e)))?;
     let ctx = SessionContext::new();
     ctx.register_catalog("ducklake", Arc::new(catalog));
 
@@ -1884,10 +1815,7 @@ async fn test_sequential_queries_same_table() -> DataFusionResult<()> {
     for i in 0..20 {
         let count = query_count(&ctx, "SELECT COUNT(*) FROM ducklake.main.users").await?;
         if i == 0 || i == 19 {
-            eprintln!(
-                "[#610 sequential] Query {}: count={}",
-                i, count
-            );
+            eprintln!("[#610 sequential] Query {}: count={}", i, count);
         }
         assert_eq!(count, 3, "Query {} returned wrong count", i);
     }
@@ -1926,8 +1854,7 @@ fn test_field_id_mapping_with_id_mismatch() {
     parquet_field_ids.insert(10, "id".to_string());
     parquet_field_ids.insert(20, "name".to_string());
 
-    let result =
-        build_read_schema_with_field_id_mapping(&current_columns, &parquet_field_ids);
+    let result = build_read_schema_with_field_id_mapping(&current_columns, &parquet_field_ids);
 
     match result {
         Ok((schema, name_mapping)) => {
@@ -1939,13 +1866,10 @@ fn test_field_id_mapping_with_id_mismatch() {
             // When field_ids don't match, it falls back to current column names
             assert_eq!(schema.field(0).name(), "id");
             assert_eq!(schema.field(1).name(), "name");
-        }
+        },
         Err(e) => {
-            eprintln!(
-                "[#791 field_id mismatch] FINDING: Failed: {}",
-                e
-            );
-        }
+            eprintln!("[#791 field_id mismatch] FINDING: Failed: {}", e);
+        },
     }
 }
 
@@ -1977,7 +1901,12 @@ fn test_zero_size_file_metadata() {
     };
 
     // This should not panic
-    let resolved = resolve_path("/data/table/", &table_file.file.path, table_file.file.path_is_relative).unwrap();
+    let resolved = resolve_path(
+        "/data/table/",
+        &table_file.file.path,
+        table_file.file.path_is_relative,
+    )
+    .unwrap();
     eprintln!(
         "[#609 zero-size file] Resolved path: {} (file_size=0)",
         resolved
@@ -1996,18 +1925,15 @@ async fn test_column_rename_preserves_type_info() -> DataFusionResult<()> {
     let temp_dir = TempDir::new()?;
     let catalog_path = temp_dir.path().join("rename_type.ducklake");
 
-    let conn = duckdb::Connection::open_in_memory()
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let conn =
+        duckdb::Connection::open_in_memory().map_err(|e| DataFusionError::External(Box::new(e)))?;
     conn.execute("INSTALL ducklake;", [])
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     conn.execute("LOAD ducklake;", [])
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
-    conn.execute(
-        &format!("ATTACH '{}' AS test_catalog;", ducklake_path),
-        [],
-    )
-    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
     conn.execute(
         "CREATE TABLE test_catalog.products (id BIGINT, price DECIMAL(10,2));",
@@ -2031,8 +1957,8 @@ async fn test_column_rename_preserves_type_info() -> DataFusionResult<()> {
 
     let provider = DuckdbMetadataProvider::new(catalog_path.to_string_lossy().to_string())
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
-    let catalog = DuckLakeCatalog::new(provider)
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let catalog =
+        DuckLakeCatalog::new(provider).map_err(|e| DataFusionError::External(Box::new(e)))?;
     let ctx = SessionContext::new();
     ctx.register_catalog("ducklake", Arc::new(catalog));
 
@@ -2048,12 +1974,10 @@ async fn test_column_rename_preserves_type_info() -> DataFusionResult<()> {
             if !batches.is_empty() {
                 let schema = batches[0].schema();
                 let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-                eprintln!(
-                    "[#781 rename DDL] Column names after rename: {:?}",
-                    names
-                );
+                eprintln!("[#781 rename DDL] Column names after rename: {:?}", names);
                 // Check that unit_price is present, not price
-                let base_names: Vec<&&str> = names.iter()
+                let base_names: Vec<&&str> = names
+                    .iter()
                     .filter(|n| **n != "filename" && **n != "file_row_number")
                     .collect();
                 assert!(
@@ -2065,13 +1989,13 @@ async fn test_column_rename_preserves_type_info() -> DataFusionResult<()> {
                     "Old column name 'price' should not appear"
                 );
             }
-        }
+        },
         Err(e) => {
             eprintln!(
                 "[#781 rename DDL] FINDING: Query after rename failed: {}",
                 e
             );
-        }
+        },
     }
 
     Ok(())
@@ -2088,18 +2012,15 @@ async fn test_added_column_returns_null_for_old_files() -> DataFusionResult<()> 
     let temp_dir = TempDir::new()?;
     let catalog_path = temp_dir.path().join("null_col.ducklake");
 
-    let conn = duckdb::Connection::open_in_memory()
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let conn =
+        duckdb::Connection::open_in_memory().map_err(|e| DataFusionError::External(Box::new(e)))?;
     conn.execute("INSTALL ducklake;", [])
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     conn.execute("LOAD ducklake;", [])
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
-    conn.execute(
-        &format!("ATTACH '{}' AS test_catalog;", ducklake_path),
-        [],
-    )
-    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
     // Insert data with original schema
     conn.execute("CREATE TABLE test_catalog.t1 (id INT, name VARCHAR);", [])
@@ -2115,18 +2036,15 @@ async fn test_added_column_returns_null_for_old_files() -> DataFusionResult<()> 
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
     // Insert new data with the new column
-    conn.execute(
-        "INSERT INTO test_catalog.t1 VALUES (3, 'Charlie', 30);",
-        [],
-    )
-    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    conn.execute("INSERT INTO test_catalog.t1 VALUES (3, 'Charlie', 30);", [])
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
     drop(conn);
 
     let provider = DuckdbMetadataProvider::new(catalog_path.to_string_lossy().to_string())
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
-    let catalog = DuckLakeCatalog::new(provider)
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let catalog =
+        DuckLakeCatalog::new(provider).map_err(|e| DataFusionError::External(Box::new(e)))?;
     let ctx = SessionContext::new();
     ctx.register_catalog("ducklake", Arc::new(catalog));
 
@@ -2145,21 +2063,18 @@ async fn test_added_column_returns_null_for_old_files() -> DataFusionResult<()> 
                         "[#307 added col null] Total rows: {} (expected 3)",
                         total_rows
                     );
-                }
+                },
                 Err(ref e) => {
-                    eprintln!(
-                        "[#307 added col null] FINDING: Collect failed: {}",
-                        e
-                    );
-                }
+                    eprintln!("[#307 added col null] FINDING: Collect failed: {}", e);
+                },
             }
-        }
+        },
         Err(e) => {
             eprintln!(
                 "[#307 added col null] FINDING: Query with added column failed: {}",
                 e
             );
-        }
+        },
     }
 
     Ok(())
@@ -2183,8 +2098,9 @@ fn test_path_resolver_deep_hive_partition_hierarchy() {
     let table_resolver = schema_resolver.child_resolver("events/", true).unwrap();
 
     // Deep hive partition path
-    let partition_resolver =
-        table_resolver.child_resolver("year=2024/month=01/day=15/hour=10/", true).unwrap();
+    let partition_resolver = table_resolver
+        .child_resolver("year=2024/month=01/day=15/hour=10/", true)
+        .unwrap();
     assert_eq!(
         partition_resolver.base_path(),
         "/warehouse/prod/events/year=2024/month=01/day=15/hour=10/"
@@ -2208,20 +2124,17 @@ fn test_field_id_mapping_large_column_ids() {
     use datafusion_ducklake::metadata_provider::DuckLakeTableColumn;
 
     // Column IDs that are large but fit in i32
-    let current_columns = vec![
-        DuckLakeTableColumn {
-            column_id: i32::MAX as i64,
-            column_name: "big_id_col".to_string(),
-            column_type: "int32".to_string(),
-            is_nullable: true,
-        },
-    ];
+    let current_columns = vec![DuckLakeTableColumn {
+        column_id: i32::MAX as i64,
+        column_name: "big_id_col".to_string(),
+        column_type: "int32".to_string(),
+        is_nullable: true,
+    }];
 
     let mut parquet_field_ids = HashMap::new();
     parquet_field_ids.insert(i32::MAX, "big_id_col".to_string());
 
-    let result =
-        build_read_schema_with_field_id_mapping(&current_columns, &parquet_field_ids);
+    let result = build_read_schema_with_field_id_mapping(&current_columns, &parquet_field_ids);
     assert!(
         result.is_ok(),
         "Should handle large column_id: {:?}",
@@ -2229,22 +2142,22 @@ fn test_field_id_mapping_large_column_ids() {
     );
 
     // Column ID that OVERFLOWS i32 when cast
-    let overflow_columns = vec![
-        DuckLakeTableColumn {
-            column_id: (i32::MAX as i64) + 1,
-            column_name: "overflow_col".to_string(),
-            column_type: "varchar".to_string(),
-            is_nullable: true,
-        },
-    ];
+    let overflow_columns = vec![DuckLakeTableColumn {
+        column_id: (i32::MAX as i64) + 1,
+        column_name: "overflow_col".to_string(),
+        column_type: "varchar".to_string(),
+        is_nullable: true,
+    }];
 
     let parquet_field_ids2 = HashMap::new(); // No matching field
-    let result2 =
-        build_read_schema_with_field_id_mapping(&overflow_columns, &parquet_field_ids2);
+    let result2 = build_read_schema_with_field_id_mapping(&overflow_columns, &parquet_field_ids2);
     eprintln!(
         "[#794 large column_id] Overflow i32 column_id result: {:?}",
         result2.as_ref().map(|(s, m)| (
-            s.fields().iter().map(|f| f.name().clone()).collect::<Vec<_>>(),
+            s.fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect::<Vec<_>>(),
             m.clone()
         ))
     );
@@ -2286,14 +2199,14 @@ fn test_special_characters_in_column_names() {
             Ok(schema) => {
                 assert_eq!(schema.field(0).name(), name);
                 eprintln!("[#790 special chars] '{}' -> OK", name.escape_debug());
-            }
+            },
             Err(e) => {
                 eprintln!(
                     "[#790 special chars] FINDING: '{}' -> Error: {}",
                     name.escape_debug(),
                     e
                 );
-            }
+            },
         }
     }
 }
@@ -2321,10 +2234,10 @@ fn test_error_messages_contain_useful_info() {
     match result {
         Ok(dt) => {
             eprintln!("[#795 error msg] decimal(abc,def) -> {:?}", dt);
-        }
+        },
         Err(e) => {
             eprintln!("[#795 error msg] decimal(abc,def) -> Error: {}", e);
-        }
+        },
     }
 }
 
@@ -2339,18 +2252,15 @@ async fn test_catalog_listing_not_n_plus_one() -> DataFusionResult<()> {
     let temp_dir = TempDir::new()?;
     let catalog_path = temp_dir.path().join("n_plus_one.ducklake");
 
-    let conn = duckdb::Connection::open_in_memory()
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let conn =
+        duckdb::Connection::open_in_memory().map_err(|e| DataFusionError::External(Box::new(e)))?;
     conn.execute("INSTALL ducklake;", [])
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     conn.execute("LOAD ducklake;", [])
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
-    conn.execute(
-        &format!("ATTACH '{}' AS test_catalog;", ducklake_path),
-        [],
-    )
-    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
     // Create 20 tables with data
     for i in 0..20 {
@@ -2376,8 +2286,8 @@ async fn test_catalog_listing_not_n_plus_one() -> DataFusionResult<()> {
 
     let provider = DuckdbMetadataProvider::new(catalog_path.to_string_lossy().to_string())
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
-    let catalog = DuckLakeCatalog::new(provider)
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let catalog =
+        DuckLakeCatalog::new(provider).map_err(|e| DataFusionError::External(Box::new(e)))?;
     let ctx = SessionContext::new();
     ctx.register_catalog("ducklake", Arc::new(catalog));
 
@@ -2394,11 +2304,7 @@ async fn test_catalog_listing_not_n_plus_one() -> DataFusionResult<()> {
     assert_eq!(table_names.len(), 20, "Should list all 20 tables");
 
     // Verify we can query each table
-    let first_count = query_count(
-        &ctx,
-        "SELECT COUNT(*) FROM ducklake.main.table_0",
-    )
-    .await?;
+    let first_count = query_count(&ctx, "SELECT COUNT(*) FROM ducklake.main.table_0").await?;
     assert_eq!(first_count, 1, "Each table should have 1 row");
 
     Ok(())
@@ -2418,8 +2324,8 @@ async fn test_read_only_catalog_rejects_schema_mutation() -> DataFusionResult<()
     let provider = DuckdbMetadataProvider::new(catalog_path.to_string_lossy().to_string())
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     // Using DuckLakeCatalog::new() creates a read-only catalog (no writer)
-    let catalog = DuckLakeCatalog::new(provider)
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let catalog =
+        DuckLakeCatalog::new(provider).map_err(|e| DataFusionError::External(Box::new(e)))?;
 
     // schema_names should work in read-only mode
     let names = catalog.schema_names();
@@ -2452,7 +2358,10 @@ fn test_timestamp_type_variations() {
     use arrow::datatypes::TimeUnit;
 
     let type_tests = vec![
-        ("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None)),
+        (
+            "timestamp",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+        ),
         (
             "timestamptz",
             DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
@@ -2481,13 +2390,13 @@ fn test_timestamp_type_variations() {
                     "Type '{}' should map to {:?}",
                     type_str, expected
                 );
-            }
+            },
             Err(e) => {
                 eprintln!(
                     "[#652 timestamp] FINDING: '{}' not recognized: {}",
                     type_str, e
                 );
-            }
+            },
         }
     }
 
@@ -2518,7 +2427,11 @@ fn test_type_parsing_whitespace_and_casing() {
 
     // Decimal with spaces
     let result = ducklake_to_arrow_type("DECIMAL( 10 , 2 )");
-    assert!(result.is_ok(), "Decimal with spaces should work: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Decimal with spaces should work: {:?}",
+        result
+    );
     if let Ok(DataType::Decimal128(p, s)) = result {
         assert_eq!(p, 10);
         assert_eq!(s, 2);
@@ -2566,18 +2479,15 @@ async fn test_partition_metadata_loaded_on_catalog_create() -> DataFusionResult<
     let temp_dir = TempDir::new()?;
     let catalog_path = temp_dir.path().join("part_meta.ducklake");
 
-    let conn = duckdb::Connection::open_in_memory()
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let conn =
+        duckdb::Connection::open_in_memory().map_err(|e| DataFusionError::External(Box::new(e)))?;
     conn.execute("INSTALL ducklake;", [])
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     conn.execute("LOAD ducklake;", [])
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
-    conn.execute(
-        &format!("ATTACH '{}' AS test_catalog;", ducklake_path),
-        [],
-    )
-    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
     conn.execute(
         "CREATE TABLE test_catalog.partitioned_data (id INT, region VARCHAR, value DOUBLE);",
@@ -2600,17 +2510,14 @@ async fn test_partition_metadata_loaded_on_catalog_create() -> DataFusionResult<
     // Fresh connection — catalog should load partition metadata
     let provider = DuckdbMetadataProvider::new(catalog_path.to_string_lossy().to_string())
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
-    let catalog = DuckLakeCatalog::new(provider)
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let catalog =
+        DuckLakeCatalog::new(provider).map_err(|e| DataFusionError::External(Box::new(e)))?;
     let ctx = SessionContext::new();
     ctx.register_catalog("ducklake", Arc::new(catalog));
 
     // Filter on partition column should not lose data
-    let all_count = query_count(
-        &ctx,
-        "SELECT COUNT(*) FROM ducklake.main.partitioned_data",
-    )
-    .await?;
+    let all_count =
+        query_count(&ctx, "SELECT COUNT(*) FROM ducklake.main.partitioned_data").await?;
     let us_count = query_count(
         &ctx,
         "SELECT COUNT(*) FROM ducklake.main.partitioned_data WHERE region = 'US'",

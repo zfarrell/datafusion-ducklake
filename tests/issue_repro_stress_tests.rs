@@ -21,9 +21,25 @@ use tempfile::TempDir;
 fn get_i64_col0(batch: &arrow::record_batch::RecordBatch) -> Vec<i64> {
     let col = batch.column(0);
     if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
-        (0..a.len()).filter_map(|i| if a.is_null(i) { None } else { Some(a.value(i)) }).collect()
+        (0..a.len())
+            .filter_map(|i| {
+                if a.is_null(i) {
+                    None
+                } else {
+                    Some(a.value(i))
+                }
+            })
+            .collect()
     } else if let Some(a) = col.as_any().downcast_ref::<Int32Array>() {
-        (0..a.len()).filter_map(|i| if a.is_null(i) { None } else { Some(a.value(i) as i64) }).collect()
+        (0..a.len())
+            .filter_map(|i| {
+                if a.is_null(i) {
+                    None
+                } else {
+                    Some(a.value(i) as i64)
+                }
+            })
+            .collect()
     } else {
         panic!("Expected Int32 or Int64, got {:?}", col.data_type());
     }
@@ -61,23 +77,32 @@ fn attach_ducklake(conn: &duckdb::Connection, catalog_path: &str, alias: &str) {
 /// base_path already ends with a separator, preventing double slashes in S3 URLs.
 #[test]
 fn test_issue_217_double_slash_in_paths() {
-    use datafusion_ducklake::path_resolver::{join_paths, resolve_path, PathResolver};
     use datafusion::datasource::object_store::ObjectStoreUrl;
+    use datafusion_ducklake::path_resolver::{PathResolver, join_paths, resolve_path};
 
     // Case 1: Base with trailing slash + relative with leading slash -> no double slash
     let result = join_paths("/data/", "/subdir/file.parquet").unwrap();
     assert_eq!(result, "/data/subdir/file.parquet");
-    assert!(!result.contains("//"), "join_paths must not produce double slashes");
+    assert!(
+        !result.contains("//"),
+        "join_paths must not produce double slashes"
+    );
 
     // Case 2: S3-like path hierarchy
     let result = join_paths("/warehouse/prod/", "/data/file.parquet").unwrap();
     assert_eq!(result, "/warehouse/prod/data/file.parquet");
-    assert!(!result.contains("//"), "S3 path must not have double slashes");
+    assert!(
+        !result.contains("//"),
+        "S3 path must not have double slashes"
+    );
 
     // Case 3: resolve_path with is_relative=true
     let result = resolve_path("/bucket/prefix/", "/schema/table/file.parquet", true).unwrap();
     assert_eq!(result, "/bucket/prefix/schema/table/file.parquet");
-    assert!(!result.contains("//"), "resolve_path must not produce double slashes");
+    assert!(
+        !result.contains("//"),
+        "resolve_path must not produce double slashes"
+    );
 
     // Case 4: PathResolver child_resolver
     let resolver = PathResolver::new(
@@ -86,14 +111,22 @@ fn test_issue_217_double_slash_in_paths() {
     );
     let child = resolver.child_resolver("/subpath/", true).unwrap();
     assert_eq!(child.base_path(), "/data/subpath/");
-    assert!(!child.base_path().contains("//"), "PathResolver must not produce double slashes");
+    assert!(
+        !child.base_path().contains("//"),
+        "PathResolver must not produce double slashes"
+    );
 
     // Case 5: Multiple levels of nesting
     let base = "/s3/bucket/warehouse/";
     for p in &["/schema/", "/table/", "/partition=1/"] {
         let result = join_paths(base, p).unwrap();
-        assert!(!result.contains("//"),
-            "join_paths({}, {}) = {} must not have //", base, p, result);
+        assert!(
+            !result.contains("//"),
+            "join_paths({}, {}) = {} must not have //",
+            base,
+            p,
+            result
+        );
     }
 
     // Case 6: Normal cases still work
@@ -166,8 +199,7 @@ async fn test_issue_268_284_concurrent_table_creation() -> DataFusionResult<()> 
     let provider = DuckdbMetadataProvider::new(catalog_str.clone())
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     let catalog = Arc::new(
-        DuckLakeCatalog::new(provider)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?,
+        DuckLakeCatalog::new(provider).map_err(|e| DataFusionError::External(Box::new(e)))?,
     );
 
     let contamination_count = Arc::new(AtomicU32::new(0));
@@ -268,14 +300,23 @@ async fn test_issue_69_101_230_drop_table_while_reading() -> DataFusionResult<()
             let conn = duckdb_conn_with_ducklake();
             attach_ducklake(&conn, &catalog_str, "dc");
 
-            conn.execute("CREATE TABLE dc.stable1 (id INT, name VARCHAR);", []).unwrap();
-            conn.execute("INSERT INTO dc.stable1 VALUES (1, 'a'), (2, 'b'), (3, 'c');", []).unwrap();
+            conn.execute("CREATE TABLE dc.stable1 (id INT, name VARCHAR);", [])
+                .unwrap();
+            conn.execute(
+                "INSERT INTO dc.stable1 VALUES (1, 'a'), (2, 'b'), (3, 'c');",
+                [],
+            )
+            .unwrap();
 
-            conn.execute("CREATE TABLE dc.stable2 (id INT, val INT);", []).unwrap();
-            conn.execute("INSERT INTO dc.stable2 VALUES (10, 100), (20, 200);", []).unwrap();
+            conn.execute("CREATE TABLE dc.stable2 (id INT, val INT);", [])
+                .unwrap();
+            conn.execute("INSERT INTO dc.stable2 VALUES (10, 100), (20, 200);", [])
+                .unwrap();
 
-            conn.execute("CREATE TABLE dc.to_drop (id INT, x VARCHAR);", []).unwrap();
-            conn.execute("INSERT INTO dc.to_drop VALUES (99, 'drop_me');", []).unwrap();
+            conn.execute("CREATE TABLE dc.to_drop (id INT, x VARCHAR);", [])
+                .unwrap();
+            conn.execute("INSERT INTO dc.to_drop VALUES (99, 'drop_me');", [])
+                .unwrap();
         }
 
         let cat_str = catalog_str.clone();
@@ -301,46 +342,48 @@ async fn test_issue_69_101_230_drop_table_while_reading() -> DataFusionResult<()
 
                 // Read stable1
                 match conn.prepare("SELECT COUNT(*) FROM dc.stable1") {
-                    Ok(mut stmt) => {
-                        match stmt.query_row([], |row| row.get::<_, i64>(0)) {
-                            Ok(count) => {
-                                if count != 3 {
-                                    eprintln!("  Iteration {}: stable1 count={} (expected 3)", iteration, count);
-                                    err_cnt.fetch_add(1, Ordering::Relaxed);
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("  Iteration {}: stable1 read error: {}", iteration, e);
+                    Ok(mut stmt) => match stmt.query_row([], |row| row.get::<_, i64>(0)) {
+                        Ok(count) => {
+                            if count != 3 {
+                                eprintln!(
+                                    "  Iteration {}: stable1 count={} (expected 3)",
+                                    iteration, count
+                                );
                                 err_cnt.fetch_add(1, Ordering::Relaxed);
                             }
-                        }
-                    }
+                        },
+                        Err(e) => {
+                            eprintln!("  Iteration {}: stable1 read error: {}", iteration, e);
+                            err_cnt.fetch_add(1, Ordering::Relaxed);
+                        },
+                    },
                     Err(e) => {
                         eprintln!("  Iteration {}: stable1 prepare error: {}", iteration, e);
                         err_cnt.fetch_add(1, Ordering::Relaxed);
-                    }
+                    },
                 }
 
                 // Read stable2
                 match conn.prepare("SELECT COUNT(*) FROM dc.stable2") {
-                    Ok(mut stmt) => {
-                        match stmt.query_row([], |row| row.get::<_, i64>(0)) {
-                            Ok(count) => {
-                                if count != 2 {
-                                    eprintln!("  Iteration {}: stable2 count={} (expected 2)", iteration, count);
-                                    err_cnt.fetch_add(1, Ordering::Relaxed);
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("  Iteration {}: stable2 read error: {}", iteration, e);
+                    Ok(mut stmt) => match stmt.query_row([], |row| row.get::<_, i64>(0)) {
+                        Ok(count) => {
+                            if count != 2 {
+                                eprintln!(
+                                    "  Iteration {}: stable2 count={} (expected 2)",
+                                    iteration, count
+                                );
                                 err_cnt.fetch_add(1, Ordering::Relaxed);
                             }
-                        }
-                    }
+                        },
+                        Err(e) => {
+                            eprintln!("  Iteration {}: stable2 read error: {}", iteration, e);
+                            err_cnt.fetch_add(1, Ordering::Relaxed);
+                        },
+                    },
                     Err(e) => {
                         eprintln!("  Iteration {}: stable2 prepare error: {}", iteration, e);
                         err_cnt.fetch_add(1, Ordering::Relaxed);
-                    }
+                    },
                 }
             })
         };
@@ -352,26 +395,40 @@ async fn test_issue_69_101_230_drop_table_while_reading() -> DataFusionResult<()
         let provider = DuckdbMetadataProvider::new(catalog_str.clone())
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         let catalog = Arc::new(
-            DuckLakeCatalog::new(provider)
-                .map_err(|e| DataFusionError::External(Box::new(e)))?,
+            DuckLakeCatalog::new(provider).map_err(|e| DataFusionError::External(Box::new(e)))?,
         );
         let ctx = SessionContext::new();
         ctx.register_catalog("dc", catalog);
 
-        let df = ctx.sql("SELECT COUNT(*) as cnt FROM dc.main.stable1").await?;
+        let df = ctx
+            .sql("SELECT COUNT(*) as cnt FROM dc.main.stable1")
+            .await?;
         let results = df.collect().await?;
-        let count = results[0].column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0);
+        let count = results[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
         if count != 3 {
-            eprintln!("  Iteration {}: DataFusion stable1 count={} after drop (expected 3)", iteration, count);
+            eprintln!(
+                "  Iteration {}: DataFusion stable1 count={} after drop (expected 3)",
+                iteration, count
+            );
             error_count.fetch_add(1, Ordering::Relaxed);
         }
     }
 
     let errors = error_count.load(Ordering::Relaxed);
     if errors > 0 {
-        eprintln!("✗ Issues #69/#101/#230: {} errors across 10 iterations of DROP + concurrent read", errors);
+        eprintln!(
+            "✗ Issues #69/#101/#230: {} errors across 10 iterations of DROP + concurrent read",
+            errors
+        );
     } else {
-        eprintln!("✓ Issues #69/#101/#230: No corruption in 10 iterations of DROP + concurrent read");
+        eprintln!(
+            "✓ Issues #69/#101/#230: No corruption in 10 iterations of DROP + concurrent read"
+        );
     }
 
     Ok(())
@@ -393,29 +450,41 @@ async fn test_issue_322_table_view_id_conflict() -> DataFusionResult<()> {
         attach_ducklake(&conn, &catalog_str, "vc");
 
         // Create a base table
-        conn.execute("CREATE TABLE vc.base_table (id INT, name VARCHAR);", []).unwrap();
-        conn.execute("INSERT INTO vc.base_table VALUES (1, 'hello'), (2, 'world');", []).unwrap();
+        conn.execute("CREATE TABLE vc.base_table (id INT, name VARCHAR);", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO vc.base_table VALUES (1, 'hello'), (2, 'world');",
+            [],
+        )
+        .unwrap();
 
         // Create a view on it
-        conn.execute("CREATE VIEW vc.base_view AS SELECT id, name FROM vc.base_table WHERE id = 1;", []).unwrap();
+        conn.execute(
+            "CREATE VIEW vc.base_view AS SELECT id, name FROM vc.base_table WHERE id = 1;",
+            [],
+        )
+        .unwrap();
 
         // Create another table to increase ID overlap chance
-        conn.execute("CREATE TABLE vc.other_table (x INT);", []).unwrap();
-        conn.execute("INSERT INTO vc.other_table VALUES (42);", []).unwrap();
+        conn.execute("CREATE TABLE vc.other_table (x INT);", [])
+            .unwrap();
+        conn.execute("INSERT INTO vc.other_table VALUES (42);", [])
+            .unwrap();
     }
 
     // Read via DataFusion - verify both table and view data are correct
     let provider = DuckdbMetadataProvider::new(catalog_str)
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     let catalog = Arc::new(
-        DuckLakeCatalog::new(provider)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?,
+        DuckLakeCatalog::new(provider).map_err(|e| DataFusionError::External(Box::new(e)))?,
     );
     let ctx = SessionContext::new();
     ctx.register_catalog("vc", catalog);
 
     // Read base table
-    let df = ctx.sql("SELECT * FROM vc.main.base_table ORDER BY id").await?;
+    let df = ctx
+        .sql("SELECT * FROM vc.main.base_table ORDER BY id")
+        .await?;
     let results = df.collect().await?;
     let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 2, "base_table should have 2 rows");
@@ -432,10 +501,10 @@ async fn test_issue_322_table_view_id_conflict() -> DataFusionResult<()> {
             let results = df.collect().await?;
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
             eprintln!("  View returned {} rows", total_rows);
-        }
+        },
         Err(e) => {
             eprintln!("  View query error (may not be supported): {}", e);
-        }
+        },
     }
 
     eprintln!("✓ Issue #322: Tables readable alongside views, no ID conflict");
@@ -461,61 +530,68 @@ async fn test_issue_362_intermittent_data_file_not_found() -> DataFusionResult<(
             let conn = duckdb_conn_with_ducklake();
             attach_ducklake(&conn, &catalog_str, "r");
             conn.execute("CREATE TABLE r.items (id INT);", []).unwrap();
-            conn.execute("INSERT INTO r.items VALUES (1), (2), (3);", []).unwrap();
+            conn.execute("INSERT INTO r.items VALUES (1), (2), (3);", [])
+                .unwrap();
         }
 
         // Immediately read back via our DataFusion catalog
         match DuckdbMetadataProvider::new(catalog_str.clone()) {
-            Ok(provider) => {
-                match DuckLakeCatalog::new(provider) {
-                    Ok(catalog) => {
-                        let ctx = SessionContext::new();
-                        ctx.register_catalog("r", Arc::new(catalog));
+            Ok(provider) => match DuckLakeCatalog::new(provider) {
+                Ok(catalog) => {
+                    let ctx = SessionContext::new();
+                    ctx.register_catalog("r", Arc::new(catalog));
 
-                        match ctx.sql("SELECT COUNT(*) FROM r.main.items").await {
-                            Ok(df) => {
-                                match df.collect().await {
-                                    Ok(results) => {
-                                        if results.is_empty() {
-                                            eprintln!("  Iteration {}: empty results", iteration);
-                                            error_count.fetch_add(1, Ordering::Relaxed);
-                                        } else {
-                                            let count = results[0].column(0).as_any()
-                                                .downcast_ref::<Int64Array>().unwrap().value(0);
-                                            if count != 3 {
-                                                eprintln!("  Iteration {}: count={} (expected 3)", iteration, count);
-                                                error_count.fetch_add(1, Ordering::Relaxed);
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        eprintln!("  Iteration {}: collect error: {}", iteration, e);
+                    match ctx.sql("SELECT COUNT(*) FROM r.main.items").await {
+                        Ok(df) => match df.collect().await {
+                            Ok(results) => {
+                                if results.is_empty() {
+                                    eprintln!("  Iteration {}: empty results", iteration);
+                                    error_count.fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    let count = results[0]
+                                        .column(0)
+                                        .as_any()
+                                        .downcast_ref::<Int64Array>()
+                                        .unwrap()
+                                        .value(0);
+                                    if count != 3 {
+                                        eprintln!(
+                                            "  Iteration {}: count={} (expected 3)",
+                                            iteration, count
+                                        );
                                         error_count.fetch_add(1, Ordering::Relaxed);
                                     }
                                 }
-                            }
+                            },
                             Err(e) => {
-                                eprintln!("  Iteration {}: SQL error: {}", iteration, e);
+                                eprintln!("  Iteration {}: collect error: {}", iteration, e);
                                 error_count.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
+                            },
+                        },
+                        Err(e) => {
+                            eprintln!("  Iteration {}: SQL error: {}", iteration, e);
+                            error_count.fetch_add(1, Ordering::Relaxed);
+                        },
                     }
-                    Err(e) => {
-                        eprintln!("  Iteration {}: catalog creation error: {}", iteration, e);
-                        error_count.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            }
+                },
+                Err(e) => {
+                    eprintln!("  Iteration {}: catalog creation error: {}", iteration, e);
+                    error_count.fetch_add(1, Ordering::Relaxed);
+                },
+            },
             Err(e) => {
                 eprintln!("  Iteration {}: provider creation error: {}", iteration, e);
                 error_count.fetch_add(1, Ordering::Relaxed);
-            }
+            },
         }
     }
 
     let errors = error_count.load(Ordering::Relaxed);
     if errors > 0 {
-        eprintln!("✗ Issue #362: {} failures in 50 rapid create/read cycles", errors);
+        eprintln!(
+            "✗ Issue #362: {} failures in 50 rapid create/read cycles",
+            errors
+        );
     } else {
         eprintln!("✓ Issue #362: 50 rapid create/read cycles with zero intermittent failures");
     }
@@ -538,8 +614,10 @@ async fn test_issue_651_683_transaction_error_handling() -> DataFusionResult<()>
     {
         let conn = duckdb_conn_with_ducklake();
         attach_ducklake(&conn, &catalog_str, "txn");
-        conn.execute("CREATE TABLE txn.valid_table (id INT, name VARCHAR);", []).unwrap();
-        conn.execute("INSERT INTO txn.valid_table VALUES (1, 'original');", []).unwrap();
+        conn.execute("CREATE TABLE txn.valid_table (id INT, name VARCHAR);", [])
+            .unwrap();
+        conn.execute("INSERT INTO txn.valid_table VALUES (1, 'original');", [])
+            .unwrap();
     }
 
     let mut errors_found = false;
@@ -573,7 +651,9 @@ async fn test_issue_651_683_transaction_error_handling() -> DataFusionResult<()>
             }
 
             Ok(())
-        }).join().map_err(|_| "Thread panicked".to_string());
+        })
+        .join()
+        .map_err(|_| "Thread panicked".to_string());
 
         if result.is_err() {
             eprintln!("  Iteration {}: thread panicked", iteration);
@@ -582,38 +662,51 @@ async fn test_issue_651_683_transaction_error_handling() -> DataFusionResult<()>
 
         // After each iteration, verify catalog is still readable
         match DuckdbMetadataProvider::new(catalog_str.clone()) {
-            Ok(provider) => {
-                match DuckLakeCatalog::new(provider) {
-                    Ok(catalog) => {
-                        let ctx = SessionContext::new();
-                        ctx.register_catalog("txn", Arc::new(catalog));
+            Ok(provider) => match DuckLakeCatalog::new(provider) {
+                Ok(catalog) => {
+                    let ctx = SessionContext::new();
+                    ctx.register_catalog("txn", Arc::new(catalog));
 
-                        let df = ctx.sql("SELECT COUNT(*) FROM txn.main.valid_table").await?;
-                        let results = df.collect().await?;
-                        let count = results[0].column(0).as_any()
-                            .downcast_ref::<Int64Array>().unwrap().value(0);
-                        if count < 1 {
-                            eprintln!("  Iteration {}: valid_table lost data (count={})", iteration, count);
-                            errors_found = true;
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("  Iteration {}: catalog unreadable after txn error: {}", iteration, e);
+                    let df = ctx.sql("SELECT COUNT(*) FROM txn.main.valid_table").await?;
+                    let results = df.collect().await?;
+                    let count = results[0]
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .value(0);
+                    if count < 1 {
+                        eprintln!(
+                            "  Iteration {}: valid_table lost data (count={})",
+                            iteration, count
+                        );
                         errors_found = true;
                     }
-                }
-            }
+                },
+                Err(e) => {
+                    eprintln!(
+                        "  Iteration {}: catalog unreadable after txn error: {}",
+                        iteration, e
+                    );
+                    errors_found = true;
+                },
+            },
             Err(e) => {
-                eprintln!("  Iteration {}: provider failed after txn error: {}", iteration, e);
+                eprintln!(
+                    "  Iteration {}: provider failed after txn error: {}",
+                    iteration, e
+                );
                 errors_found = true;
-            }
+            },
         }
     }
 
     if errors_found {
         eprintln!("✗ Issues #651/#683: Catalog state inconsistent after transaction errors");
     } else {
-        eprintln!("✓ Issues #651/#683: Catalog remains consistent after 10 iterations of error injection");
+        eprintln!(
+            "✓ Issues #651/#683: Catalog remains consistent after 10 iterations of error injection"
+        );
     }
 
     Ok(())
@@ -638,36 +731,46 @@ async fn test_issue_733_snapshot_consistency_after_updates() -> DataFusionResult
             let conn = duckdb_conn_with_ducklake();
             attach_ducklake(&conn, &catalog_str, "snap");
 
-            conn.execute("CREATE TABLE snap.data (id INT, val INT);", []).unwrap();
+            conn.execute("CREATE TABLE snap.data (id INT, val INT);", [])
+                .unwrap();
 
             // Write 1
-            conn.execute("INSERT INTO snap.data VALUES (1, 10), (2, 20), (3, 30);", []).unwrap();
+            conn.execute(
+                "INSERT INTO snap.data VALUES (1, 10), (2, 20), (3, 30);",
+                [],
+            )
+            .unwrap();
 
             // Update 1
-            conn.execute("UPDATE snap.data SET val = 15 WHERE id = 1;", []).unwrap();
+            conn.execute("UPDATE snap.data SET val = 15 WHERE id = 1;", [])
+                .unwrap();
 
             // Write 2
-            conn.execute("INSERT INTO snap.data VALUES (4, 40), (5, 50);", []).unwrap();
+            conn.execute("INSERT INTO snap.data VALUES (4, 40), (5, 50);", [])
+                .unwrap();
 
             // Update 2
-            conn.execute("UPDATE snap.data SET val = 25 WHERE id = 2;", []).unwrap();
+            conn.execute("UPDATE snap.data SET val = 25 WHERE id = 2;", [])
+                .unwrap();
 
             // Delete
-            conn.execute("DELETE FROM snap.data WHERE id = 3;", []).unwrap();
+            conn.execute("DELETE FROM snap.data WHERE id = 3;", [])
+                .unwrap();
         }
 
         // Read via DataFusion at latest snapshot
         let provider = DuckdbMetadataProvider::new(catalog_str.clone())
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         let catalog = Arc::new(
-            DuckLakeCatalog::new(provider)
-                .map_err(|e| DataFusionError::External(Box::new(e)))?,
+            DuckLakeCatalog::new(provider).map_err(|e| DataFusionError::External(Box::new(e)))?,
         );
         let ctx = SessionContext::new();
         ctx.register_catalog("snap", catalog);
 
         // Expected: ids 1(val=15), 2(val=25), 4(val=40), 5(val=50). id=3 deleted.
-        let df = ctx.sql("SELECT id, val FROM snap.main.data ORDER BY id").await?;
+        let df = ctx
+            .sql("SELECT id, val FROM snap.main.data ORDER BY id")
+            .await?;
         let results = df.collect().await?;
 
         let mut all_ids = Vec::new();
@@ -677,30 +780,45 @@ async fn test_issue_733_snapshot_consistency_after_updates() -> DataFusionResult
             let val_col = batch.column(1);
             if let Some(a) = val_col.as_any().downcast_ref::<Int32Array>() {
                 for i in 0..a.len() {
-                    if !a.is_null(i) { all_vals.push(a.value(i) as i64); }
+                    if !a.is_null(i) {
+                        all_vals.push(a.value(i) as i64);
+                    }
                 }
             } else if let Some(a) = val_col.as_any().downcast_ref::<Int64Array>() {
                 for i in 0..a.len() {
-                    if !a.is_null(i) { all_vals.push(a.value(i)); }
+                    if !a.is_null(i) {
+                        all_vals.push(a.value(i));
+                    }
                 }
             }
         }
 
         if all_ids != vec![1, 2, 4, 5] {
-            eprintln!("  Iteration {}: wrong IDs: {:?} (expected [1,2,4,5])", iteration, all_ids);
+            eprintln!(
+                "  Iteration {}: wrong IDs: {:?} (expected [1,2,4,5])",
+                iteration, all_ids
+            );
             error_count.fetch_add(1, Ordering::Relaxed);
         }
         if all_vals != vec![15, 25, 40, 50] {
-            eprintln!("  Iteration {}: wrong vals: {:?} (expected [15,25,40,50])", iteration, all_vals);
+            eprintln!(
+                "  Iteration {}: wrong vals: {:?} (expected [15,25,40,50])",
+                iteration, all_vals
+            );
             error_count.fetch_add(1, Ordering::Relaxed);
         }
     }
 
     let errors = error_count.load(Ordering::Relaxed);
     if errors > 0 {
-        eprintln!("✗ Issue #733: {} snapshot consistency errors in 10 iterations", errors);
+        eprintln!(
+            "✗ Issue #733: {} snapshot consistency errors in 10 iterations",
+            errors
+        );
     } else {
-        eprintln!("✓ Issue #733: Snapshot consistency maintained across 10 iterations of write/update/delete");
+        eprintln!(
+            "✓ Issue #733: Snapshot consistency maintained across 10 iterations of write/update/delete"
+        );
     }
 
     Ok(())
@@ -744,22 +862,24 @@ async fn test_issue_749_multi_partition_write_read() -> DataFusionResult<()> {
 
                 // Try UPDATE on multi-partition table (this is what triggers #749)
                 if duckdb_error.is_none() {
-                    if let Err(e) = conn.execute(
-                        "UPDATE mp.events SET val = 99 WHERE id = 1;",
-                        [],
-                    ) {
-                        duckdb_error = Some(format!("UPDATE on multi-partition table failed: {}", e));
+                    if let Err(e) = conn.execute("UPDATE mp.events SET val = 99 WHERE id = 1;", [])
+                    {
+                        duckdb_error =
+                            Some(format!("UPDATE on multi-partition table failed: {}", e));
                     }
                 }
-            }
+            },
             Err(e) => {
                 duckdb_error = Some(format!("CREATE TABLE failed: {}", e));
-            }
+            },
         }
     }
 
     if let Some(err) = &duckdb_error {
-        eprintln!("⚠ Issue #749: DuckDB error during multi-partition test: {}", err);
+        eprintln!(
+            "⚠ Issue #749: DuckDB error during multi-partition test: {}",
+            err
+        );
     }
 
     // Read back via DataFusion
@@ -770,7 +890,9 @@ async fn test_issue_749_multi_partition_write_read() -> DataFusionResult<()> {
                     let ctx = SessionContext::new();
                     ctx.register_catalog("mp", Arc::new(catalog));
 
-                    let df = ctx.sql("SELECT id, val FROM mp.main.events ORDER BY id").await?;
+                    let df = ctx
+                        .sql("SELECT id, val FROM mp.main.events ORDER BY id")
+                        .await?;
                     let results = df.collect().await?;
                     let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
                     eprintln!("  Multi-partition table read back {} rows", total_rows);
@@ -786,15 +908,15 @@ async fn test_issue_749_multi_partition_write_read() -> DataFusionResult<()> {
                     }
 
                     eprintln!("✓ Issue #749: Multi-partition table readable via DataFusion");
-                }
+                },
                 Err(e) => {
                     eprintln!("✗ Issue #749: Catalog creation failed: {}", e);
-                }
+                },
             }
-        }
+        },
         Err(e) => {
             eprintln!("✗ Issue #749: Provider creation failed: {}", e);
-        }
+        },
     }
 
     Ok(())
@@ -815,23 +937,26 @@ async fn test_issue_197_two_catalog_instances_same_db() -> DataFusionResult<()> 
     {
         let conn = duckdb_conn_with_ducklake();
         attach_ducklake(&conn, &catalog_str, "shared");
-        conn.execute("CREATE TABLE shared.users (id INT, name VARCHAR);", []).unwrap();
-        conn.execute("INSERT INTO shared.users VALUES (1, 'Alice'), (2, 'Bob');", []).unwrap();
+        conn.execute("CREATE TABLE shared.users (id INT, name VARCHAR);", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO shared.users VALUES (1, 'Alice'), (2, 'Bob');",
+            [],
+        )
+        .unwrap();
     }
 
     // Open two separate DuckLakeCatalog instances pointing at the same file
     let provider1 = DuckdbMetadataProvider::new(catalog_str.clone())
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     let catalog1 = Arc::new(
-        DuckLakeCatalog::new(provider1)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?,
+        DuckLakeCatalog::new(provider1).map_err(|e| DataFusionError::External(Box::new(e)))?,
     );
 
     let provider2 = DuckdbMetadataProvider::new(catalog_str.clone())
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     let catalog2 = Arc::new(
-        DuckLakeCatalog::new(provider2)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?,
+        DuckLakeCatalog::new(provider2).map_err(|e| DataFusionError::External(Box::new(e)))?,
     );
 
     // Read from both simultaneously
@@ -844,13 +969,17 @@ async fn test_issue_197_two_catalog_instances_same_db() -> DataFusionResult<()> 
     // Concurrent reads from both catalogs
     let (result1, result2) = tokio::join!(
         async {
-            let df = ctx1.sql("SELECT * FROM shared.main.users ORDER BY id").await?;
+            let df = ctx1
+                .sql("SELECT * FROM shared.main.users ORDER BY id")
+                .await?;
             let results = df.collect().await?;
             let total: usize = results.iter().map(|b| b.num_rows()).sum();
             Ok::<_, DataFusionError>(total)
         },
         async {
-            let df = ctx2.sql("SELECT * FROM shared.main.users ORDER BY id").await?;
+            let df = ctx2
+                .sql("SELECT * FROM shared.main.users ORDER BY id")
+                .await?;
             let results = df.collect().await?;
             let total: usize = results.iter().map(|b| b.num_rows()).sum();
             Ok::<_, DataFusionError>(total)
@@ -867,23 +996,31 @@ async fn test_issue_197_two_catalog_instances_same_db() -> DataFusionResult<()> 
     {
         let conn = duckdb_conn_with_ducklake();
         attach_ducklake(&conn, &catalog_str, "shared");
-        conn.execute("INSERT INTO shared.users VALUES (3, 'Charlie');", []).unwrap();
+        conn.execute("INSERT INTO shared.users VALUES (3, 'Charlie');", [])
+            .unwrap();
     }
 
     // New provider should see the updated data
     let provider3 = DuckdbMetadataProvider::new(catalog_str.clone())
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     let catalog3 = Arc::new(
-        DuckLakeCatalog::new(provider3)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?,
+        DuckLakeCatalog::new(provider3).map_err(|e| DataFusionError::External(Box::new(e)))?,
     );
     let ctx3 = SessionContext::new();
     ctx3.register_catalog("shared", catalog3);
 
     let df = ctx3.sql("SELECT COUNT(*) FROM shared.main.users").await?;
     let results = df.collect().await?;
-    let count3 = results[0].column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0);
-    assert_eq!(count3, 3, "New catalog instance should see 3 rows after insert");
+    let count3 = results[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(
+        count3, 3,
+        "New catalog instance should see 3 rows after insert"
+    );
 
     eprintln!("✓ Issue #197: Two catalog instances on same DB work correctly");
     eprintln!("  Both read 2 rows initially, new instance sees 3 after write");
@@ -906,8 +1043,10 @@ async fn test_concurrent_read_during_write_stress() -> DataFusionResult<()> {
     {
         let conn = duckdb_conn_with_ducklake();
         attach_ducklake(&conn, &catalog_str, "rw");
-        conn.execute("CREATE TABLE rw.data (id INT, val INT);", []).unwrap();
-        conn.execute("INSERT INTO rw.data VALUES (1, 100);", []).unwrap();
+        conn.execute("CREATE TABLE rw.data (id INT, val INT);", [])
+            .unwrap();
+        conn.execute("INSERT INTO rw.data VALUES (1, 100);", [])
+            .unwrap();
     }
 
     let error_count = Arc::new(AtomicU32::new(0));
@@ -917,12 +1056,14 @@ async fn test_concurrent_read_during_write_stress() -> DataFusionResult<()> {
         let provider = DuckdbMetadataProvider::new(catalog_str.clone())
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         let catalog = Arc::new(
-            DuckLakeCatalog::new(provider)
-                .map_err(|e| DataFusionError::External(Box::new(e)))?,
+            DuckLakeCatalog::new(provider).map_err(|e| DataFusionError::External(Box::new(e)))?,
         );
 
         let ctx = SessionContext::new();
-        ctx.register_catalog("rw", catalog.clone() as Arc<dyn datafusion::catalog::CatalogProvider>);
+        ctx.register_catalog(
+            "rw",
+            catalog.clone() as Arc<dyn datafusion::catalog::CatalogProvider>,
+        );
 
         // Spawn reader tasks
         let mut read_tasks = Vec::new();
@@ -931,19 +1072,25 @@ async fn test_concurrent_read_during_write_stress() -> DataFusionResult<()> {
             let err_cnt = Arc::clone(&error_count);
             read_tasks.push(tokio::spawn(async move {
                 match ctx_clone.sql("SELECT COUNT(*) FROM rw.main.data").await {
-                    Ok(df) => {
-                        match df.collect().await {
-                            Ok(results) => {
-                                let count = results[0].column(0).as_any()
-                                    .downcast_ref::<Int64Array>().unwrap().value(0);
-                                if count < 1 {
-                                    err_cnt.fetch_add(1, Ordering::Relaxed);
-                                }
+                    Ok(df) => match df.collect().await {
+                        Ok(results) => {
+                            let count = results[0]
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<Int64Array>()
+                                .unwrap()
+                                .value(0);
+                            if count < 1 {
+                                err_cnt.fetch_add(1, Ordering::Relaxed);
                             }
-                            Err(_) => { err_cnt.fetch_add(1, Ordering::Relaxed); }
-                        }
-                    }
-                    Err(_) => { err_cnt.fetch_add(1, Ordering::Relaxed); }
+                        },
+                        Err(_) => {
+                            err_cnt.fetch_add(1, Ordering::Relaxed);
+                        },
+                    },
+                    Err(_) => {
+                        err_cnt.fetch_add(1, Ordering::Relaxed);
+                    },
                 }
             }));
         }
@@ -966,7 +1113,9 @@ async fn test_concurrent_read_during_write_stress() -> DataFusionResult<()> {
     if errors > 0 {
         eprintln!("✗ Concurrent read/write stress: {} read errors", errors);
     } else {
-        eprintln!("✓ Concurrent read/write stress: 10 iterations x 5 readers + 1 writer, zero errors");
+        eprintln!(
+            "✓ Concurrent read/write stress: 10 iterations x 5 readers + 1 writer, zero errors"
+        );
     }
 
     Ok(())

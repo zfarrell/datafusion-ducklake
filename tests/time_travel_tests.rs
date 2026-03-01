@@ -101,10 +101,7 @@ async fn test_table_insertions_returns_inserted_rows() -> DataFusionResult<()> {
     assert_eq!(total_rows(&batches), 5);
 
     let ids = collect_int32(&batches, 0);
-    assert_eq!(
-        ids,
-        vec![Some(1), Some(2), Some(3), Some(4), Some(5)]
-    );
+    assert_eq!(ids, vec![Some(1), Some(2), Some(3), Some(4), Some(5)]);
 
     Ok(())
 }
@@ -248,9 +245,7 @@ async fn test_current_snapshot_returns_latest() -> DataFusionResult<()> {
 
     let ctx = create_context(catalog_path.to_str().unwrap()).await?;
 
-    let df = ctx
-        .sql("SELECT * FROM ducklake_current_snapshot()")
-        .await?;
+    let df = ctx.sql("SELECT * FROM ducklake_current_snapshot()").await?;
 
     let schema = df.schema().clone();
     let batches = df.collect().await?;
@@ -271,8 +266,7 @@ async fn test_current_snapshot_no_args() -> DataFusionResult<()> {
     let temp_dir = TempDir::new().unwrap();
     let catalog_path = temp_dir.path().join("current_snap_args.ducklake");
 
-    common::create_catalog_no_deletes(&catalog_path)
-        .map_err(common::to_datafusion_error)?;
+    common::create_catalog_no_deletes(&catalog_path).map_err(common::to_datafusion_error)?;
 
     let ctx = create_context(catalog_path.to_str().unwrap()).await?;
 
@@ -314,9 +308,7 @@ async fn test_last_committed_snapshot() -> DataFusionResult<()> {
     let last_committed = collect_int64(&batches, 0);
 
     // Get current snapshot for comparison
-    let df2 = ctx
-        .sql("SELECT * FROM ducklake_current_snapshot()")
-        .await?;
+    let df2 = ctx.sql("SELECT * FROM ducklake_current_snapshot()").await?;
     let batches2 = df2.collect().await?;
     let current = collect_int64(&batches2, 0);
 
@@ -404,8 +396,7 @@ async fn test_table_deletions_returns_deleted_rows() -> DataFusionResult<()> {
     let temp_dir = TempDir::new().unwrap();
     let catalog_path = temp_dir.path().join("deletions_verify.ducklake");
 
-    common::create_catalog_with_deletes(&catalog_path)
-        .map_err(common::to_datafusion_error)?;
+    common::create_catalog_with_deletes(&catalog_path).map_err(common::to_datafusion_error)?;
 
     let ctx = create_context(catalog_path.to_str().unwrap()).await?;
 

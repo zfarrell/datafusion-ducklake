@@ -1515,8 +1515,14 @@ async fn test_get_inlined_data_with_data() {
     let data = provider.get_inlined_data(1, 1).unwrap();
     assert_eq!(data.len(), 2);
     assert_eq!(data[0].column_names, vec!["name", "age"]);
-    assert_eq!(data[0].values, vec![Some("Alice".to_string()), Some("30".to_string())]);
-    assert_eq!(data[1].values, vec![Some("Bob".to_string()), Some("25".to_string())]);
+    assert_eq!(
+        data[0].values,
+        vec![Some("Alice".to_string()), Some("30".to_string())]
+    );
+    assert_eq!(
+        data[1].values,
+        vec![Some("Bob".to_string()), Some("25".to_string())]
+    );
 }
 
 // --- Row count with inlined data ---
