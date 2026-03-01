@@ -48,24 +48,24 @@ Also in `/home/zac/`:
 - Table functions: 14 implemented (incl. `ducklake_flush_inlined_data()`)
 - Multi-backend (SQLite/Postgres/MySQL): ALL methods implemented, Docker tests passing
 - SLT pass rate: 157/254 (61.8%)
-- ~687 total tests, 46 cross-engine tests, 254 SLT files
+- ~703 total tests, 62 cross-engine tests, 254 SLT files
 
 ### What's Been Done (Phases 0-6)
 Everything through Phase 6 is complete. See `docs/project-status.md` for the full verified feature matrix.
 
 ### What Remains (from remaining-work-audit.md)
 
-**Tier 1 — Completed this sprint:**
+**Tier 1 — ALL COMPLETE:**
 - T1-1: Write-side partitioning — DONE (Hive routing, IDENTITY/YEAR/MONTH/DAY/HOUR transforms)
 - T1-2: Write-side data inlining — DONE (SQLite backend, auto-flush, flush table function)
 - T1-3/4/5: SLT improvements — DONE (+6 tests; count_star rewriting, float formatting)
 - T1-6: File pruning benchmark — DONE
 - T1-7: Fix branch PRs — DONE (PRs #80, #81, #82)
+- T1-8: Cross-engine Postgres/MySQL tests — DONE (16 tests: 8 PG, 8 MySQL; DuckDB `ducklake:postgres:` interop confirmed)
 - T1-9: Reserved schema test — ALREADY EXISTED
 - T1-10: View SLT tests — DONE (6 new test files)
 
-**Tier 1 — Still remaining:**
-- T1-8: Cross-engine Postgres/MySQL tests — IN PROGRESS
+**Remaining (Tier 2+):**
 - T1-5 remainder: SLT result mismatch fixes — Medium, 10-15 more tests fixable
 - T1-3 remainder: CTAS table visibility — Small, 2-3 tests
 

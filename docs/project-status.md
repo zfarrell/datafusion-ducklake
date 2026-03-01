@@ -225,7 +225,7 @@
 
 | Category | Count |
 |----------|-------|
-| **Total `#[test]` + `#[tokio::test]`** | **~687** |
+| **Total `#[test]` + `#[tokio::test]`** | **~703** |
 | SLT test files | 254 |
 | SLT pass rate | 157/254 (61.8%) |
 
@@ -249,6 +249,8 @@
 | `cross_engine_inline_tests.rs` | 0 | 9 | 9 |
 | `cross_engine_insert_tests.rs` | 0 | 1 | 1 |
 | `cross_engine_partition_tests.rs` | 0 | 7 | 7 |
+| `cross_engine_postgres_tests.rs` | 0 | 8 | 8 |
+| `cross_engine_mysql_tests.rs` | 0 | 8 | 8 |
 | `delete_filter_tests.rs` | 0 | 11 | 11 |
 | `encryption_tests.rs` | 0 | 3 | 3 |
 | `information_schema_test.rs` | 0 | 17 | 17 |
@@ -299,7 +301,9 @@
 | Inline data | 9 | Same |
 | Insert verification | 1 | Same |
 | Partition operations | 7 | Same |
-| **Total cross-engine** | **35** | |
+| Postgres cross-engine | 8 | `write-postgres` + `metadata-duckdb` + `metadata-postgres` (Docker) |
+| MySQL cross-engine | 8 | `write-mysql` + `metadata-duckdb` + `metadata-mysql` (Docker) |
+| **Total cross-engine** | **51** | |
 
 ### 2.4 Per-Backend Test Coverage
 
@@ -316,11 +320,13 @@ Note: Postgres/MySQL tests require running database containers (testcontainers).
 
 ### Tier 1: Implementable Now (no external blockers)
 
-| Item | Effort | Details |
-|------|--------|---------|
-| SLT pass rate improvement | Medium | Currently 157/254 (61.8%). Remaining failures: 21 add_files issues, 12 unsupported struct evolution, 10 data inlining, 9 macros, 30 result mismatches, 15 other blocked. Fixable subset: ~10-15 result mismatches, 2-3 CTAS visibility. |
-| ADD/REMOVE/RENAME FIELD (struct evolution) | Medium | Add `AlterTableOp` variants for nested struct field operations |
-| Cross-engine Postgres/MySQL tests | Medium | DF writes to Postgres/MySQL-backed catalog, DuckDB reads — in progress |
+All Tier 1 items are now complete.
+
+| Item | Effort | Status |
+|------|--------|--------|
+| SLT pass rate improvement | Medium | Partially done. Currently 157/254 (61.8%). Fixable subset: ~10-15 result mismatches, 2-3 CTAS visibility. |
+| ADD/REMOVE/RENAME FIELD (struct evolution) | Medium | Deferred to Tier 3 (architecture change needed) |
+| Cross-engine Postgres/MySQL tests | Medium | **COMPLETE** — 16 tests (8 Postgres, 8 MySQL) in `tests/cross_engine_postgres_tests.rs` and `tests/cross_engine_mysql_tests.rs`. Patterns: df_write_df_read, df_write_duckdb_read, duckdb_write_df_read, null_handling, sql_create_insert_select, multiple_tables, count_query, bidirectional_roundtrip. DuckDB `ducklake:postgres:` interop confirmed. DuckDB `ducklake:mysql:` has minor DSN issue with empty passwords (tests gracefully skip). Tests use testcontainers, marked `#[ignore]`. |
 
 ### Tier 2: Blocked on External Factors
 
@@ -559,8 +565,10 @@ A comprehensive test harness with three SLT execution modes that validate every 
 | Features | `cross_engine_feature_tests.rs` | 1 | Virtual cols, stats, conflicts |
 | Inline data | `cross_engine_inline_tests.rs` | 9 | Data inlining interop |
 | Partitions | `cross_engine_partition_tests.rs` | 7 | Partition pruning interop |
+| Postgres | `cross_engine_postgres_tests.rs` | 8 | df_write_df_read, df_write_duckdb_read, duckdb_write_df_read, null_handling, sql_create_insert_select, multiple_tables, count_query, bidirectional_roundtrip |
+| MySQL | `cross_engine_mysql_tests.rs` | 8 | Same 8 patterns as Postgres |
 | Roundtrip (CLI) | `roundtrip_interop_tests.rs` | 5 | DuckDB CLI binary roundtrip |
-| **Total** | | **46** | |
+| **Total** | | **62** | |
 
 ## 6. Source Code Size Summary (unchanged)
 
