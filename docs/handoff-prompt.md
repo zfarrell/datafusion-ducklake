@@ -83,6 +83,28 @@ Everything through Phase 6 is complete. See `docs/project-status.md` for the ful
 - Mode 2 (Pure DataFusion SLT runner) — highest value, needs ~450 lines of adapter code
 - Mode 3 (DF→DuckDB reverse interop SLT) — builds on Mode 2
 
+### Code Review Findings (2026-03-01)
+
+A comprehensive four-part code review was conducted on the Tier 1 sprint code. See `docs/2026-03-01-review-synthesis.md` for the full consolidated action plan. The review identified **36 deduplicated findings** (6 P0, 11 P1, 13 P2, 13 P3).
+
+**Critical P0 items that must be fixed before further feature work:**
+- P0-1/P0-4: Partitioned writes create independent snapshots per partition — stale field IDs, partial commits
+- P0-2: Replace-mode ends old files before upload succeeds — table empty on failure
+- P0-3/P0-5: Inline data cleared/errors swallowed before Parquet write — data loss on failure
+- P0-6: SQL injection via column name interpolation in SQLite inlining
+
+**Key P1 items:**
+- P1-1 through P1-8: Various partition and inline correctness issues (silent misrouting, wrong paths, non-atomic registration)
+- P1-9 through P1-11: Test infrastructure gaps (false pass risk, missing DF-write interop tests)
+
+**Recommended fix agents**: 4 concurrent agents (write atomicity, inline safety, input validation, test infrastructure). See synthesis doc for detailed assignments.
+
+**Source review documents:**
+- `docs/2026-03-01-review-idiomatic.md`
+- `docs/2026-03-01-review-correctness.md`
+- `docs/2026-03-01-review-interop.md`
+- `docs/2026-03-01-review-test-harness.md`
+
 ### After Implementation: PR Creation
 Follow `/home/zac/ducklake-pr-strategy.md`:
 - Each PR is a coherent unit re-implemented on branches off main

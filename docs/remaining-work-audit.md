@@ -7,6 +7,35 @@
 
 ---
 
+## Review Findings (2026-03-01)
+
+A four-part code review (idiomatic, correctness, interop, test harness) identified 36 deduplicated findings. The P0 and P1 items below represent new work discovered by the review. Full details in `docs/2026-03-01-review-synthesis.md`.
+
+### P0: Fix Immediately (data corruption, data loss, security)
+
+- **P0-1** [L]: Partitioned writes create independent snapshots per partition, reassigning column IDs each time. Earlier partitions' Parquet files embed stale field IDs. Cross-engine reads fail. (`insert_exec.rs`, `table_writer.rs`, `metadata_writer_sqlite.rs`)
+- **P0-2** [M]: Replace-mode metadata commit occurs before Parquet upload. Upload failure leaves table empty. (`table_writer.rs`, `metadata_writer_sqlite.rs`)
+- **P0-3** [S]: Inline data cleared before Parquet write. Flush failure permanently loses inlined rows. (`table_writer.rs`)
+- **P0-4** [L]: Partitioned writes partially commit on failure. Each partition is independent; failure mid-way leaves table in inconsistent state. (`insert_exec.rs`)
+- **P0-5** [S]: Inline data read failure silently swallowed during threshold-exceeded flush. Error discarded, then data cleared. (`table_writer.rs`)
+- **P0-6** [S]: SQL injection via column name interpolation in SQLite inlining. Column names from `ColumnDef` interpolated into SQL without sanitization. (`metadata_writer_sqlite.rs`)
+
+### P1: Fix Soon (correctness bugs, interop breakage)
+
+- **P1-1** [S]: Replace-mode with partitioned writes uses non-deterministic HashMap order for which partition gets Replace semantics. (`insert_exec.rs`)
+- **P1-2** [S]: Timestamp partition transforms only support microsecond resolution. Other precisions silently route to default partition. (`insert_exec.rs`)
+- **P1-3** [S]: Unknown partition transforms silently produce NULL partition values instead of erroring. (`insert_exec.rs`)
+- **P1-4** [S]: Inline flush writes to wrong directory (`t{table_id}/` vs `table_name/`). File not found on read. (`table_writer.rs`)
+- **P1-5** [S]: Hive partition values not URL-encoded. Special characters create malformed paths. (`insert_exec.rs`)
+- **P1-6** [S]: `compute_partition_value` returns `None` for unsupported types — silent data misrouting. (`insert_exec.rs`)
+- **P1-7** [M]: Partition value registration non-atomic with file registration. Failure leaves orphaned data files. (`insert_exec.rs`)
+- **P1-8** [S]: `InlinedDataRow` clones `column_names` per row — unnecessary allocation. (`table_writer.rs`)
+- **P1-9** [S]: `assert_results_eq` uses `zip` without column-count check — false pass risk in cross-engine tests. (`cross_engine_postgres_tests.rs`, `cross_engine_mysql_tests.rs`)
+- **P1-10** [M]: No DF-write partitioned data interop test. All partition tests are DuckDB-write direction only. (`cross_engine_partition_tests.rs`)
+- **P1-11** [M]: No DF-write inlined data interop test. TEXT-only SQLite columns untested with DuckDB reader. (`cross_engine_inline_tests.rs`)
+
+---
+
 ## 1. Executive Summary
 
 ### Overall Feature Parity: ~85-90% (honest assessment)
