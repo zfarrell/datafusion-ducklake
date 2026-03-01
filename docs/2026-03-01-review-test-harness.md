@@ -292,9 +292,43 @@ There is no summary of how many statements are skipped per test file. This makes
 
 ---
 
+### Risk 6: `assert_results_eq` Missing Column-Count Check (High)
+**Location**: `cross_engine_postgres_tests.rs:289-290`
+**Scenario**: The `assert_results_eq` function uses `zip` to compare rows, which silently truncates the longer row. If one engine returns 3 columns and the other returns 4, `zip` stops at 3 and the extra column is never compared. This is a **false pass** risk.
+
+### Risk 7: Sorting Helpers Mask ORDER BY Regressions (Medium)
+**Location**: `write_partition_tests.rs:93, 182`
+**Scenario**: Several tests apply `rows.sort()` after a query that includes `ORDER BY`. If the query's ORDER BY is broken, the sort mask hides the regression and the test still passes.
+
+### Risk 8: Partial Hive Directory Verification (Low)
+**Location**: `write_partition_tests.rs:324, 340`
+**Scenario**: The Hive directory test verifies parquet presence for `region=US` but only checks that `region=EU` directory exists without confirming it contains parquet files. A partial write failure for EU data would not be caught.
+
+---
+
 ## Codex CLI Findings
 
-Codex CLI (`/usr/local/bin/codex`) was invoked to analyze `tests/hybrid_asyncdb.rs`, `tests/cross_engine_postgres_tests.rs`, `tests/write_partition_tests.rs`, and `tests/write_inline_tests.rs`. The CLI invocation failed due to argument parsing differences in the installed version (the `--quiet` and `-q` flags are not supported). The `exec` subcommand was also attempted but requires different file-passing syntax. Manual review was performed instead, and the findings are incorporated throughout this document.
+Codex CLI (`/usr/local/bin/codex exec --full-auto`) was successfully invoked to analyze `tests/hybrid_asyncdb.rs`, `tests/cross_engine_postgres_tests.rs`, `tests/write_partition_tests.rs`, and `tests/write_inline_tests.rs`.
+
+### Codex-Identified Issues
+
+1. **High: `assert_results_eq` column-count false positive** — Uses `zip` without asserting per-row width, so extra columns are silently ignored. (`cross_engine_postgres_tests.rs:289-290`)
+
+2. **High: Silent pass when DuckDB+Postgres extensions unavailable** — Several cross-engine tests contain early `return`/conditional blocks when DuckDB can't connect to Postgres, meaning interop can regress without CI failure. (`cross_engine_postgres_tests.rs:394, 426, 696, 747`)
+
+3. **Medium: Weak partial assertions** — Some cross-engine tests validate only partial cells/rows rather than full result sets. (`cross_engine_postgres_tests.rs:403, 653, 661, 749`)
+
+4. **Medium: `test_table_rewrite` uses `contains`** — Table rewrite unit tests use `contains()` for verification, so malformed rewrites can still pass. (`hybrid_asyncdb.rs:723, 732`)
+
+5. **Medium: Partition pruning claimed but not verified** — Tests verify correct final rows but don't confirm that partition pruning actually reduced the number of files scanned. (`write_partition_tests.rs:191`)
+
+6. **Medium: Sort helpers mask ORDER BY regressions** — `rows.sort()` applied after `ORDER BY` queries hides broken ordering. (`write_partition_tests.rs:93, 182`)
+
+7. **Low: Partial Hive directory verification** — Only `region=US` parquet presence is verified; `region=EU` existence is checked but not its contents. (`write_partition_tests.rs:324, 340`)
+
+8. **Low: Inline/flush tests assert counts not content** — Some inline transition tests only verify row counts, not full row content, leaving room for corruption or reordering to go undetected. (`write_inline_tests.rs:382, 421, 509`)
+
+**Cleanup**: No resource leak or cleanup defects found. `TempDir` and container lifetimes are RAII-managed.
 
 ---
 
