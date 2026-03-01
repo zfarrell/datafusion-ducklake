@@ -4,14 +4,14 @@
 
 | Metric | Count |
 |--------|-------|
-| **Total tests** | 248 |
-| **Passing** | 151 |
+| **Total tests** | 254 |
+| **Passing** | 157 |
 | **Failing** | 97 |
-| **Pass rate** | 60.9% |
+| **Pass rate** | 61.8% |
 | **Baseline (before fixes)** | 75 / 248 (30.2%) |
-| **Previous milestone** | 120 / 248 (48.4%) |
-| **Tests gained (from baseline)** | +76 |
-| **Tests gained (from previous)** | +31 |
+| **Previous milestone** | 151 / 248 (60.9%) |
+| **Tests gained (from baseline)** | +82 |
+| **Tests gained (from previous)** | +6 (plus 6 new SLT files added) |
 
 ## Fixes Applied
 
@@ -33,7 +33,17 @@
 16. **Expected failure alignment** — Fixed 3 tests where hybrid adapter behavior diverged from expected DuckDB-only failure behavior.
 17. **Migration and checkpoint improvements** — Fixed migration test and checkpoint interleaving result format differences.
 
-## Newly Passing Tests (since 120/248 milestone)
+## Newly Passing Tests (since 151/248 milestone)
+
+### From view SLT tests (6 tests — newly added)
+- `view/ducklake_view_basic_select.test`
+- `view/ducklake_view_drop_recreate.test`
+- `view/ducklake_rename_view.test`
+- `view/ducklake_view_aggregation.test`
+- `view/ducklake_view_join.test`
+- `view/ducklake_view_schema.test`
+
+## Previously Passing Tests (since 120/248 milestone)
 
 ### From add_files category (5 tests)
 - `add_files/add_file_footer_size.test`

@@ -1,6 +1,6 @@
 # DataFusion-DuckLake Project Status
 
-**Generated**: 2026-02-28
+**Generated**: 2026-03-01
 **Branch**: `ducklake-features/integration`
 **Source of truth**: Code verification via grep/read of actual source files
 
@@ -30,8 +30,8 @@
 | Table writer (Parquet) | Complete | `src/table_writer.rs` `DuckLakeTableWriter` (707 lines), writes Parquet + commits metadata | — | `src/table_writer.rs` (4 unit tests) |
 | Write-side column stats | Complete | `src/table_writer.rs:312` `extract_column_stats()`, calls `register_column_stats()` | — | Implicit via write tests |
 | CTAS (CREATE TABLE AS) | Complete | `src/table_writer.rs` handles `WriteMode::Replace` | — | Cross-engine tests |
-| Write-side partitioning | Not Started | `src/insert_exec.rs:8` comment: "Single partition only" | No Hive-style partition output | — |
-| Write-side inlining | Not Started | No inlining logic in `src/table_writer.rs` or `src/insert_exec.rs` | Writes always produce Parquet files | — |
+| Write-side partitioning | Complete | `src/insert_exec.rs` partition routing, `src/table_writer.rs` Hive-style output | — | `tests/write_partition_tests.rs` (6) |
+| Write-side inlining | Complete | `src/metadata_writer.rs` inlining trait methods, `src/metadata_writer_sqlite.rs` SQLite backend, auto-flush to Parquet | — | `tests/write_inline_tests.rs` (8) |
 | Encrypted writes | Not Started | No encryption config in `src/table_writer.rs` or `src/insert_exec.rs` | PME write-side not implemented | — |
 
 ### 1.3 DELETE
@@ -119,7 +119,7 @@
 | RENAME TABLE | Complete | `src/metadata_writer.rs:479` `rename_table()` | — | Same as above |
 | SET COMMENT (table) | Complete | `src/metadata_writer.rs:486` `set_table_comment()` | — | `src/metadata_writer_sqlite.rs:2276` unit test |
 | SET COMMENT (column) | Complete | `src/metadata_writer.rs:493` `set_column_comment()` | — | `src/metadata_writer_sqlite.rs:2337` unit test |
-| SET PARTITIONED BY | Not Started | No `AlterTableOp` variant for partitioning | — | — |
+| SET PARTITIONED BY | Complete | `src/metadata_writer.rs` `AlterTableOp::SetPartitionedBy` | — | `tests/write_partition_tests.rs` |
 | ADD/REMOVE/RENAME FIELD (struct evolution) | Not Started | No `AlterTableOp` variants for struct field operations | — | — |
 
 ### 1.11 Views
@@ -225,9 +225,9 @@
 
 | Category | Count |
 |----------|-------|
-| **Total `#[test]` + `#[tokio::test]`** | **666** |
-| SLT test files | 248 |
-| SLT pass rate | ~151/248 (60.9%) |
+| **Total `#[test]` + `#[tokio::test]`** | **~687** |
+| SLT test files | 254 |
+| SLT pass rate | 157/254 (61.8%) |
 
 ### 2.2 Test Breakdown by File
 
@@ -266,7 +266,9 @@
 | `table_function_tests.rs` | 0 | 8 | 8 |
 | `table_tests.rs` | 0 | 5 | 5 |
 | `time_travel_tests.rs` | 0 | 14 | 14 |
-| `sqllogictest_runner.rs` | 0 | 1 | 1 (runs 248 SLT files) |
+| `write_partition_tests.rs` | 0 | 6 | 6 |
+| `write_inline_tests.rs` | 0 | 8 | 8 |
+| `sqllogictest_runner.rs` | 0 | 1 | 1 (runs 254 SLT files) |
 
 **Unit tests (src/):**
 
@@ -316,11 +318,9 @@ Note: Postgres/MySQL tests require running database containers (testcontainers).
 
 | Item | Effort | Details |
 |------|--------|---------|
-| SLT pass rate improvement | Medium | Currently 151/248 (60.9%). Remaining failures: 21 add_files issues, 12 unsupported struct evolution, 10 data inlining, 9 macros, 30 result mismatches, 15 other blocked. Fixable subset: ~10-15 result mismatches, 2-3 CTAS visibility. |
-| SET PARTITIONED BY (ALTER TABLE) | Small | Add `AlterTableOp::SetPartitionedBy` variant + writer implementations |
+| SLT pass rate improvement | Medium | Currently 157/254 (61.8%). Remaining failures: 21 add_files issues, 12 unsupported struct evolution, 10 data inlining, 9 macros, 30 result mismatches, 15 other blocked. Fixable subset: ~10-15 result mismatches, 2-3 CTAS visibility. |
 | ADD/REMOVE/RENAME FIELD (struct evolution) | Medium | Add `AlterTableOp` variants for nested struct field operations |
-| Write-side Hive partitioning | Large | INSERT should partition output by partition columns into Hive-style directory layout |
-| Write-side data inlining | Medium | Small inserts should go into catalog DB directly instead of Parquet files |
+| Cross-engine Postgres/MySQL tests | Medium | DF writes to Postgres/MySQL-backed catalog, DuckDB reads — in progress |
 
 ### Tier 2: Blocked on External Factors
 
@@ -441,10 +441,10 @@ A comprehensive test harness with three SLT execution modes that validate every 
 
 ### 5.2 Mode 1: Hybrid DuckDB→DataFusion (EXISTING — ~61% pass rate)
 
-**Status**: Operational. 151/248 tests passing.
+**Status**: Operational. 157/254 tests passing.
 
 **Infrastructure**:
-- `tests/sqllogictest_runner.rs`: Auto-discovers 248 `.test` files, preprocesses DuckDB-specific directives
+- `tests/sqllogictest_runner.rs`: Auto-discovers 254 `.test` files, preprocesses DuckDB-specific directives
 - `tests/hybrid_asyncdb.rs`: `HybridDuckLakeDB` adapter implementing `AsyncDB` trait
   - Routes writes (CREATE/INSERT/UPDATE/DELETE/DROP/ALTER/USE/BEGIN/COMMIT/ROLLBACK) → DuckDB
   - Routes reads (SELECT) → DataFusion
@@ -460,7 +460,7 @@ A comprehensive test harness with three SLT execution modes that validate every 
 - Rewrites: `ORDER BY ALL` → removed (adds `rowsort` to query directive)
 - Filters: DuckDB-specific functions (`GLOB()`, `DUCKDB_TABLES()`, `PARQUET_METADATA()`, internal metadata tables, etc.)
 
-**Remaining 97 failures**: 21 add_files issues, 12 unsupported struct/list/map evolution types, 10 data inlining (fundamental hybrid limitation), 9 macros (DuckLake limitation), 30 result mismatches, 15 other blocked (catalog names, DuckDB-specific, transactions).
+**Remaining 97 failures**: 21 add_files issues, 12 unsupported struct/list/map evolution types, 10 data inlining (fundamental hybrid limitation), 9 macros (DuckLake limitation), 30 result mismatches, 15 other blocked (catalog names, DuckDB-specific, transactions). Note: 6 new view SLT tests were added, bringing total from 248 to 254.
 
 ### 5.3 Mode 2: Pure DataFusion (NOT STARTED — Feasibility Analysis)
 
