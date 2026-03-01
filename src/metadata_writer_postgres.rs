@@ -1402,6 +1402,54 @@ impl MetadataWriter for PostgresMetadataWriter {
                     .execute(&mut *tx)
                     .await?;
                 },
+                AlterTableAction::SetPartitionedBy {
+                    partition_columns,
+                } => {
+                    // End any existing partition info
+                    sqlx::query(
+                        "UPDATE ducklake_partition_info SET end_snapshot = $1
+                         WHERE table_id = $2 AND end_snapshot IS NULL",
+                    )
+                    .bind(snapshot_id)
+                    .bind(table_id)
+                    .execute(&mut *tx)
+                    .await?;
+
+                    // Create new partition_info entry
+                    let pid_row = sqlx::query(
+                        "SELECT COALESCE(MAX(partition_id), 0) + 1 FROM ducklake_partition_info",
+                    )
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    let partition_id: i64 = pid_row.try_get(0)?;
+
+                    sqlx::query(
+                        "INSERT INTO ducklake_partition_info (partition_id, table_id, begin_snapshot)
+                         VALUES ($1, $2, $3)",
+                    )
+                    .bind(partition_id)
+                    .bind(table_id)
+                    .bind(snapshot_id)
+                    .execute(&mut *tx)
+                    .await?;
+
+                    // Create partition_column entries
+                    for (key_index, (column_id, _column_name, transform)) in
+                        partition_columns.iter().enumerate()
+                    {
+                        sqlx::query(
+                            "INSERT INTO ducklake_partition_column (partition_id, table_id, partition_key_index, column_id, transform)
+                             VALUES ($1, $2, $3, $4, $5)",
+                        )
+                        .bind(partition_id)
+                        .bind(table_id)
+                        .bind(key_index as i64)
+                        .bind(column_id)
+                        .bind(transform.as_deref().unwrap_or("identity"))
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                },
             }
 
             // Record change for conflict detection
