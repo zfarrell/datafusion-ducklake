@@ -473,6 +473,28 @@ impl AsyncDB for HybridDuckLakeDB {
     }
 }
 
+/// Format a float value to match DuckDB display conventions.
+/// DuckDB always shows at least one decimal place for float/double values,
+/// and displays NaN as "nan" and Infinity as "inf".
+fn format_float(v: f64) -> String {
+    if v.is_nan() {
+        return "nan".to_string();
+    }
+    if v.is_infinite() {
+        return if v.is_sign_positive() {
+            "inf".to_string()
+        } else {
+            "-inf".to_string()
+        };
+    }
+    let s = v.to_string();
+    if !s.contains('.') {
+        format!("{}.0", s)
+    } else {
+        s
+    }
+}
+
 /// Convert RecordBatch to string rows for sqllogictest
 fn convert_batch_to_strings(batch: &RecordBatch) -> Result<Vec<Vec<String>>, HybridError> {
     let mut rows = Vec::new();
@@ -519,11 +541,11 @@ fn convert_batch_to_strings(batch: &RecordBatch) -> Result<Vec<Vec<String>>, Hyb
                     },
                     DataType::Float32 => {
                         let arr = column.as_any().downcast_ref::<Float32Array>().unwrap();
-                        arr.value(row_idx).to_string()
+                        format_float(arr.value(row_idx) as f64)
                     },
                     DataType::Float64 => {
                         let arr = column.as_any().downcast_ref::<Float64Array>().unwrap();
-                        arr.value(row_idx).to_string()
+                        format_float(arr.value(row_idx))
                     },
                     DataType::Utf8 => {
                         let arr = column.as_any().downcast_ref::<StringArray>().unwrap();
