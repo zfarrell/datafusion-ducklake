@@ -1,0 +1,70 @@
+# name: test/sql/view/ducklake_view_drop_recreate.test
+# description: Test dropping and recreating views in DuckLake
+# group: [view]
+
+require ducklake
+
+require parquet
+
+test-env DUCKLAKE_CONNECTION __TEST_DIR__/{UUID}.db
+
+test-env DATA_PATH __TEST_DIR__
+
+statement ok
+ATTACH 'ducklake:${DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '${DATA_PATH}/ducklake_view_drop_recreate')
+
+statement ok
+CREATE TABLE ducklake.main.t1 (x INT)
+
+statement ok
+INSERT INTO ducklake.main.t1 VALUES (1), (2), (3)
+
+# Create a view
+statement ok
+CREATE VIEW ducklake.main.v1 AS SELECT x FROM ducklake.main.t1
+
+query I
+SELECT x FROM ducklake.main.v1 ORDER BY x
+----
+1
+2
+3
+
+# Drop the view
+statement ok
+DROP VIEW ducklake.main.v1
+
+# View should be gone
+statement error
+SELECT * FROM ducklake.main.v1
+----
+does not exist
+
+# Recreate with different definition
+statement ok
+CREATE VIEW ducklake.main.v1 AS SELECT x * 10 AS x10 FROM ducklake.main.t1
+
+query I
+SELECT x10 FROM ducklake.main.v1 ORDER BY x10
+----
+10
+20
+30
+
+# DROP VIEW IF EXISTS on existing view
+statement ok
+DROP VIEW IF EXISTS ducklake.main.v1
+
+# DROP VIEW IF EXISTS on non-existing view should succeed silently
+statement ok
+DROP VIEW IF EXISTS ducklake.main.v1
+
+# Recreate again
+statement ok
+CREATE VIEW ducklake.main.v1 AS SELECT x FROM ducklake.main.t1 WHERE x > 1
+
+query I
+SELECT x FROM ducklake.main.v1 ORDER BY x
+----
+2
+3

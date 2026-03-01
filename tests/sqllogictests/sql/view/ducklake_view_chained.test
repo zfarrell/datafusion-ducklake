@@ -1,0 +1,56 @@
+# name: test/sql/view/ducklake_view_chained.test
+# description: Test views built on other views (chained views) in DuckLake
+# group: [view]
+
+require ducklake
+
+require parquet
+
+test-env DUCKLAKE_CONNECTION __TEST_DIR__/{UUID}.db
+
+test-env DATA_PATH __TEST_DIR__
+
+statement ok
+ATTACH 'ducklake:${DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '${DATA_PATH}/ducklake_view_chained')
+
+statement ok
+CREATE TABLE ducklake.main.data (id INT, category VARCHAR, value INT)
+
+statement ok
+INSERT INTO ducklake.main.data VALUES (1, 'A', 10), (2, 'B', 20), (3, 'A', 30), (4, 'B', 40), (5, 'A', 50)
+
+# Base view: filter category A
+statement ok
+CREATE VIEW ducklake.main.cat_a AS SELECT id, value FROM ducklake.main.data WHERE category = 'A'
+
+query II
+SELECT id, value FROM ducklake.main.cat_a ORDER BY id
+----
+1	10
+3	30
+5	50
+
+# View on top of view: high values only
+statement ok
+CREATE VIEW ducklake.main.cat_a_high AS SELECT id, value FROM ducklake.main.cat_a WHERE value > 20
+
+query II
+SELECT id, value FROM ducklake.main.cat_a_high ORDER BY id
+----
+3	30
+5	50
+
+# Aggregation view on chained view (avoid COUNT(*) in view def — DuckDB rewrites to count_star())
+statement ok
+CREATE VIEW ducklake.main.cat_a_stats AS SELECT SUM(value) AS total FROM ducklake.main.cat_a
+
+query I
+SELECT total FROM ducklake.main.cat_a_stats
+----
+90
+
+# COUNT(*) at query level over chained view works fine
+query I
+SELECT COUNT(*) FROM ducklake.main.cat_a
+----
+3

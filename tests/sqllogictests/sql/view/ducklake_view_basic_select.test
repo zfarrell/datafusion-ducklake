@@ -1,0 +1,83 @@
+# name: test/sql/view/ducklake_view_basic_select.test
+# description: Test basic view selection patterns in DuckLake
+# group: [view]
+
+require ducklake
+
+require parquet
+
+test-env DUCKLAKE_CONNECTION __TEST_DIR__/{UUID}.db
+
+test-env DATA_PATH __TEST_DIR__
+
+statement ok
+ATTACH 'ducklake:${DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '${DATA_PATH}/ducklake_view_basic_select')
+
+# Create a base table with data
+statement ok
+CREATE TABLE ducklake.main.employees (id INT, name VARCHAR, dept VARCHAR, salary INT)
+
+statement ok
+INSERT INTO ducklake.main.employees VALUES (1, 'Alice', 'eng', 90000), (2, 'Bob', 'eng', 85000), (3, 'Carol', 'sales', 70000), (4, 'Dave', 'sales', 75000), (5, 'Eve', 'hr', 60000)
+
+# View selecting all columns
+statement ok
+CREATE VIEW ducklake.main.all_employees AS SELECT id, name, dept, salary FROM ducklake.main.employees
+
+query ITIT
+SELECT id, name, dept, salary FROM ducklake.main.all_employees ORDER BY id
+----
+1	Alice	eng	90000
+2	Bob	eng	85000
+3	Carol	sales	70000
+4	Dave	sales	75000
+5	Eve	hr	60000
+
+# View with column subset
+statement ok
+CREATE VIEW ducklake.main.employee_names AS SELECT id, name FROM ducklake.main.employees
+
+query IT
+SELECT id, name FROM ducklake.main.employee_names ORDER BY id
+----
+1	Alice
+2	Bob
+3	Carol
+4	Dave
+5	Eve
+
+# View with WHERE filter
+statement ok
+CREATE VIEW ducklake.main.eng_employees AS SELECT id, name, salary FROM ducklake.main.employees WHERE dept = 'eng'
+
+query IIT
+SELECT id, name, salary FROM ducklake.main.eng_employees ORDER BY id
+----
+1	Alice	90000
+2	Bob	85000
+
+# View with expression
+statement ok
+CREATE VIEW ducklake.main.employee_annual AS SELECT id, name, salary * 12 AS annual_salary FROM ducklake.main.employees
+
+query IIT
+SELECT id, name, annual_salary FROM ducklake.main.employee_annual ORDER BY id
+----
+1	Alice	1080000
+2	Bob	1020000
+3	Carol	840000
+4	Dave	900000
+5	Eve	720000
+
+# Query a view with additional WHERE clause
+query IT
+SELECT id, name FROM ducklake.main.all_employees WHERE salary > 80000 ORDER BY id
+----
+1	Alice
+2	Bob
+
+# COUNT on a view
+query I
+SELECT COUNT(*) FROM ducklake.main.eng_employees
+----
+2
