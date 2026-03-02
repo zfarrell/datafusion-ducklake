@@ -118,8 +118,18 @@ impl MetadataProvider for DuckdbMetadataProvider {
 
     fn get_data_path(&self) -> crate::Result<String> {
         let conn = self.connection()?;
-        let data_path: String = conn.query_row(SQL_GET_DATA_PATH, [], |row| row.get(0))?;
-        Ok(data_path)
+        let result = conn.query_row(SQL_GET_DATA_PATH, [], |row| row.get(0));
+        match result {
+            Ok(data_path) => Ok(data_path),
+            Err(duckdb::Error::QueryReturnedNoRows) => {
+                Err(DuckLakeError::InvalidConfig(
+                    "No data_path found in ducklake_metadata table. \
+                     Is this a valid DuckLake catalog?"
+                        .to_string(),
+                ))
+            }
+            Err(e) => Err(DuckLakeError::DuckDb(e)),
+        }
     }
 
     fn list_snapshots(&self) -> crate::Result<Vec<SnapshotMetadata>> {
@@ -187,12 +197,12 @@ impl MetadataProvider for DuckdbMetadataProvider {
         Ok(tables)
     }
 
-    fn get_table_structure(&self, table_id: i64) -> crate::Result<Vec<DuckLakeTableColumn>> {
+    fn get_table_structure(&self, table_id: i64, snapshot_id: i64) -> crate::Result<Vec<DuckLakeTableColumn>> {
         let conn = self.connection()?;
         let mut stmt = conn.prepare(SQL_GET_TABLE_COLUMNS)?;
 
         let columns = stmt
-            .query_map([table_id], |row| {
+            .query_map([table_id, snapshot_id, snapshot_id], |row| {
                 let column_id: i64 = row.get(0)?;
                 let column_name: String = row.get(1)?;
                 let column_type: String = row.get(2)?;

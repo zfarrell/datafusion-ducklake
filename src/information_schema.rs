@@ -110,7 +110,7 @@ impl SnapshotsTable {
         ));
 
         RecordBatch::try_new(
-            self.schema.clone(),
+            Arc::clone(&self.schema),
             vec![
                 snapshot_ids,
                 snapshot_times,
@@ -132,7 +132,7 @@ impl TableProvider for SnapshotsTable {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+        Arc::clone(&self.schema)
     }
 
     fn table_type(&self) -> TableType {
@@ -150,7 +150,7 @@ impl TableProvider for SnapshotsTable {
         let batch = self.query_snapshots()?;
 
         // Use MemTable for execution (MemTable handles projection/filters/limit)
-        let mem_table = MemTable::try_new(self.schema.clone(), vec![vec![batch]])?;
+        let mem_table = MemTable::try_new(Arc::clone(&self.schema), vec![vec![batch]])?;
         mem_table.scan(state, projection, filters, limit).await
     }
 }
@@ -212,7 +212,7 @@ impl SchemataTable {
         ));
 
         RecordBatch::try_new(
-            self.schema.clone(),
+            Arc::clone(&self.schema),
             vec![snapshot_ids, schema_ids, schema_names, paths, path_is_relative],
         )
         .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
@@ -226,7 +226,7 @@ impl TableProvider for SchemataTable {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+        Arc::clone(&self.schema)
     }
 
     fn table_type(&self) -> TableType {
@@ -244,7 +244,7 @@ impl TableProvider for SchemataTable {
         let batch = self.query_schemata()?;
 
         // Use MemTable for execution
-        let mem_table = MemTable::try_new(self.schema.clone(), vec![vec![batch]])?;
+        let mem_table = MemTable::try_new(Arc::clone(&self.schema), vec![vec![batch]])?;
         mem_table.scan(state, projection, filters, limit).await
     }
 }
@@ -322,7 +322,7 @@ impl TablesTable {
         ));
 
         RecordBatch::try_new(
-            self.schema.clone(),
+            Arc::clone(&self.schema),
             vec![snapshot_ids, schema_names, table_ids, table_names, paths, path_is_relative],
         )
         .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
@@ -336,7 +336,7 @@ impl TableProvider for TablesTable {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+        Arc::clone(&self.schema)
     }
 
     fn table_type(&self) -> TableType {
@@ -354,7 +354,7 @@ impl TableProvider for TablesTable {
         let batch = self.query_tables()?;
 
         // Use MemTable for execution
-        let mem_table = MemTable::try_new(self.schema.clone(), vec![vec![batch]])?;
+        let mem_table = MemTable::try_new(Arc::clone(&self.schema), vec![vec![batch]])?;
         mem_table.scan(state, projection, filters, limit).await
     }
 }
@@ -428,7 +428,7 @@ impl ColumnsTable {
         ));
 
         RecordBatch::try_new(
-            self.schema.clone(),
+            Arc::clone(&self.schema),
             vec![schema_names, table_names, column_ids, column_names, column_types],
         )
         .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
@@ -442,7 +442,7 @@ impl TableProvider for ColumnsTable {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+        Arc::clone(&self.schema)
     }
 
     fn table_type(&self) -> TableType {
@@ -460,7 +460,7 @@ impl TableProvider for ColumnsTable {
         let batch = self.query_columns()?;
 
         // Use MemTable for execution
-        let mem_table = MemTable::try_new(self.schema.clone(), vec![vec![batch]])?;
+        let mem_table = MemTable::try_new(Arc::clone(&self.schema), vec![vec![batch]])?;
         mem_table.scan(state, projection, filters, limit).await
     }
 }
@@ -593,7 +593,7 @@ impl TableInfoTable {
         let delete_file_sizes: ArrayRef = Arc::new(Int64Array::from(delete_file_sizes));
 
         RecordBatch::try_new(
-            self.schema.clone(),
+            Arc::clone(&self.schema),
             vec![
                 table_names,
                 schema_ids,
@@ -616,7 +616,7 @@ impl TableProvider for TableInfoTable {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+        Arc::clone(&self.schema)
     }
 
     fn table_type(&self) -> TableType {
@@ -631,7 +631,7 @@ impl TableProvider for TableInfoTable {
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let batch = self.query_table_info()?;
-        let mem_table = MemTable::try_new(self.schema.clone(), vec![vec![batch]])?;
+        let mem_table = MemTable::try_new(Arc::clone(&self.schema), vec![vec![batch]])?;
         mem_table.scan(state, projection, filters, limit).await
     }
 }
@@ -714,7 +714,7 @@ impl FilesTable {
         ));
 
         RecordBatch::try_new(
-            self.schema.clone(),
+            Arc::clone(&self.schema),
             vec![schema_names, table_names, file_paths, file_sizes, record_counts, has_delete_file],
         )
         .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
@@ -728,7 +728,7 @@ impl TableProvider for FilesTable {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+        Arc::clone(&self.schema)
     }
 
     fn table_type(&self) -> TableType {
@@ -746,7 +746,7 @@ impl TableProvider for FilesTable {
         let batch = self.query_files()?;
 
         // Use MemTable for execution
-        let mem_table = MemTable::try_new(self.schema.clone(), vec![vec![batch]])?;
+        let mem_table = MemTable::try_new(Arc::clone(&self.schema), vec![vec![batch]])?;
         mem_table.scan(state, projection, filters, limit).await
     }
 }
@@ -791,25 +791,25 @@ impl SchemaProvider for InformationSchemaProvider {
     async fn table(&self, name: &str) -> DataFusionResult<Option<Arc<dyn TableProvider>>> {
         // Create table provider on-demand - queries will be live
         let provider: Option<Arc<dyn TableProvider>> = match name {
-            "snapshots" => Some(Arc::new(SnapshotsTable::new(self.provider.clone()))),
+            "snapshots" => Some(Arc::new(SnapshotsTable::new(Arc::clone(&self.provider)))),
             "schemata" => Some(Arc::new(SchemataTable::new(
-                self.provider.clone(),
+                Arc::clone(&self.provider),
                 self.snapshot_id,
             ))),
             "tables" => Some(Arc::new(TablesTable::new(
-                self.provider.clone(),
+                Arc::clone(&self.provider),
                 self.snapshot_id,
             ))),
             "table_info" => Some(Arc::new(TableInfoTable::new(
-                self.provider.clone(),
+                Arc::clone(&self.provider),
                 self.snapshot_id,
             ))),
             "columns" => Some(Arc::new(ColumnsTable::new(
-                self.provider.clone(),
+                Arc::clone(&self.provider),
                 self.snapshot_id,
             ))),
             "files" => Some(Arc::new(FilesTable::new(
-                self.provider.clone(),
+                Arc::clone(&self.provider),
                 self.snapshot_id,
             ))),
             _ => None,
@@ -818,6 +818,9 @@ impl SchemaProvider for InformationSchemaProvider {
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        self.table_names().iter().any(|t| t == name)
+        matches!(
+            name,
+            "snapshots" | "schemata" | "tables" | "table_info" | "columns" | "files"
+        )
     }
 }

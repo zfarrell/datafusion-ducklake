@@ -339,12 +339,20 @@ fn attack_type_decimal_overflow_precision() {
 
 #[test]
 fn attack_type_decimal_no_params() {
-    // "decimal" without parentheses.
+    // "decimal" without parentheses defaults to Decimal128(18,0) matching DuckDB behavior.
     let result = ducklake_to_arrow_type("decimal");
-    assert!(result.is_err(), "'decimal' without params should fail");
-    // parse_decimal looks for '(' which isn't there, returns None.
-    // Then falls through to the match, which doesn't have "decimal".
-    // DEFENDED: UnsupportedType("decimal")
+    assert!(result.is_ok(), "'decimal' without params should default to Decimal128(18,0)");
+    assert_eq!(
+        result.unwrap(),
+        arrow::datatypes::DataType::Decimal128(18, 0)
+    );
+    // Also check "numeric" bare
+    let result = ducklake_to_arrow_type("numeric");
+    assert!(result.is_ok(), "'numeric' without params should default to Decimal128(18,0)");
+    assert_eq!(
+        result.unwrap(),
+        arrow::datatypes::DataType::Decimal128(18, 0)
+    );
 }
 
 #[test]
@@ -353,6 +361,15 @@ fn attack_type_numeric_alias() {
     let result = ducklake_to_arrow_type("numeric(10, 2)");
     assert!(result.is_ok(), "numeric should be accepted");
     // DEFENDED: parse_decimal checks for "numeric" prefix
+}
+
+#[test]
+fn attack_type_decimal_trailing_garbage() {
+    // Trailing garbage after closing parenthesis should be rejected.
+    let result = ducklake_to_arrow_type("decimal(10,2)extra_garbage");
+    assert!(result.is_err(), "trailing garbage after ')' should fail");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(err_msg.contains("trailing"), "error should mention trailing characters: {}", err_msg);
 }
 
 // ---------- VARCHAR/CHAR edge cases ----------
@@ -559,30 +576,24 @@ fn attack_type_roundtrip_large_utf8() {
 #[test]
 fn attack_type_roundtrip_date64() {
     use arrow::datatypes::DataType;
-    // Date64 -> ducklake -> arrow
+    // Date64 -> ducklake -> arrow: now roundtrips correctly via "date_ms"
     let ducklake = arrow_to_ducklake_type(&DataType::Date64).unwrap();
-    assert_eq!(ducklake, "date");
+    assert_eq!(ducklake, "date_ms");
     let back = ducklake_to_arrow_type(&ducklake).unwrap();
-    // BUG: Date64 -> "date" -> Date32 (not Date64!)
-    assert_ne!(
-        DataType::Date64,
-        back,
-        "Date64 != Date32 after roundtrip (info loss BUG)"
-    );
+    assert_eq!(DataType::Date64, back, "Date64 should roundtrip losslessly");
 }
 
 #[test]
 fn attack_type_roundtrip_time32() {
     use arrow::datatypes::{DataType, TimeUnit};
-    // Time32 -> ducklake -> arrow
+    // Time32(Millisecond) -> "time_ms" -> Time32(Millisecond): roundtrips correctly
     let ducklake = arrow_to_ducklake_type(&DataType::Time32(TimeUnit::Millisecond)).unwrap();
-    assert_eq!(ducklake, "time");
+    assert_eq!(ducklake, "time_ms");
     let back = ducklake_to_arrow_type(&ducklake).unwrap();
-    // BUG: Time32(Millisecond) -> "time" -> Time64(Microsecond)
-    assert_ne!(
+    assert_eq!(
         DataType::Time32(TimeUnit::Millisecond),
         back,
-        "Time32(ms) != Time64(us) after roundtrip (info loss BUG)"
+        "Time32(Millisecond) should roundtrip losslessly"
     );
 }
 

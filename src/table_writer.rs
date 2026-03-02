@@ -1143,16 +1143,11 @@ fn parse_string_to_array(
                 TimeUnit::Nanosecond => build_timestamp!(TimestampNanosecondBuilder),
             }
         },
-        _ => {
-            // Fallback: store as strings
-            let mut builder = StringBuilder::new();
-            for val in values {
-                match val {
-                    Some(s) => builder.append_value(s),
-                    None => builder.append_null(),
-                }
-            }
-            Arc::new(builder.finish())
+        other => {
+            return Err(crate::error::DuckLakeError::UnsupportedType(format!(
+                "Unsupported data type {:?} in parse_string_to_array",
+                other
+            )));
         },
     };
 

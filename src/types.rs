@@ -56,6 +56,7 @@ pub fn ducklake_to_arrow_type(ducklake_type: &str) -> Result<DataType> {
         "time_ms" => Ok(DataType::Time32(TimeUnit::Millisecond)),
         "time_ns" => Ok(DataType::Time64(TimeUnit::Nanosecond)),
         "date" => Ok(DataType::Date32),
+        "date_ms" => Ok(DataType::Date64),
         "timestamp" => Ok(DataType::Timestamp(TimeUnit::Microsecond, None)),
         "timestamptz" | "timestamp with time zone" => Ok(DataType::Timestamp(
             TimeUnit::Microsecond,
@@ -74,6 +75,8 @@ pub fn ducklake_to_arrow_type(ducklake_type: &str) -> Result<DataType> {
         "timestamp_ms" => Ok(DataType::Timestamp(TimeUnit::Millisecond, None)),
         "timestamp_ns" => Ok(DataType::Timestamp(TimeUnit::Nanosecond, None)),
         "interval" => Ok(DataType::Interval(IntervalUnit::MonthDayNano)),
+        "interval_ym" => Ok(DataType::Interval(IntervalUnit::YearMonth)),
+        "interval_dt" => Ok(DataType::Interval(IntervalUnit::DayTime)),
 
         // String types
         "varchar" | "text" | "string" => Ok(DataType::Utf8),
@@ -124,7 +127,8 @@ pub fn arrow_to_ducklake_type(arrow_type: &DataType) -> Result<String> {
         DataType::Float64 => Ok("float64".to_string()),
 
         // Temporal types
-        DataType::Date32 | DataType::Date64 => Ok("date".to_string()),
+        DataType::Date32 => Ok("date".to_string()),
+        DataType::Date64 => Ok("date_ms".to_string()),
         DataType::Time32(TimeUnit::Second) => Ok("time_s".to_string()),
         DataType::Time32(TimeUnit::Millisecond) => Ok("time_ms".to_string()),
         DataType::Time32(_) => Ok("time_s".to_string()),
@@ -135,6 +139,8 @@ pub fn arrow_to_ducklake_type(arrow_type: &DataType) -> Result<String> {
         DataType::Timestamp(TimeUnit::Millisecond, None) => Ok("timestamp_ms".to_string()),
         DataType::Timestamp(TimeUnit::Microsecond, None) => Ok("timestamp".to_string()),
         DataType::Timestamp(TimeUnit::Nanosecond, None) => Ok("timestamp_ns".to_string()),
+        // Note: DuckLake normalizes all timezones to UTC on roundtrip,
+        // consistent with DuckDB's behavior. The original timezone is not preserved.
         DataType::Timestamp(unit, Some(_tz)) => {
             let base = match unit {
                 TimeUnit::Second => "timestamptz_s",
@@ -144,7 +150,9 @@ pub fn arrow_to_ducklake_type(arrow_type: &DataType) -> Result<String> {
             };
             Ok(base.to_string())
         },
-        DataType::Interval(_) => Ok("interval".to_string()),
+        DataType::Interval(IntervalUnit::YearMonth) => Ok("interval_ym".to_string()),
+        DataType::Interval(IntervalUnit::DayTime) => Ok("interval_dt".to_string()),
+        DataType::Interval(IntervalUnit::MonthDayNano) => Ok("interval".to_string()),
 
         // String types
         DataType::Utf8 | DataType::LargeUtf8 => Ok("varchar".to_string()),
@@ -156,7 +164,7 @@ pub fn arrow_to_ducklake_type(arrow_type: &DataType) -> Result<String> {
 
         // Decimal types
         DataType::Decimal128(precision, scale) | DataType::Decimal256(precision, scale) => {
-            Ok(format!("decimal({}, {})", precision, scale))
+            Ok(format!("decimal({},{})", precision, scale))
         },
 
         // Null type - map to varchar as there's no direct equivalent
@@ -247,15 +255,26 @@ fn parse_decimal(type_str: &str) -> Result<Option<DataType>> {
         return Ok(None);
     }
 
-    // Extract parameters from parentheses
+    // Handle bare decimal/numeric without parameters — default to Decimal128(18,0)
+    // matching DuckDB's default behavior
     let start = match type_str.find('(') {
         Some(s) => s,
-        None => return Ok(None),
+        None => return Ok(Some(DataType::Decimal128(18, 0))),
     };
     let end = match type_str.find(')') {
         Some(e) => e,
-        None => return Ok(None),
+        None => return Ok(Some(DataType::Decimal128(18, 0))),
     };
+
+    // R3F-029: Reject trailing garbage after closing parenthesis
+    let after_paren = &type_str[end + 1..];
+    if !after_paren.is_empty() {
+        return Err(DuckLakeError::UnsupportedType(format!(
+            "Unexpected trailing characters '{}' after closing parenthesis in type '{}'",
+            after_paren, type_str
+        )));
+    }
+
     let params = &type_str[start + 1..end];
 
     let parts: Vec<&str> = params.split(',').map(|s| s.trim()).collect();
@@ -730,7 +749,7 @@ mod tests {
     #[test]
     fn test_decimal_types() {
         assert_eq!(
-            ducklake_to_arrow_type("decimal(10, 2)").unwrap(),
+            ducklake_to_arrow_type("decimal(10,2)").unwrap(),
             DataType::Decimal128(10, 2)
         );
         assert_eq!(
@@ -1092,7 +1111,10 @@ mod tests {
     #[test]
     fn test_arrow_to_ducklake_temporal_types() {
         assert_eq!(arrow_to_ducklake_type(&DataType::Date32).unwrap(), "date");
-        assert_eq!(arrow_to_ducklake_type(&DataType::Date64).unwrap(), "date");
+        assert_eq!(
+            arrow_to_ducklake_type(&DataType::Date64).unwrap(),
+            "date_ms"
+        );
         assert_eq!(
             arrow_to_ducklake_type(&DataType::Time64(TimeUnit::Microsecond)).unwrap(),
             "time"
@@ -1140,11 +1162,11 @@ mod tests {
     fn test_arrow_to_ducklake_decimal() {
         assert_eq!(
             arrow_to_ducklake_type(&DataType::Decimal128(10, 2)).unwrap(),
-            "decimal(10, 2)"
+            "decimal(10,2)"
         );
         assert_eq!(
             arrow_to_ducklake_type(&DataType::Decimal256(40, 5)).unwrap(),
-            "decimal(40, 5)"
+            "decimal(40,5)"
         );
     }
 
@@ -1219,7 +1241,7 @@ mod tests {
 
         // But "decimal(10,2)" should still work
         assert_eq!(
-            ducklake_to_arrow_type("decimal(10, 2)").unwrap(),
+            ducklake_to_arrow_type("decimal(10,2)").unwrap(),
             DataType::Decimal128(10, 2)
         );
 

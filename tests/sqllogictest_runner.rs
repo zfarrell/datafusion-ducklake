@@ -64,7 +64,6 @@ fn preprocess_test_file(content: &str, test_dir: &str) -> String {
     // Third pass: handle directives and rewriting
     let mut output = String::new();
     let mut lines = expanded.lines().peekable();
-    let mut in_ducklake_context = false;
 
     while let Some(line) = lines.next() {
         let trimmed = line.trim();
@@ -165,15 +164,6 @@ fn preprocess_test_file(content: &str, test_dir: &str) -> String {
                     continue;
                 }
             }
-        }
-
-        // Track USE ducklake context for table reference rewriting
-        if trimmed.to_uppercase().starts_with("USE DUCKLAKE") {
-            in_ducklake_context = true;
-        } else if trimmed.to_uppercase().starts_with("USE ")
-            && !trimmed.to_uppercase().starts_with("USE DUCKLAKE")
-        {
-            in_ducklake_context = false;
         }
 
         // Skip ATTACH/DETACH statements (we handle connection in Rust)
@@ -281,11 +271,7 @@ fn preprocess_test_file(content: &str, test_dir: &str) -> String {
                     }
                     let sql_line = lines.next().unwrap();
                     let rewritten_sql = rewrite_order_by_all(sql_line);
-                    if in_ducklake_context {
-                        output.push_str(&rewrite_unqualified_tables(&rewritten_sql));
-                    } else {
-                        output.push_str(&rewritten_sql);
-                    }
+                    output.push_str(&rewritten_sql);
                     output.push('\n');
                 }
                 continue;
@@ -406,33 +392,16 @@ fn preprocess_test_file(content: &str, test_dir: &str) -> String {
                 {
                     break;
                 } else {
-                    // SQL line - pass through, applying table rewriting if needed
+                    // SQL line - pass through
                     let sql_line = lines.next().unwrap();
-                    if in_ducklake_context {
-                        output.push_str(&rewrite_unqualified_tables(sql_line));
-                    } else {
-                        output.push_str(sql_line);
-                    }
+                    output.push_str(sql_line);
                     output.push('\n');
                 }
             }
             continue;
         }
 
-        // Rewrite table references in SQL lines if in ducklake context
-        // (SQL lines come right after statement/query directives)
-        if in_ducklake_context
-            && !trimmed.starts_with('#')
-            && !trimmed.starts_with("statement")
-            && !trimmed.starts_with("query")
-            && !trimmed.starts_with("halt")
-            && !trimmed.starts_with("----")
-            && !trimmed.is_empty()
-        {
-            output.push_str(&rewrite_unqualified_tables(line));
-        } else {
-            output.push_str(line);
-        }
+        output.push_str(line);
         output.push('\n');
     }
 
@@ -609,19 +578,6 @@ fn skip_statement_error_body(lines: &mut std::iter::Peekable<std::str::Lines>) {
         }
         lines.next();
     }
-}
-
-/// Rewrite unqualified table names for DataFusion when in ducklake context
-/// After `USE ducklake`, DuckDB resolves bare table names to ducklake.main.table
-/// but DataFusion needs explicit catalog.schema.table references
-fn rewrite_unqualified_tables(line: &str) -> String {
-    // Don't rewrite comments, empty lines, or lines that already have ducklake references
-    let trimmed = line.trim();
-    if trimmed.starts_with('#') || trimmed.is_empty() {
-        return line.to_string();
-    }
-    // Already handled by HybridDuckLakeDB::rewrite_table_references
-    line.to_string()
 }
 
 /// Check if a query mixes virtual column names with * (SELECT rowid, * FROM ...)

@@ -542,15 +542,17 @@ impl SqliteMetadataWriter {
         // Record in snapshot_changes with DuckDB-compatible format (F-027)
         if !table_exists {
             // R3F-014: Include created_schema if schema was also new
+            let esc_schema = schema_name.replace('"', "\"\"");
+            let esc_table = table_name.replace('"', "\"\"");
             let changes = if !schema_exists {
                 format!(
                     "created_schema:\"{}\",created_table:\"{}\".\"{}\"",
-                    schema_name, schema_name, table_name
+                    esc_schema, esc_schema, esc_table
                 )
             } else {
                 format!(
                     "created_table:\"{}\".\"{}\"",
-                    schema_name, table_name
+                    esc_schema, esc_table
                 )
             };
             sqlx::query(
@@ -878,7 +880,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                  VALUES (?, ?)",
             )
             .bind(snapshot_id)
-            .bind(format!("created_schema:\"{}\"", name))
+            .bind(format!("created_schema:\"{}\"", name.replace('"', "\"\"")))
             .execute(&mut *tx)
             .await?;
 
@@ -1629,7 +1631,8 @@ impl MetadataWriter for SqliteMetadataWriter {
             .bind(snapshot_id)
             .bind(format!(
                 "created_view:\"{}\".\"{}\"",
-                schema_name, view_name
+                schema_name.replace('"', "\"\""),
+                view_name.replace('"', "\"\"")
             ))
             .execute(&mut *tx)
             .await?;

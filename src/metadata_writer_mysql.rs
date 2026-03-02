@@ -581,7 +581,8 @@ impl MySqlMetadataWriter {
             .bind(snapshot_id)
             .bind(format!(
                 "created_table:\"{}\".\"{}\"",
-                schema_name, table_name
+                schema_name.replace('"', "\"\""),
+                table_name.replace('"', "\"\"")
             ))
             .execute(&mut *tx)
             .await?;
@@ -1574,7 +1575,8 @@ impl MetadataWriter for MySqlMetadataWriter {
             .bind(snapshot_id)
             .bind(format!(
                 "created_view:\"{}\".\"{}\"",
-                schema_name, view_name
+                schema_name.replace('"', "\"\""),
+                view_name.replace('"', "\"\"")
             ))
             .execute(&mut *tx)
             .await?;
