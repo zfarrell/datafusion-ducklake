@@ -398,6 +398,14 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// Initialize DuckLake schema tables if they don't exist.
     fn initialize_schema(&self) -> Result<()>;
 
+    /// Record changes_made for a snapshot in ducklake_snapshot_changes.
+    ///
+    /// Used by DML operations to record what changed (e.g., "deleted_from_table:1").
+    /// Default implementation is a no-op for backward compatibility.
+    fn record_snapshot_changes(&self, _snapshot_id: i64, _changes_made: &str) -> Result<()> {
+        Ok(())
+    }
+
     /// Atomically set up catalog metadata for a write operation.
     /// Creates snapshot, schema, table, columns in a single transaction.
     ///

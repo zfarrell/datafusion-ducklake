@@ -534,18 +534,6 @@ impl SqliteMetadataWriter {
                 .bind(snapshot_id)
                 .execute(&mut *tx)
                 .await?;
-
-                // R3F-001: Initialize ducklake_table_column_stats with non-NULL contains_null
-                sqlx::query(
-                    "INSERT INTO ducklake_table_column_stats
-                     (table_id, column_id, contains_null, contains_nan)
-                     VALUES (?, ?, 0, NULL)",
-                )
-                .bind(table_id)
-                .bind(column_id)
-                .execute(&mut *tx)
-                .await?;
-
                 new_ids.push(column_id);
             }
             new_ids
@@ -586,32 +574,19 @@ impl SqliteMetadataWriter {
         }
 
         // R3F-011: Update snapshot with next_catalog_id and next_file_id
-        let cat_row = sqlx::query(
-            "SELECT MAX(v) + 1 FROM (
-                SELECT COALESCE(MAX(schema_id), 0) AS v FROM ducklake_schema
-                UNION ALL SELECT COALESCE(MAX(table_id), 0) FROM ducklake_table
-                UNION ALL SELECT COALESCE(MAX(view_id), 0) FROM ducklake_view
-            )",
-        )
-        .fetch_one(&mut *tx)
-        .await?;
-        let next_catalog_id: i64 = cat_row.try_get::<Option<i64>, _>(0)?.unwrap_or(0);
-
-        let file_row = sqlx::query(
-            "SELECT MAX(v) + 1 FROM (
-                SELECT COALESCE(MAX(data_file_id), 0) AS v FROM ducklake_data_file
-                UNION ALL SELECT COALESCE(MAX(delete_file_id), 0) FROM ducklake_delete_file
-            )",
-        )
-        .fetch_one(&mut *tx)
-        .await?;
-        let next_file_id: i64 = file_row.try_get::<Option<i64>, _>(0)?.unwrap_or(0);
-
         sqlx::query(
-            "UPDATE ducklake_snapshot SET next_catalog_id = ?, next_file_id = ? WHERE snapshot_id = ?",
+            "UPDATE ducklake_snapshot
+             SET next_catalog_id = COALESCE((SELECT MAX(v) + 1 FROM (
+                     SELECT COALESCE(MAX(schema_id), 0) AS v FROM ducklake_schema
+                     UNION ALL SELECT COALESCE(MAX(table_id), 0) FROM ducklake_table
+                     UNION ALL SELECT COALESCE(MAX(view_id), 0) FROM ducklake_view
+                 )), 0),
+                 next_file_id = COALESCE((SELECT MAX(v) + 1 FROM (
+                     SELECT COALESCE(MAX(data_file_id), 0) AS v FROM ducklake_data_file
+                     UNION ALL SELECT COALESCE(MAX(delete_file_id), 0) FROM ducklake_delete_file
+                 )), 0)
+             WHERE snapshot_id = ?",
         )
-        .bind(next_catalog_id)
-        .bind(next_file_id)
         .bind(snapshot_id)
         .execute(&mut *tx)
         .await?;
@@ -831,50 +806,28 @@ impl SqliteMetadataWriter {
 impl MetadataWriter for SqliteMetadataWriter {
     fn create_snapshot(&self) -> Result<i64> {
         block_on(async {
-            let mut tx = self.pool.begin().await?;
-
-            // R3F-007: Inherit schema_version from previous snapshot instead of DDL default
-            let sv_row =
-                sqlx::query("SELECT COALESCE(MAX(schema_version), 1) FROM ducklake_snapshot")
-                    .fetch_one(&mut *tx)
-                    .await?;
-            let schema_version: i64 = sv_row.try_get(0)?;
-
+            // R3F-007: Inherit schema_version from previous snapshot
             // R3F-011: Compute next_catalog_id and next_file_id
-            let cat_row = sqlx::query(
-                "SELECT MAX(v) + 1 FROM (
-                    SELECT COALESCE(MAX(schema_id), 0) AS v FROM ducklake_schema
-                    UNION ALL SELECT COALESCE(MAX(table_id), 0) FROM ducklake_table
-                    UNION ALL SELECT COALESCE(MAX(view_id), 0) FROM ducklake_view
-                )",
-            )
-            .fetch_one(&mut *tx)
-            .await?;
-            let next_catalog_id: i64 = cat_row.try_get::<Option<i64>, _>(0)?.unwrap_or(0);
-
-            let file_row = sqlx::query(
-                "SELECT MAX(v) + 1 FROM (
-                    SELECT COALESCE(MAX(data_file_id), 0) AS v FROM ducklake_data_file
-                    UNION ALL SELECT COALESCE(MAX(delete_file_id), 0) FROM ducklake_delete_file
-                )",
-            )
-            .fetch_one(&mut *tx)
-            .await?;
-            let next_file_id: i64 = file_row.try_get::<Option<i64>, _>(0)?.unwrap_or(0);
-
+            // Use a single INSERT with subqueries to minimize lock duration
             let row = sqlx::query(
                 "INSERT INTO ducklake_snapshot (snapshot_time, schema_version, next_catalog_id, next_file_id)
-                 VALUES (strftime('%Y-%m-%d %H:%M:%f+00:00', 'now'), ?, ?, ?) RETURNING snapshot_id",
+                 VALUES (
+                     strftime('%Y-%m-%d %H:%M:%f+00:00', 'now'),
+                     COALESCE((SELECT MAX(schema_version) FROM ducklake_snapshot), 1),
+                     COALESCE((SELECT MAX(v) + 1 FROM (
+                         SELECT COALESCE(MAX(schema_id), 0) AS v FROM ducklake_schema
+                         UNION ALL SELECT COALESCE(MAX(table_id), 0) FROM ducklake_table
+                         UNION ALL SELECT COALESCE(MAX(view_id), 0) FROM ducklake_view
+                     )), 0),
+                     COALESCE((SELECT MAX(v) + 1 FROM (
+                         SELECT COALESCE(MAX(data_file_id), 0) AS v FROM ducklake_data_file
+                         UNION ALL SELECT COALESCE(MAX(delete_file_id), 0) FROM ducklake_delete_file
+                     )), 0)
+                 ) RETURNING snapshot_id",
             )
-            .bind(schema_version)
-            .bind(next_catalog_id)
-            .bind(next_file_id)
-            .fetch_one(&mut *tx)
+            .fetch_one(&self.pool)
             .await?;
-            let snapshot_id: i64 = row.try_get(0)?;
-
-            tx.commit().await?;
-            Ok(snapshot_id)
+            Ok(row.try_get(0)?)
         })
     }
 
@@ -1075,52 +1028,31 @@ impl MetadataWriter for SqliteMetadataWriter {
             }
 
             // R3F-001: Update ducklake_table_column_stats (aggregate table-level stats)
-            // Recompute from all active file stats for each column that was updated
-            let column_ids: Vec<i64> = stats.iter().map(|s| s.column_id).collect();
-            for &column_id in &column_ids {
-                let agg_row = sqlx::query(
-                    "SELECT
-                         CASE WHEN COALESCE(SUM(fcs.null_count), 0) > 0 THEN 1 ELSE 0 END,
-                         MIN(fcs.min_value),
-                         MAX(fcs.max_value)
-                     FROM ducklake_file_column_stats fcs
-                     INNER JOIN ducklake_data_file df
-                         ON fcs.data_file_id = df.data_file_id
-                         AND df.table_id = fcs.table_id
-                         AND df.end_snapshot IS NULL
-                     WHERE fcs.table_id = ? AND fcs.column_id = ?",
-                )
+            // Delete existing rows for this table and recompute from all active file stats.
+            // Uses DELETE + INSERT-SELECT to minimize the number of queries.
+            sqlx::query("DELETE FROM ducklake_table_column_stats WHERE table_id = ?")
                 .bind(table_id)
-                .bind(column_id)
-                .fetch_one(&mut *tx)
-                .await?;
-
-                let contains_null: bool = agg_row.try_get::<i32, _>(0)? != 0;
-                let min_value: Option<String> = agg_row.try_get(1)?;
-                let max_value: Option<String> = agg_row.try_get(2)?;
-
-                // Upsert: delete existing and insert new
-                sqlx::query(
-                    "DELETE FROM ducklake_table_column_stats WHERE table_id = ? AND column_id = ?",
-                )
-                .bind(table_id)
-                .bind(column_id)
                 .execute(&mut *tx)
                 .await?;
 
-                sqlx::query(
-                    "INSERT INTO ducklake_table_column_stats
-                     (table_id, column_id, contains_null, min_value, max_value)
-                     VALUES (?, ?, ?, ?, ?)",
-                )
-                .bind(table_id)
-                .bind(column_id)
-                .bind(contains_null)
-                .bind(&min_value)
-                .bind(&max_value)
-                .execute(&mut *tx)
-                .await?;
-            }
+            sqlx::query(
+                "INSERT INTO ducklake_table_column_stats
+                 (table_id, column_id, contains_null, min_value, max_value)
+                 SELECT fcs.table_id, fcs.column_id,
+                     CASE WHEN COALESCE(SUM(fcs.null_count), 0) > 0 THEN 1 ELSE 0 END,
+                     MIN(fcs.min_value),
+                     MAX(fcs.max_value)
+                 FROM ducklake_file_column_stats fcs
+                 INNER JOIN ducklake_data_file df
+                     ON fcs.data_file_id = df.data_file_id
+                     AND df.table_id = fcs.table_id
+                     AND df.end_snapshot IS NULL
+                 WHERE fcs.table_id = ?
+                 GROUP BY fcs.table_id, fcs.column_id",
+            )
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
 
             tx.commit().await?;
             Ok(())
