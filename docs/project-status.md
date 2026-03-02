@@ -322,7 +322,7 @@ Note: Postgres/MySQL tests require running database containers (testcontainers).
 
 ## 3. Remaining Work (Prioritized)
 
-### Code Review Fixes (2026-03-01 + 2026-03-02)
+### Code Review Fixes (2026-03-01 + 2026-03-02 + 2026-03-03)
 
 **Cycle 1 (2026-03-01)**: 36 findings (6 P0, 11 P1, 13 P2, 13 P3). All P0/P1 fixed, 9/13 P2 fixed.
 
@@ -330,9 +330,19 @@ Note: Postgres/MySQL tests require running database containers (testcontainers).
 - **Round 1** (33 fixed): SQL injection READ path, atomic DML, transaction safety, interop alignment (delete format, row_id_start, schema_versions, column IDs, UUIDs, changes_made), CTAS object store, MERGE key types, table function projections, test reliability, numeric safety
 - **Round 2** (22 fixed): Virtual column row IDs, nullable cols, temporal roundtrip, decimal parser, hex key decoding, inlined row count, MySQL sql_mode, partition routing perf, individual SLT tests, test helper dedup, numeric try_from, Debug impls, view SQL rewrite, doc comments
 
+**Cycle 3 (2026-03-02 R3, fixed 2026-03-03)**: 50 findings (3 P0, 9 P1, 16 P2, 22 P3). **25 of 50 fixed** across 6 fix agents:
+- fix-sql-quoting (`065c411`): R3F-008 — quote_identifier consistency
+- fix-inlined-types: R3F-004, 005, 012, 018, 026, 027 — Date/Timestamp roundtrip, timezone, type lossy roundtrips
+- fix-pg-mysql-parity (`d9d54ce`): R3F-006 — port SQLite-only fixes to PG/MySQL
+- fix-numeric-safety (`888705e`): R3F-009, 010, 025 — unwrap→error, as→try_from, dead variables
+- fix-interop-critical (`3203d33`): R3F-001, 002, 003, 007, 011, 013, 014, 017 — table_column_stats, row_id_start, MERGE cleanup, schema_version, next_ids, snapshot_changes, set_data_path atomicity
+- fix-test-harness (`3930b56`): R3F-015, 016, 020, 021, 023, 024 — test helper dedup, assertion fixes, SLT improvements
+
+**25 remaining open**: 3 P2 + 22 P3 (code quality nits, informational items).
+
 **3 Deferred** (architectural, L effort): F-036 (INSERT streaming/OOM), F-044 (provider/writer code dedup), F-045 (async trait redesign).
 
-See `docs/2026-03-02-review-synthesis.md` for full details with **[FIXED]**/**[DEFERRED]** markers on each finding.
+See `docs/2026-03-02-r3-review-synthesis.md` for full details with **[FIXED]**/**[OPEN]** markers on each finding.
 
 ### Tier 1: Implementable Now (no external blockers)
 

@@ -125,31 +125,24 @@ A five-part review (idiomatic, correctness, interop, test-harness, codex) identi
 - `docs/2026-03-02-review-synthesis.md` (consolidated findings with **[FIXED]**/**[DEFERRED]** markers)
 - `docs/2026-03-02-review-idiomatic.md`, `docs/2026-03-02-review-correctness.md`, `docs/2026-03-02-review-interop.md`, `docs/2026-03-02-review-test-harness.md`, `docs/2026-03-02-codex-review.md`
 
-### Code Review Cycle 3 (2026-03-02 R3) — 50 NEW FINDINGS, PENDING FIXES
+### Code Review Cycle 3 (2026-03-02 R3) — 25 of 50 FINDINGS FIXED
 
-A five-part review of the post-R2 codebase identified **67 raw -> 50 after dedup** (3 P0, 9 P1, 16 P2, 22 P3). These are NEW issues not caught in R1/R2.
+A five-part review of the post-R2 codebase identified **67 raw -> 50 after dedup** (3 P0, 9 P1, 16 P2, 22 P3). Six fix agents resolved **25 of 50** findings — all P0, all P1, and 13 of 16 P2. Remaining 25 are P2/P3 nits.
 
-**P0 Critical (3):**
-- R3F-001: Missing `ducklake_table_column_stats` — blocks ALL DF→DuckDB interop
-- R3F-002: `register_dml_files` omits `row_id_start` / `table_stats` (all writers)
-- R3F-003: MERGE orphaned file cleanup missing
+**Fix agents and commits:**
+- Agent 1 — fix-sql-quoting (`065c411`): R3F-008 (quote_identifier consistency)
+- Agent 2 — fix-inlined-types: R3F-004, 005, 012, 018, 026, 027 (Date/Timestamp roundtrip, timezone, projection order, type lossy roundtrips)
+- Agent 3 — fix-pg-mysql-parity (`d9d54ce`): R3F-006 (port SQLite-only fixes to PG/MySQL)
+- Agent 4 — fix-numeric-safety (`888705e`): R3F-009, 010, 025 (unwrap→error, as→try_from, dead variables)
+- Agent 5 — fix-interop-critical (`3203d33`): R3F-001, 002, 003, 007, 011, 013, 014, 017 (table_column_stats, row_id_start, MERGE cleanup, schema_version, next_ids, snapshot_changes, created_schema, set_data_path atomicity)
+- Agent 6 — fix-test-harness (`3930b56`): R3F-015, 016, 020, 021, 023, 024 (batches_to_strings dedup, read-only assertion, ORDER BY ALL, test helper migration, SLT logging, double-slash test)
 
-**P1 High (9):**
-- R3F-004/005: Date32/Date64 + Timestamp inlined data roundtrip broken (silent data loss)
-- R3F-006: PG/MySQL missing 4 SQLite-only fixes (schema_versions, column IDs, UUIDs, changes_made)
-- R3F-007: `create_snapshot()` doesn't inherit `schema_version`
-- R3F-008: `quote_identifier` gaps in inlined data paths (1 SQL injection vector)
-- R3F-009: `.unwrap()` on downcasts in production code (panic risk)
-- R3F-010: ~30 unchecked `as` casts across DML execs
-- R3F-011: `next_catalog_id`/`next_file_id` never populated in snapshots
-- R3F-012: Non-UTC timestamps silently replaced with UTC
-
-**Recommended 6 fix agents** (see `docs/2026-03-02-r3-review-synthesis.md` for groupings).
+**25 remaining open**: 3 P2 (snapshot-aware table structure, test coverage gaps, extra catalog columns) + 22 P3 (code quality nits).
 
 **R2 deferred items remain deferred**: F-036, F-044, F-045.
 
 **Source documents:**
-- `docs/2026-03-02-r3-review-synthesis.md` (deduplicated + prioritized)
+- `docs/2026-03-02-r3-review-synthesis.md` (deduplicated + prioritized, with **[FIXED]**/**[OPEN]** markers)
 - `docs/2026-03-02-r3-review-idiomatic.md`, `docs/2026-03-02-r3-review-correctness.md`, `docs/2026-03-02-r3-review-interop.md`, `docs/2026-03-02-r3-review-test-harness.md`, `docs/2026-03-02-r3-codex-review.md`
 
 ### After Implementation: PR Creation

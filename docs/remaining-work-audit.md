@@ -34,21 +34,27 @@ A five-part review (idiomatic, correctness, interop, test-harness, codex) identi
 - F-044: Provider/writer code deduplication
 - F-045: Async trait redesign (sync→async)
 
-### Cycle 3 (2026-03-02 R3) — 50 FINDINGS, PENDING FIXES
+### Cycle 3 (2026-03-02 R3) — 25 of 50 FINDINGS FIXED
 
-A five-part review (idiomatic, correctness, interop, test-harness, codex) of the post-R2 codebase identified 67 raw findings → 50 after deduplication. These are NEW issues not caught in R1/R2, including regressions from R2 fix code.
+A five-part review (idiomatic, correctness, interop, test-harness, codex) of the post-R2 codebase identified 67 raw findings → 50 after deduplication. These are NEW issues not caught in R1/R2, including regressions from R2 fix code. Six fix agents resolved 25 of 50 findings (all P0 + all P1 + 13 of 16 P2).
 
-| Priority | Count | Key Themes |
-|----------|-------|-----------|
-| P0 | 3 | `ducklake_table_column_stats` DuckDB crash (interop blocker), DML `row_id_start` gap, MERGE orphan cleanup |
-| P1 | 9 | Inlined data roundtrip (Date/Timestamp data loss), PG/MySQL fix parity gap (4 fixes not ported), schema_version inheritance, SQL quoting gaps, unchecked casts, unwrap panics |
-| P2 | 16 | DML snapshot_changes, test harness divergence, type lossy roundtrips, atomicity gaps |
-| P3 | 22 | Code quality, minor consistency, informational |
-| **Total** | **50** | |
+| Priority | Count | Fixed | Open |
+|----------|-------|-------|------|
+| P0 | 3 | 3 | 0 |
+| P1 | 9 | 9 | 0 |
+| P2 | 16 | 13 | 3 |
+| P3 | 22 | 0 | 22 |
+| **Total** | **50** | **25** | **25** |
 
-**Critical finding (R3F-001)**: Missing `ducklake_table_column_stats` population blocks ALL DF→DuckDB read interop. 2 of 7 cross-engine tests fail.
+**Fix agents (6):**
+- Agent 1 — fix-sql-quoting (`065c411`): R3F-008
+- Agent 2 — fix-inlined-types: R3F-004, 005, 012, 018, 026, 027
+- Agent 3 — fix-pg-mysql-parity (`d9d54ce`): R3F-006
+- Agent 4 — fix-numeric-safety (`888705e`): R3F-009, 010, 025
+- Agent 5 — fix-interop-critical (`3203d33`): R3F-001, 002, 003, 007, 011, 013, 014, 017
+- Agent 6 — fix-test-harness (`3930b56`): R3F-015, 016, 020, 021, 023, 024
 
-**Systemic finding (R3F-006)**: R2 fixes F-012, F-013, F-026, F-027 were applied to SQLite writer only. PG/MySQL writers have 4+ interop regressions.
+**25 remaining open items**: 3 P2 (R3F-019 snapshot-aware table structure, R3F-022 test coverage gaps, R3F-028 extra catalog columns) + 22 P3 (code quality nits, minor consistency items, informational).
 
 Full details in `docs/2026-03-02-r3-review-synthesis.md`.
 
@@ -402,13 +408,7 @@ Note: Several previously-listed items are now resolved:
 
 **Code Review Cycle 2**: 55 of 58 findings fixed (see Cycle 2 section above). Only 3 deferred (F-036, F-044, F-045).
 
-**Code Review Cycle 3**: 50 new findings identified (see Cycle 3 section above). Recommended 6 fix agents:
-- Agent 1: Critical Interop + DML Metadata (R3F-001–003, 007, 011, 013, 014, 017) — L effort
-- Agent 2: Inlined Data + Type Roundtrip (R3F-004, 005, 012, 018, 026, 027) — M effort
-- Agent 3: PG/MySQL Fix Parity (R3F-006) — M effort
-- Agent 4: Numeric Safety + Panic Prevention (R3F-009, 010, 025) — M effort
-- Agent 5: SQL Quoting Consistency (R3F-008) — S effort
-- Agent 6: Test Harness Fixes (R3F-015, 016, 020, 021, 023, 024) — M effort
+**Code Review Cycle 3**: 50 findings, **25 fixed** by 6 agents (all P0 + all P1 + 13/16 P2). 25 remaining are P2/P3 nits. See Cycle 3 section above for details.
 
 **Remaining items (Tier 2+):**
 
