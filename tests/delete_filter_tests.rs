@@ -16,42 +16,7 @@ use datafusion_ducklake::{DuckLakeCatalog, DuckdbMetadataProvider};
 use parquet::file::reader::FileReader;
 use tempfile::TempDir;
 
-/// Test helper to extract integer values from a RecordBatch column
-/// Supports both Int32 and Int64
-fn get_int_column(batch: &RecordBatch, col_idx: usize) -> Vec<i32> {
-    let column = batch.column(col_idx);
-
-    // Try Int32 first
-    if let Some(array) = column.as_any().downcast_ref::<arrow::array::Int32Array>() {
-        return (0..array.len())
-            .filter_map(|i| {
-                if array.is_null(i) {
-                    None
-                } else {
-                    Some(array.value(i))
-                }
-            })
-            .collect();
-    }
-
-    // Try Int64
-    if let Some(array) = column.as_any().downcast_ref::<arrow::array::Int64Array>() {
-        return (0..array.len())
-            .filter_map(|i| {
-                if array.is_null(i) {
-                    None
-                } else {
-                    Some(array.value(i) as i32)
-                }
-            })
-            .collect();
-    }
-
-    panic!(
-        "Column should be Int32Array or Int64Array, got {:?}",
-        column.data_type()
-    );
-}
+use common::test_utils::get_int_column;
 
 #[cfg(test)]
 mod integration_tests {

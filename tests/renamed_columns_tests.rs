@@ -9,11 +9,14 @@
 
 #![cfg(feature = "metadata-duckdb")]
 
+mod common;
+
+use arrow::array::Array;
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
-use arrow::array::{Array, Int32Array, StringArray};
+use arrow::array::StringArray;
 use arrow::record_batch::RecordBatch;
 use datafusion::prelude::*;
 use datafusion_ducklake::{DuckLakeCatalog, DuckdbMetadataProvider};
@@ -108,12 +111,7 @@ fn create_catalog_with_multiple_renames(catalog_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Helper to get int column values from a batch
-fn get_int_column(batch: &RecordBatch, col_idx: usize) -> Vec<i32> {
-    let column = batch.column(col_idx);
-    let array = column.as_any().downcast_ref::<Int32Array>().unwrap();
-    array.values().to_vec()
-}
+use common::test_utils::get_int_column;
 
 /// Helper to get string column values from a batch
 fn get_string_column(batch: &RecordBatch, col_idx: usize) -> Vec<String> {

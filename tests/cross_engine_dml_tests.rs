@@ -21,7 +21,7 @@ use std::sync::Arc;
 use arrow::array::*;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use common::test_utils::{arrow_value_to_string, duckdb_value_to_string};
+use common::test_utils::{assert_results_eq, df_query, duckdb_value_to_string};
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::*;
 use object_store::local::LocalFileSystem;
@@ -224,59 +224,6 @@ impl DuckDbConn {
     }
 }
 
-/// Run a SQL query via DataFusion and return results as string rows.
-async fn df_query(ctx: &SessionContext, sql: &str) -> Vec<Vec<String>> {
-    let df = ctx.sql(sql).await.expect("DataFusion SQL failed");
-    let batches = df.collect().await.expect("DataFusion collect failed");
-    batches_to_strings(&batches)
-}
-
-fn batches_to_strings(batches: &[RecordBatch]) -> Vec<Vec<String>> {
-    let mut rows = Vec::new();
-    for batch in batches {
-        for row_idx in 0..batch.num_rows() {
-            let mut row = Vec::new();
-            for col_idx in 0..batch.num_columns() {
-                let col = batch.column(col_idx);
-                if col.is_null(row_idx) {
-                    row.push("NULL".to_string());
-                } else {
-                    row.push(arrow_value_to_string(col, row_idx));
-                }
-            }
-            rows.push(row);
-        }
-    }
-    rows
-}
-
-/// Normalize and compare query results.
-fn assert_results_eq(scenario: &str, expected: &[Vec<String>], actual: &[Vec<String>]) {
-    assert_eq!(
-        expected.len(),
-        actual.len(),
-        "[{scenario}] Row count mismatch: expected {}, got {}.\n  Expected: {expected:?}\n  Actual:   {actual:?}",
-        expected.len(),
-        actual.len()
-    );
-    for (i, (exp, act)) in expected.iter().zip(actual.iter()).enumerate() {
-        assert_eq!(
-            exp.len(),
-            act.len(),
-            "[{scenario}] Column count mismatch at row {i}"
-        );
-        for (j, (e, a)) in exp.iter().zip(act.iter()).enumerate() {
-            // Normalize floats for comparison
-            let en = normalize(e);
-            let an = normalize(a);
-            assert_eq!(
-                en, an,
-                "[{scenario}] Mismatch at row {i}, col {j}: expected '{e}', got '{a}'"
-            );
-        }
-    }
-}
-
 /// Assert a string value equals a float (handles DuckDB returning "10" for 10.0).
 fn assert_float_eq(actual: &str, expected: f64, msg: &str) {
     let actual_f: f64 = actual
@@ -286,16 +233,6 @@ fn assert_float_eq(actual: &str, expected: f64, msg: &str) {
         (actual_f - expected).abs() < 0.01,
         "{msg}: expected {expected}, got {actual_f} (raw: '{actual}')"
     );
-}
-
-fn normalize(s: &str) -> String {
-    if s == "NULL" {
-        return s.to_string();
-    }
-    if let Ok(f) = s.parse::<f64>() {
-        return format!("{:.6}", f);
-    }
-    s.to_string()
 }
 
 /// Helper to collect DML count from a DataFrame result.

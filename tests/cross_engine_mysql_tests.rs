@@ -194,18 +194,7 @@ fn sqlx_mysql_to_duckdb(url: &str) -> String {
     }
 }
 
-use common::test_utils::{
-    arrow_value_to_string, assert_results_eq, batches_to_strings, duckdb_value_to_string,
-    normalize_value,
-};
-
-// ==================== Query helpers ====================
-
-async fn df_query(ctx: &SessionContext, sql: &str) -> Vec<Vec<String>> {
-    let df = ctx.sql(sql).await.expect("DataFusion SQL failed");
-    let batches = df.collect().await.expect("DataFusion collect failed");
-    batches_to_strings(&batches)
-}
+use common::test_utils::{assert_results_eq, df_query, duckdb_value_to_string};
 
 // ==================== Test 1: DF writes → DF reads (MySQL catalog) ====================
 

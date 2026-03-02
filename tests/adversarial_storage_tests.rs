@@ -169,22 +169,17 @@ fn test_double_slash_in_various_positions() {
         "/data/file.parquet"
     );
 
-    // Multiple slashes in the middle of relative path (NOT cleaned)
+    // Multiple slashes in the middle of relative path (normalized to single)
     assert_eq!(
         join_paths("/data/", "schema///table///file.parquet").unwrap(),
-        "/data/schema///table///file.parquet"
+        "/data/schema/table/file.parquet"
     );
-    // FINDING: Internal multiple slashes are preserved. While the
-    // leading-slash double-slash fix works, paths like "/data/schema///table/"
-    // pass through uncleaned.
 
-    // Base without trailing slash (adds one via format!)
+    // Base without trailing slash + relative with leading slash (normalized)
     assert_eq!(
         join_paths("/data", "/file.parquet").unwrap(),
-        "/data//file.parquet"
+        "/data/file.parquet"
     );
-    // FINDING: When base has NO trailing slash but relative has leading slash,
-    // we get a double slash! The fix only covers the case where base ends with '/'.
 }
 
 #[test]

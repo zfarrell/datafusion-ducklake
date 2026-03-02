@@ -21,9 +21,7 @@ use std::sync::Arc;
 use arrow::array::*;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use common::test_utils::{
-    arrow_value_to_string, batches_to_strings, duckdb_value_to_string, normalize_value,
-};
+use common::test_utils::{assert_results_eq, df_query, duckdb_value_to_string};
 use datafusion::prelude::*;
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
@@ -162,38 +160,6 @@ impl DuckDbConn {
     }
 }
 
-async fn df_query(ctx: &SessionContext, sql: &str) -> Vec<Vec<String>> {
-    let df = ctx.sql(sql).await.expect("DataFusion SQL failed");
-    let batches = df.collect().await.expect("DataFusion collect failed");
-    batches_to_strings(&batches)
-}
-
-fn assert_query_eq(scenario: &str, expected: &[Vec<String>], actual: &[Vec<String>]) {
-    assert_eq!(
-        expected.len(),
-        actual.len(),
-        "[{scenario}] Row count mismatch: expected {} rows, got {}.\n  Expected: {expected:?}\n  Actual:   {actual:?}",
-        expected.len(),
-        actual.len()
-    );
-    for (i, (exp_row, act_row)) in expected.iter().zip(actual.iter()).enumerate() {
-        assert_eq!(
-            exp_row.len(),
-            act_row.len(),
-            "[{scenario}] Column count mismatch at row {i}: expected {} cols, got {}.\n  Expected row: {exp_row:?}\n  Actual row:   {act_row:?}",
-            exp_row.len(),
-            act_row.len()
-        );
-        for (j, (exp_val, act_val)) in exp_row.iter().zip(act_row.iter()).enumerate() {
-            let exp_norm = normalize_value(exp_val);
-            let act_norm = normalize_value(act_val);
-            assert_eq!(
-                exp_norm, act_norm,
-                "[{scenario}] Mismatch at row {i}, col {j}: expected '{exp_val}', got '{act_val}'"
-            );
-        }
-    }
-}
 
 // ==================== Test 1: DF INSERT + DuckDB SELECT ====================
 // DataFusion writes via DuckLakeTableWriter → DuckDB reads and verifies columns/types
@@ -314,7 +280,7 @@ async fn cross_engine_insert_duckdb_write_df_read() {
         vec!["3".into(), "Keyboard".into(), "75.0".into(), "false".into()],
     ];
 
-    assert_query_eq("duckdb_insert_df_read", &expected, &actual);
+    assert_results_eq("duckdb_insert_df_read", &expected, &actual);
 }
 
 // ==================== Test 3: INSERT with NOT NULL constraint ====================
@@ -497,7 +463,7 @@ async fn cross_engine_ctas() {
             )
             .await;
             assert_eq!(df_rows.len(), 3);
-            assert_query_eq(
+            assert_results_eq(
                 "ctas_df_read",
                 &vec![
                     vec!["10".into(), "X".into(), "1.1".into()],
@@ -654,7 +620,7 @@ async fn cross_engine_insert_replace_mode() {
         "SELECT id, value FROM ducklake.main.replace_test ORDER BY id",
     )
     .await;
-    assert_query_eq(
+    assert_results_eq(
         "replace_mode_df_read",
         &vec![vec!["10".into(), "new_x".into()], vec!["20".into(), "new_y".into()]],
         &df_rows,

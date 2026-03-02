@@ -12,7 +12,7 @@ mod common;
 use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
-use common::test_utils::{arrow_value_to_string, batches_to_strings, duckdb_value_to_string};
+use common::test_utils::{assert_results_eq, batches_to_strings_filtered, duckdb_value_to_string};
 use datafusion::error::Result as DfResult;
 use datafusion::prelude::*;
 use datafusion_ducklake::{DuckLakeCatalog, DuckdbMetadataProvider};
@@ -62,48 +62,6 @@ fn duckdb_query(catalog_path: &str, sql: &str) -> Vec<Vec<String>> {
     results
 }
 
-/// Assert two result sets are equal (after normalizing floats).
-fn assert_results_equal(scenario: &str, expected: &[Vec<String>], actual: &[Vec<String>]) {
-    assert_eq!(
-        expected.len(),
-        actual.len(),
-        "[{scenario}] Row count mismatch: expected {} rows, got {}.\n  Expected: {expected:?}\n  Actual:   {actual:?}",
-        expected.len(),
-        actual.len()
-    );
-    for (i, (exp_row, act_row)) in expected.iter().zip(actual.iter()).enumerate() {
-        assert_eq!(
-            exp_row.len(),
-            act_row.len(),
-            "[{scenario}] Column count mismatch at row {i}: expected {} cols, got {}",
-            exp_row.len(),
-            act_row.len()
-        );
-        for (j, (exp_val, act_val)) in exp_row.iter().zip(act_row.iter()).enumerate() {
-            // Normalize floats for comparison
-            let exp_norm = normalize_value(exp_val);
-            let act_norm = normalize_value(act_val);
-            assert_eq!(
-                exp_norm, act_norm,
-                "[{scenario}] Mismatch at row {i}, col {j}: expected '{exp_val}', got '{act_val}'"
-            );
-        }
-    }
-}
-
-/// Normalize a string value for comparison (handle float precision differences).
-fn normalize_value(s: &str) -> String {
-    if s == "NULL" {
-        return s.to_string();
-    }
-    // Try parsing as f64 for float comparison
-    if let Ok(f) = s.parse::<f64>() {
-        // Round to 6 decimal places to handle precision differences
-        return format!("{:.6}", f);
-    }
-    s.to_string()
-}
-
 /// Helper: create a DuckLake catalog with DuckDB and run setup SQL.
 fn setup_ducklake_catalog(catalog_path: &std::path::Path, setup_sql: &str) {
     let conn = duckdb::Connection::open_in_memory().unwrap();
@@ -142,9 +100,9 @@ async fn parity_basic_crud_after_insert() -> DfResult<()> {
 
     let ctx = create_df_session(&path_str)?;
     let actual_batches = df_query(&ctx, "SELECT * FROM dl.main.t ORDER BY id").await?;
-    let actual = batches_to_strings(&actual_batches);
+    let actual = batches_to_strings_filtered(&actual_batches);
 
-    assert_results_equal("CRUD after INSERT", &expected, &actual);
+    assert_results_eq("CRUD after INSERT", &expected, &actual);
     Ok(())
 }
 
@@ -166,9 +124,9 @@ async fn parity_basic_crud_after_delete() -> DfResult<()> {
 
     let ctx = create_df_session(&path_str)?;
     let actual_batches = df_query(&ctx, "SELECT * FROM dl.main.t ORDER BY id").await?;
-    let actual = batches_to_strings(&actual_batches);
+    let actual = batches_to_strings_filtered(&actual_batches);
 
-    assert_results_equal("CRUD after DELETE", &expected, &actual);
+    assert_results_eq("CRUD after DELETE", &expected, &actual);
     Ok(())
 }
 
@@ -191,9 +149,9 @@ async fn parity_basic_crud_after_update() -> DfResult<()> {
 
     let ctx = create_df_session(&path_str)?;
     let actual_batches = df_query(&ctx, "SELECT * FROM dl.main.t ORDER BY id").await?;
-    let actual = batches_to_strings(&actual_batches);
+    let actual = batches_to_strings_filtered(&actual_batches);
 
-    assert_results_equal("CRUD after UPDATE", &expected, &actual);
+    assert_results_eq("CRUD after UPDATE", &expected, &actual);
     Ok(())
 }
 
@@ -222,9 +180,9 @@ async fn parity_type_handling() -> DfResult<()> {
 
     let ctx = create_df_session(&path_str)?;
     let actual_batches = df_query(&ctx, "SELECT * FROM dl.main.types_test").await?;
-    let actual = batches_to_strings(&actual_batches);
+    let actual = batches_to_strings_filtered(&actual_batches);
 
-    assert_results_equal("Type handling", &expected, &actual);
+    assert_results_eq("Type handling", &expected, &actual);
     Ok(())
 }
 
@@ -249,9 +207,9 @@ async fn parity_schema_operations() -> DfResult<()> {
 
     let ctx = create_df_session(&path_str)?;
     let actual_batches = df_query(&ctx, "SELECT * FROM dl.test_schema.t1").await?;
-    let actual = batches_to_strings(&actual_batches);
+    let actual = batches_to_strings_filtered(&actual_batches);
 
-    assert_results_equal("Schema operations", &expected, &actual);
+    assert_results_eq("Schema operations", &expected, &actual);
     Ok(())
 }
 
@@ -281,9 +239,9 @@ async fn parity_null_is_null_filter() -> DfResult<()> {
         "SELECT * FROM dl.main.nulls WHERE val IS NULL ORDER BY id",
     )
     .await?;
-    let actual = batches_to_strings(&actual_batches);
+    let actual = batches_to_strings_filtered(&actual_batches);
 
-    assert_results_equal("NULL IS NULL filter", &expected, &actual);
+    assert_results_eq("NULL IS NULL filter", &expected, &actual);
     Ok(())
 }
 
@@ -305,9 +263,9 @@ async fn parity_null_count_semantics() -> DfResult<()> {
 
     let ctx = create_df_session(&path_str)?;
     let actual_batches = df_query(&ctx, "SELECT COUNT(*), COUNT(val) FROM dl.main.nulls").await?;
-    let actual = batches_to_strings(&actual_batches);
+    let actual = batches_to_strings_filtered(&actual_batches);
 
-    assert_results_equal("NULL count semantics", &expected, &actual);
+    assert_results_eq("NULL count semantics", &expected, &actual);
     Ok(())
 }
 
@@ -332,8 +290,8 @@ async fn parity_alter_table_add_column() -> DfResult<()> {
 
     let ctx = create_df_session(&path_str)?;
     let actual_batches = df_query(&ctx, "SELECT * FROM dl.main.alter_test ORDER BY id").await?;
-    let actual = batches_to_strings(&actual_batches);
+    let actual = batches_to_strings_filtered(&actual_batches);
 
-    assert_results_equal("ALTER TABLE ADD COLUMN", &expected, &actual);
+    assert_results_eq("ALTER TABLE ADD COLUMN", &expected, &actual);
     Ok(())
 }

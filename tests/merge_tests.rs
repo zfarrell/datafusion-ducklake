@@ -103,26 +103,7 @@ async fn query_results(ctx: &SessionContext, sql: &str) -> Vec<Vec<String>> {
     batches_to_strings(&batches)
 }
 
-use common::test_utils::arrow_value_to_string;
-
-fn batches_to_strings(batches: &[RecordBatch]) -> Vec<Vec<String>> {
-    let mut rows = Vec::new();
-    for batch in batches {
-        for row_idx in 0..batch.num_rows() {
-            let mut row = Vec::new();
-            for col_idx in 0..batch.num_columns() {
-                let col = batch.column(col_idx);
-                if col.is_null(row_idx) {
-                    row.push("NULL".to_string());
-                } else {
-                    row.push(arrow_value_to_string(col, row_idx));
-                }
-            }
-            rows.push(row);
-        }
-    }
-    rows
-}
+use common::test_utils::batches_to_strings;
 
 /// Build the standard test schema: (id INT32, name VARCHAR, value INT32)
 fn test_schema() -> Arc<Schema> {

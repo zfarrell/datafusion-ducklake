@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use arrow::array::*;
-use common::test_utils::{arrow_value_to_string, batches_to_strings, duckdb_value_to_string};
+use common::test_utils::{batches_to_strings_filtered, duckdb_value_to_string};
 use datafusion::prelude::*;
 use tempfile::TempDir;
 
@@ -139,7 +139,7 @@ async fn test_duckdb_inlined_data_df_duckdb_read() {
         .await
         .unwrap();
     let batches = df.collect().await.unwrap();
-    let mut rows = batches_to_strings(&batches);
+    let mut rows = batches_to_strings_filtered(&batches);
     rows.sort();
 
     assert_eq!(rows.len(), 3);
@@ -174,7 +174,7 @@ async fn test_duckdb_inlined_data_integer_types() {
         .await
         .unwrap();
     let batches = df.collect().await.unwrap();
-    let mut rows = batches_to_strings(&batches);
+    let mut rows = batches_to_strings_filtered(&batches);
     rows.sort();
 
     assert_eq!(rows.len(), 3);
@@ -204,7 +204,7 @@ async fn test_duckdb_inlined_data_with_deletes() {
         .await
         .unwrap();
     let batches = df.collect().await.unwrap();
-    let mut rows = batches_to_strings(&batches);
+    let mut rows = batches_to_strings_filtered(&batches);
     rows.sort();
 
     assert_eq!(rows.len(), 2);
@@ -236,7 +236,7 @@ async fn test_duckdb_mixed_inline_and_parquet() {
         .await
         .unwrap();
     let batches = df.collect().await.unwrap();
-    let mut rows = batches_to_strings(&batches);
+    let mut rows = batches_to_strings_filtered(&batches);
     rows.sort();
 
     assert_eq!(rows.len(), 4);
@@ -288,7 +288,7 @@ async fn test_duckdb_flush_inlined_data() {
         .await
         .unwrap();
     let batches = df.collect().await.unwrap();
-    let mut rows = batches_to_strings(&batches);
+    let mut rows = batches_to_strings_filtered(&batches);
     rows.sort();
 
     assert_eq!(rows.len(), 3);
@@ -317,7 +317,7 @@ async fn test_duckdb_inlined_count() {
         .await
         .unwrap();
     let batches = df.collect().await.unwrap();
-    let rows = batches_to_strings(&batches);
+    let rows = batches_to_strings_filtered(&batches);
     assert_eq!(rows[0], vec!["5"]);
 }
 
@@ -343,7 +343,7 @@ async fn test_duckdb_inlined_multiple_inserts() {
         .await
         .unwrap();
     let batches = df.collect().await.unwrap();
-    let mut rows = batches_to_strings(&batches);
+    let mut rows = batches_to_strings_filtered(&batches);
     rows.sort();
 
     assert_eq!(rows.len(), 3);
@@ -368,7 +368,7 @@ async fn test_duckdb_empty_inlined_table() {
     let ctx = open_in_datafusion_duckdb(&catalog_path);
     let df = ctx.sql("SELECT * FROM ducklake.main.t1").await.unwrap();
     let batches = df.collect().await.unwrap();
-    let rows = batches_to_strings(&batches);
+    let rows = batches_to_strings_filtered(&batches);
     assert_eq!(rows.len(), 0);
 }
 
@@ -394,7 +394,7 @@ async fn test_duckdb_inlined_data_with_nulls() {
         .await
         .unwrap();
     let batches = df.collect().await.unwrap();
-    let mut rows = batches_to_strings(&batches);
+    let mut rows = batches_to_strings_filtered(&batches);
     rows.sort();
 
     assert_eq!(rows.len(), 3);

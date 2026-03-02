@@ -181,8 +181,28 @@ pub fn arrow_value_to_string(array: &dyn Array, idx: usize) -> String {
 const VIRTUAL_COLUMNS: &[&str] =
     &["filename", "file_row_number", "rowid", "snapshot_id", "file_index"];
 
-/// Convert RecordBatches to Vec<Vec<String>>, filtering out virtual columns.
+/// Convert RecordBatches to Vec<Vec<String>>, including all columns.
 pub fn batches_to_strings(batches: &[RecordBatch]) -> Vec<Vec<String>> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        for row_idx in 0..batch.num_rows() {
+            let mut row = Vec::new();
+            for col_idx in 0..batch.num_columns() {
+                let col = batch.column(col_idx);
+                if col.is_null(row_idx) {
+                    row.push("NULL".to_string());
+                } else {
+                    row.push(arrow_value_to_string(col, row_idx));
+                }
+            }
+            rows.push(row);
+        }
+    }
+    rows
+}
+
+/// Convert RecordBatches to Vec<Vec<String>>, filtering out virtual columns.
+pub fn batches_to_strings_filtered(batches: &[RecordBatch]) -> Vec<Vec<String>> {
     let mut rows = Vec::new();
     for batch in batches {
         let schema = batch.schema();
@@ -210,9 +230,45 @@ pub fn batches_to_strings(batches: &[RecordBatch]) -> Vec<Vec<String>> {
 
 /// Convert RecordBatches to sorted Vec<Vec<String>>, filtering out virtual columns.
 pub fn batches_to_sorted_strings(batches: &[RecordBatch]) -> Vec<Vec<String>> {
-    let mut rows = batches_to_strings(batches);
+    let mut rows = batches_to_strings_filtered(batches);
     rows.sort();
     rows
+}
+
+/// Extract i32 values from a specific column in a record batch.
+/// Supports both Int32 and Int64 columns, skipping nulls.
+pub fn get_int_column(batch: &RecordBatch, col_idx: usize) -> Vec<i32> {
+    let column = batch.column(col_idx);
+
+    if let Some(array) = column.as_any().downcast_ref::<Int32Array>() {
+        return (0..array.len())
+            .filter_map(|i| {
+                if array.is_null(i) {
+                    None
+                } else {
+                    Some(array.value(i))
+                }
+            })
+            .collect();
+    }
+
+    if let Some(array) = column.as_any().downcast_ref::<Int64Array>() {
+        return (0..array.len())
+            .filter_map(|i| {
+                if array.is_null(i) {
+                    None
+                } else {
+                    Some(array.value(i) as i32)
+                }
+            })
+            .collect();
+    }
+
+    panic!(
+        "Column {} is not Int32 or Int64, got {:?}",
+        col_idx,
+        column.data_type()
+    );
 }
 
 /// Normalize a string value for comparison (handle float precision differences).
@@ -257,9 +313,9 @@ pub fn assert_results_eq(scenario: &str, expected: &[Vec<String>], actual: &[Vec
     }
 }
 
-/// Run a SQL query via DataFusion and return results as string rows.
+/// Run a SQL query via DataFusion and return results as string rows (filters virtual columns).
 pub async fn df_query(ctx: &datafusion::prelude::SessionContext, sql: &str) -> Vec<Vec<String>> {
     let df = ctx.sql(sql).await.expect("DataFusion SQL failed");
     let batches = df.collect().await.expect("DataFusion collect failed");
-    batches_to_strings(&batches)
+    batches_to_strings_filtered(&batches)
 }

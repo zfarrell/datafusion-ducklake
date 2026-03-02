@@ -267,14 +267,27 @@ fn preprocess_test_file(content: &str, test_dir: &str) -> String {
                 let query_line = rewrite_query_directive_with_rowsort(trimmed);
                 output.push_str(&query_line);
                 output.push('\n');
-                let sql_line = lines.next().unwrap();
-                let rewritten_sql = rewrite_order_by_all(sql_line);
-                if in_ducklake_context {
-                    output.push_str(&rewrite_unqualified_tables(&rewritten_sql));
-                } else {
-                    output.push_str(&rewritten_sql);
+                // Consume and rewrite all SQL lines (ORDER BY ALL may be on any line)
+                while let Some(peek) = lines.peek() {
+                    let t = peek.trim();
+                    if t == "----"
+                        || t.is_empty()
+                        || t.starts_with("statement")
+                        || t.starts_with("query")
+                        || t.starts_with("halt")
+                        || t.starts_with("#")
+                    {
+                        break;
+                    }
+                    let sql_line = lines.next().unwrap();
+                    let rewritten_sql = rewrite_order_by_all(sql_line);
+                    if in_ducklake_context {
+                        output.push_str(&rewrite_unqualified_tables(&rewritten_sql));
+                    } else {
+                        output.push_str(&rewritten_sql);
+                    }
+                    output.push('\n');
                 }
-                output.push('\n');
                 continue;
             }
         }
@@ -734,8 +747,8 @@ const HYBRID_INCOMPATIBLE_PATTERNS: &[(&str, &str)] = &[
 fn is_hybrid_incompatible_error(error_upper: &str) -> bool {
     for (pattern, reason) in HYBRID_INCOMPATIBLE_PATTERNS {
         if error_upper.contains(pattern) {
-            eprintln!(
-                "  [hybrid-skip] Converting 'statement error' to 'statement ok': pattern '{}' ({})",
+            tracing::warn!(
+                "Converting 'statement error' to 'statement ok': pattern '{}' ({})",
                 pattern, reason
             );
             return true;

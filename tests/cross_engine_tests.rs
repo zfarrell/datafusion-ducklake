@@ -19,7 +19,7 @@ use std::sync::Arc;
 use arrow::array::*;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use common::test_utils::{arrow_value_to_string, batches_to_strings, duckdb_value_to_string};
+use common::test_utils::{assert_results_eq, df_query, duckdb_value_to_string};
 use datafusion::prelude::*;
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
@@ -195,52 +195,6 @@ impl DuckDbConn {
 
 // ==================== Query + comparison helpers ====================
 
-/// Run a SQL query via DataFusion and return results as string rows.
-async fn df_query(ctx: &SessionContext, sql: &str) -> Vec<Vec<String>> {
-    let df = ctx.sql(sql).await.expect("DataFusion SQL failed");
-    let batches = df.collect().await.expect("DataFusion collect failed");
-    batches_to_strings(&batches)
-}
-
-/// Normalize a string value for comparison (handle float precision differences).
-fn normalize_value(s: &str) -> String {
-    if s == "NULL" {
-        return s.to_string();
-    }
-    if let Ok(f) = s.parse::<f64>() {
-        return format!("{:.6}", f);
-    }
-    s.to_string()
-}
-
-/// Assert two result sets are equal (after normalizing floats).
-fn assert_query_eq(scenario: &str, expected: &[Vec<String>], actual: &[Vec<String>]) {
-    assert_eq!(
-        expected.len(),
-        actual.len(),
-        "[{scenario}] Row count mismatch: expected {} rows, got {}.\n  Expected: {expected:?}\n  Actual:   {actual:?}",
-        expected.len(),
-        actual.len()
-    );
-    for (i, (exp_row, act_row)) in expected.iter().zip(actual.iter()).enumerate() {
-        assert_eq!(
-            exp_row.len(),
-            act_row.len(),
-            "[{scenario}] Column count mismatch at row {i}: expected {} cols, got {}.\n  Expected row: {exp_row:?}\n  Actual row:   {act_row:?}",
-            exp_row.len(),
-            act_row.len()
-        );
-        for (j, (exp_val, act_val)) in exp_row.iter().zip(act_row.iter()).enumerate() {
-            let exp_norm = normalize_value(exp_val);
-            let act_norm = normalize_value(act_val);
-            assert_eq!(
-                exp_norm, act_norm,
-                "[{scenario}] Mismatch at row {i}, col {j}: expected '{exp_val}', got '{act_val}'"
-            );
-        }
-    }
-}
-
 // ==================== Test Pattern 1: df_write_df_read ====================
 // DataFusion writes data via DuckLakeTableWriter → DataFusion reads back
 
@@ -296,7 +250,7 @@ async fn cross_engine_df_write_df_read() {
         vec!["3".into(), "Charlie".into(), "30.5".into()],
     ];
 
-    assert_query_eq("df_write_df_read", &expected, &actual);
+    assert_results_eq("df_write_df_read", &expected, &actual);
 }
 
 // ==================== Test Pattern 2: df_write_duckdb_read ====================
@@ -402,7 +356,7 @@ async fn cross_engine_duckdb_write_df_read() {
         vec!["3".into(), "Doohickey".into(), "9.99".into()],
     ];
 
-    assert_query_eq("duckdb_write_df_read", &expected, &actual);
+    assert_results_eq("duckdb_write_df_read", &expected, &actual);
 }
 
 // ==================== Validation: bidirectional roundtrip ====================
@@ -486,7 +440,7 @@ async fn cross_engine_bidirectional_roundtrip() {
         vec!["3".into(), "Charlie".into(), "300".into()],
     ];
 
-    assert_query_eq("bidirectional_roundtrip", &expected, &actual);
+    assert_results_eq("bidirectional_roundtrip", &expected, &actual);
 }
 
 // ==================== Validation: query result comparison ====================
@@ -526,7 +480,7 @@ async fn cross_engine_assert_query_eq_both_engines() {
     .await;
 
     // Compare
-    assert_query_eq("both_engines_full_comparison", &duckdb_results, &df_results);
+    assert_results_eq("both_engines_full_comparison", &duckdb_results, &df_results);
 }
 
 // ==================== Validation: NULL handling roundtrip ====================
@@ -610,5 +564,5 @@ async fn cross_engine_count_query() {
     let ctx = open_in_datafusion_duckdb(&catalog_path);
     let df_count = df_query(&ctx, "SELECT COUNT(*) FROM ducklake.main.nums").await;
 
-    assert_query_eq("count_query", &duckdb_count, &df_count);
+    assert_results_eq("count_query", &duckdb_count, &df_count);
 }

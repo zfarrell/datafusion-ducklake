@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use arrow::array::*;
 use arrow::datatypes::{DataType, Field, Schema};
-use common::test_utils::{arrow_value_to_string, batches_to_strings, duckdb_value_to_string};
+use common::test_utils::{arrow_value_to_string, batches_to_strings_filtered, duckdb_value_to_string};
 use datafusion::prelude::*;
 use tempfile::TempDir;
 
@@ -114,7 +114,7 @@ async fn test_duckdb_partitioned_table_df_read_all() {
         .await
         .unwrap();
     let batches = df.collect().await.unwrap();
-    let mut rows = batches_to_strings(&batches);
+    let mut rows = batches_to_strings_filtered(&batches);
     rows.sort();
 
     assert_eq!(rows.len(), 4);
@@ -144,7 +144,7 @@ async fn test_duckdb_partitioned_table_df_read_with_filter() {
         .await
         .unwrap();
     let batches = df.collect().await.unwrap();
-    let rows = batches_to_strings(&batches);
+    let rows = batches_to_strings_filtered(&batches);
 
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0], vec!["1", "10"]);
@@ -175,7 +175,7 @@ async fn test_duckdb_partition_pre_and_post_data() {
         .await
         .unwrap();
     let batches = df.collect().await.unwrap();
-    let mut rows = batches_to_strings(&batches);
+    let mut rows = batches_to_strings_filtered(&batches);
     rows.sort();
 
     assert_eq!(rows.len(), 4);
@@ -209,7 +209,7 @@ async fn test_duckdb_multi_column_partition() {
         .await
         .unwrap();
     let batches = df.collect().await.unwrap();
-    let mut rows = batches_to_strings(&batches);
+    let mut rows = batches_to_strings_filtered(&batches);
     rows.sort();
 
     assert_eq!(rows.len(), 3);
@@ -223,7 +223,7 @@ async fn test_duckdb_multi_column_partition() {
         .await
         .unwrap();
     let batches = df.collect().await.unwrap();
-    let rows = batches_to_strings(&batches);
+    let rows = batches_to_strings_filtered(&batches);
 
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0], vec!["1", "10"]);
@@ -252,7 +252,7 @@ async fn test_duckdb_month_partition_transform() {
         .await
         .unwrap();
     let batches = df.collect().await.unwrap();
-    let mut rows = batches_to_strings(&batches);
+    let mut rows = batches_to_strings_filtered(&batches);
     rows.sort();
 
     assert_eq!(rows.len(), 3);
@@ -283,7 +283,7 @@ async fn test_duckdb_partitioned_count() {
         .await
         .unwrap();
     let batches = df.collect().await.unwrap();
-    let rows = batches_to_strings(&batches);
+    let rows = batches_to_strings_filtered(&batches);
     assert_eq!(rows[0], vec!["5"]);
 }
 
@@ -303,6 +303,6 @@ async fn test_duckdb_empty_partitioned_table() {
     let ctx = open_in_datafusion_duckdb(&catalog_path);
     let df = ctx.sql("SELECT * FROM ducklake.main.events").await.unwrap();
     let batches = df.collect().await.unwrap();
-    let rows = batches_to_strings(&batches);
+    let rows = batches_to_strings_filtered(&batches);
     assert_eq!(rows.len(), 0);
 }

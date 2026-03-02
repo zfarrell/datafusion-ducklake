@@ -26,49 +26,14 @@ mod common;
 
 use std::sync::Arc;
 
-use arrow::array::{Array, Int32Array, Int64Array};
+use arrow::array::{Array, Int64Array};
 use datafusion::common::DataFusionError;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::prelude::*;
 use datafusion_ducklake::{DuckLakeCatalog, DuckdbMetadataProvider};
 use tempfile::TempDir;
 
-/// Test helper to extract integer values from a RecordBatch column
-/// Supports both Int32 and Int64
-fn get_int_column(batch: &arrow::record_batch::RecordBatch, col_idx: usize) -> Vec<i32> {
-    let column = batch.column(col_idx);
-
-    // Try Int32 first
-    if let Some(array) = column.as_any().downcast_ref::<Int32Array>() {
-        return (0..array.len())
-            .filter_map(|i| {
-                if array.is_null(i) {
-                    None
-                } else {
-                    Some(array.value(i))
-                }
-            })
-            .collect();
-    }
-
-    // Try Int64
-    if let Some(array) = column.as_any().downcast_ref::<Int64Array>() {
-        return (0..array.len())
-            .filter_map(|i| {
-                if array.is_null(i) {
-                    None
-                } else {
-                    Some(array.value(i) as i32)
-                }
-            })
-            .collect();
-    }
-
-    panic!(
-        "Column should be Int32Array or Int64Array, got {:?}",
-        column.data_type()
-    );
-}
+use common::test_utils::get_int_column;
 
 /// Test concurrent queries on the same table
 ///

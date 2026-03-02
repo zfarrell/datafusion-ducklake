@@ -267,8 +267,7 @@ async fn test_insert_into_read_only_fails() {
                     );
                 },
                 Ok(_) => {
-                    // If insert_into is not implemented, it might just return empty
-                    // This is acceptable behavior during development
+                    panic!("Expected error for read-only insert, but it succeeded");
                 },
             }
         },

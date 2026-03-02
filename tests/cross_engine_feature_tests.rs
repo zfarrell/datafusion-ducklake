@@ -14,7 +14,7 @@ use std::sync::Arc;
 use arrow::array::*;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use common::test_utils::{arrow_value_to_string, duckdb_value_to_string};
+use common::test_utils::{batches_to_strings, df_query, duckdb_value_to_string};
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::*;
 use object_store::local::LocalFileSystem;
@@ -154,29 +154,11 @@ impl DuckDbConn {
     }
 }
 
-async fn df_query(ctx: &SessionContext, sql: &str) -> Vec<Vec<String>> {
+/// Run a SQL query via DataFusion and return results including virtual columns.
+async fn df_query_all(ctx: &SessionContext, sql: &str) -> Vec<Vec<String>> {
     let df = ctx.sql(sql).await.expect("DataFusion SQL failed");
     let batches = df.collect().await.expect("DataFusion collect failed");
     batches_to_strings(&batches)
-}
-
-fn batches_to_strings(batches: &[RecordBatch]) -> Vec<Vec<String>> {
-    let mut rows = Vec::new();
-    for batch in batches {
-        for row_idx in 0..batch.num_rows() {
-            let mut row = Vec::new();
-            for col_idx in 0..batch.num_columns() {
-                let col = batch.column(col_idx);
-                if col.is_null(row_idx) {
-                    row.push("NULL".to_string());
-                } else {
-                    row.push(arrow_value_to_string(col, row_idx));
-                }
-            }
-            rows.push(row);
-        }
-    }
-    rows
 }
 
 // ==================== Virtual Columns Tests ====================
@@ -211,7 +193,7 @@ async fn cross_engine_virtual_col_filename_returns_paths() {
         .unwrap();
 
     let ctx = open_df_sqlite_readonly(&env.catalog_db_path).await;
-    let rows = df_query(&ctx, "SELECT filename FROM ducklake.main.people").await;
+    let rows = df_query_all(&ctx, "SELECT filename FROM ducklake.main.people").await;
 
     assert_eq!(rows.len(), 3, "Should have 3 rows");
     for row in &rows {
@@ -247,7 +229,7 @@ async fn cross_engine_virtual_col_row_numbers_sequential() {
         .unwrap();
 
     let ctx = open_df_sqlite_readonly(&env.catalog_db_path).await;
-    let rows = df_query(
+    let rows = df_query_all(
         &ctx,
         "SELECT file_row_number FROM ducklake.main.nums ORDER BY file_row_number",
     )
@@ -283,7 +265,7 @@ async fn cross_engine_duckdb_write_df_read_virtual_columns() {
     ctx.register_catalog("ducklake", Arc::new(catalog));
 
     // SELECT * should include virtual columns
-    let rows = df_query(&ctx, "SELECT * FROM ducklake.main.items ORDER BY id").await;
+    let rows = df_query_all(&ctx, "SELECT * FROM ducklake.main.items ORDER BY id").await;
     assert_eq!(rows.len(), 3);
     // Schema should have id, name, filename, file_row_number, rowid, snapshot_id, file_index (7 columns)
     assert_eq!(rows[0].len(), 7, "SELECT * should include virtual columns");
@@ -351,7 +333,7 @@ async fn cross_engine_virtual_cols_with_delete() {
 
     // Re-read: virtual columns should still work after delete
     let read_ctx = open_df_sqlite_readonly(&env.catalog_db_path).await;
-    let rows = df_query(
+    let rows = df_query_all(
         &read_ctx,
         "SELECT id, filename, file_row_number FROM ducklake.main.del_vc ORDER BY id",
     )
@@ -407,7 +389,7 @@ async fn cross_engine_virtual_cols_with_update() {
 
     // Re-read with virtual columns
     let read_ctx = open_df_sqlite_readonly(&env.catalog_db_path).await;
-    let rows = df_query(
+    let rows = df_query_all(
         &read_ctx,
         "SELECT id, name, filename FROM ducklake.main.upd_vc ORDER BY id",
     )

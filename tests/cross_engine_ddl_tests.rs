@@ -22,7 +22,7 @@ use std::sync::Arc;
 use arrow::array::*;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use common::test_utils::{arrow_value_to_string, duckdb_value_to_string};
+use common::test_utils::{batches_to_strings_filtered, df_query, duckdb_value_to_string};
 use datafusion::prelude::*;
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
@@ -242,39 +242,15 @@ impl DuckDbConn {
 
 // ==================== Query helpers ====================
 
-async fn df_query(ctx: &SessionContext, sql: &str) -> Vec<Vec<String>> {
-    let df = ctx.sql(sql).await.expect("DataFusion SQL failed");
-    let batches = df.collect().await.expect("DataFusion collect failed");
-    batches_to_strings(&batches)
-}
-
 async fn df_query_result(
     ctx: &SessionContext,
     sql: &str,
 ) -> datafusion::error::Result<Vec<Vec<String>>> {
     let df = ctx.sql(sql).await?;
     let batches = df.collect().await?;
-    Ok(batches_to_strings(&batches))
+    Ok(batches_to_strings_filtered(&batches))
 }
 
-fn batches_to_strings(batches: &[RecordBatch]) -> Vec<Vec<String>> {
-    let mut rows = Vec::new();
-    for batch in batches {
-        for row_idx in 0..batch.num_rows() {
-            let mut row = Vec::new();
-            for col_idx in 0..batch.num_columns() {
-                let col = batch.column(col_idx);
-                if col.is_null(row_idx) {
-                    row.push("NULL".to_string());
-                } else {
-                    row.push(arrow_value_to_string(col, row_idx));
-                }
-            }
-            rows.push(row);
-        }
-    }
-    rows
-}
 
 fn make_test_batch() -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
