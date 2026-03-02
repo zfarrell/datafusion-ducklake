@@ -147,6 +147,8 @@ pub const SQL_GET_DATA_FILES_ADDED_BETWEEN_SNAPSHOTS: &str = "
       AND data.begin_snapshot <= ?
     ORDER BY data.begin_snapshot";
 
+// Note: This query uses LEFT JOIN LATERAL which is supported by DuckDB and PostgreSQL
+// but not SQLite. SQLite-based providers use their own query implementations.
 pub const SQL_GET_DELETE_FILES_ADDED_BETWEEN_SNAPSHOTS: &str = "
 WITH params AS (
     SELECT

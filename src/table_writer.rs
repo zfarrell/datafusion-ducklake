@@ -261,7 +261,17 @@ impl DuckLakeTableWriter {
             ));
         }
 
-        let total_new_rows: i64 = batches.iter().map(|b| b.num_rows() as i64).sum();
+        let total_new_rows: i64 = batches
+            .iter()
+            .map(|b| {
+                i64::try_from(b.num_rows()).map_err(|_| {
+                    crate::error::DuckLakeError::Internal(format!(
+                        "Batch row count {} exceeds i64 range",
+                        b.num_rows()
+                    ))
+                })
+            })
+            .try_fold(0i64, |acc, r| r.and_then(|n| Ok(acc.saturating_add(n))))?;
 
         // Only try inlining for Append mode
         if mode == WriteMode::Append {
@@ -460,7 +470,12 @@ impl DuckLakeTableWriter {
             let batch_with_ids =
                 RecordBatch::try_new(schema_with_ids.clone(), batch.columns().to_vec())?;
             writer.write(&batch_with_ids)?;
-            row_count += batch.num_rows() as i64;
+            row_count += i64::try_from(batch.num_rows()).map_err(|_| {
+                crate::error::DuckLakeError::Internal(format!(
+                    "Batch row count {} exceeds i64 range",
+                    batch.num_rows()
+                ))
+            })?;
         }
 
         writer.flush()?;
@@ -653,7 +668,6 @@ pub struct TableWriteSession {
     snapshot_id: i64,
     schema_id: i64,
     table_id: i64,
-    #[allow(dead_code)]
     column_ids: Vec<i64>,
     schema_with_ids: SchemaRef,
     writer: Option<ArrowWriter<Vec<u8>>>,
@@ -1440,7 +1454,7 @@ impl TableFunctionImpl for DucklakeFlushInlinedDataFunction {
             vec![
                 Arc::new(arrow::array::Int64Array::from(vec![result.records_written])),
                 Arc::new(arrow::array::Int64Array::from(vec![
-                    result.files_written as i64,
+                    i64::try_from(result.files_written).unwrap_or(i64::MAX),
                 ])),
             ],
         )

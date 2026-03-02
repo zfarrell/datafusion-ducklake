@@ -1004,6 +1004,15 @@ impl MetadataWriter for PostgresMetadataWriter {
             .execute(&self.pool)
             .await?;
 
+            // DuckDB sets `encrypted=false` in metadata; match for interop (F-047)
+            sqlx::query(
+                "INSERT INTO ducklake_metadata (key, value)
+                 SELECT 'encrypted', 'false'
+                 WHERE NOT EXISTS (SELECT 1 FROM ducklake_metadata WHERE key = 'encrypted' AND scope IS NULL)",
+            )
+            .execute(&self.pool)
+            .await?;
+
             // Insert initial snapshot 0 (DuckDB expects this as the "empty catalog" snapshot)
             sqlx::query(
                 "INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time, schema_version, next_catalog_id, next_file_id)

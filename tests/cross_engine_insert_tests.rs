@@ -13,12 +13,17 @@
 
 #![cfg(all(feature = "write-sqlite", feature = "metadata-duckdb", feature = "metadata-sqlite"))]
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::array::*;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use common::test_utils::{
+    arrow_value_to_string, batches_to_strings, duckdb_value_to_string, normalize_value,
+};
 use datafusion::prelude::*;
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
@@ -157,122 +162,10 @@ impl DuckDbConn {
     }
 }
 
-fn duckdb_value_to_string(v: &duckdb::types::Value) -> String {
-    match v {
-        duckdb::types::Value::Null => "NULL".to_string(),
-        duckdb::types::Value::Boolean(b) => b.to_string(),
-        duckdb::types::Value::TinyInt(i) => i.to_string(),
-        duckdb::types::Value::SmallInt(i) => i.to_string(),
-        duckdb::types::Value::Int(i) => i.to_string(),
-        duckdb::types::Value::BigInt(i) => i.to_string(),
-        duckdb::types::Value::Float(f) => format!("{f}"),
-        duckdb::types::Value::Double(f) => format!("{f}"),
-        duckdb::types::Value::Text(s) => s.clone(),
-        duckdb::types::Value::HugeInt(i) => i.to_string(),
-        duckdb::types::Value::Date32(days) => {
-            let date = chrono::NaiveDate::from_num_days_from_ce_opt(days + 719_163).unwrap();
-            date.format("%Y-%m-%d").to_string()
-        },
-        duckdb::types::Value::Timestamp(unit, val) => {
-            let (secs, nsecs) = match unit {
-                duckdb::types::TimeUnit::Second => (*val, 0u32),
-                duckdb::types::TimeUnit::Millisecond => {
-                    (val / 1000, ((val % 1000) * 1_000_000) as u32)
-                },
-                duckdb::types::TimeUnit::Microsecond => {
-                    (val / 1_000_000, ((val % 1_000_000) * 1_000) as u32)
-                },
-                duckdb::types::TimeUnit::Nanosecond => {
-                    (val / 1_000_000_000, (val % 1_000_000_000) as u32)
-                },
-            };
-            let dt = chrono::DateTime::from_timestamp(secs, nsecs).unwrap();
-            dt.format("%Y-%m-%d %H:%M:%S").to_string()
-        },
-        _ => {
-            let s = format!("{v:?}");
-            if s.starts_with("Decimal(") && s.ends_with(')') {
-                return s[8..s.len() - 1].to_string();
-            }
-            s
-        },
-    }
-}
-
-fn batches_to_strings(batches: &[RecordBatch]) -> Vec<Vec<String>> {
-    let mut rows = Vec::new();
-    for batch in batches {
-        let schema = batch.schema();
-        let col_indices: Vec<usize> = (0..batch.num_columns())
-            .filter(|&i| {
-                let name = schema.field(i).name();
-                name != "filename" && name != "file_row_number"
-            })
-            .collect();
-        for row_idx in 0..batch.num_rows() {
-            let mut row = Vec::new();
-            for &col_idx in &col_indices {
-                let col = batch.column(col_idx);
-                if col.is_null(row_idx) {
-                    row.push("NULL".to_string());
-                } else {
-                    row.push(arrow_value_to_string(col, row_idx));
-                }
-            }
-            rows.push(row);
-        }
-    }
-    rows
-}
-
-fn arrow_value_to_string(array: &dyn Array, idx: usize) -> String {
-    match array.data_type() {
-        DataType::Boolean => {
-            let a = array.as_any().downcast_ref::<BooleanArray>().unwrap();
-            a.value(idx).to_string()
-        },
-        DataType::Int32 => {
-            let a = array.as_any().downcast_ref::<Int32Array>().unwrap();
-            a.value(idx).to_string()
-        },
-        DataType::Int64 => {
-            let a = array.as_any().downcast_ref::<Int64Array>().unwrap();
-            a.value(idx).to_string()
-        },
-        DataType::UInt64 => {
-            let a = array.as_any().downcast_ref::<UInt64Array>().unwrap();
-            a.value(idx).to_string()
-        },
-        DataType::Float64 => {
-            let a = array.as_any().downcast_ref::<Float64Array>().unwrap();
-            format!("{}", a.value(idx))
-        },
-        DataType::Utf8 => {
-            let a = array.as_any().downcast_ref::<StringArray>().unwrap();
-            a.value(idx).to_string()
-        },
-        DataType::LargeUtf8 => {
-            let a = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
-            a.value(idx).to_string()
-        },
-        other => format!("<unsupported:{other:?}>"),
-    }
-}
-
 async fn df_query(ctx: &SessionContext, sql: &str) -> Vec<Vec<String>> {
     let df = ctx.sql(sql).await.expect("DataFusion SQL failed");
     let batches = df.collect().await.expect("DataFusion collect failed");
     batches_to_strings(&batches)
-}
-
-fn normalize_value(s: &str) -> String {
-    if s == "NULL" {
-        return s.to_string();
-    }
-    if let Ok(f) = s.parse::<f64>() {
-        return format!("{:.6}", f);
-    }
-    s.to_string()
 }
 
 fn assert_query_eq(scenario: &str, expected: &[Vec<String>], actual: &[Vec<String>]) {

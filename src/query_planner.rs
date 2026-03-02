@@ -93,7 +93,10 @@ fn downcast_ducklake_table(
         .downcast_ref::<DefaultTableSource>()
         .ok_or_else(|| {
             DataFusionError::Plan(
-                "DELETE/UPDATE: table source is not a DefaultTableSource".to_string(),
+                "DELETE/UPDATE: table source is not a DefaultTableSource. \
+                 This can happen when using custom table source wrappers. \
+                 Ensure the table is accessed directly through the DuckLake catalog."
+                    .to_string(),
             )
         })?;
 

@@ -166,23 +166,26 @@ impl DuckLakeSchema {
     fn rewrite_duckdb_view_sql(sql: &str) -> String {
         let mut result = String::with_capacity(sql.len());
         let lower = sql.to_lowercase();
-        let bytes = sql.as_bytes();
         let mut i = 0;
+        let chars: Vec<char> = sql.chars().collect();
+        let lower_chars: Vec<char> = lower.chars().collect();
 
-        while i < bytes.len() {
-            if lower[i..].starts_with("count_star()") {
+        while i < chars.len() {
+            // Check for "count_star()" case-insensitively
+            let remaining: String = lower_chars[i..].iter().collect();
+            if remaining.starts_with("count_star()") {
                 // Check word boundary: char before must not be alphanumeric or '_'
                 let is_word_start = i == 0 || {
-                    let prev = bytes[i - 1];
-                    !prev.is_ascii_alphanumeric() && prev != b'_'
+                    let prev = chars[i - 1];
+                    !prev.is_alphanumeric() && prev != '_'
                 };
                 if is_word_start {
                     result.push_str("COUNT(*)");
-                    i += 12;
+                    i += "count_star()".len();
                     continue;
                 }
             }
-            result.push(bytes[i] as char);
+            result.push(chars[i]);
             i += 1;
         }
         result

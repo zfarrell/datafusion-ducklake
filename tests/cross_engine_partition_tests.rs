@@ -5,11 +5,14 @@
 
 #![cfg(all(feature = "write-sqlite", feature = "metadata-duckdb", feature = "metadata-sqlite"))]
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::array::*;
 use arrow::datatypes::{DataType, Field, Schema};
+use common::test_utils::{arrow_value_to_string, batches_to_strings, duckdb_value_to_string};
 use datafusion::prelude::*;
 use tempfile::TempDir;
 
@@ -74,75 +77,6 @@ impl DuckDbConn {
             results.push(vals);
         }
         results
-    }
-}
-
-fn duckdb_value_to_string(v: &duckdb::types::Value) -> String {
-    match v {
-        duckdb::types::Value::Null => "NULL".to_string(),
-        duckdb::types::Value::Boolean(b) => b.to_string(),
-        duckdb::types::Value::TinyInt(i) => i.to_string(),
-        duckdb::types::Value::SmallInt(i) => i.to_string(),
-        duckdb::types::Value::Int(i) => i.to_string(),
-        duckdb::types::Value::BigInt(i) => i.to_string(),
-        duckdb::types::Value::Float(f) => format!("{f}"),
-        duckdb::types::Value::Double(f) => format!("{f}"),
-        duckdb::types::Value::Text(s) => s.clone(),
-        _ => format!("{v:?}"),
-    }
-}
-
-fn batches_to_strings(batches: &[arrow::record_batch::RecordBatch]) -> Vec<Vec<String>> {
-    let mut rows = Vec::new();
-    for batch in batches {
-        let schema = batch.schema();
-        let col_indices: Vec<usize> = (0..batch.num_columns())
-            .filter(|&i| {
-                let name = schema.field(i).name();
-                name != "filename" && name != "file_row_number"
-            })
-            .collect();
-        for row_idx in 0..batch.num_rows() {
-            let mut row = Vec::new();
-            for &col_idx in &col_indices {
-                let col = batch.column(col_idx);
-                if col.is_null(row_idx) {
-                    row.push("NULL".to_string());
-                } else {
-                    row.push(arrow_value_to_string(col, row_idx));
-                }
-            }
-            rows.push(row);
-        }
-    }
-    rows
-}
-
-fn arrow_value_to_string(array: &dyn Array, idx: usize) -> String {
-    match array.data_type() {
-        DataType::Int32 => {
-            let a = array.as_any().downcast_ref::<Int32Array>().unwrap();
-            a.value(idx).to_string()
-        },
-        DataType::Int64 => {
-            let a = array.as_any().downcast_ref::<Int64Array>().unwrap();
-            a.value(idx).to_string()
-        },
-        DataType::Float64 => {
-            let a = array.as_any().downcast_ref::<Float64Array>().unwrap();
-            format!("{}", a.value(idx))
-        },
-        DataType::Utf8 => {
-            let a = array.as_any().downcast_ref::<StringArray>().unwrap();
-            a.value(idx).to_string()
-        },
-        DataType::Date32 => {
-            let a = array.as_any().downcast_ref::<Date32Array>().unwrap();
-            let days = a.value(idx);
-            let date = chrono::NaiveDate::from_num_days_from_ce_opt(days + 719_163).unwrap();
-            date.format("%Y-%m-%d").to_string()
-        },
-        _ => format!("{:?}", array),
     }
 }
 

@@ -258,19 +258,67 @@ pub fn resolve_path(base_path: &str, path: &str, is_relative: bool) -> Result<St
 /// # use datafusion_ducklake::path_resolver::join_paths;
 /// assert_eq!(join_paths("/data/", "table/file.parquet").unwrap(), "/data/table/file.parquet");
 /// assert_eq!(join_paths("/data", "table/file.parquet").unwrap(), "/data/table/file.parquet");
-/// assert_eq!(join_paths("/data/", "/absolute").unwrap(), "/data/absolute"); // strips leading slash to avoid double slash
+/// assert_eq!(join_paths("/data/", "/absolute").unwrap(), "/data/absolute"); // strips leading slash
+/// assert_eq!(join_paths("/data//", "file.parquet").unwrap(), "/data/file.parquet"); // normalizes double separators
 /// ```
 pub fn join_paths(base_path: &str, relative_path: &str) -> Result<String> {
+    validate_path(base_path)?;
     validate_path(relative_path)?;
 
-    if base_path.ends_with('/') || base_path.ends_with('\\') {
+    let joined = if base_path.ends_with('/') || base_path.ends_with('\\') {
         let trimmed = relative_path
             .trim_start_matches('/')
             .trim_start_matches('\\');
-        Ok(format!("{}{}", base_path, trimmed))
+        format!("{}{}", base_path, trimmed)
     } else {
-        Ok(format!("{}/{}", base_path, relative_path))
+        format!("{}/{}", base_path, relative_path)
+    };
+
+    // Normalize double separators (e.g., "s3://bucket//path" -> "s3://bucket/path")
+    // but preserve the double slash in scheme prefixes like "s3://" or "file:///"
+    Ok(normalize_path_separators(&joined))
+}
+
+/// Normalize double forward slashes while preserving URL scheme prefixes.
+///
+/// Collapses runs of `/` to a single `/` except after `:` (i.e., `://`).
+/// Backslashes are preserved as-is (Windows paths).
+fn normalize_path_separators(path: &str) -> String {
+    let mut result = String::with_capacity(path.len());
+    let mut chars = path.chars().peekable();
+    let mut prev_was_slash = false;
+    let mut after_scheme = false;
+
+    while let Some(c) = chars.next() {
+        if c == ':' && chars.peek() == Some(&'/') {
+            // Preserve scheme separator (e.g., "s3://", "file:///")
+            result.push(c);
+            after_scheme = true;
+            prev_was_slash = false;
+            continue;
+        }
+        if after_scheme && c == '/' {
+            // Pass through all slashes immediately after scheme colon
+            result.push(c);
+            if chars.peek() != Some(&'/') {
+                after_scheme = false;
+            }
+            prev_was_slash = true;
+            continue;
+        }
+        after_scheme = false;
+
+        if c == '/' {
+            if !prev_was_slash {
+                result.push('/');
+            }
+            prev_was_slash = true;
+        } else {
+            result.push(c);
+            prev_was_slash = false;
+        }
     }
+    result
 }
 
 /// Path resolver for hierarchical DuckLake paths
@@ -908,8 +956,9 @@ mod tests {
 
     #[test]
     fn test_path_with_consecutive_slashes() {
+        // Double slashes in paths should be normalized to single slashes
         let resolved = resolve_path("/data/", "schema//table/", true).unwrap();
-        assert_eq!(resolved, "/data/schema//table/");
+        assert_eq!(resolved, "/data/schema/table/");
     }
 
     #[test]

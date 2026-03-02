@@ -24,8 +24,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 #[derive(Debug, Clone)]
 pub struct DuckdbMetadataProvider {
     conn: Arc<Mutex<Connection>>,
-    /// Path to the catalog database, retained for logging/debugging
-    #[allow(dead_code)]
+    /// Path to the catalog database, used in error messages and tracing
     catalog_path: String,
 }
 
@@ -44,7 +43,10 @@ impl DuckdbMetadataProvider {
     /// Get a reference to the shared connection
     fn connection(&self) -> crate::Result<MutexGuard<'_, Connection>> {
         self.conn.lock().map_err(|e| {
-            DuckLakeError::Internal(format!("DuckDB connection mutex poisoned: {}", e))
+            DuckLakeError::Internal(format!(
+                "DuckDB connection mutex poisoned for catalog '{}': {}",
+                self.catalog_path, e
+            ))
         })
     }
 
@@ -69,6 +71,41 @@ impl DuckdbMetadataProvider {
                 Err(DuckLakeError::DuckDb(msg))
             },
         }
+    }
+
+    /// Count inlined rows for a table at a given snapshot.
+    fn count_inlined_rows(
+        &self,
+        conn: &Connection,
+        table_id: i64,
+        snapshot_id: i64,
+    ) -> crate::Result<i64> {
+        // Look up the inlined data table name
+        let result = conn.query_row(
+            "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?",
+            [table_id],
+            |row| {
+                let table_name: String = row.get(0)?;
+                Ok(table_name)
+            },
+        );
+
+        let inlined_table_name = match result {
+            Ok(name) => name,
+            Err(duckdb::Error::QueryReturnedNoRows) => return Ok(0),
+            Err(e) => return Err(DuckLakeError::DuckDb(e)),
+        };
+
+        // Count active inlined rows at this snapshot
+        let count_sql = format!(
+            "SELECT COUNT(*) FROM {} WHERE ? >= begin_snapshot AND (? < end_snapshot OR end_snapshot IS NULL)",
+            quote_identifier(&inlined_table_name)
+        );
+        let count: i64 = conn.query_row(&count_sql, params![snapshot_id, snapshot_id], |row| {
+            row.get(0)
+        })?;
+
+        Ok(count)
     }
 }
 
@@ -441,12 +478,19 @@ impl MetadataProvider for DuckdbMetadataProvider {
 
     fn get_table_row_count(&self, table_id: i64, snapshot_id: i64) -> crate::Result<Option<i64>> {
         let conn = self.connection()?;
-        let row_count: Option<i64> = conn.query_row(
+        let file_count: Option<i64> = conn.query_row(
             SQL_GET_TABLE_ROW_COUNT,
             params![table_id, snapshot_id, snapshot_id, table_id, snapshot_id, snapshot_id],
             |row| row.get(0),
         )?;
-        Ok(row_count)
+
+        // Also count inlined data rows (matching SQLite/Postgres/MySQL providers)
+        let inlined_count = self.count_inlined_rows(&conn, table_id, snapshot_id)?;
+
+        match (file_count, inlined_count) {
+            (Some(fc), ic) => Ok(Some(fc + ic)),
+            (None, _) => Ok(None),
+        }
     }
 
     fn get_file_column_stats(

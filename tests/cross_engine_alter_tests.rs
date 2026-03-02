@@ -11,6 +11,8 @@
 
 #![cfg(all(feature = "write-sqlite", feature = "metadata-duckdb", feature = "metadata-sqlite"))]
 
+mod common;
+
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -207,21 +209,7 @@ impl DuckDbConn {
     }
 }
 
-fn duckdb_value_to_string(v: &duckdb::types::Value) -> String {
-    match v {
-        duckdb::types::Value::Null => "NULL".to_string(),
-        duckdb::types::Value::Boolean(b) => b.to_string(),
-        duckdb::types::Value::TinyInt(i) => i.to_string(),
-        duckdb::types::Value::SmallInt(i) => i.to_string(),
-        duckdb::types::Value::Int(i) => i.to_string(),
-        duckdb::types::Value::BigInt(i) => i.to_string(),
-        duckdb::types::Value::Float(f) => format!("{f}"),
-        duckdb::types::Value::Double(f) => format!("{f}"),
-        duckdb::types::Value::Text(s) => s.clone(),
-        duckdb::types::Value::HugeInt(i) => i.to_string(),
-        _ => format!("{v:?}"),
-    }
-}
+use common::test_utils::duckdb_value_to_string;
 
 async fn df_query(ctx: &SessionContext, sql: &str) -> Vec<Vec<String>> {
     let df = ctx.sql(sql).await.expect("DataFusion SQL failed");

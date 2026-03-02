@@ -52,10 +52,22 @@ pub fn ducklake_to_arrow_type(ducklake_type: &str) -> Result<DataType> {
 
         // Temporal types
         "time" => Ok(DataType::Time64(TimeUnit::Microsecond)),
+        "time_s" => Ok(DataType::Time32(TimeUnit::Second)),
+        "time_ms" => Ok(DataType::Time32(TimeUnit::Millisecond)),
+        "time_ns" => Ok(DataType::Time64(TimeUnit::Nanosecond)),
         "date" => Ok(DataType::Date32),
         "timestamp" => Ok(DataType::Timestamp(TimeUnit::Microsecond, None)),
         "timestamptz" | "timestamp with time zone" => Ok(DataType::Timestamp(
             TimeUnit::Microsecond,
+            Some("UTC".into()),
+        )),
+        "timestamptz_s" => Ok(DataType::Timestamp(TimeUnit::Second, Some("UTC".into()))),
+        "timestamptz_ms" => Ok(DataType::Timestamp(
+            TimeUnit::Millisecond,
+            Some("UTC".into()),
+        )),
+        "timestamptz_ns" => Ok(DataType::Timestamp(
+            TimeUnit::Nanosecond,
             Some("UTC".into()),
         )),
         "timestamp_s" => Ok(DataType::Timestamp(TimeUnit::Second, None)),
@@ -113,12 +125,25 @@ pub fn arrow_to_ducklake_type(arrow_type: &DataType) -> Result<String> {
 
         // Temporal types
         DataType::Date32 | DataType::Date64 => Ok("date".to_string()),
-        DataType::Time32(_) | DataType::Time64(_) => Ok("time".to_string()),
+        DataType::Time32(TimeUnit::Second) => Ok("time_s".to_string()),
+        DataType::Time32(TimeUnit::Millisecond) => Ok("time_ms".to_string()),
+        DataType::Time32(_) => Ok("time_s".to_string()),
+        DataType::Time64(TimeUnit::Microsecond) => Ok("time".to_string()),
+        DataType::Time64(TimeUnit::Nanosecond) => Ok("time_ns".to_string()),
+        DataType::Time64(_) => Ok("time".to_string()),
         DataType::Timestamp(TimeUnit::Second, None) => Ok("timestamp_s".to_string()),
         DataType::Timestamp(TimeUnit::Millisecond, None) => Ok("timestamp_ms".to_string()),
         DataType::Timestamp(TimeUnit::Microsecond, None) => Ok("timestamp".to_string()),
         DataType::Timestamp(TimeUnit::Nanosecond, None) => Ok("timestamp_ns".to_string()),
-        DataType::Timestamp(_, Some(_)) => Ok("timestamptz".to_string()),
+        DataType::Timestamp(unit, Some(_tz)) => {
+            let base = match unit {
+                TimeUnit::Second => "timestamptz_s",
+                TimeUnit::Millisecond => "timestamptz_ms",
+                TimeUnit::Microsecond => "timestamptz",
+                TimeUnit::Nanosecond => "timestamptz_ns",
+            };
+            Ok(base.to_string())
+        },
         DataType::Interval(_) => Ok("interval".to_string()),
 
         // String types
@@ -214,7 +239,11 @@ fn validate_decimal_precision_scale(precision: u8, scale: i8, type_str: &str) ->
 /// Returns `Ok(None)` if the type string is not a decimal type.
 /// Returns `Err` if it is a decimal type but has invalid precision/scale.
 fn parse_decimal(type_str: &str) -> Result<Option<DataType>> {
-    if !type_str.starts_with("decimal") && !type_str.starts_with("numeric") {
+    if !(type_str == "decimal"
+        || type_str.starts_with("decimal(")
+        || type_str == "numeric"
+        || type_str.starts_with("numeric("))
+    {
         return Ok(None);
     }
 
@@ -1069,6 +1098,18 @@ mod tests {
             "time"
         );
         assert_eq!(
+            arrow_to_ducklake_type(&DataType::Time64(TimeUnit::Nanosecond)).unwrap(),
+            "time_ns"
+        );
+        assert_eq!(
+            arrow_to_ducklake_type(&DataType::Time32(TimeUnit::Second)).unwrap(),
+            "time_s"
+        );
+        assert_eq!(
+            arrow_to_ducklake_type(&DataType::Time32(TimeUnit::Millisecond)).unwrap(),
+            "time_ms"
+        );
+        assert_eq!(
             arrow_to_ducklake_type(&DataType::Timestamp(TimeUnit::Microsecond, None)).unwrap(),
             "timestamp"
         );
@@ -1079,6 +1120,19 @@ mod tests {
             ))
             .unwrap(),
             "timestamptz"
+        );
+        assert_eq!(
+            arrow_to_ducklake_type(&DataType::Timestamp(TimeUnit::Second, Some("UTC".into())))
+                .unwrap(),
+            "timestamptz_s"
+        );
+        assert_eq!(
+            arrow_to_ducklake_type(&DataType::Timestamp(
+                TimeUnit::Nanosecond,
+                Some("UTC".into())
+            ))
+            .unwrap(),
+            "timestamptz_ns"
         );
     }
 
@@ -1119,6 +1173,13 @@ mod tests {
             DataType::Binary,
             DataType::Date32,
             DataType::Timestamp(TimeUnit::Microsecond, None),
+            DataType::Timestamp(TimeUnit::Second, None),
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            DataType::Time64(TimeUnit::Microsecond),
+            DataType::Time64(TimeUnit::Nanosecond),
+            DataType::Time32(TimeUnit::Second),
+            DataType::Time32(TimeUnit::Millisecond),
             DataType::Decimal128(10, 2),
         ];
 
@@ -1127,6 +1188,50 @@ mod tests {
             let back = ducklake_to_arrow_type(&ducklake).unwrap();
             assert_eq!(original, back, "Roundtrip failed for {:?}", original);
         }
+    }
+
+    #[test]
+    fn test_timestamptz_roundtrip() {
+        // Timestamptz roundtrip: timezone is normalized to UTC
+        let tz_types = vec![
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            DataType::Timestamp(TimeUnit::Second, Some("UTC".into())),
+            DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+        ];
+
+        for original in tz_types {
+            let ducklake = arrow_to_ducklake_type(&original).unwrap();
+            let back = ducklake_to_arrow_type(&ducklake).unwrap();
+            assert_eq!(
+                original, back,
+                "Timestamptz roundtrip failed for {:?}",
+                original
+            );
+        }
+    }
+
+    #[test]
+    fn test_decimal_prefix_match_strict() {
+        // F-053: "decimalx(10,2)" should NOT match as a decimal type
+        let result = ducklake_to_arrow_type("decimalx(10,2)");
+        assert!(result.is_err(), "decimalx should not be treated as decimal");
+
+        // But "decimal(10,2)" should still work
+        assert_eq!(
+            ducklake_to_arrow_type("decimal(10, 2)").unwrap(),
+            DataType::Decimal128(10, 2)
+        );
+
+        // And "numeric(10,2)" should work
+        assert_eq!(
+            ducklake_to_arrow_type("numeric(10, 2)").unwrap(),
+            DataType::Decimal128(10, 2)
+        );
+
+        // "numericx(10,2)" should not match
+        let result = ducklake_to_arrow_type("numericx(10,2)");
+        assert!(result.is_err(), "numericx should not be treated as numeric");
     }
 
     #[test]

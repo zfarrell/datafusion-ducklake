@@ -13,6 +13,8 @@
 
 #![cfg(all(feature = "write-sqlite", feature = "metadata-duckdb", feature = "metadata-sqlite"))]
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -101,6 +103,8 @@ async fn query_results(ctx: &SessionContext, sql: &str) -> Vec<Vec<String>> {
     batches_to_strings(&batches)
 }
 
+use common::test_utils::arrow_value_to_string;
+
 fn batches_to_strings(batches: &[RecordBatch]) -> Vec<Vec<String>> {
     let mut rows = Vec::new();
     for batch in batches {
@@ -118,32 +122,6 @@ fn batches_to_strings(batches: &[RecordBatch]) -> Vec<Vec<String>> {
         }
     }
     rows
-}
-
-fn arrow_value_to_string(array: &dyn arrow::array::Array, idx: usize) -> String {
-    match array.data_type() {
-        DataType::Int32 => {
-            let a = array.as_any().downcast_ref::<Int32Array>().unwrap();
-            a.value(idx).to_string()
-        },
-        DataType::Int64 => {
-            let a = array.as_any().downcast_ref::<Int64Array>().unwrap();
-            a.value(idx).to_string()
-        },
-        DataType::UInt64 => {
-            let a = array.as_any().downcast_ref::<UInt64Array>().unwrap();
-            a.value(idx).to_string()
-        },
-        DataType::Utf8 => {
-            let a = array.as_any().downcast_ref::<StringArray>().unwrap();
-            a.value(idx).to_string()
-        },
-        DataType::Float64 => {
-            let a = array.as_any().downcast_ref::<Float64Array>().unwrap();
-            format!("{}", a.value(idx))
-        },
-        other => format!("<unsupported:{other:?}>"),
-    }
 }
 
 /// Build the standard test schema: (id INT32, name VARCHAR, value INT32)
@@ -491,15 +469,7 @@ impl DuckDbConn {
     }
 }
 
-fn duckdb_value_to_string(v: &duckdb::types::Value) -> String {
-    match v {
-        duckdb::types::Value::Null => "NULL".to_string(),
-        duckdb::types::Value::Int(i) => i.to_string(),
-        duckdb::types::Value::BigInt(i) => i.to_string(),
-        duckdb::types::Value::Text(s) => s.clone(),
-        _ => format!("{v:?}"),
-    }
-}
+use common::test_utils::duckdb_value_to_string;
 
 /// Cross-engine test: DuckDB MERGE → DataFusion reads.
 ///

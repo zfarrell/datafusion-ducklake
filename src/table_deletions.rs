@@ -11,6 +11,7 @@
 
 use std::any::Any;
 use std::collections::HashSet;
+use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -360,7 +361,7 @@ impl TableProvider for TableDeletionsTable {
 
         // Combine with UnionExec if multiple
         if execs.len() == 1 {
-            Ok(execs.into_iter().next().unwrap())
+            Ok(execs.into_iter().next().expect("checked len == 1 above"))
         } else {
             UnionExec::try_new(execs)
         }
@@ -466,7 +467,7 @@ impl ExecutionPlan for DeletedRowsExec {
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        let mut children = Vec::new();
+        let mut children = Vec::with_capacity(3);
         if let Some(ref curr) = self.current_delete_scan {
             children.push(curr);
         }
@@ -590,7 +591,12 @@ enum DeltaPositions {
 }
 
 /// Stream that reads deleted rows from a data file
+///
+/// Uses a state machine to read delete files, compute delta positions,
+/// then filter data file rows to only include deleted rows.
 struct DeletedRowsStream {
+    // Note: manual Debug is not derived because SendableRecordBatchStream
+    // does not implement Debug. Use the struct name for debug output.
     /// Current delete file stream (None for full file delete)
     current_delete_stream: Option<SendableRecordBatchStream>,
     /// Previous delete file stream (if exists)
@@ -617,6 +623,18 @@ struct DeletedRowsStream {
     row_offset: i64,
     /// State machine
     state: StreamState,
+}
+
+impl fmt::Debug for DeletedRowsStream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeletedRowsStream")
+            .field("snapshot_id", &self.snapshot_id)
+            .field("include_snapshot_id", &self.include_snapshot_id)
+            .field("include_change_type", &self.include_change_type)
+            .field("row_offset", &self.row_offset)
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
 }
 
 impl DeletedRowsStream {

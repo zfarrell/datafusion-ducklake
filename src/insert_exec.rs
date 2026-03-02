@@ -524,6 +524,135 @@ fn route_batches_to_partitions(
     batches: &[RecordBatch],
     partition_columns: &[WritePartitionColumn],
 ) -> crate::Result<BTreeMap<String, (Vec<Option<String>>, Vec<(usize, usize)>)>> {
+    // For identity-only partitions, use optimized path that pre-computes
+    // partition values per column per batch (avoids per-row type dispatch).
+    let all_identity = partition_columns.iter().all(|pc| {
+        pc.transform.as_deref().map_or(true, |t| {
+            matches!(t.to_lowercase().as_str(), "identity" | "")
+        })
+    });
+
+    if all_identity {
+        route_batches_identity(batches, partition_columns)
+    } else {
+        route_batches_generic(batches, partition_columns)
+    }
+}
+
+/// Optimized partition routing for identity transforms.
+///
+/// Pre-computes string values for each partition column per batch (single type
+/// dispatch per column), then groups rows by partition key. This avoids
+/// O(rows × columns) type dispatches in the inner loop.
+fn route_batches_identity(
+    batches: &[RecordBatch],
+    partition_columns: &[WritePartitionColumn],
+) -> crate::Result<BTreeMap<String, (Vec<Option<String>>, Vec<(usize, usize)>)>> {
+    let mut partitions: BTreeMap<String, (Vec<Option<String>>, Vec<(usize, usize)>)> =
+        BTreeMap::new();
+
+    for (batch_idx, batch) in batches.iter().enumerate() {
+        // Pre-compute all partition values per column (one type dispatch per column per batch)
+        let col_values: Vec<Vec<Option<String>>> = partition_columns
+            .iter()
+            .map(|pc| {
+                let array = batch.column(pc.column_index);
+                precompute_identity_values(array.as_ref())
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+
+        for row_idx in 0..batch.num_rows() {
+            let values: Vec<Option<String>> =
+                col_values.iter().map(|col| col[row_idx].clone()).collect();
+            let key = build_hive_dir(partition_columns, &values);
+            partitions
+                .entry(key)
+                .or_insert_with(|| (values, Vec::new()))
+                .1
+                .push((batch_idx, row_idx));
+        }
+    }
+
+    Ok(partitions)
+}
+
+/// Pre-compute identity partition values for all rows in an array.
+///
+/// Performs a single type dispatch, then iterates all rows with the resolved
+/// typed array reference. This is much faster than dispatching per row.
+fn precompute_identity_values(
+    array: &dyn arrow::array::Array,
+) -> crate::Result<Vec<Option<String>>> {
+    use arrow::array::*;
+
+    let len = array.len();
+    let mut values = Vec::with_capacity(len);
+
+    macro_rules! extract_all {
+        ($array_type:ty) => {{
+            let a = array.as_any().downcast_ref::<$array_type>().unwrap();
+            for i in 0..len {
+                values.push(if a.is_null(i) {
+                    None
+                } else {
+                    Some(a.value(i).to_string())
+                });
+            }
+        }};
+    }
+
+    match array.data_type() {
+        DataType::Int8 => extract_all!(Int8Array),
+        DataType::Int16 => extract_all!(Int16Array),
+        DataType::Int32 => extract_all!(Int32Array),
+        DataType::Int64 => extract_all!(Int64Array),
+        DataType::UInt8 => extract_all!(UInt8Array),
+        DataType::UInt16 => extract_all!(UInt16Array),
+        DataType::UInt32 => extract_all!(UInt32Array),
+        DataType::UInt64 => extract_all!(UInt64Array),
+        DataType::Float32 => extract_all!(Float32Array),
+        DataType::Float64 => extract_all!(Float64Array),
+        DataType::Utf8 => extract_all!(StringArray),
+        DataType::LargeUtf8 => extract_all!(LargeStringArray),
+        DataType::Boolean => extract_all!(BooleanArray),
+        DataType::Date32 => {
+            let a = array.as_any().downcast_ref::<Date32Array>().unwrap();
+            for i in 0..len {
+                values.push(if a.is_null(i) {
+                    None
+                } else {
+                    chrono::NaiveDate::from_num_days_from_ce_opt(a.value(i) + 719_163)
+                        .map(|date| date.format("%Y-%m-%d").to_string())
+                });
+            }
+        },
+        DataType::Date64 => {
+            let a = array.as_any().downcast_ref::<Date64Array>().unwrap();
+            for i in 0..len {
+                values.push(if a.is_null(i) {
+                    None
+                } else {
+                    chrono::DateTime::from_timestamp_millis(a.value(i))
+                        .map(|dt| dt.format("%Y-%m-%d").to_string())
+                });
+            }
+        },
+        dt => {
+            return Err(DuckLakeError::InvalidConfig(format!(
+                "Unsupported partition column type {:?} for identity transform",
+                dt
+            )));
+        },
+    }
+
+    Ok(values)
+}
+
+/// Generic row-by-row partition routing for non-identity transforms.
+fn route_batches_generic(
+    batches: &[RecordBatch],
+    partition_columns: &[WritePartitionColumn],
+) -> crate::Result<BTreeMap<String, (Vec<Option<String>>, Vec<(usize, usize)>)>> {
     let mut partitions: BTreeMap<String, (Vec<Option<String>>, Vec<(usize, usize)>)> =
         BTreeMap::new();
 

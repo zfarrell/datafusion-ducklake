@@ -144,7 +144,8 @@ fn arrow_val_to_string(array: &dyn Array, idx: usize) -> String {
             .unwrap()
             .value(idx)
             .to_string(),
-        _ => format!("{:?}", array),
+        _ => arrow::util::display::array_value_to_string(array, idx)
+            .unwrap_or_else(|_| format!("<unsupported:{:?}>", array.data_type())),
     }
 }
 

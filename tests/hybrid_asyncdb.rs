@@ -695,7 +695,13 @@ impl datafusion::logical_expr::ScalarUDFImpl for DatePartAliasUdf {
         // Call the built-in date_part function
         let date_part_udf = datafusion::functions::datetime::date_part();
         let new_args = datafusion::logical_expr::ScalarFunctionArgs {
-            args: vec![part, args.args.into_iter().next().unwrap()],
+            args: vec![
+                part,
+                args.args
+                    .into_iter()
+                    .next()
+                    .expect("date_part requires at least one argument"),
+            ],
             ..args
         };
         date_part_udf.invoke_with_args(new_args)

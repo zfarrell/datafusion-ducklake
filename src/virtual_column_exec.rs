@@ -15,9 +15,11 @@ use arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::execution_plan::Boundedness;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
+    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning,
+    PlanProperties,
 };
 use futures::Stream;
 
@@ -83,10 +85,25 @@ impl VirtualColumnExec {
         included: VirtualColumnSet,
         output_schema: SchemaRef,
     ) -> Self {
+        // When row-number-dependent virtual columns are requested and the input
+        // has multiple partitions, coalesce into a single partition to avoid
+        // duplicate row numbers across partitions (F-033).
+        let needs_single_partition = included.file_row_number || included.rowid;
+        let input = if needs_single_partition && input.output_partitioning().partition_count() > 1 {
+            Arc::new(CoalescePartitionsExec::new(input)) as Arc<dyn ExecutionPlan>
+        } else {
+            input
+        };
+
         let eq_props = EquivalenceProperties::new(Arc::clone(&output_schema));
+        let partitioning = if needs_single_partition {
+            Partitioning::UnknownPartitioning(1)
+        } else {
+            input.output_partitioning().clone()
+        };
         let properties = PlanProperties::new(
             eq_props,
-            input.output_partitioning().clone(),
+            partitioning,
             input.pipeline_behavior(),
             Boundedness::Bounded,
         );
@@ -204,17 +221,29 @@ impl Stream for VirtualColumnStream {
                 }
 
                 if self.included.rowid {
-                    let row_id_start = self.file_info.row_id_start.unwrap_or(0);
-                    let rowids: Vec<i64> = (row_offset..row_offset + num_rows as i64)
-                        .map(|offset| row_id_start + offset)
-                        .collect();
-                    columns.push(Arc::new(Int64Array::from(rowids)));
+                    match self.file_info.row_id_start {
+                        Some(row_id_start) => {
+                            let rowids: Vec<i64> = (row_offset..row_offset + num_rows as i64)
+                                .map(|offset| row_id_start + offset)
+                                .collect();
+                            columns.push(Arc::new(Int64Array::from(rowids)));
+                        },
+                        None => {
+                            columns.push(Arc::new(Int64Array::from(vec![None::<i64>; num_rows])));
+                        },
+                    }
                 }
 
                 if self.included.snapshot_id {
-                    let snap_id = self.file_info.snapshot_id.unwrap_or(0);
-                    let snapshot_ids = Int64Array::from(vec![snap_id; num_rows]);
-                    columns.push(Arc::new(snapshot_ids));
+                    match self.file_info.snapshot_id {
+                        Some(snap_id) => {
+                            let snapshot_ids = Int64Array::from(vec![snap_id; num_rows]);
+                            columns.push(Arc::new(snapshot_ids));
+                        },
+                        None => {
+                            columns.push(Arc::new(Int64Array::from(vec![None::<i64>; num_rows])));
+                        },
+                    }
                 }
 
                 if self.included.file_index {

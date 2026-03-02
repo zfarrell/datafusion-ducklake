@@ -14,12 +14,15 @@
 
 #![cfg(all(feature = "write-sqlite", feature = "metadata-duckdb", feature = "metadata-sqlite"))]
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::array::*;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use common::test_utils::{arrow_value_to_string, duckdb_value_to_string};
 use datafusion::prelude::*;
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
@@ -237,21 +240,6 @@ impl DuckDbConn {
     }
 }
 
-fn duckdb_value_to_string(v: &duckdb::types::Value) -> String {
-    match v {
-        duckdb::types::Value::Null => "NULL".to_string(),
-        duckdb::types::Value::Boolean(b) => b.to_string(),
-        duckdb::types::Value::TinyInt(i) => i.to_string(),
-        duckdb::types::Value::SmallInt(i) => i.to_string(),
-        duckdb::types::Value::Int(i) => i.to_string(),
-        duckdb::types::Value::BigInt(i) => i.to_string(),
-        duckdb::types::Value::Float(f) => format!("{f}"),
-        duckdb::types::Value::Double(f) => format!("{f}"),
-        duckdb::types::Value::Text(s) => s.clone(),
-        _ => format!("{v:?}"),
-    }
-}
-
 // ==================== Query helpers ====================
 
 async fn df_query(ctx: &SessionContext, sql: &str) -> Vec<Vec<String>> {
@@ -286,50 +274,6 @@ fn batches_to_strings(batches: &[RecordBatch]) -> Vec<Vec<String>> {
         }
     }
     rows
-}
-
-fn arrow_value_to_string(array: &dyn Array, idx: usize) -> String {
-    match array.data_type() {
-        DataType::Boolean => array
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .unwrap()
-            .value(idx)
-            .to_string(),
-        DataType::Int32 => array
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap()
-            .value(idx)
-            .to_string(),
-        DataType::Int64 => array
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap()
-            .value(idx)
-            .to_string(),
-        DataType::Float64 => {
-            let val = array
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .unwrap()
-                .value(idx);
-            format!("{val}")
-        },
-        DataType::Utf8 => array
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap()
-            .value(idx)
-            .to_string(),
-        DataType::LargeUtf8 => array
-            .as_any()
-            .downcast_ref::<LargeStringArray>()
-            .unwrap()
-            .value(idx)
-            .to_string(),
-        other => format!("<unsupported:{other:?}>"),
-    }
 }
 
 fn make_test_batch() -> RecordBatch {

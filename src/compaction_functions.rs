@@ -56,6 +56,10 @@ fn path_schema() -> SchemaRef {
 
 /// Open a temporary DuckDB connection with the ducklake extension and ATTACH the catalog.
 /// Returns the connection with the catalog attached as `__compaction`.
+///
+/// Note: Creates a fresh connection per call. Since compaction is an infrequent
+/// maintenance operation, this overhead is acceptable and avoids connection caching
+/// complexity.
 fn open_compaction_connection(catalog_path: &str) -> DataFusionResult<duckdb::Connection> {
     let conn = duckdb::Connection::open_in_memory()
         .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;

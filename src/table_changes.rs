@@ -235,7 +235,12 @@ impl ExecutionPlan for AppendCDCColumnsExec {
 }
 
 /// Stream that appends CDC columns to input batches
+///
+/// Takes a stream of record batches and appends `snapshot_id` and/or
+/// `change_type` columns to each batch.
 struct AppendCDCColumnsStream {
+    // Note: manual Debug is not derived because SendableRecordBatchStream
+    // does not implement Debug. Use the struct name for debug output.
     input: SendableRecordBatchStream,
     snapshot_id: i64,
     change_type: ChangeType,
@@ -244,6 +249,18 @@ struct AppendCDCColumnsStream {
     skip_input_columns: bool,
     reorder_indices: Option<Vec<usize>>,
     output_schema: SchemaRef,
+}
+
+impl fmt::Debug for AppendCDCColumnsStream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AppendCDCColumnsStream")
+            .field("snapshot_id", &self.snapshot_id)
+            .field("change_type", &self.change_type)
+            .field("include_snapshot_id", &self.include_snapshot_id)
+            .field("include_change_type", &self.include_change_type)
+            .field("skip_input_columns", &self.skip_input_columns)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Stream for AppendCDCColumnsStream {
@@ -675,7 +692,7 @@ impl TableProvider for TableChangesTable {
 
         // Combine with UnionExec if multiple files
         if execs.len() == 1 {
-            Ok(execs.into_iter().next().unwrap())
+            Ok(execs.into_iter().next().expect("checked len == 1 above"))
         } else {
             UnionExec::try_new(execs)
         }

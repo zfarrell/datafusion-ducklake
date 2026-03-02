@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS ducklake_metadata (
 
 CREATE TABLE IF NOT EXISTS ducklake_snapshot (
     snapshot_id INTEGER PRIMARY KEY,
-    snapshot_time TEXT DEFAULT CURRENT_TIMESTAMP,
+    snapshot_time TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%f+00:00', 'now')),
     schema_version INTEGER DEFAULT 1,
     next_catalog_id INTEGER DEFAULT 0,
     next_file_id INTEGER DEFAULT 0
@@ -393,7 +393,7 @@ impl SqliteMetadataWriter {
 
         // Create snapshot with correct schema_version
         let row = sqlx::query(
-            "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES (CURRENT_TIMESTAMP, ?) RETURNING snapshot_id",
+            "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES (strftime('%Y-%m-%d %H:%M:%f+00:00', 'now'), ?) RETURNING snapshot_id",
         )
         .bind(new_schema_version)
         .fetch_one(&mut *tx)
@@ -581,7 +581,7 @@ impl SqliteMetadataWriter {
         let new_schema_version: i64 = prev_sv_row.try_get::<i64, _>(0)? + 1;
 
         let row = sqlx::query(
-            "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES (CURRENT_TIMESTAMP, ?) RETURNING snapshot_id",
+            "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES (strftime('%Y-%m-%d %H:%M:%f+00:00', 'now'), ?) RETURNING snapshot_id",
         )
         .bind(new_schema_version)
         .fetch_one(&mut *tx)
@@ -673,7 +673,7 @@ impl SqliteMetadataWriter {
         let new_schema_version: i64 = prev_sv_row.try_get::<i64, _>(0)? + 1;
 
         let row = sqlx::query(
-            "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES (CURRENT_TIMESTAMP, ?) RETURNING snapshot_id",
+            "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES (strftime('%Y-%m-%d %H:%M:%f+00:00', 'now'), ?) RETURNING snapshot_id",
         )
         .bind(new_schema_version)
         .fetch_one(&mut *tx)
@@ -770,7 +770,7 @@ impl MetadataWriter for SqliteMetadataWriter {
     fn create_snapshot(&self) -> Result<i64> {
         block_on(async {
             let row = sqlx::query(
-                "INSERT INTO ducklake_snapshot (snapshot_time) VALUES (CURRENT_TIMESTAMP) RETURNING snapshot_id",
+                "INSERT INTO ducklake_snapshot (snapshot_time) VALUES (strftime('%Y-%m-%d %H:%M:%f+00:00', 'now')) RETURNING snapshot_id",
             )
             .fetch_one(&self.pool)
             .await?;
@@ -1174,10 +1174,19 @@ impl MetadataWriter for SqliteMetadataWriter {
             .execute(&self.pool)
             .await?;
 
+            // DuckDB sets `encrypted=false` in metadata; match for interop (F-047)
+            sqlx::query(
+                "INSERT INTO ducklake_metadata (key, value)
+                 SELECT 'encrypted', 'false'
+                 WHERE NOT EXISTS (SELECT 1 FROM ducklake_metadata WHERE key = 'encrypted' AND scope IS NULL)",
+            )
+            .execute(&self.pool)
+            .await?;
+
             // Insert initial snapshot 0 (DuckDB expects this as the "empty catalog" snapshot)
             sqlx::query(
                 "INSERT OR IGNORE INTO ducklake_snapshot (snapshot_id, snapshot_time, schema_version, next_catalog_id, next_file_id)
-                 VALUES (0, CURRENT_TIMESTAMP, 0, 0, 0)",
+                 VALUES (0, strftime('%Y-%m-%d %H:%M:%f+00:00', 'now'), 0, 0, 0)",
             )
             .execute(&self.pool)
             .await?;
@@ -1414,7 +1423,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             let new_schema_version: i64 = prev_sv_row.try_get::<i64, _>(0)? + 1;
 
             let row = sqlx::query(
-                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES (CURRENT_TIMESTAMP, ?) RETURNING snapshot_id",
+                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES (strftime('%Y-%m-%d %H:%M:%f+00:00', 'now'), ?) RETURNING snapshot_id",
             )
             .bind(new_schema_version)
             .fetch_one(&mut *tx)
@@ -1490,7 +1499,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             let new_schema_version: i64 = prev_sv_row.try_get::<i64, _>(0)? + 1;
 
             let row = sqlx::query(
-                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES (CURRENT_TIMESTAMP, ?) RETURNING snapshot_id",
+                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES (strftime('%Y-%m-%d %H:%M:%f+00:00', 'now'), ?) RETURNING snapshot_id",
             )
             .bind(new_schema_version)
             .fetch_one(&mut *tx)
@@ -1564,7 +1573,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             let new_schema_version: i64 = prev_sv_row.try_get::<i64, _>(0)? + 1;
 
             let row = sqlx::query(
-                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES (CURRENT_TIMESTAMP, ?) RETURNING snapshot_id",
+                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES (strftime('%Y-%m-%d %H:%M:%f+00:00', 'now'), ?) RETURNING snapshot_id",
             )
             .bind(new_schema_version)
             .fetch_one(&mut *tx)
@@ -1675,7 +1684,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             let new_schema_version: i64 = prev_sv_row.try_get::<i64, _>(0)? + 1;
 
             let row = sqlx::query(
-                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES (CURRENT_TIMESTAMP, ?) RETURNING snapshot_id",
+                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES (strftime('%Y-%m-%d %H:%M:%f+00:00', 'now'), ?) RETURNING snapshot_id",
             )
             .bind(new_schema_version)
             .fetch_one(&mut *tx)
@@ -1963,7 +1972,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             let new_schema_version: i64 = prev_sv_row.try_get::<i64, _>(0)? + 1;
 
             let row = sqlx::query(
-                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES (CURRENT_TIMESTAMP, ?) RETURNING snapshot_id",
+                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES (strftime('%Y-%m-%d %H:%M:%f+00:00', 'now'), ?) RETURNING snapshot_id",
             )
             .bind(new_schema_version)
             .fetch_one(&mut *tx)
@@ -2040,7 +2049,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             let new_schema_version: i64 = prev_sv_row.try_get::<i64, _>(0)? + 1;
 
             let row = sqlx::query(
-                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES (CURRENT_TIMESTAMP, ?) RETURNING snapshot_id",
+                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES (strftime('%Y-%m-%d %H:%M:%f+00:00', 'now'), ?) RETURNING snapshot_id",
             )
             .bind(new_schema_version)
             .fetch_one(&mut *tx)
@@ -2131,7 +2140,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             let new_schema_version: i64 = prev_sv_row.try_get::<i64, _>(0)? + 1;
 
             let row = sqlx::query(
-                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES (CURRENT_TIMESTAMP, ?) RETURNING snapshot_id",
+                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES (strftime('%Y-%m-%d %H:%M:%f+00:00', 'now'), ?) RETURNING snapshot_id",
             )
             .bind(new_schema_version)
             .fetch_one(&mut *tx)

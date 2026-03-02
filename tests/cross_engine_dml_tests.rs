@@ -13,12 +13,15 @@
 
 #![cfg(all(feature = "write-sqlite", feature = "metadata-duckdb", feature = "metadata-sqlite"))]
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::array::*;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use common::test_utils::{arrow_value_to_string, duckdb_value_to_string};
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::*;
 use object_store::local::LocalFileSystem;
@@ -221,24 +224,6 @@ impl DuckDbConn {
     }
 }
 
-// ==================== Value conversion helpers ====================
-
-fn duckdb_value_to_string(v: &duckdb::types::Value) -> String {
-    match v {
-        duckdb::types::Value::Null => "NULL".to_string(),
-        duckdb::types::Value::Boolean(b) => b.to_string(),
-        duckdb::types::Value::TinyInt(i) => i.to_string(),
-        duckdb::types::Value::SmallInt(i) => i.to_string(),
-        duckdb::types::Value::Int(i) => i.to_string(),
-        duckdb::types::Value::BigInt(i) => i.to_string(),
-        duckdb::types::Value::Float(f) => format!("{f}"),
-        duckdb::types::Value::Double(f) => format!("{f}"),
-        duckdb::types::Value::Text(s) => s.clone(),
-        duckdb::types::Value::HugeInt(i) => i.to_string(),
-        _ => format!("{v:?}"),
-    }
-}
-
 /// Run a SQL query via DataFusion and return results as string rows.
 async fn df_query(ctx: &SessionContext, sql: &str) -> Vec<Vec<String>> {
     let df = ctx.sql(sql).await.expect("DataFusion SQL failed");
@@ -263,36 +248,6 @@ fn batches_to_strings(batches: &[RecordBatch]) -> Vec<Vec<String>> {
         }
     }
     rows
-}
-
-fn arrow_value_to_string(array: &dyn Array, idx: usize) -> String {
-    match array.data_type() {
-        DataType::Int32 => {
-            let a = array.as_any().downcast_ref::<Int32Array>().unwrap();
-            a.value(idx).to_string()
-        },
-        DataType::Int64 => {
-            let a = array.as_any().downcast_ref::<Int64Array>().unwrap();
-            a.value(idx).to_string()
-        },
-        DataType::UInt64 => {
-            let a = array.as_any().downcast_ref::<UInt64Array>().unwrap();
-            a.value(idx).to_string()
-        },
-        DataType::Float64 => {
-            let a = array.as_any().downcast_ref::<Float64Array>().unwrap();
-            format!("{}", a.value(idx))
-        },
-        DataType::Utf8 => {
-            let a = array.as_any().downcast_ref::<StringArray>().unwrap();
-            a.value(idx).to_string()
-        },
-        DataType::LargeUtf8 => {
-            let a = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
-            a.value(idx).to_string()
-        },
-        other => format!("<unsupported:{other:?}>"),
-    }
 }
 
 /// Normalize and compare query results.

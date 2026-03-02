@@ -190,15 +190,32 @@ impl DuckLakeTable {
         let table_files = provider.get_table_files_for_select(table_id, snapshot_id)?;
 
         // Load row count from metadata for COUNT(*) optimization
-        let cached_row_count = provider
-            .get_table_row_count(table_id, snapshot_id)
-            .ok()
-            .flatten();
+        let cached_row_count = match provider.get_table_row_count(table_id, snapshot_id) {
+            Ok(count) => count,
+            Err(e) => {
+                tracing::warn!(
+                    table_id,
+                    snapshot_id,
+                    error = %e,
+                    "Failed to load row count from metadata; COUNT(*) optimization disabled"
+                );
+                None
+            },
+        };
 
         // Load partition metadata for partition pruning
-        let partition_columns = provider
-            .get_partition_columns(table_id, snapshot_id)
-            .unwrap_or_default();
+        let partition_columns = match provider.get_partition_columns(table_id, snapshot_id) {
+            Ok(cols) => cols,
+            Err(e) => {
+                tracing::warn!(
+                    table_id,
+                    snapshot_id,
+                    error = %e,
+                    "Failed to load partition columns; partition pruning disabled"
+                );
+                Vec::new()
+            },
+        };
         let file_partition_values = if !partition_columns.is_empty() {
             let raw_values = provider
                 .get_file_partition_values(table_id, snapshot_id)
@@ -1738,7 +1755,7 @@ fn combine_execution_plans(
     execs: Vec<Arc<dyn ExecutionPlan>>,
 ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
     if execs.len() == 1 {
-        Ok(execs.into_iter().next().unwrap())
+        Ok(execs.into_iter().next().expect("checked len == 1 above"))
     } else {
         use datafusion::physical_plan::union::UnionExec;
         UnionExec::try_new(execs)

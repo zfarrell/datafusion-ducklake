@@ -13,6 +13,8 @@
 
 #![cfg(all(feature = "write-mysql", feature = "metadata-duckdb"))]
 
+mod common;
+
 use std::sync::Arc;
 
 use arrow::array::*;
@@ -192,21 +194,10 @@ fn sqlx_mysql_to_duckdb(url: &str) -> String {
     }
 }
 
-fn duckdb_value_to_string(v: &duckdb::types::Value) -> String {
-    match v {
-        duckdb::types::Value::Null => "NULL".to_string(),
-        duckdb::types::Value::Boolean(b) => b.to_string(),
-        duckdb::types::Value::TinyInt(i) => i.to_string(),
-        duckdb::types::Value::SmallInt(i) => i.to_string(),
-        duckdb::types::Value::Int(i) => i.to_string(),
-        duckdb::types::Value::BigInt(i) => i.to_string(),
-        duckdb::types::Value::Float(f) => format!("{f}"),
-        duckdb::types::Value::Double(f) => format!("{f}"),
-        duckdb::types::Value::Text(s) => s.clone(),
-        duckdb::types::Value::HugeInt(i) => i.to_string(),
-        _ => format!("{v:?}"),
-    }
-}
+use common::test_utils::{
+    arrow_value_to_string, assert_results_eq, batches_to_strings, duckdb_value_to_string,
+    normalize_value,
+};
 
 // ==================== Query helpers ====================
 
@@ -214,91 +205,6 @@ async fn df_query(ctx: &SessionContext, sql: &str) -> Vec<Vec<String>> {
     let df = ctx.sql(sql).await.expect("DataFusion SQL failed");
     let batches = df.collect().await.expect("DataFusion collect failed");
     batches_to_strings(&batches)
-}
-
-fn batches_to_strings(batches: &[RecordBatch]) -> Vec<Vec<String>> {
-    let mut rows = Vec::new();
-    for batch in batches {
-        let schema = batch.schema();
-        let col_indices: Vec<usize> = (0..batch.num_columns())
-            .filter(|&i| {
-                let name = schema.field(i).name();
-                name != "filename" && name != "file_row_number"
-            })
-            .collect();
-        for row_idx in 0..batch.num_rows() {
-            let mut row = Vec::new();
-            for &col_idx in &col_indices {
-                let col = batch.column(col_idx);
-                if col.is_null(row_idx) {
-                    row.push("NULL".to_string());
-                } else {
-                    row.push(arrow_value_to_string(col, row_idx));
-                }
-            }
-            rows.push(row);
-        }
-    }
-    rows
-}
-
-fn arrow_value_to_string(array: &dyn Array, idx: usize) -> String {
-    match array.data_type() {
-        DataType::Boolean => {
-            let a = array.as_any().downcast_ref::<BooleanArray>().unwrap();
-            a.value(idx).to_string()
-        },
-        DataType::Int32 => {
-            let a = array.as_any().downcast_ref::<Int32Array>().unwrap();
-            a.value(idx).to_string()
-        },
-        DataType::Int64 => {
-            let a = array.as_any().downcast_ref::<Int64Array>().unwrap();
-            a.value(idx).to_string()
-        },
-        DataType::Float64 => {
-            let a = array.as_any().downcast_ref::<Float64Array>().unwrap();
-            format!("{}", a.value(idx))
-        },
-        DataType::Utf8 => {
-            let a = array.as_any().downcast_ref::<StringArray>().unwrap();
-            a.value(idx).to_string()
-        },
-        DataType::LargeUtf8 => {
-            let a = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
-            a.value(idx).to_string()
-        },
-        other => format!("<unsupported:{other:?}>"),
-    }
-}
-
-fn normalize_value(s: &str) -> String {
-    if s == "NULL" {
-        return s.to_string();
-    }
-    if let Ok(f) = s.parse::<f64>() {
-        return format!("{:.6}", f);
-    }
-    s.to_string()
-}
-
-fn assert_results_eq(scenario: &str, expected: &[Vec<String>], actual: &[Vec<String>]) {
-    assert_eq!(
-        expected.len(),
-        actual.len(),
-        "[{scenario}] Row count mismatch: expected {}, got {}.\n  Expected: {expected:?}\n  Actual: {actual:?}",
-        expected.len(),
-        actual.len()
-    );
-    for (i, (exp, act)) in expected.iter().zip(actual.iter()).enumerate() {
-        for (j, (ev, av)) in exp.iter().zip(act.iter()).enumerate() {
-            assert_eq!(
-                normalize_value(ev),
-                normalize_value(av),
-                "[{scenario}] Mismatch at row {i}, col {j}: expected '{ev}', got '{av}'"
-            );
-        }
-    }
 }
 
 // ==================== Test 1: DF writes → DF reads (MySQL catalog) ====================

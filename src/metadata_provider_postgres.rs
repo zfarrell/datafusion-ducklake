@@ -977,9 +977,9 @@ WHERE data.table_id = $1
 
             let num_columns = user_columns.len();
             let user_columns = Arc::new(user_columns);
-            let mut result = Vec::new();
+            let mut result = Vec::with_capacity(rows.len());
             for row in &rows {
-                let mut values = Vec::new();
+                let mut values = Vec::with_capacity(num_columns);
                 for i in 0..num_columns {
                     let val: Option<String> = row.try_get(i)?;
                     values.push(val);

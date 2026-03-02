@@ -8,6 +8,8 @@
 
 #![allow(dead_code)]
 
+pub mod test_utils;
+
 use anyhow::Result;
 use std::path::Path;
 use std::sync::Once;

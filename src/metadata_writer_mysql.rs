@@ -1138,11 +1138,22 @@ impl MetadataWriter for MySqlMetadataWriter {
             .execute(&self.pool)
             .await?;
 
+            // DuckDB sets `encrypted=false` in metadata; match for interop (F-047)
+            sqlx::query(
+                "INSERT INTO ducklake_metadata (`key`, value)
+                 SELECT 'encrypted', 'false' FROM DUAL
+                 WHERE NOT EXISTS (SELECT 1 FROM ducklake_metadata WHERE `key` = 'encrypted' AND scope IS NULL)",
+            )
+            .execute(&self.pool)
+            .await?;
+
             // Insert initial snapshot 0 (DuckDB expects this as the "empty catalog" snapshot).
             // MySQL treats INSERT of 0 into AUTO_INCREMENT as a new auto-value unless
             // NO_AUTO_VALUE_ON_ZERO is set, so we temporarily enable that mode.
             // We must use a single connection for session variable save/restore,
             // since pool connections don't share user variables.
+            // IMPORTANT: Always restore sql_mode even if the INSERT fails, to avoid
+            // leaking modified sql_mode on a pooled connection.
             let mut conn = self.pool.acquire().await?;
             sqlx::query("SET @old_sql_mode = @@SESSION.sql_mode")
                 .execute(&mut *conn)
@@ -1152,15 +1163,17 @@ impl MetadataWriter for MySqlMetadataWriter {
             )
             .execute(&mut *conn)
             .await?;
-            sqlx::query(
+            let insert_result = sqlx::query(
                 "INSERT IGNORE INTO ducklake_snapshot (snapshot_id, snapshot_time, schema_version, next_catalog_id, next_file_id)
                  VALUES (0, NOW(6), 0, 0, 0)",
             )
             .execute(&mut *conn)
-            .await?;
+            .await;
+            // Always restore sql_mode before checking the insert result
             sqlx::query("SET SESSION sql_mode = @old_sql_mode")
                 .execute(&mut *conn)
                 .await?;
+            insert_result?;
 
             Ok(())
         })
