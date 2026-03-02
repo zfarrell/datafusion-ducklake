@@ -562,16 +562,18 @@ impl MetadataProvider for DuckdbMetadataProvider {
             inlined_table_name,
         );
 
+        let num_columns = user_columns.len();
+        let user_columns = Arc::new(user_columns);
         let mut stmt = conn.prepare(&select_sql)?;
         let rows = stmt
             .query_map([snapshot_id, snapshot_id], |row| {
                 let mut values = Vec::new();
-                for i in 0..user_columns.len() {
+                for i in 0..num_columns {
                     let val: Option<String> = row.get(i)?;
                     values.push(val);
                 }
                 Ok(InlinedDataRow {
-                    column_names: user_columns.clone(),
+                    column_names: Arc::clone(&user_columns),
                     values,
                 })
             })?

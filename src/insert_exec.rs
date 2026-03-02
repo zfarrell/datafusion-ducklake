@@ -23,6 +23,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::stream::{self, TryStreamExt};
 
+use crate::error::DuckLakeError;
 use crate::metadata_writer::{MetadataWriter, WriteMode};
 use crate::table_writer::DuckLakeTableWriter;
 
@@ -290,15 +291,16 @@ impl ExecutionPlan for DuckLakeInsertExec {
 /// Compute partition value for a single element from a column array.
 ///
 /// Applies the configured transform to produce the Hive directory value.
+/// Returns an error for unsupported column types or unknown transforms.
 fn compute_partition_value(
     array: &dyn arrow::array::Array,
     row: usize,
     transform: Option<&str>,
-) -> Option<String> {
+) -> crate::Result<Option<String>> {
     use arrow::array::*;
 
     if array.is_null(row) {
-        return None;
+        return Ok(None);
     }
 
     let transform = transform
@@ -308,121 +310,92 @@ fn compute_partition_value(
     match transform.as_str() {
         "identity" | "" => {
             // Extract the raw value as a string
-            match array.data_type() {
-                DataType::Int8 => Some(
-                    array
-                        .as_any()
-                        .downcast_ref::<Int8Array>()?
-                        .value(row)
-                        .to_string(),
-                ),
-                DataType::Int16 => Some(
-                    array
-                        .as_any()
-                        .downcast_ref::<Int16Array>()?
-                        .value(row)
-                        .to_string(),
-                ),
-                DataType::Int32 => Some(
-                    array
-                        .as_any()
-                        .downcast_ref::<Int32Array>()?
-                        .value(row)
-                        .to_string(),
-                ),
-                DataType::Int64 => Some(
-                    array
-                        .as_any()
-                        .downcast_ref::<Int64Array>()?
-                        .value(row)
-                        .to_string(),
-                ),
-                DataType::UInt8 => Some(
-                    array
-                        .as_any()
-                        .downcast_ref::<UInt8Array>()?
-                        .value(row)
-                        .to_string(),
-                ),
-                DataType::UInt16 => Some(
-                    array
-                        .as_any()
-                        .downcast_ref::<UInt16Array>()?
-                        .value(row)
-                        .to_string(),
-                ),
-                DataType::UInt32 => Some(
-                    array
-                        .as_any()
-                        .downcast_ref::<UInt32Array>()?
-                        .value(row)
-                        .to_string(),
-                ),
-                DataType::UInt64 => Some(
-                    array
-                        .as_any()
-                        .downcast_ref::<UInt64Array>()?
-                        .value(row)
-                        .to_string(),
-                ),
-                DataType::Float32 => Some(
-                    array
-                        .as_any()
-                        .downcast_ref::<Float32Array>()?
-                        .value(row)
-                        .to_string(),
-                ),
-                DataType::Float64 => Some(
-                    array
-                        .as_any()
-                        .downcast_ref::<Float64Array>()?
-                        .value(row)
-                        .to_string(),
-                ),
-                DataType::Utf8 => Some(
-                    array
-                        .as_any()
-                        .downcast_ref::<StringArray>()?
-                        .value(row)
-                        .to_string(),
-                ),
-                DataType::LargeUtf8 => Some(
-                    array
-                        .as_any()
-                        .downcast_ref::<LargeStringArray>()?
-                        .value(row)
-                        .to_string(),
-                ),
-                DataType::Boolean => Some(
-                    array
-                        .as_any()
-                        .downcast_ref::<BooleanArray>()?
-                        .value(row)
-                        .to_string(),
-                ),
+            let value = match array.data_type() {
+                DataType::Int8 => array
+                    .as_any()
+                    .downcast_ref::<Int8Array>()
+                    .map(|a| a.value(row).to_string()),
+                DataType::Int16 => array
+                    .as_any()
+                    .downcast_ref::<Int16Array>()
+                    .map(|a| a.value(row).to_string()),
+                DataType::Int32 => array
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .map(|a| a.value(row).to_string()),
+                DataType::Int64 => array
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .map(|a| a.value(row).to_string()),
+                DataType::UInt8 => array
+                    .as_any()
+                    .downcast_ref::<UInt8Array>()
+                    .map(|a| a.value(row).to_string()),
+                DataType::UInt16 => array
+                    .as_any()
+                    .downcast_ref::<UInt16Array>()
+                    .map(|a| a.value(row).to_string()),
+                DataType::UInt32 => array
+                    .as_any()
+                    .downcast_ref::<UInt32Array>()
+                    .map(|a| a.value(row).to_string()),
+                DataType::UInt64 => array
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .map(|a| a.value(row).to_string()),
+                DataType::Float32 => array
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .map(|a| a.value(row).to_string()),
+                DataType::Float64 => array
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .map(|a| a.value(row).to_string()),
+                DataType::Utf8 => array
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .map(|a| a.value(row).to_string()),
+                DataType::LargeUtf8 => array
+                    .as_any()
+                    .downcast_ref::<LargeStringArray>()
+                    .map(|a| a.value(row).to_string()),
+                DataType::Boolean => array
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .map(|a| a.value(row).to_string()),
                 DataType::Date32 => {
-                    let days = array.as_any().downcast_ref::<Date32Array>()?.value(row);
-                    let date = chrono::NaiveDate::from_num_days_from_ce_opt(days + 719_163)?;
-                    Some(date.format("%Y-%m-%d").to_string())
+                    let days = array
+                        .as_any()
+                        .downcast_ref::<Date32Array>()
+                        .map(|a| a.value(row));
+                    days.and_then(|d| chrono::NaiveDate::from_num_days_from_ce_opt(d + 719_163))
+                        .map(|date| date.format("%Y-%m-%d").to_string())
                 },
                 DataType::Date64 => {
-                    let ms = array.as_any().downcast_ref::<Date64Array>()?.value(row);
-                    let date = chrono::DateTime::from_timestamp_millis(ms)?;
-                    Some(date.format("%Y-%m-%d").to_string())
+                    let ms = array
+                        .as_any()
+                        .downcast_ref::<Date64Array>()
+                        .map(|a| a.value(row));
+                    ms.and_then(chrono::DateTime::from_timestamp_millis)
+                        .map(|dt| dt.format("%Y-%m-%d").to_string())
                 },
-                _ => Some(format!(
-                    "{}",
-                    arrow::util::display::ArrayFormatter::try_new(array, &Default::default())
-                        .ok()?
-                        .value(row)
-                )),
-            }
+                dt => {
+                    return Err(DuckLakeError::InvalidConfig(format!(
+                        "Unsupported partition column type {:?} for identity transform",
+                        dt
+                    )));
+                },
+            };
+            Ok(value)
         },
         "year" => extract_temporal_component(array, row, TemporalComponent::Year),
         "month" => extract_temporal_component(array, row, TemporalComponent::Month),
         "day" => extract_temporal_component(array, row, TemporalComponent::Day),
         "hour" => extract_temporal_component(array, row, TemporalComponent::Hour),
-        _ => None,
+        other => Err(DuckLakeError::InvalidConfig(format!(
+            "Unknown partition transform '{}'. Valid transforms: identity, year, month, day, hour",
+            other
+        ))),
     }
 }
 
@@ -437,54 +410,98 @@ fn extract_temporal_component(
     array: &dyn arrow::array::Array,
     row: usize,
     component: TemporalComponent,
-) -> Option<String> {
+) -> crate::Result<Option<String>> {
     use arrow::array::*;
 
     match array.data_type() {
         DataType::Date32 => {
-            let days = array.as_any().downcast_ref::<Date32Array>()?.value(row);
-            let date = chrono::NaiveDate::from_num_days_from_ce_opt(days + 719_163)?;
-            match component {
-                TemporalComponent::Year => Some(date.format("%Y").to_string()),
-                TemporalComponent::Month => Some(date.format("%-m").to_string()),
-                TemporalComponent::Day => Some(date.format("%-d").to_string()),
-                TemporalComponent::Hour => Some("0".to_string()),
-            }
+            let days = array
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .map(|a| a.value(row));
+            let date = days.and_then(|d| chrono::NaiveDate::from_num_days_from_ce_opt(d + 719_163));
+            Ok(date.map(|d| match component {
+                TemporalComponent::Year => d.format("%Y").to_string(),
+                TemporalComponent::Month => d.format("%-m").to_string(),
+                TemporalComponent::Day => d.format("%-d").to_string(),
+                TemporalComponent::Hour => "0".to_string(),
+            }))
         },
         DataType::Date64 => {
-            let ms = array.as_any().downcast_ref::<Date64Array>()?.value(row);
-            let dt = chrono::DateTime::from_timestamp_millis(ms)?;
-            match component {
-                TemporalComponent::Year => Some(dt.format("%Y").to_string()),
-                TemporalComponent::Month => Some(dt.format("%-m").to_string()),
-                TemporalComponent::Day => Some(dt.format("%-d").to_string()),
-                TemporalComponent::Hour => Some(dt.format("%-H").to_string()),
-            }
+            let ms = array
+                .as_any()
+                .downcast_ref::<Date64Array>()
+                .map(|a| a.value(row));
+            let dt = ms.and_then(chrono::DateTime::from_timestamp_millis);
+            Ok(dt.map(|d| match component {
+                TemporalComponent::Year => d.format("%Y").to_string(),
+                TemporalComponent::Month => d.format("%-m").to_string(),
+                TemporalComponent::Day => d.format("%-d").to_string(),
+                TemporalComponent::Hour => d.format("%-H").to_string(),
+            }))
         },
-        DataType::Timestamp(_, _) => {
-            // Handle Timestamp types via cast to Date32 for year/month/day
-            let ts_array = array.as_any().downcast_ref::<TimestampMicrosecondArray>();
-            if let Some(ts) = ts_array {
-                let us = ts.value(row);
-                let dt = chrono::DateTime::from_timestamp_micros(us)?;
-                match component {
-                    TemporalComponent::Year => Some(dt.format("%Y").to_string()),
-                    TemporalComponent::Month => Some(dt.format("%-m").to_string()),
-                    TemporalComponent::Day => Some(dt.format("%-d").to_string()),
-                    TemporalComponent::Hour => Some(dt.format("%-H").to_string()),
-                }
-            } else {
-                None
-            }
+        DataType::Timestamp(unit, _) => {
+            // Convert all timestamp precisions to microseconds for uniform handling
+            let us = match unit {
+                arrow::datatypes::TimeUnit::Second => array
+                    .as_any()
+                    .downcast_ref::<TimestampSecondArray>()
+                    .map(|a| a.value(row) * 1_000_000),
+                arrow::datatypes::TimeUnit::Millisecond => array
+                    .as_any()
+                    .downcast_ref::<TimestampMillisecondArray>()
+                    .map(|a| a.value(row) * 1_000),
+                arrow::datatypes::TimeUnit::Microsecond => array
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .map(|a| a.value(row)),
+                arrow::datatypes::TimeUnit::Nanosecond => array
+                    .as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .map(|a| a.value(row) / 1_000),
+            };
+            let dt = us.and_then(chrono::DateTime::from_timestamp_micros);
+            Ok(dt.map(|d| match component {
+                TemporalComponent::Year => d.format("%Y").to_string(),
+                TemporalComponent::Month => d.format("%-m").to_string(),
+                TemporalComponent::Day => d.format("%-d").to_string(),
+                TemporalComponent::Hour => d.format("%-H").to_string(),
+            }))
         },
-        _ => None,
+        dt => Err(DuckLakeError::InvalidConfig(format!(
+            "Cannot apply temporal partition transform to non-temporal type {:?}",
+            dt
+        ))),
     }
+}
+
+/// URL-encode a partition value per Hive convention.
+fn url_encode_partition_value(value: &str) -> String {
+    use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
+    const HIVE_ENCODE_SET: &AsciiSet = &CONTROLS
+        .add(b' ')
+        .add(b'/')
+        .add(b'=')
+        .add(b'%')
+        .add(b'#')
+        .add(b'?')
+        .add(b'\\')
+        .add(b'"')
+        .add(b'<')
+        .add(b'>')
+        .add(b'{')
+        .add(b'}')
+        .add(b'|')
+        .add(b'^')
+        .add(b'`')
+        .add(b'[')
+        .add(b']');
+    utf8_percent_encode(value, HIVE_ENCODE_SET).to_string()
 }
 
 /// Build a Hive-style partition directory path from partition values.
 ///
-/// Example: for partition columns [(category, "A"), (year, "2024")]:
-/// Returns "category=A/year=2024"
+/// Partition values are URL-encoded to prevent path traversal and malformed paths.
 fn build_hive_dir(partition_columns: &[WritePartitionColumn], values: &[Option<String>]) -> String {
     partition_columns
         .iter()
@@ -492,7 +509,7 @@ fn build_hive_dir(partition_columns: &[WritePartitionColumn], values: &[Option<S
         .map(|(col, val)| {
             let name = &col.column_name;
             match val {
-                Some(v) => format!("{}={}", name, v),
+                Some(v) => format!("{}={}", name, url_encode_partition_value(v)),
                 None => format!("{}=__HIVE_DEFAULT_PARTITION__", name),
             }
         })
@@ -502,11 +519,11 @@ fn build_hive_dir(partition_columns: &[WritePartitionColumn], values: &[Option<S
 
 /// Route rows into partition buckets, keyed by their partition values.
 ///
-/// Returns a map from partition_key (Hive dir string) to (partition_values, row_indices).
+/// Returns an error if any partition value computation fails (unsupported type or transform).
 fn route_batches_to_partitions(
     batches: &[RecordBatch],
     partition_columns: &[WritePartitionColumn],
-) -> HashMap<String, (Vec<Option<String>>, Vec<(usize, usize)>)> {
+) -> crate::Result<HashMap<String, (Vec<Option<String>>, Vec<(usize, usize)>)>> {
     let mut partitions: HashMap<String, (Vec<Option<String>>, Vec<(usize, usize)>)> =
         HashMap::new();
 
@@ -515,7 +532,8 @@ fn route_batches_to_partitions(
             let mut values = Vec::with_capacity(partition_columns.len());
             for pc in partition_columns {
                 let array = batch.column(pc.column_index);
-                let val = compute_partition_value(array.as_ref(), row_idx, pc.transform.as_deref());
+                let val =
+                    compute_partition_value(array.as_ref(), row_idx, pc.transform.as_deref())?;
                 values.push(val);
             }
             let key = build_hive_dir(partition_columns, &values);
@@ -527,7 +545,7 @@ fn route_batches_to_partitions(
         }
     }
 
-    partitions
+    Ok(partitions)
 }
 
 /// Extract a sub-batch containing only the specified row indices.
@@ -602,7 +620,7 @@ async fn write_partitioned(
     partition_columns: &[WritePartitionColumn],
     write_mode: WriteMode,
 ) -> crate::Result<u64> {
-    let partition_map = route_batches_to_partitions(batches, partition_columns);
+    let partition_map = route_batches_to_partitions(batches, partition_columns)?;
 
     let mut total_rows: u64 = 0;
     let mut first_partition = true;
@@ -697,28 +715,47 @@ mod tests {
     }
 
     #[test]
+    fn test_build_hive_dir_url_encodes_special_chars() {
+        let cols = vec![WritePartitionColumn {
+            column_name: "path".to_string(),
+            column_index: 0,
+            transform: None,
+        }];
+        let values = vec![Some("a/b".to_string())];
+        let result = build_hive_dir(&cols, &values);
+        assert_eq!(result, "path=a%2Fb");
+
+        let values = vec![Some("x=y".to_string())];
+        let result = build_hive_dir(&cols, &values);
+        assert_eq!(result, "path=x%3Dy");
+
+        let values = vec![Some("../../etc/passwd".to_string())];
+        let result = build_hive_dir(&cols, &values);
+        assert!(result.contains("%2F"));
+    }
+
+    #[test]
     fn test_compute_partition_value_identity() {
         let array = arrow::array::StringArray::from(vec!["hello", "world"]);
         assert_eq!(
-            compute_partition_value(&array, 0, Some("identity")),
+            compute_partition_value(&array, 0, Some("identity")).unwrap(),
             Some("hello".to_string())
         );
         assert_eq!(
-            compute_partition_value(&array, 1, None),
+            compute_partition_value(&array, 1, None).unwrap(),
             Some("world".to_string())
         );
     }
 
     #[test]
     fn test_compute_partition_value_year() {
-        // Date32: days since epoch
         let date = chrono::NaiveDate::from_ymd_opt(2024, 6, 15).unwrap();
         let days_since_epoch = date
             .signed_duration_since(chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
             .num_days() as i32;
         let array = arrow::array::Date32Array::from(vec![days_since_epoch]);
         assert_eq!(
-            compute_partition_value(&array, 0, Some("year")),
+            compute_partition_value(&array, 0, Some("year")).unwrap(),
             Some("2024".to_string())
         );
     }
@@ -731,8 +768,81 @@ mod tests {
             .num_days() as i32;
         let array = arrow::array::Date32Array::from(vec![days_since_epoch]);
         assert_eq!(
-            compute_partition_value(&array, 0, Some("month")),
+            compute_partition_value(&array, 0, Some("month")).unwrap(),
             Some("3".to_string())
+        );
+    }
+
+    #[test]
+    fn test_compute_partition_value_unknown_transform_errors() {
+        let array = arrow::array::Int32Array::from(vec![42]);
+        let result = compute_partition_value(&array, 0, Some("yer"));
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Unknown partition transform")
+        );
+    }
+
+    #[test]
+    fn test_compute_partition_value_unsupported_type_errors() {
+        let array = arrow::array::BinaryArray::from(vec![b"data".as_slice()]);
+        let result = compute_partition_value(&array, 0, Some("identity"));
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Unsupported partition column type")
+        );
+    }
+
+    #[test]
+    fn test_temporal_transform_all_timestamp_precisions() {
+        // 2024-06-15 09:30:00 UTC
+        let us = 1_718_443_800_000_000i64;
+
+        let sec_array = arrow::array::TimestampSecondArray::from(vec![us / 1_000_000]);
+        assert_eq!(
+            compute_partition_value(&sec_array, 0, Some("year")).unwrap(),
+            Some("2024".to_string())
+        );
+        assert_eq!(
+            compute_partition_value(&sec_array, 0, Some("hour")).unwrap(),
+            Some("9".to_string())
+        );
+
+        let ms_array = arrow::array::TimestampMillisecondArray::from(vec![us / 1_000]);
+        assert_eq!(
+            compute_partition_value(&ms_array, 0, Some("year")).unwrap(),
+            Some("2024".to_string())
+        );
+
+        let us_array = arrow::array::TimestampMicrosecondArray::from(vec![us]);
+        assert_eq!(
+            compute_partition_value(&us_array, 0, Some("month")).unwrap(),
+            Some("6".to_string())
+        );
+
+        let ns_array = arrow::array::TimestampNanosecondArray::from(vec![us * 1_000]);
+        assert_eq!(
+            compute_partition_value(&ns_array, 0, Some("day")).unwrap(),
+            Some("15".to_string())
+        );
+    }
+
+    #[test]
+    fn test_temporal_transform_on_non_temporal_type_errors() {
+        let array = arrow::array::StringArray::from(vec!["not-a-date"]);
+        let result = compute_partition_value(&array, 0, Some("year"));
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("non-temporal type")
         );
     }
 
@@ -758,7 +868,7 @@ mod tests {
             transform: None,
         }];
 
-        let result = route_batches_to_partitions(&[batch], &cols);
+        let result = route_batches_to_partitions(&[batch], &cols).unwrap();
         assert_eq!(result.len(), 1);
         assert!(result.contains_key("category=A"));
         assert_eq!(result["category=A"].1.len(), 3);
@@ -786,7 +896,7 @@ mod tests {
             transform: None,
         }];
 
-        let result = route_batches_to_partitions(&[batch], &cols);
+        let result = route_batches_to_partitions(&[batch], &cols).unwrap();
         assert_eq!(result.len(), 3);
         assert_eq!(result["category=A"].1.len(), 2);
         assert_eq!(result["category=B"].1.len(), 1);

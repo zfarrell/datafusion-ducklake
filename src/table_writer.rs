@@ -665,7 +665,8 @@ pub(crate) fn batches_to_inlined_rows(
     batches: &[RecordBatch],
     schema: &Schema,
 ) -> Vec<InlinedDataRow> {
-    let column_names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+    let column_names: Arc<Vec<String>> =
+        Arc::new(schema.fields().iter().map(|f| f.name().clone()).collect());
     let mut rows = Vec::new();
 
     for batch in batches {
@@ -680,7 +681,7 @@ pub(crate) fn batches_to_inlined_rows(
                 }
             }
             rows.push(InlinedDataRow {
-                column_names: column_names.clone(),
+                column_names: Arc::clone(&column_names),
                 values,
             });
         }
@@ -757,11 +758,19 @@ fn arrow_array_value_to_string(array: &dyn arrow::array::Array, idx: usize) -> S
         },
         DataType::Date32 => {
             let a = array.as_any().downcast_ref::<Date32Array>().unwrap();
-            a.value(idx).to_string()
+            let days = a.value(idx);
+            match arrow::temporal_conversions::date32_to_datetime(days) {
+                Some(dt) => dt.format("%Y-%m-%d").to_string(),
+                None => days.to_string(),
+            }
         },
         DataType::Date64 => {
             let a = array.as_any().downcast_ref::<Date64Array>().unwrap();
-            a.value(idx).to_string()
+            let ms = a.value(idx);
+            match arrow::temporal_conversions::date64_to_datetime(ms) {
+                Some(dt) => dt.format("%Y-%m-%d").to_string(),
+                None => ms.to_string(),
+            }
         },
         _ => {
             // Fallback: use Arrow's default display
@@ -1313,5 +1322,28 @@ mod tests {
         // Footer should be the raw Thrift metadata size (without PAR1 magic + length field)
         assert!(footer_size > 0);
         assert!(footer_size < 10000);
+    }
+
+    #[test]
+    fn test_arrow_array_value_to_string_date32_iso8601() {
+        use arrow::array::Date32Array;
+        // 2024-06-15 is 19889 days since epoch
+        let array = Date32Array::from(vec![19889]);
+        assert_eq!(arrow_array_value_to_string(&array, 0), "2024-06-15");
+    }
+
+    #[test]
+    fn test_arrow_array_value_to_string_date64_iso8601() {
+        use arrow::array::Date64Array;
+        let ms: i64 = 19889 * 86400 * 1000;
+        let array = Date64Array::from(vec![ms]);
+        assert_eq!(arrow_array_value_to_string(&array, 0), "2024-06-15");
+    }
+
+    #[test]
+    fn test_arrow_array_value_to_string_epoch_date32() {
+        use arrow::array::Date32Array;
+        let array = Date32Array::from(vec![0]);
+        assert_eq!(arrow_array_value_to_string(&array, 0), "1970-01-01");
     }
 }

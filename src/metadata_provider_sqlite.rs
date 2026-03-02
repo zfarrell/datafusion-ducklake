@@ -1,5 +1,7 @@
 //! SQLite metadata provider for DuckLake catalogs.
 
+use std::sync::Arc;
+
 use crate::Result;
 use crate::metadata_provider::{
     ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileData, DuckLakeTableColumn,
@@ -902,15 +904,17 @@ WHERE data.table_id = ?
                 .fetch_all(&self.pool)
                 .await?;
 
+            let num_columns = user_columns.len();
+            let user_columns = Arc::new(user_columns);
             let mut result = Vec::new();
             for row in &rows {
                 let mut values = Vec::new();
-                for i in 0..user_columns.len() {
+                for i in 0..num_columns {
                     let val: Option<String> = row.try_get(i)?;
                     values.push(val);
                 }
                 result.push(InlinedDataRow {
-                    column_names: user_columns.clone(),
+                    column_names: Arc::clone(&user_columns),
                     values,
                 });
             }

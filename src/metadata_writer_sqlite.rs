@@ -2,6 +2,8 @@
 //!
 //! Requires multi-threaded Tokio runtime (`#[tokio::test(flavor = "multi_thread")]`).
 
+use std::sync::Arc;
+
 use crate::Result;
 use crate::metadata_provider::{InlinedDataRow, block_on};
 use crate::metadata_writer::{
@@ -9,8 +11,8 @@ use crate::metadata_writer::{
     WriteMode, WriteSetupResult,
 };
 use crate::metadata_writer_validation::{
-    ActiveColumnInfo, AlterTableAction, validate_alter_table, validate_no_duplicate_columns,
-    validate_schema_evolution, validate_table_has_columns,
+    ActiveColumnInfo, AlterTableAction, quote_identifier, validate_alter_table,
+    validate_no_duplicate_columns, validate_schema_evolution, validate_table_has_columns,
 };
 use sqlx::Row;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
@@ -1864,7 +1866,8 @@ impl MetadataWriter for SqliteMetadataWriter {
                 );
                 for col in columns {
                     // Use TEXT for all columns in SQLite (dynamic typing)
-                    create_sql.push_str(&format!(", \"{}\" TEXT", col.name()));
+                    // quote_identifier() escapes embedded quotes to prevent SQL injection
+                    create_sql.push_str(&format!(", {} TEXT", quote_identifier(col.name())));
                 }
                 create_sql.push(')');
                 sqlx::query(&create_sql).execute(&mut *tx).await?;
@@ -1887,11 +1890,9 @@ impl MetadataWriter for SqliteMetadataWriter {
             let next_row_id_row = sqlx::query(&next_row_id_sql).fetch_one(&mut *tx).await?;
             let mut row_id: i64 = next_row_id_row.try_get(0)?;
 
-            // Build column names for the INSERT
-            let col_names: Vec<String> = columns
-                .iter()
-                .map(|c| format!("\"{}\"", c.name()))
-                .collect();
+            // Build column names for the INSERT (properly quoted to prevent injection)
+            let col_names: Vec<String> =
+                columns.iter().map(|c| quote_identifier(c.name())).collect();
             let placeholders: Vec<&str> = (0..columns.len()).map(|_| "?").collect();
             let insert_sql = format!(
                 "INSERT INTO \"{}\" (row_id, begin_snapshot, {}) VALUES (?, ?, {})",
@@ -1971,10 +1972,10 @@ impl MetadataWriter for SqliteMetadataWriter {
                 return Ok(Vec::new());
             }
 
-            // Query active rows
+            // Query active rows (properly quoted to prevent injection)
             let col_list: Vec<String> = user_columns
                 .iter()
-                .map(|c| format!("CAST(\"{}\" AS TEXT)", c))
+                .map(|c| format!("CAST({} AS TEXT)", quote_identifier(c)))
                 .collect();
             let select_sql = format!(
                 "SELECT {} FROM \"{}\" WHERE end_snapshot IS NULL",
@@ -1984,15 +1985,17 @@ impl MetadataWriter for SqliteMetadataWriter {
 
             let rows = sqlx::query(&select_sql).fetch_all(&self.pool).await?;
 
+            let num_columns = user_columns.len();
+            let user_columns = Arc::new(user_columns);
             let mut result = Vec::new();
             for row in &rows {
                 let mut values = Vec::new();
-                for i in 0..user_columns.len() {
+                for i in 0..num_columns {
                     let val: Option<String> = row.try_get(i)?;
                     values.push(val);
                 }
                 result.push(InlinedDataRow {
-                    column_names: user_columns.clone(),
+                    column_names: Arc::clone(&user_columns),
                     values,
                 });
             }

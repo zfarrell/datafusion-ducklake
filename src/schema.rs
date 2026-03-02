@@ -147,10 +147,26 @@ impl DuckLakeSchema {
     /// Rewrite DuckDB-specific SQL in view definitions to DataFusion-compatible SQL.
     /// DuckDB serializes some functions differently (e.g., COUNT(*) becomes count_star()).
     fn rewrite_duckdb_view_sql(sql: &str) -> String {
-        let mut result = sql.to_string();
-        // Handle count_star() - DuckDB's internal representation of COUNT(*)
-        while let Some(pos) = result.to_lowercase().find("count_star()") {
-            result.replace_range(pos..pos + 12, "COUNT(*)");
+        let mut result = String::with_capacity(sql.len());
+        let lower = sql.to_lowercase();
+        let bytes = sql.as_bytes();
+        let mut i = 0;
+
+        while i < bytes.len() {
+            if lower[i..].starts_with("count_star()") {
+                // Check word boundary: char before must not be alphanumeric or '_'
+                let is_word_start = i == 0 || {
+                    let prev = bytes[i - 1];
+                    !prev.is_ascii_alphanumeric() && prev != b'_'
+                };
+                if is_word_start {
+                    result.push_str("COUNT(*)");
+                    i += 12;
+                    continue;
+                }
+            }
+            result.push(bytes[i] as char);
+            i += 1;
         }
         result
     }
@@ -454,5 +470,35 @@ mod tests {
         assert!(validate_schema_name("foo/bar").is_err());
         assert!(validate_schema_name("..").is_err());
         assert!(validate_schema_name(".").is_err());
+    }
+
+    #[test]
+    fn test_rewrite_count_star() {
+        assert_eq!(
+            DuckLakeSchema::rewrite_duckdb_view_sql("SELECT count_star() FROM t"),
+            "SELECT COUNT(*) FROM t"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_count_star_preserves_discount_star() {
+        let sql = "SELECT discount_star() FROM t";
+        assert_eq!(DuckLakeSchema::rewrite_duckdb_view_sql(sql), sql);
+    }
+
+    #[test]
+    fn test_rewrite_count_star_multiple() {
+        assert_eq!(
+            DuckLakeSchema::rewrite_duckdb_view_sql("SELECT count_star(), count_star() FROM t"),
+            "SELECT COUNT(*), COUNT(*) FROM t"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_count_star_at_start() {
+        assert_eq!(
+            DuckLakeSchema::rewrite_duckdb_view_sql("count_star()"),
+            "COUNT(*)"
+        );
     }
 }

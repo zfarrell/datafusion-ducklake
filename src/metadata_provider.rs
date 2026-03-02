@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::Result;
 
 // SQL queries for DuckLake catalog tables
@@ -455,8 +457,8 @@ pub struct PartitionColumn {
 /// `data_inlining_row_limit` option.
 #[derive(Debug, Clone)]
 pub struct InlinedDataRow {
-    /// Column names for this row (matches table column order)
-    pub column_names: Vec<String>,
+    /// Column names for this row (shared across all rows in a batch to avoid redundant allocations)
+    pub column_names: Arc<Vec<String>>,
     /// Values as optional strings (None = NULL)
     pub values: Vec<Option<String>>,
 }

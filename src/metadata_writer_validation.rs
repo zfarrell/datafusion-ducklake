@@ -59,6 +59,15 @@ pub(crate) enum AlterTableAction {
     },
 }
 
+/// Escape a SQL identifier for safe use in double-quoted contexts.
+///
+/// Doubles any internal double-quotes per SQL standard identifier quoting,
+/// then wraps the result in double quotes. This prevents SQL injection via
+/// identifiers containing quotes, semicolons, or other special characters.
+pub(crate) fn quote_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
 /// Validate that column names are unique within the provided column list.
 ///
 /// Returns an error if any two columns share the same name (case-sensitive).
@@ -836,5 +845,32 @@ mod tests {
             column_name: "missing".into(),
         };
         assert!(validate_alter_table(&columns, &op).is_err());
+    }
+
+    // --- quote_identifier tests ---
+
+    #[test]
+    fn test_quote_identifier_simple() {
+        assert_eq!(quote_identifier("name"), "\"name\"");
+    }
+
+    #[test]
+    fn test_quote_identifier_with_double_quote() {
+        assert_eq!(quote_identifier(r#"my"col"#), r#""my""col""#);
+    }
+
+    #[test]
+    fn test_quote_identifier_with_semicolon() {
+        assert_eq!(
+            quote_identifier("col; DROP TABLE users"),
+            "\"col; DROP TABLE users\""
+        );
+    }
+
+    #[test]
+    fn test_quote_identifier_injection_attempt() {
+        let malicious = r#"x" TEXT); DROP TABLE foo; --"#;
+        let quoted = quote_identifier(malicious);
+        assert_eq!(quoted, r#""x"" TEXT); DROP TABLE foo; --""#);
     }
 }
