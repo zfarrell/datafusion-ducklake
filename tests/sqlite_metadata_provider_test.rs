@@ -268,8 +268,8 @@ async fn populate_test_data(provider: &SqliteMetadataProvider) -> anyhow::Result
 
     // Insert columns for users table
     sqlx::query(
-        "INSERT INTO ducklake_column (column_id, table_id, column_name, column_type, column_order, nulls_allowed)
-         VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO ducklake_column (column_id, table_id, column_name, column_type, column_order, nulls_allowed, begin_snapshot)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(1i64)
     .bind(1i64)
@@ -277,12 +277,13 @@ async fn populate_test_data(provider: &SqliteMetadataProvider) -> anyhow::Result
     .bind("INT")
     .bind(0i32)
     .bind(0i32) // false
+    .bind(1i64)
     .execute(pool)
     .await?;
 
     sqlx::query(
-        "INSERT INTO ducklake_column (column_id, table_id, column_name, column_type, column_order, nulls_allowed)
-         VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO ducklake_column (column_id, table_id, column_name, column_type, column_order, nulls_allowed, begin_snapshot)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(2i64)
     .bind(1i64)
@@ -290,12 +291,13 @@ async fn populate_test_data(provider: &SqliteMetadataProvider) -> anyhow::Result
     .bind("VARCHAR")
     .bind(1i32)
     .bind(1i32) // true
+    .bind(1i64)
     .execute(pool)
     .await?;
 
     sqlx::query(
-        "INSERT INTO ducklake_column (column_id, table_id, column_name, column_type, column_order, nulls_allowed)
-         VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO ducklake_column (column_id, table_id, column_name, column_type, column_order, nulls_allowed, begin_snapshot)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(3i64)
     .bind(1i64)
@@ -303,6 +305,7 @@ async fn populate_test_data(provider: &SqliteMetadataProvider) -> anyhow::Result
     .bind("VARCHAR")
     .bind(2i32)
     .bind(1i32) // true
+    .bind(1i64)
     .execute(pool)
     .await?;
 
@@ -430,7 +433,7 @@ async fn populate_from_duckdb_catalog(
             .execute(pool)
             .await?;
 
-            let columns = duckdb_provider.get_table_structure(table.table_id)?;
+            let columns = duckdb_provider.get_table_structure(table.table_id, current_snapshot.snapshot_id)?;
 
             for (order, column) in columns.iter().enumerate() {
                 sqlx::query(
@@ -726,7 +729,7 @@ async fn test_get_table_structure() {
         .expect("Failed to populate test data");
 
     let columns = provider
-        .get_table_structure(1)
+        .get_table_structure(1, 1)
         .expect("Should get table structure");
 
     assert_eq!(columns.len(), 3, "users table should have 3 columns");
@@ -866,7 +869,7 @@ async fn test_concurrent_access() {
             let _schemas = provider.list_schemas(1).expect("Should list schemas");
             let _tables = provider.list_tables(1, 1).expect("Should list tables");
             let _columns = provider
-                .get_table_structure(1)
+                .get_table_structure(1, 1)
                 .expect("Should get structure");
         });
         tasks.push(task);

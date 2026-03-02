@@ -222,11 +222,6 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                 .runtime_env()
                 .object_store(object_store_url.as_ref())?;
 
-            // Create a single snapshot for the entire update operation
-            let snapshot_id = writer
-                .create_snapshot()
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
             // Compile filter expressions into physical expressions
             let df_schema = DFSchema::try_from(table_schema.as_ref().clone())?;
             let physical_filters: Vec<_> = filters
@@ -357,10 +352,9 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                     continue;
                 }
 
-                let update_count = i64::try_from(positions_to_delete.len())
+                let new_update_count = u64::try_from(positions_to_delete.len())
                     .map_err(|e| DataFusionError::Execution(format!("Update count overflow: {}", e)))?;
-                total_updated += u64::try_from(update_count)
-                    .map_err(|e| DataFusionError::Execution(format!("Update count overflow: {}", e)))?;
+                total_updated += new_update_count;
 
                 // Apply SET transformations to matching rows
                 for matched_batch in &matching_rows {
@@ -400,6 +394,9 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                     ObjectPath::from(delete_object_key.trim_start_matches('/'));
 
                 let del_schema = delete_file_schema();
+                // R3F-034: delete_count tracks total positions in delete file, not just new deletions
+                let total_delete_count = i64::try_from(all_positions.len())
+                    .map_err(|e| DataFusionError::Execution(format!("Delete count overflow: {}", e)))?;
                 let file_path_values: Vec<&str> = vec![&table_file.file.path; all_positions.len()];
                 let file_path_array: ArrayRef = Arc::new(StringArray::from(file_path_values));
                 let pos_array: ArrayRef = Arc::new(Int64Array::from(all_positions));
@@ -431,7 +428,7 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                 uploaded_files.push(delete_object_path);
 
                 let delete_file_info =
-                    DeleteFileInfo::new(data_file_id, &delete_file_name, file_size, update_count)
+                    DeleteFileInfo::new(data_file_id, &delete_file_name, file_size, total_delete_count)
                         .with_footer_size(footer_size);
 
                 pending_delete_files.push(delete_file_info);
@@ -492,6 +489,17 @@ impl ExecutionPlan for DuckLakeUpdateExec {
 
                 pending_data_files.push(data_file_info);
             }
+
+            // R3F-032: Skip snapshot creation if no rows were affected
+            if total_updated == 0 {
+                let count_array: ArrayRef = Arc::new(UInt64Array::from(vec![0u64]));
+                return Ok(RecordBatch::try_new(output_schema, vec![count_array])?);
+            }
+
+            // Create a snapshot for this update operation (deferred until we know rows are affected)
+            let snapshot_id = writer
+                .create_snapshot()
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
             // Atomically register all delete files and data files
             if let Err(e) = writer.register_dml_files(

@@ -156,7 +156,7 @@ impl DuckLakeTable {
         table_path: String,
     ) -> Result<Self> {
         // Load ALL metadata with this snapshot_id
-        let columns = provider.get_table_structure(table_id)?;
+        let columns = provider.get_table_structure(table_id, snapshot_id)?;
         let schema = Arc::new(build_arrow_schema(&columns)?);
         let full_schema = {
             let mut fields = schema.fields().to_vec();

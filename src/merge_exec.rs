@@ -310,10 +310,6 @@ impl ExecutionPlan for DuckLakeMergeExec {
                 .runtime_env()
                 .object_store(object_store_url.as_ref())?;
 
-            let snapshot_id = writer
-                .create_snapshot()
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
             let has_matched_action = matched_action.is_some();
 
             let mut total_affected: u64 = 0;
@@ -323,9 +319,10 @@ impl ExecutionPlan for DuckLakeMergeExec {
             // R3F-003: Track uploaded files for cleanup on metadata failure
             let mut uploaded_files: Vec<ObjectPath> = Vec::new();
 
-            // Track which source rows have been matched (for NOT MATCHED INSERT)
+            // Track how many target rows each source row has matched
+            // R3F-033: SQL standard requires error when source row matches multiple targets
             let total_source_rows: usize = source_batches.iter().map(|b| b.num_rows()).sum();
-            let mut source_matched = vec![false; total_source_rows];
+            let mut source_match_count = vec![0u32; total_source_rows];
 
             // For UPDATE: collect matched source rows to write as replacement data
             let mut matched_source_rows: Vec<RecordBatch> = Vec::new();
@@ -406,7 +403,17 @@ impl ExecutionPlan for DuckLakeMergeExec {
                                     }
                                 }
                                 if all_keys_match {
-                                    source_matched[source_global_idx + src_row_idx] = true;
+                                    let src_global = source_global_idx + src_row_idx;
+                                    source_match_count[src_global] += 1;
+
+                                    // R3F-033: Error if source row matches multiple target rows
+                                    if source_match_count[src_global] > 1 {
+                                        return Err(DataFusionError::Execution(
+                                            "MERGE violation: a source row matched more than one target row. \
+                                             SQL standard requires each source row to match at most one target row."
+                                                .to_string(),
+                                        ));
+                                    }
 
                                     // Only process matched action if one exists
                                     if has_matched_action {
@@ -430,9 +437,9 @@ impl ExecutionPlan for DuckLakeMergeExec {
                     continue;
                 }
 
-                let match_count = u64::try_from(positions_to_delete.len())
+                let new_match_count = u64::try_from(positions_to_delete.len())
                     .map_err(|e| DataFusionError::Execution(format!("Delete count overflow: {}", e)))?;
-                total_affected += match_count;
+                total_affected += new_match_count;
 
                 // For UPDATE: collect the matched source rows (these replace the deleted target rows)
                 if matches!(&matched_action, Some(MergeMatchedAction::Update)) {
@@ -464,6 +471,9 @@ impl ExecutionPlan for DuckLakeMergeExec {
                     ObjectPath::from(delete_object_key.trim_start_matches('/'));
 
                 let del_schema = delete_file_schema();
+                // R3F-034: delete_count tracks total positions in delete file, not just new matches
+                let total_delete_count = i64::try_from(all_positions.len())
+                    .map_err(|e| DataFusionError::Execution(format!("Delete count overflow: {}", e)))?;
                 let file_path_values: Vec<&str> = vec![&table_file.file.path; all_positions.len()];
                 let file_path_array: ArrayRef = Arc::new(StringArray::from(file_path_values));
                 let pos_array: ArrayRef = Arc::new(Int64Array::from(all_positions));
@@ -494,13 +504,11 @@ impl ExecutionPlan for DuckLakeMergeExec {
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
                 uploaded_files.push(delete_object_path);
 
-                let match_count_i64 = i64::try_from(match_count)
-                    .map_err(|e| DataFusionError::Execution(format!("Match count overflow: {}", e)))?;
                 let delete_file_info = DeleteFileInfo::new(
                     data_file_id,
                     &delete_file_name,
                     file_size,
-                    match_count_i64,
+                    total_delete_count,
                 )
                 .with_footer_size(footer_size);
 
@@ -516,7 +524,7 @@ impl ExecutionPlan for DuckLakeMergeExec {
                 for src_batch in &source_batches {
                     let mut mask_values = vec![false; src_batch.num_rows()];
                     for (i, mask_val) in mask_values.iter_mut().enumerate() {
-                        if !source_matched[source_global_idx + i] {
+                        if source_match_count[source_global_idx + i] == 0 {
                             *mask_val = true;
                         }
                     }
@@ -585,6 +593,17 @@ impl ExecutionPlan for DuckLakeMergeExec {
 
                 pending_data_files.push(data_file_info);
             }
+
+            // R3F-032: Skip snapshot creation if no rows were affected
+            if total_affected == 0 {
+                let count_array: ArrayRef = Arc::new(UInt64Array::from(vec![0u64]));
+                return Ok(RecordBatch::try_new(output_schema, vec![count_array])?);
+            }
+
+            // Create a snapshot for this merge operation (deferred until we know rows are affected)
+            let snapshot_id = writer
+                .create_snapshot()
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
             // R3F-003: Atomically register all delete files and data files with cleanup on failure
             if let Err(e) = writer.register_dml_files(

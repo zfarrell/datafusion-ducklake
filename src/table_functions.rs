@@ -325,7 +325,7 @@ fn resolve_table_for_function(
         .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
 
     let columns = provider
-        .get_table_structure(table.table_id)
+        .get_table_structure(table.table_id, snapshot_id)
         .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
 
     let table_schema = Arc::new(

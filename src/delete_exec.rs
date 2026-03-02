@@ -195,11 +195,6 @@ impl ExecutionPlan for DuckLakeDeleteExec {
                 .runtime_env()
                 .object_store(object_store_url.as_ref())?;
 
-            // Create a snapshot for this delete operation
-            let snapshot_id = writer
-                .create_snapshot()
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
             // Compile filter expressions into physical expressions
             let df_schema = DFSchema::try_from(table_schema.as_ref().clone())?;
             let physical_filters: Vec<_> = filters
@@ -311,10 +306,9 @@ impl ExecutionPlan for DuckLakeDeleteExec {
                     continue;
                 }
 
-                let delete_count = i64::try_from(positions_to_delete.len())
+                let new_delete_count = u64::try_from(positions_to_delete.len())
                     .map_err(|e| DataFusionError::Execution(format!("Delete count overflow: {}", e)))?;
-                total_deleted += u64::try_from(delete_count)
-                    .map_err(|e| DataFusionError::Execution(format!("Delete count overflow: {}", e)))?;
+                total_deleted += new_delete_count;
 
                 // Merge with existing deletes if any
                 if let Some(existing) = existing_positions {
@@ -324,6 +318,10 @@ impl ExecutionPlan for DuckLakeDeleteExec {
                     positions_to_delete.sort_unstable();
                     positions_to_delete.dedup();
                 }
+
+                // R3F-034: delete_count tracks total positions in delete file, not just new deletions
+                let delete_count = i64::try_from(positions_to_delete.len())
+                    .map_err(|e| DataFusionError::Execution(format!("Delete count overflow: {}", e)))?;
 
                 // Write the delete file
                 let delete_file_name = format!("ducklake-{}-delete.parquet", Uuid::new_v4());
@@ -374,6 +372,17 @@ impl ExecutionPlan for DuckLakeDeleteExec {
 
                 pending_delete_files.push(delete_file_info);
             }
+
+            // R3F-032: Skip snapshot creation if no rows were affected
+            if total_deleted == 0 {
+                let count_array: ArrayRef = Arc::new(UInt64Array::from(vec![0u64]));
+                return Ok(RecordBatch::try_new(output_schema, vec![count_array])?);
+            }
+
+            // Create a snapshot for this delete operation (deferred until we know rows are affected)
+            let snapshot_id = writer
+                .create_snapshot()
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
             // Atomically register all delete files
             if let Err(e) =
