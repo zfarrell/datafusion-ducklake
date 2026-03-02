@@ -90,26 +90,43 @@ Everything through Phase 6 is complete. See `docs/project-status.md` for the ful
 - Mode 2 (Pure DataFusion SLT runner) — highest value, needs ~450 lines of adapter code
 - Mode 3 (DF→DuckDB reverse interop SLT) — builds on Mode 2
 
-### Code Review Cycle (2026-03-01 → 2026-03-02)
+### Code Review Cycle 1 (2026-03-01 → 2026-03-02)
 
-A comprehensive four-part code review was conducted on the Tier 1 sprint code, identifying **36 deduplicated findings** (6 P0, 11 P1, 13 P2, 13 P3). Four fix agents then resolved all P0 and P1 items plus 9 of 13 P2 items.
+A four-part code review identified **36 deduplicated findings** (6 P0, 11 P1, 13 P2, 13 P3). Four fix agents resolved all P0 and P1 items plus 9 of 13 P2 items.
 
-**What was fixed (all P0 + P1 + partial P2):**
-- **Write atomicity** (P0-1, P0-2, P0-4, P1-1, P1-7): Single transaction for partitioned writes, deferred Replace-mode, all-or-nothing commit, BTreeMap ordering, atomic partition value registration
-- **Inline data safety** (P0-3, P0-5, P1-4, P1-8): Error propagation, correct flush paths, `Arc<Vec<String>>`
-- **Input validation** (P0-6, P1-2, P1-3, P1-5, P1-6, P2-9, P2-12): SQL injection prevention via `quote_identifier()`, all timestamp precisions, URL-encoded partition values, error on unknown transforms/unsupported types, word-boundary `count_star()`, ISO-8601 date formatting. +18 unit tests.
-- **Test infrastructure** (P1-9, P1-10, P1-11, P2-2 through P2-7, P2-11): Column-count assertions, 3 new interop tests, shared `tests/common/test_utils.rs`, dead code removal, skip logging, sort masking fix, DuckDB skip warnings
+**What was fixed**: Write atomicity (single transaction for partitioned writes, deferred Replace-mode), inline data safety (error propagation, correct flush paths), input validation (SQL injection prevention in WRITE path, all timestamp precisions, URL-encoded partition values), test infrastructure (shared test_utils.rs, 3 new interop tests, skip logging).
 
-**Remaining (P2/P3):**
-- P2-1: Vectorized partition routing (performance)
-- P2-8: PG/MySQL inlining fallback
-- P2-10: Snapshot field population
-- P2-13: UNIQUE constraints for PG/MySQL ID allocation
-- All P3 items (13 nits/style)
+**Source**: `docs/2026-03-01-review-synthesis.md`
+
+### Code Review Cycle 2 (2026-03-02)
+
+A five-part review (idiomatic, correctness, interop, test-harness, codex) identified **99 raw findings → 64 after dedup → 58 actionable** (5 P0, 15 P1, 21 P2, 17 P3).
+
+**Key NEW P0 findings:**
+- SQL injection in inlined data READ path (all 4 metadata providers) — Cycle 1 only fixed WRITE path
+- Non-atomic DELETE/UPDATE/MERGE metadata commit — Cycle 1 only fixed INSERT
+- CTAS hard-wired to LocalFileSystem (broken for S3/MinIO)
+- Tests that silently pass on errors (sql_write_tests, roundtrip_interop_tests)
+
+**Key NEW P1 findings:**
+- Transaction safety gaps in sqlx writers (TOCTOU races, non-transactional stats/file operations)
+- MERGE panics on unsupported key types (Decimal, Timestamp)
+- DuckLake interop: delete file format mismatch, missing row_id_start, missing table_stats/schema_versions, column ID instability
+- Table function projection/snapshot bugs
+- drop_schema orphans child tables
+- SLT runner never fails CI
+
+**Recommended 6 fix agents** (see synthesis doc for details):
+1. Security (SQL injection READ path)
+2. Write atomicity & transaction safety
+3. DuckLake interop alignment
+4. DML & table function correctness
+5. Test reliability
+6. Data integrity & numeric safety
 
 **Source documents:**
-- `docs/2026-03-01-review-synthesis.md` (consolidated findings + resolution status)
-- `docs/2026-03-01-review-idiomatic.md`, `docs/2026-03-01-review-correctness.md`, `docs/2026-03-01-review-interop.md`, `docs/2026-03-01-review-test-harness.md`
+- `docs/2026-03-02-review-synthesis.md` (consolidated findings, agent assignments)
+- `docs/2026-03-02-review-idiomatic.md`, `docs/2026-03-02-review-correctness.md`, `docs/2026-03-02-review-interop.md`, `docs/2026-03-02-review-test-harness.md`, `docs/2026-03-02-codex-review.md`
 
 ### After Implementation: PR Creation
 Follow `/home/zac/ducklake-pr-strategy.md`:

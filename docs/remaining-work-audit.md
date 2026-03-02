@@ -7,32 +7,29 @@
 
 ---
 
-## Review Findings (2026-03-01, updated 2026-03-02)
+## Review Findings
 
-A four-part code review (idiomatic, correctness, interop, test harness) identified 36 deduplicated findings. All P0 and P1 items have been **FIXED** (2026-03-02). Full details in `docs/2026-03-01-review-synthesis.md`.
+### Cycle 1 (2026-03-01) — ALL P0/P1 FIXED
 
-### P0: Fix Immediately — ALL FIXED
+A four-part review identified 36 deduplicated findings. All 6 P0 and 11 P1 items were fixed. 9 of 13 P2 items fixed. Full details in `docs/2026-03-01-review-synthesis.md`.
 
-- **P0-1** [L]: ~~Partitioned writes create independent snapshots per partition.~~ **FIXED**: Single `begin_write_transaction` for all partitions. New APIs: `UploadedFile`, `upload()`, `begin_write_partitioned_with_setup()`, `commit_uploaded_files()`.
-- **P0-2** [M]: ~~Replace-mode metadata commit before Parquet upload.~~ **FIXED**: Replace-mode defers old file ending until after upload succeeds.
-- **P0-3** [S]: ~~Inline data cleared before Parquet write.~~ **FIXED**: `clear_inlined_data` moved after successful Parquet write.
-- **P0-4** [L]: ~~Partitioned writes partially commit on failure.~~ **FIXED**: All-or-nothing commit with `cleanup_uploaded_files()` on failure.
-- **P0-5** [S]: ~~Inline data read failure silently swallowed.~~ **FIXED**: Error propagation for inline reads.
-- **P0-6** [S]: ~~SQL injection via column name interpolation.~~ **FIXED**: `quote_identifier()` for SQL injection prevention.
+### Cycle 2 (2026-03-02) — 58 NEW ACTIONABLE FINDINGS
 
-### P1: Fix Soon — ALL FIXED
+A five-part review (idiomatic, correctness, interop, test-harness, codex) identified 99 raw findings → 64 after dedup → 58 after filtering previously fixed items. Full details in `docs/2026-03-02-review-synthesis.md`.
 
-- **P1-1** [S]: ~~Non-deterministic HashMap order for Replace semantics.~~ **FIXED**: BTreeMap for deterministic partition ordering.
-- **P1-2** [S]: ~~Timestamp partition transforms only support microsecond.~~ **FIXED**: All 4 Arrow timestamp precisions supported.
-- **P1-3** [S]: ~~Unknown partition transforms silently produce NULL.~~ **FIXED**: Unknown transforms return error.
-- **P1-4** [S]: ~~Inline flush writes to wrong directory.~~ **FIXED**: Flush path uses `table_name/` not `t{table_id}/`.
-- **P1-5** [S]: ~~Hive partition values not URL-encoded.~~ **FIXED**: Partition values URL-encoded.
-- **P1-6** [S]: ~~`compute_partition_value` returns `None` for unsupported types.~~ **FIXED**: Unsupported partition types return error.
-- **P1-7** [M]: ~~Partition value registration non-atomic.~~ **FIXED**: Partition values registered atomically with file registration.
-- **P1-8** [S]: ~~`InlinedDataRow` clones `column_names` per row.~~ **FIXED**: Uses `Arc<Vec<String>>`.
-- **P1-9** [S]: ~~`assert_results_eq` uses `zip` without column-count check.~~ **FIXED**: Checks column counts before zip.
-- **P1-10** [M]: ~~No DF-write partitioned data interop test.~~ **FIXED**: New `test_df_write_partitioned_duckdb_read()`.
-- **P1-11** [M]: ~~No DF-write inlined data interop test.~~ **FIXED**: New `test_df_write_inlined_duckdb_read()`.
+| Priority | Count | Key themes |
+|----------|-------|------------|
+| P0 | 5 | SQL injection (READ path), non-atomic DML, CTAS object store, test false-passes |
+| P1 | 15 | Transaction safety, MERGE panics, interop format mismatches, column ID instability, drop cascade |
+| P2 | 21 | Virtual columns, type mapping, numeric casts, encryption keys, performance |
+| P3 | 17 | Code duplication, missing Debug impls, minor interop diffs, test nits |
+
+**New P0 items (not in Cycle 1):**
+- F-001: SQL injection in inlined data READ path (all 4 providers) — Cycle 1 fixed WRITE path only
+- F-002: Non-atomic DELETE/UPDATE/MERGE metadata commit — Cycle 1 fixed INSERT only
+- F-003: CTAS hard-wired to LocalFileSystem — new finding
+- F-004: sql_write_tests.rs silently passes on errors — new finding
+- F-005: Roundtrip interop tests silently skip — new finding
 
 ---
 
