@@ -11,8 +11,8 @@ use arrow::array::{Array, Int64Array, StringArray};
 use arrow::record_batch::RecordBatch;
 use datafusion::prelude::*;
 use datafusion_ducklake::{
-    DuckLakeCatalog, DuckdbMetadataProvider, register_ducklake_compaction_functions,
-    register_ducklake_functions,
+    DuckLakeCatalog, DuckdbMetadataProvider, MetadataProvider,
+    register_ducklake_compaction_functions, register_ducklake_functions,
 };
 use tempfile::TempDir;
 
