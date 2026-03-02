@@ -152,6 +152,8 @@
 | Feature | Status | Evidence | Missing | Tests |
 |---------|--------|----------|---------|-------|
 | Atomic write transactions | Complete | `src/metadata_writer.rs:387` `begin_write_transaction()` | — | `tests/concurrent_write_tests.rs` |
+| Partitioned write atomicity | Complete (2026-03-02) | Single `begin_write_transaction` for all partitions; all-or-nothing commit via `commit_uploaded_files()` / `cleanup_uploaded_files()` | — | Existing partition tests |
+| Replace-mode safety | Complete (2026-03-02) | Old file ending deferred until after upload succeeds; prevents empty-table on upload failure | — | Existing write tests |
 | Conflict detection (OCC) | Complete | `src/metadata_writer.rs:428` `begin_checked_write_transaction()` | — | `tests/conflict_detection_tests.rs` |
 | Orphaned file cleanup | Complete | `src/table_writer.rs:582` `cleanup_orphaned_files()`, best-effort on commit failure | — | Implicit via write tests |
 
@@ -225,9 +227,11 @@
 
 | Category | Count |
 |----------|-------|
-| **Total `#[test]` + `#[tokio::test]`** | **~703** |
+| **Total `#[test]` + `#[tokio::test]`** | **~724** |
 | SLT test files | 254 |
 | SLT pass rate | 157/254 (61.8%) |
+
+**Note (2026-03-02)**: +21 tests added during the review fix cycle: 18 new unit tests (input validation, timestamp precisions, partition safety, SQL identifier quoting, date formatting) + 3 new interop tests (`test_df_write_partitioned_duckdb_read`, `test_df_write_inlined_duckdb_read`, `test_duckdb_partitioned_inlined_data`).
 
 ### 2.2 Test Breakdown by File
 
@@ -317,6 +321,18 @@
 Note: Postgres/MySQL tests require running database containers (testcontainers).
 
 ## 3. Remaining Work (Prioritized)
+
+### Code Review Fixes (2026-03-02)
+
+A four-part code review identified 36 findings (6 P0, 11 P1, 13 P2, 13 P3). All P0 and P1 items are now **FIXED**. 9 of 13 P2 items are also fixed. Key improvements:
+- **Write atomicity**: Single transaction for partitioned writes, deferred Replace-mode, all-or-nothing commit
+- **Input validation**: SQL identifier quoting, all timestamp precisions, URL-encoded partition values
+- **Inline data safety**: Error propagation, correct flush paths, `Arc<Vec<String>>` for column names
+- **Test infrastructure**: Shared test helpers, column-count assertions, 3 new interop tests, skip logging
+
+Remaining P2: vectorized partition routing (P2-1), PG/MySQL inlining fallback (P2-8), snapshot field population (P2-10), UNIQUE constraints for PG/MySQL (P2-13). All P3 items (13 nits/style) remain as backlog.
+
+See `docs/2026-03-01-review-synthesis.md` for full details and resolution status.
 
 ### Tier 1: Implementable Now (no external blockers)
 

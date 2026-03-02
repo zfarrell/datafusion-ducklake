@@ -6,6 +6,57 @@
 
 ---
 
+## Resolution Status (2026-03-02)
+
+All P0 and P1 findings have been resolved. P2 items partially addressed. P3 items remain as backlog.
+
+| Priority | Total | Fixed | Remaining |
+|----------|-------|-------|-----------|
+| P0 | 6 | 6 | 0 |
+| P1 | 11 | 11 | 0 |
+| P2 | 13 | 9 | 4 |
+| P3 | 13 | 0 | 13 |
+
+### P0 Fixes (all resolved)
+- **P0-1, P0-2, P0-4** (Agent 1): Single `begin_write_transaction` for all partitions. Replace-mode defers old file ending until after upload. All-or-nothing commit with `cleanup_uploaded_files()` on failure.
+- **P0-3, P0-5** (Agent 2): `clear_inlined_data` moved after successful Parquet write. Error propagation for inline reads.
+- **P0-6** (Agent 3): `quote_identifier()` for SQL injection prevention.
+
+### P1 Fixes (all resolved)
+- **P1-1** (Agent 1): BTreeMap for deterministic partition ordering.
+- **P1-2** (Agent 3): All 4 Arrow timestamp precisions supported.
+- **P1-3** (Agent 3): Unknown transforms return error.
+- **P1-4** (Agent 2): Flush path fixed to use `table_name/` not `t{table_id}/`.
+- **P1-5** (Agent 3): Hive partition values URL-encoded.
+- **P1-6** (Agent 3): Unsupported partition types return error.
+- **P1-7** (Agent 1): Partition values registered atomically with file registration.
+- **P1-8** (Agent 2): `InlinedDataRow.column_names` uses `Arc<Vec<String>>`.
+- **P1-9** (Agent 4): `assert_results_eq` checks column counts before zip.
+- **P1-10** (Agent 4): New `test_df_write_partitioned_duckdb_read()` test.
+- **P1-11** (Agent 4): New `test_df_write_inlined_duckdb_read()` test.
+
+### P2 Fixes (9 of 13 resolved)
+- **P2-2** (Agent 4): Shared `tests/common/test_utils.rs` module.
+- **P2-3** (Agent 4): Dead `rewrite_unqualified_tables()` removed.
+- **P2-4** (Agent 4): Word-boundary matching for virtual column stripping.
+- **P2-5** (Agent 4): SLT skip-count logging.
+- **P2-6** (Agent 4): Sort masking fixed.
+- **P2-7** (Agent 4): DuckDB skip warnings added.
+- **P2-9** (Agent 3): `count_star()` rewriting uses word boundaries.
+- **P2-11** (Agent 4): New `test_duckdb_partitioned_inlined_data()` combo test.
+- **P2-12** (Agent 3): Date32/Date64 use ISO-8601 formatting.
+
+### P2 Remaining (4 items)
+- **P2-1**: Vectorized partition routing (performance optimization).
+- **P2-8**: PG/MySQL inlining fallback.
+- **P2-10**: Snapshot field population (`schema_version`, `next_catalog_id`, `next_file_id`).
+- **P2-13**: UNIQUE constraints for PG/MySQL ID allocation.
+
+### P3 Remaining (13 items — all backlog nits/style)
+All P3 items (P3-1 through P3-13) remain unaddressed. See P3 table below for details.
+
+---
+
 ## Executive Summary
 
 Four independent reviews of the Tier 1 sprint code examined idiomatic Rust/DataFusion patterns, correctness/bugs, DuckLake interop compliance, and test infrastructure. A total of **57 raw findings** were identified across the four reviews. After deduplication (multiple reviews flagged the same underlying issues), **36 unique findings** remain.

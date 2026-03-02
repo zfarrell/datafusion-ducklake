@@ -65,9 +65,16 @@ Everything through Phase 6 is complete. See `docs/project-status.md` for the ful
 - T1-9: Reserved schema test — ALREADY EXISTED
 - T1-10: View SLT tests — DONE (6 new test files)
 
-**Remaining (Tier 2+):**
+**Remaining (Tier 1 — SLT):**
 - T1-5 remainder: SLT result mismatch fixes — Medium, 10-15 more tests fixable
 - T1-3 remainder: CTAS table visibility — Small, 2-3 tests
+
+**Remaining (Review P2/P3):**
+- P2-1: Vectorized partition routing (performance optimization)
+- P2-8: PG/MySQL inlining fallback (graceful degradation when inlining unsupported)
+- P2-10: Snapshot field population (`schema_version`, `next_catalog_id`, `next_file_id`)
+- P2-13: UNIQUE constraints for PG/MySQL ID allocation (concurrent writer safety)
+- P3-1 through P3-13: 13 nits/style items (see synthesis doc)
 
 **Tier 2 — Blocked:**
 - SQL MERGE parsing (DataFusion limitation)
@@ -83,27 +90,26 @@ Everything through Phase 6 is complete. See `docs/project-status.md` for the ful
 - Mode 2 (Pure DataFusion SLT runner) — highest value, needs ~450 lines of adapter code
 - Mode 3 (DF→DuckDB reverse interop SLT) — builds on Mode 2
 
-### Code Review Findings (2026-03-01)
+### Code Review Cycle (2026-03-01 → 2026-03-02)
 
-A comprehensive four-part code review was conducted on the Tier 1 sprint code. See `docs/2026-03-01-review-synthesis.md` for the full consolidated action plan. The review identified **36 deduplicated findings** (6 P0, 11 P1, 13 P2, 13 P3).
+A comprehensive four-part code review was conducted on the Tier 1 sprint code, identifying **36 deduplicated findings** (6 P0, 11 P1, 13 P2, 13 P3). Four fix agents then resolved all P0 and P1 items plus 9 of 13 P2 items.
 
-**Critical P0 items that must be fixed before further feature work:**
-- P0-1/P0-4: Partitioned writes create independent snapshots per partition — stale field IDs, partial commits
-- P0-2: Replace-mode ends old files before upload succeeds — table empty on failure
-- P0-3/P0-5: Inline data cleared/errors swallowed before Parquet write — data loss on failure
-- P0-6: SQL injection via column name interpolation in SQLite inlining
+**What was fixed (all P0 + P1 + partial P2):**
+- **Write atomicity** (P0-1, P0-2, P0-4, P1-1, P1-7): Single transaction for partitioned writes, deferred Replace-mode, all-or-nothing commit, BTreeMap ordering, atomic partition value registration
+- **Inline data safety** (P0-3, P0-5, P1-4, P1-8): Error propagation, correct flush paths, `Arc<Vec<String>>`
+- **Input validation** (P0-6, P1-2, P1-3, P1-5, P1-6, P2-9, P2-12): SQL injection prevention via `quote_identifier()`, all timestamp precisions, URL-encoded partition values, error on unknown transforms/unsupported types, word-boundary `count_star()`, ISO-8601 date formatting. +18 unit tests.
+- **Test infrastructure** (P1-9, P1-10, P1-11, P2-2 through P2-7, P2-11): Column-count assertions, 3 new interop tests, shared `tests/common/test_utils.rs`, dead code removal, skip logging, sort masking fix, DuckDB skip warnings
 
-**Key P1 items:**
-- P1-1 through P1-8: Various partition and inline correctness issues (silent misrouting, wrong paths, non-atomic registration)
-- P1-9 through P1-11: Test infrastructure gaps (false pass risk, missing DF-write interop tests)
+**Remaining (P2/P3):**
+- P2-1: Vectorized partition routing (performance)
+- P2-8: PG/MySQL inlining fallback
+- P2-10: Snapshot field population
+- P2-13: UNIQUE constraints for PG/MySQL ID allocation
+- All P3 items (13 nits/style)
 
-**Recommended fix agents**: 4 concurrent agents (write atomicity, inline safety, input validation, test infrastructure). See synthesis doc for detailed assignments.
-
-**Source review documents:**
-- `docs/2026-03-01-review-idiomatic.md`
-- `docs/2026-03-01-review-correctness.md`
-- `docs/2026-03-01-review-interop.md`
-- `docs/2026-03-01-review-test-harness.md`
+**Source documents:**
+- `docs/2026-03-01-review-synthesis.md` (consolidated findings + resolution status)
+- `docs/2026-03-01-review-idiomatic.md`, `docs/2026-03-01-review-correctness.md`, `docs/2026-03-01-review-interop.md`, `docs/2026-03-01-review-test-harness.md`
 
 ### After Implementation: PR Creation
 Follow `/home/zac/ducklake-pr-strategy.md`:

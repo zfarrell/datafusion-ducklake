@@ -573,6 +573,42 @@ SQLite backend implementation (`src/metadata_writer_sqlite.rs`):
 - Auto-flush to Parquet when `DATA_INLINING_ROW_LIMIT` exceeded
 - `ducklake_flush_inlined_data()` table function for manual flush
 
+### Write Atomicity Model (updated 2026-03-02)
+
+Partitioned writes use a **single-transaction, all-or-nothing** model:
+
+1. **Single `begin_write_transaction`**: Called once for the entire write, not per partition. Returns a shared `WriteSetupResult` with snapshot_id and column_ids used by all partitions.
+2. **Upload-then-commit**: Files are uploaded to object storage first via `upload()`, returning `UploadedFile` structs. Only after ALL uploads succeed are files registered in the catalog via `commit_uploaded_files()`.
+3. **Deferred Replace-mode**: In Replace mode, old files are ended AFTER upload succeeds (not before). This prevents an empty table if upload fails.
+4. **Cleanup on failure**: If any upload or commit fails, `cleanup_uploaded_files()` removes already-uploaded files from object storage.
+5. **Deterministic ordering**: Partitions use `BTreeMap` (not `HashMap`) for deterministic iteration order.
+6. **Atomic partition values**: Partition values are registered inside the write transaction, not after `session.finish()`.
+
+Key types: `UploadedFile`, `begin_write_partitioned_with_setup()`, `commit_uploaded_files()`, `cleanup_uploaded_files()`.
+
+### SQL Identifier Quoting
+
+All SQL identifiers (column names, table names) interpolated into dynamic SQL **must** be sanitized using `quote_identifier()`. This prevents SQL injection when column names contain special characters (quotes, semicolons, etc.).
+
+```rust
+// WRONG: SQL injection risk
+format!("CREATE TABLE inline_{} ({})", table_id, col_name);
+
+// CORRECT: Use quote_identifier()
+format!("CREATE TABLE inline_{} ({})", table_id, quote_identifier(col_name));
+```
+
+This applies to all metadata writer backends (SQLite, PostgreSQL, MySQL), especially in the inlining code paths.
+
+### Partition Value URL-Encoding
+
+Hive partition values are URL-encoded per Hive convention before being used in directory paths. Values containing `/`, `..`, `=`, or other special characters are encoded to prevent malformed or directory-traversal paths.
+
+```rust
+// Partition value "hello/world" becomes "hello%2Fworld" in the path:
+// year=2024/region=hello%2Fworld/data.parquet
+```
+
 ### Pre-commit Hook
 A pre-commit hook is installed at `.githooks/pre-commit`:
 - Automatically runs `cargo fmt` on staged Rust files before committing
