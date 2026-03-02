@@ -534,6 +534,18 @@ impl SqliteMetadataWriter {
                 .bind(snapshot_id)
                 .execute(&mut *tx)
                 .await?;
+
+                // R3F-001: Initialize ducklake_table_column_stats with non-NULL contains_null
+                sqlx::query(
+                    "INSERT INTO ducklake_table_column_stats
+                     (table_id, column_id, contains_null, contains_nan)
+                     VALUES (?, ?, 0, NULL)",
+                )
+                .bind(table_id)
+                .bind(column_id)
+                .execute(&mut *tx)
+                .await?;
+
                 new_ids.push(column_id);
             }
             new_ids
@@ -541,18 +553,68 @@ impl SqliteMetadataWriter {
 
         // Record in snapshot_changes with DuckDB-compatible format (F-027)
         if !table_exists {
+            // R3F-014: Include created_schema if schema was also new
+            let changes = if !schema_exists {
+                format!(
+                    "created_schema:\"{}\",created_table:\"{}\".\"{}\"",
+                    schema_name, schema_name, table_name
+                )
+            } else {
+                format!(
+                    "created_table:\"{}\".\"{}\"",
+                    schema_name, table_name
+                )
+            };
             sqlx::query(
                 "INSERT OR REPLACE INTO ducklake_snapshot_changes (snapshot_id, changes_made)
                  VALUES (?, ?)",
             )
             .bind(snapshot_id)
-            .bind(format!(
-                "created_table:\"{}\".\"{}\"",
-                schema_name, table_name
-            ))
+            .bind(&changes)
+            .execute(&mut *tx)
+            .await?;
+        } else {
+            // R3F-013: Record inserted_into_table for append to existing table
+            sqlx::query(
+                "INSERT OR REPLACE INTO ducklake_snapshot_changes (snapshot_id, changes_made)
+                 VALUES (?, ?)",
+            )
+            .bind(snapshot_id)
+            .bind(format!("inserted_into_table:{}", table_id))
             .execute(&mut *tx)
             .await?;
         }
+
+        // R3F-011: Update snapshot with next_catalog_id and next_file_id
+        let cat_row = sqlx::query(
+            "SELECT MAX(v) + 1 FROM (
+                SELECT COALESCE(MAX(schema_id), 0) AS v FROM ducklake_schema
+                UNION ALL SELECT COALESCE(MAX(table_id), 0) FROM ducklake_table
+                UNION ALL SELECT COALESCE(MAX(view_id), 0) FROM ducklake_view
+            )",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        let next_catalog_id: i64 = cat_row.try_get::<Option<i64>, _>(0)?.unwrap_or(0);
+
+        let file_row = sqlx::query(
+            "SELECT MAX(v) + 1 FROM (
+                SELECT COALESCE(MAX(data_file_id), 0) AS v FROM ducklake_data_file
+                UNION ALL SELECT COALESCE(MAX(delete_file_id), 0) FROM ducklake_delete_file
+            )",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        let next_file_id: i64 = file_row.try_get::<Option<i64>, _>(0)?.unwrap_or(0);
+
+        sqlx::query(
+            "UPDATE ducklake_snapshot SET next_catalog_id = ?, next_file_id = ? WHERE snapshot_id = ?",
+        )
+        .bind(next_catalog_id)
+        .bind(next_file_id)
+        .bind(snapshot_id)
+        .execute(&mut *tx)
+        .await?;
 
         // Note: Replace-mode file ending is NOT done here. The caller is
         // responsible for calling end_table_files() after the Parquet upload
@@ -769,12 +831,50 @@ impl SqliteMetadataWriter {
 impl MetadataWriter for SqliteMetadataWriter {
     fn create_snapshot(&self) -> Result<i64> {
         block_on(async {
-            let row = sqlx::query(
-                "INSERT INTO ducklake_snapshot (snapshot_time) VALUES (strftime('%Y-%m-%d %H:%M:%f+00:00', 'now')) RETURNING snapshot_id",
+            let mut tx = self.pool.begin().await?;
+
+            // R3F-007: Inherit schema_version from previous snapshot instead of DDL default
+            let sv_row =
+                sqlx::query("SELECT COALESCE(MAX(schema_version), 1) FROM ducklake_snapshot")
+                    .fetch_one(&mut *tx)
+                    .await?;
+            let schema_version: i64 = sv_row.try_get(0)?;
+
+            // R3F-011: Compute next_catalog_id and next_file_id
+            let cat_row = sqlx::query(
+                "SELECT MAX(v) + 1 FROM (
+                    SELECT COALESCE(MAX(schema_id), 0) AS v FROM ducklake_schema
+                    UNION ALL SELECT COALESCE(MAX(table_id), 0) FROM ducklake_table
+                    UNION ALL SELECT COALESCE(MAX(view_id), 0) FROM ducklake_view
+                )",
             )
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *tx)
             .await?;
-            Ok(row.try_get(0)?)
+            let next_catalog_id: i64 = cat_row.try_get::<Option<i64>, _>(0)?.unwrap_or(0);
+
+            let file_row = sqlx::query(
+                "SELECT MAX(v) + 1 FROM (
+                    SELECT COALESCE(MAX(data_file_id), 0) AS v FROM ducklake_data_file
+                    UNION ALL SELECT COALESCE(MAX(delete_file_id), 0) FROM ducklake_delete_file
+                )",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            let next_file_id: i64 = file_row.try_get::<Option<i64>, _>(0)?.unwrap_or(0);
+
+            let row = sqlx::query(
+                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version, next_catalog_id, next_file_id)
+                 VALUES (strftime('%Y-%m-%d %H:%M:%f+00:00', 'now'), ?, ?, ?) RETURNING snapshot_id",
+            )
+            .bind(schema_version)
+            .bind(next_catalog_id)
+            .bind(next_file_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let snapshot_id: i64 = row.try_get(0)?;
+
+            tx.commit().await?;
+            Ok(snapshot_id)
         })
     }
 
@@ -817,6 +917,16 @@ impl MetadataWriter for SqliteMetadataWriter {
             .bind(&schema_path)
             .bind(snapshot_id)
             .fetch_one(&mut *tx)
+            .await?;
+
+            // R3F-014: Record created_schema change tracking
+            sqlx::query(
+                "INSERT OR REPLACE INTO ducklake_snapshot_changes (snapshot_id, changes_made)
+                 VALUES (?, ?)",
+            )
+            .bind(snapshot_id)
+            .bind(format!("created_schema:\"{}\"", name))
+            .execute(&mut *tx)
             .await?;
 
             tx.commit().await?;
@@ -963,6 +1073,55 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .execute(&mut *tx)
                 .await?;
             }
+
+            // R3F-001: Update ducklake_table_column_stats (aggregate table-level stats)
+            // Recompute from all active file stats for each column that was updated
+            let column_ids: Vec<i64> = stats.iter().map(|s| s.column_id).collect();
+            for &column_id in &column_ids {
+                let agg_row = sqlx::query(
+                    "SELECT
+                         CASE WHEN COALESCE(SUM(fcs.null_count), 0) > 0 THEN 1 ELSE 0 END,
+                         MIN(fcs.min_value),
+                         MAX(fcs.max_value)
+                     FROM ducklake_file_column_stats fcs
+                     INNER JOIN ducklake_data_file df
+                         ON fcs.data_file_id = df.data_file_id
+                         AND df.table_id = fcs.table_id
+                         AND df.end_snapshot IS NULL
+                     WHERE fcs.table_id = ? AND fcs.column_id = ?",
+                )
+                .bind(table_id)
+                .bind(column_id)
+                .fetch_one(&mut *tx)
+                .await?;
+
+                let contains_null: bool = agg_row.try_get::<i32, _>(0)? != 0;
+                let min_value: Option<String> = agg_row.try_get(1)?;
+                let max_value: Option<String> = agg_row.try_get(2)?;
+
+                // Upsert: delete existing and insert new
+                sqlx::query(
+                    "DELETE FROM ducklake_table_column_stats WHERE table_id = ? AND column_id = ?",
+                )
+                .bind(table_id)
+                .bind(column_id)
+                .execute(&mut *tx)
+                .await?;
+
+                sqlx::query(
+                    "INSERT INTO ducklake_table_column_stats
+                     (table_id, column_id, contains_null, min_value, max_value)
+                     VALUES (?, ?, ?, ?, ?)",
+                )
+                .bind(table_id)
+                .bind(column_id)
+                .bind(contains_null)
+                .bind(&min_value)
+                .bind(&max_value)
+                .execute(&mut *tx)
+                .await?;
+            }
+
             tx.commit().await?;
             Ok(())
         })
@@ -1097,10 +1256,22 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .await?;
             }
 
+            // R3F-002: For each new data file, set row_id_start and update table_stats
             for file in data_files {
+                // Get current next_row_id from table_stats
+                let stats_row =
+                    sqlx::query("SELECT next_row_id FROM ducklake_table_stats WHERE table_id = ?")
+                        .bind(table_id)
+                        .fetch_optional(&mut *tx)
+                        .await?;
+                let row_id_start: i64 = match stats_row {
+                    Some(r) => r.try_get::<Option<i64>, _>(0)?.unwrap_or(0),
+                    None => 0,
+                };
+
                 sqlx::query(
-                    "INSERT INTO ducklake_data_file (table_id, path, path_is_relative, file_size_bytes, footer_size, record_count, begin_snapshot)
-                     VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO ducklake_data_file (table_id, path, path_is_relative, file_size_bytes, footer_size, record_count, row_id_start, begin_snapshot)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .bind(table_id)
                 .bind(&file.path)
@@ -1108,9 +1279,39 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .bind(file.file_size_bytes)
                 .bind(file.footer_size)
                 .bind(file.record_count)
+                .bind(row_id_start)
                 .bind(snapshot_id)
                 .execute(&mut *tx)
                 .await?;
+
+                // Update ducklake_table_stats
+                let new_next_row_id = row_id_start + file.record_count;
+                let updated = sqlx::query(
+                    "UPDATE ducklake_table_stats
+                     SET record_count = COALESCE(record_count, 0) + ?,
+                         next_row_id = ?,
+                         file_size_bytes = COALESCE(file_size_bytes, 0) + ?
+                     WHERE table_id = ?",
+                )
+                .bind(file.record_count)
+                .bind(new_next_row_id)
+                .bind(file.file_size_bytes)
+                .bind(table_id)
+                .execute(&mut *tx)
+                .await?;
+
+                if updated.rows_affected() == 0 {
+                    sqlx::query(
+                        "INSERT INTO ducklake_table_stats (table_id, record_count, next_row_id, file_size_bytes)
+                         VALUES (?, ?, ?, ?)",
+                    )
+                    .bind(table_id)
+                    .bind(file.record_count)
+                    .bind(new_next_row_id)
+                    .bind(file.file_size_bytes)
+                    .execute(&mut *tx)
+                    .await?;
+                }
             }
 
             tx.commit().await?;
@@ -1136,9 +1337,12 @@ impl MetadataWriter for SqliteMetadataWriter {
     }
 
     fn set_data_path(&self, path: &str) -> Result<()> {
+        // R3F-017: Wrap DELETE + INSERT in transaction for atomicity
         block_on(async {
+            let mut tx = self.pool.begin().await?;
+
             sqlx::query("DELETE FROM ducklake_metadata WHERE key = 'data_path' AND scope IS NULL")
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await?;
 
             sqlx::query(
@@ -1146,9 +1350,25 @@ impl MetadataWriter for SqliteMetadataWriter {
                  VALUES ('data_path', ?, NULL)",
             )
             .bind(path)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
 
+            tx.commit().await?;
+            Ok(())
+        })
+    }
+
+    // R3F-013: Record changes_made for DML snapshots
+    fn record_snapshot_changes(&self, snapshot_id: i64, changes_made: &str) -> Result<()> {
+        block_on(async {
+            sqlx::query(
+                "INSERT OR REPLACE INTO ducklake_snapshot_changes (snapshot_id, changes_made)
+                 VALUES (?, ?)",
+            )
+            .bind(snapshot_id)
+            .bind(changes_made)
+            .execute(&self.pool)
+            .await?;
             Ok(())
         })
     }
@@ -1755,10 +1975,12 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .execute(&mut *tx)
                     .await?;
 
-                    // Initialize table-level column stats for the new column (upstream bug #625)
+                    // R3F-001: Initialize table-level column stats for the new column.
+                    // contains_null must be non-NULL to avoid DuckDB crash.
+                    // Set to true because existing rows have NULL for the new column.
                     sqlx::query(
                         "INSERT INTO ducklake_table_column_stats (table_id, column_id, contains_null, contains_nan)
-                         VALUES (?, ?, NULL, NULL)",
+                         VALUES (?, ?, 1, NULL)",
                     )
                     .bind(table_id)
                     .bind(next_column_id)
@@ -2251,8 +2473,8 @@ impl MetadataWriter for SqliteMetadataWriter {
             }
 
             let count_sql = format!(
-                "SELECT COUNT(*) FROM \"{}\" WHERE end_snapshot IS NULL",
-                inlined_table_name
+                "SELECT COUNT(*) FROM {} WHERE end_snapshot IS NULL",
+                quote_identifier(&inlined_table_name)
             );
             let row = sqlx::query(&count_sql).fetch_one(&self.pool).await?;
             Ok(row.try_get(0)?)
@@ -2286,8 +2508,8 @@ impl MetadataWriter for SqliteMetadataWriter {
                 // Create the inline data table matching DuckDB's layout:
                 // row_id, begin_snapshot, end_snapshot, then user columns
                 let mut create_sql = format!(
-                    "CREATE TABLE \"{}\" (row_id INTEGER, begin_snapshot INTEGER, end_snapshot INTEGER",
-                    inlined_table_name
+                    "CREATE TABLE {} (row_id INTEGER, begin_snapshot INTEGER, end_snapshot INTEGER",
+                    quote_identifier(&inlined_table_name)
                 );
                 for col in columns {
                     // Use TEXT for all columns in SQLite (dynamic typing)
@@ -2309,8 +2531,8 @@ impl MetadataWriter for SqliteMetadataWriter {
 
             // Get next row_id
             let next_row_id_sql = format!(
-                "SELECT COALESCE(MAX(row_id), -1) + 1 FROM \"{}\"",
-                inlined_table_name
+                "SELECT COALESCE(MAX(row_id), -1) + 1 FROM {}",
+                quote_identifier(&inlined_table_name)
             );
             let next_row_id_row = sqlx::query(&next_row_id_sql).fetch_one(&mut *tx).await?;
             let mut row_id: i64 = next_row_id_row.try_get(0)?;
@@ -2320,8 +2542,8 @@ impl MetadataWriter for SqliteMetadataWriter {
                 columns.iter().map(|c| quote_identifier(c.name())).collect();
             let placeholders: Vec<&str> = (0..columns.len()).map(|_| "?").collect();
             let insert_sql = format!(
-                "INSERT INTO \"{}\" (row_id, begin_snapshot, {}) VALUES (?, ?, {})",
-                inlined_table_name,
+                "INSERT INTO {} (row_id, begin_snapshot, {}) VALUES (?, ?, {})",
+                quote_identifier(&inlined_table_name),
                 col_names.join(", "),
                 placeholders.join(", ")
             );
@@ -2378,7 +2600,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             }
 
             // Get column names
-            let pragma_query = format!("PRAGMA table_info('{}')", inlined_table_name);
+            let pragma_query = format!("PRAGMA table_info({})", quote_identifier(&inlined_table_name));
             let columns = sqlx::query(&pragma_query).fetch_all(&self.pool).await?;
 
             let user_columns: Vec<String> = columns
@@ -2403,9 +2625,9 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .map(|c| format!("CAST({} AS TEXT)", quote_identifier(c)))
                 .collect();
             let select_sql = format!(
-                "SELECT {} FROM \"{}\" WHERE end_snapshot IS NULL",
+                "SELECT {} FROM {} WHERE end_snapshot IS NULL",
                 col_list.join(", "),
-                inlined_table_name,
+                quote_identifier(&inlined_table_name),
             );
 
             let rows = sqlx::query(&select_sql).fetch_all(&self.pool).await?;
@@ -2446,8 +2668,8 @@ impl MetadataWriter for SqliteMetadataWriter {
 
             // Set end_snapshot on all active rows
             let update_sql = format!(
-                "UPDATE \"{}\" SET end_snapshot = ? WHERE end_snapshot IS NULL",
-                inlined_table_name
+                "UPDATE {} SET end_snapshot = ? WHERE end_snapshot IS NULL",
+                quote_identifier(&inlined_table_name)
             );
             sqlx::query(&update_sql)
                 .bind(snapshot_id)

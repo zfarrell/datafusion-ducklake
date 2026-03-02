@@ -244,7 +244,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
                         None
                     };
 
-                    let _delete_count: Option<i64> = row.get(12)?;
+                    // Column 12 (_delete_count) intentionally skipped — unused
                     let begin_snapshot: Option<i64> = row.get(13)?;
                     let row_id_start: Option<i64> = row.get(14)?;
                     let record_count: Option<i64> = row.get(15)?;
@@ -569,14 +569,10 @@ impl MetadataProvider for DuckdbMetadataProvider {
         let result = conn.query_row(
             "SELECT table_name, schema_version FROM ducklake_inlined_data_tables WHERE table_id = ?",
             [table_id],
-            |row| {
-                let table_name: String = row.get(0)?;
-                let _schema_version: i64 = row.get(1)?;
-                Ok(table_name)
-            },
+            |row| row.get::<_, String>(0),
         );
 
-        let inlined_table_name = match result {
+        let inlined_table_name: String = match result {
             Ok(name) => name,
             Err(duckdb::Error::QueryReturnedNoRows) => return Ok(Vec::new()),
             Err(e) => return Err(DuckLakeError::DuckDb(e)),

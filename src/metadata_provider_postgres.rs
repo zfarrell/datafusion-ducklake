@@ -1063,8 +1063,8 @@ impl PostgresMetadataProvider {
         }
 
         let count_sql = format!(
-            "SELECT COUNT(*) FROM \"{}\" WHERE begin_snapshot <= $1 AND (end_snapshot IS NULL OR $2 < end_snapshot)",
-            inlined_table_name,
+            "SELECT COUNT(*) FROM {} WHERE begin_snapshot <= $1 AND (end_snapshot IS NULL OR $2 < end_snapshot)",
+            quote_identifier(&inlined_table_name),
         );
 
         let row = sqlx::query(&count_sql)
