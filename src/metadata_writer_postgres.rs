@@ -307,76 +307,115 @@ impl PostgresMetadataWriter {
         columns: &[ColumnDef],
         mode: WriteMode,
     ) -> Result<WriteSetupResult> {
-        let row = sqlx::query(
-            "INSERT INTO ducklake_snapshot (snapshot_time) VALUES (CURRENT_TIMESTAMP) RETURNING snapshot_id",
+        // Check if schema exists
+        let existing_schema = sqlx::query(
+            "SELECT schema_id FROM ducklake_schema
+             WHERE schema_name = $1 AND end_snapshot IS NULL",
         )
+        .bind(schema_name)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let schema_exists = existing_schema.is_some();
+        let mut table_exists = false;
+
+        // Check if table exists (if schema exists)
+        let existing_table = if let Some(ref s_row) = existing_schema {
+            let sid: i64 = s_row.try_get(0)?;
+            let t = sqlx::query(
+                "SELECT table_id FROM ducklake_table
+                 WHERE schema_id = $1 AND table_name = $2 AND end_snapshot IS NULL",
+            )
+            .bind(sid)
+            .bind(table_name)
+            .fetch_optional(&mut *tx)
+            .await?;
+            table_exists = t.is_some();
+            t
+        } else {
+            None
+        };
+
+        let is_ddl = !schema_exists || !table_exists;
+
+        // Get current schema_version for the new snapshot (F-012)
+        let prev_sv_row =
+            sqlx::query("SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot")
+                .fetch_one(&mut *tx)
+                .await?;
+        let prev_schema_version: i64 = prev_sv_row.try_get(0)?;
+
+        let new_schema_version = if is_ddl {
+            prev_schema_version + 1
+        } else {
+            prev_schema_version
+        };
+
+        // Create snapshot with correct schema_version
+        let row = sqlx::query(
+            "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES (CURRENT_TIMESTAMP, $1) RETURNING snapshot_id",
+        )
+        .bind(new_schema_version)
         .fetch_one(&mut *tx)
         .await?;
         let snapshot_id: i64 = row.try_get(0)?;
 
-        let schema_id: i64 = {
-            let existing = sqlx::query(
-                "SELECT schema_id FROM ducklake_schema
-                 WHERE schema_name = $1 AND end_snapshot IS NULL",
+        // Record schema_version change if DDL (F-012)
+        if is_ddl {
+            sqlx::query(
+                "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version)
+                 VALUES ($1, $2)",
+            )
+            .bind(snapshot_id)
+            .bind(new_schema_version)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // Create schema if needed (F-026: generate UUID)
+        let schema_id: i64 = if let Some(s_row) = existing_schema {
+            s_row.try_get(0)?
+        } else {
+            let schema_path = format!("{}/", schema_name);
+            let row = sqlx::query(
+                "INSERT INTO ducklake_schema (schema_uuid, schema_name, path, path_is_relative, begin_snapshot)
+                 VALUES (gen_random_uuid(), $1, $2, TRUE, $3) RETURNING schema_id",
             )
             .bind(schema_name)
-            .fetch_optional(&mut *tx)
+            .bind(&schema_path)
+            .bind(snapshot_id)
+            .fetch_one(&mut *tx)
             .await?;
+            row.try_get(0)?
+        };
 
-            if let Some(row) = existing {
-                row.try_get(0)?
-            } else {
-                let schema_path = format!("{}/", schema_name);
-                let row = sqlx::query(
-                    "INSERT INTO ducklake_schema (schema_name, path, path_is_relative, begin_snapshot)
-                     VALUES ($1, $2, TRUE, $3) RETURNING schema_id",
-                )
-                .bind(schema_name)
-                .bind(&schema_path)
-                .bind(snapshot_id)
+        // Create table if needed (F-026: generate UUID)
+        let table_id: i64 = if let Some(t_row) = existing_table {
+            t_row.try_get(0)?
+        } else {
+            let next_tid_row = sqlx::query("SELECT nextval('ducklake_table_id_seq')")
                 .fetch_one(&mut *tx)
                 .await?;
-                row.try_get(0)?
-            }
-        };
+            let next_table_id: i64 = next_tid_row.try_get(0)?;
 
-        let table_id: i64 = {
-            let existing = sqlx::query(
-                "SELECT table_id FROM ducklake_table
-                 WHERE schema_id = $1 AND table_name = $2 AND end_snapshot IS NULL",
+            let table_path = format!("{}/", table_name);
+            sqlx::query(
+                "INSERT INTO ducklake_table (table_id, table_uuid, schema_id, table_name, path, path_is_relative, begin_snapshot)
+                 VALUES ($1, gen_random_uuid(), $2, $3, $4, TRUE, $5)",
             )
+            .bind(next_table_id)
             .bind(schema_id)
             .bind(table_name)
-            .fetch_optional(&mut *tx)
+            .bind(&table_path)
+            .bind(snapshot_id)
+            .execute(&mut *tx)
             .await?;
-
-            if let Some(row) = existing {
-                row.try_get(0)?
-            } else {
-                let next_tid_row = sqlx::query("SELECT nextval('ducklake_table_id_seq')")
-                    .fetch_one(&mut *tx)
-                    .await?;
-                let next_table_id: i64 = next_tid_row.try_get(0)?;
-
-                let table_path = format!("{}/", table_name);
-                sqlx::query(
-                    "INSERT INTO ducklake_table (table_id, schema_id, table_name, path, path_is_relative, begin_snapshot)
-                     VALUES ($1, $2, $3, $4, TRUE, $5)",
-                )
-                .bind(next_table_id)
-                .bind(schema_id)
-                .bind(table_name)
-                .bind(&table_path)
-                .bind(snapshot_id)
-                .execute(&mut *tx)
-                .await?;
-                next_table_id
-            }
+            next_table_id
         };
 
-        // Get existing columns to check schema compatibility for appends
-        let rows = sqlx::query(
-            "SELECT column_name, column_type, nulls_allowed
+        // Get existing columns with IDs for schema comparison (F-013)
+        let col_rows = sqlx::query(
+            "SELECT column_id, column_name, column_type, nulls_allowed
              FROM ducklake_column
              WHERE table_id = $1 AND end_snapshot IS NULL
              ORDER BY column_order",
@@ -385,51 +424,85 @@ impl PostgresMetadataWriter {
         .fetch_all(&mut *tx)
         .await?;
 
-        let mut existing_columns: Vec<(String, String, bool)> = Vec::with_capacity(rows.len());
-        for row in rows {
-            let name: String = row.try_get(0)?;
-            let col_type: String = row.try_get(1)?;
-            let nullable: bool = row.try_get::<Option<bool>, _>(2)?.unwrap_or(true);
+        let mut existing_columns: Vec<(String, String, bool)> = Vec::with_capacity(col_rows.len());
+        let mut existing_column_ids: Vec<i64> = Vec::with_capacity(col_rows.len());
+        for row in &col_rows {
+            let col_id: i64 = row.try_get(0)?;
+            let name: String = row.try_get(1)?;
+            let col_type: String = row.try_get(2)?;
+            let nullable: bool = row.try_get::<Option<bool>, _>(3)?.unwrap_or(true);
+            existing_column_ids.push(col_id);
             existing_columns.push((name, col_type, nullable));
         }
 
         validate_no_duplicate_columns(columns)?;
         validate_schema_evolution(&existing_columns, columns, mode)?;
 
-        sqlx::query(
-            "UPDATE ducklake_column SET end_snapshot = $1
-             WHERE table_id = $2 AND end_snapshot IS NULL",
-        )
-        .bind(snapshot_id)
-        .bind(table_id)
-        .execute(&mut *tx)
-        .await?;
+        // F-013: Check if schema is identical — if so, preserve column IDs
+        let schema_matches = existing_columns.len() == columns.len()
+            && existing_columns.iter().zip(columns.iter()).all(
+                |((name, col_type, _nullable), col)| {
+                    name == &col.name && col_type == &col.ducklake_type
+                },
+            );
 
-        let mut column_ids = Vec::with_capacity(columns.len());
-        for (order, col) in columns.iter().enumerate() {
-            let cid_row = sqlx::query("SELECT nextval('ducklake_column_id_seq')")
-                .fetch_one(&mut *tx)
-                .await?;
-            let column_id: i64 = cid_row.try_get(0)?;
+        let column_ids = if schema_matches && !existing_columns.is_empty() {
+            // Schema unchanged — reuse existing column IDs
+            existing_column_ids
+        } else {
+            // Schema changed or new table — end existing columns and create new ones
             sqlx::query(
-                "INSERT INTO ducklake_column (column_id, table_id, column_name, column_type, column_order, nulls_allowed, initial_default, default_value, parent_column, default_value_type, default_value_dialect, begin_snapshot)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                "UPDATE ducklake_column SET end_snapshot = $1
+                 WHERE table_id = $2 AND end_snapshot IS NULL",
             )
-            .bind(column_id)
-            .bind(table_id)
-            .bind(&col.name)
-            .bind(&col.ducklake_type)
-            .bind((order + 1) as i64)
-            .bind(col.is_nullable)
-            .bind(&col.initial_default)
-            .bind(&col.default_value)
-            .bind(col.parent_column)
-            .bind(&col.default_value_type)
-            .bind(&col.default_value_dialect)
             .bind(snapshot_id)
+            .bind(table_id)
             .execute(&mut *tx)
             .await?;
-            column_ids.push(column_id);
+
+            let mut new_ids = Vec::with_capacity(columns.len());
+            for (order, col) in columns.iter().enumerate() {
+                let cid_row = sqlx::query("SELECT nextval('ducklake_column_id_seq')")
+                    .fetch_one(&mut *tx)
+                    .await?;
+                let column_id: i64 = cid_row.try_get(0)?;
+                sqlx::query(
+                    "INSERT INTO ducklake_column (column_id, table_id, column_name, column_type, column_order, nulls_allowed, initial_default, default_value, parent_column, default_value_type, default_value_dialect, begin_snapshot)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                )
+                .bind(column_id)
+                .bind(table_id)
+                .bind(&col.name)
+                .bind(&col.ducklake_type)
+                .bind((order + 1) as i64)
+                .bind(col.is_nullable)
+                .bind(&col.initial_default)
+                .bind(&col.default_value)
+                .bind(col.parent_column)
+                .bind(&col.default_value_type)
+                .bind(&col.default_value_dialect)
+                .bind(snapshot_id)
+                .execute(&mut *tx)
+                .await?;
+                new_ids.push(column_id);
+            }
+            new_ids
+        };
+
+        // Record in snapshot_changes with DuckDB-compatible format (F-027)
+        if !table_exists {
+            sqlx::query(
+                "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made)
+                 VALUES ($1, $2)
+                 ON CONFLICT (snapshot_id) DO UPDATE SET changes_made = EXCLUDED.changes_made",
+            )
+            .bind(snapshot_id)
+            .bind(format!(
+                "created_table:\"{}\".\"{}\"",
+                schema_name, table_name
+            ))
+            .execute(&mut *tx)
+            .await?;
         }
 
         // Note: Replace-mode file ending is NOT done here. The caller is
@@ -451,13 +524,30 @@ impl PostgresMetadataWriter {
         mut tx: sqlx::Transaction<'_, sqlx::Postgres>,
         table_id: i64,
     ) -> Result<i64> {
+        // Increment schema_version for DDL (F-012)
+        let prev_sv_row =
+            sqlx::query("SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot")
+                .fetch_one(&mut *tx)
+                .await?;
+        let new_schema_version: i64 = prev_sv_row.try_get::<i64, _>(0)? + 1;
+
         let row = sqlx::query(
-            "INSERT INTO ducklake_snapshot (snapshot_time) VALUES (CURRENT_TIMESTAMP) RETURNING snapshot_id",
+            "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES (CURRENT_TIMESTAMP, $1) RETURNING snapshot_id",
         )
+        .bind(new_schema_version)
         .fetch_one(&mut *tx)
         .await?;
         let snapshot_id: i64 = row.try_get(0)?;
 
+        sqlx::query(
+            "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version) VALUES ($1, $2)",
+        )
+        .bind(snapshot_id)
+        .bind(new_schema_version)
+        .execute(&mut *tx)
+        .await?;
+
+        // Mark the table as dropped by setting end_snapshot
         sqlx::query(
             "UPDATE ducklake_table SET end_snapshot = $1
              WHERE table_id = $2 AND end_snapshot IS NULL",
@@ -503,13 +593,14 @@ impl PostgresMetadataWriter {
         .execute(&mut *tx)
         .await?;
 
+        // Record in spec-compliant snapshot changes (F-027)
         sqlx::query(
             "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made)
              VALUES ($1, $2)
              ON CONFLICT (snapshot_id) DO UPDATE SET changes_made = EXCLUDED.changes_made",
         )
         .bind(snapshot_id)
-        .bind(format!("Dropped table (id={})", table_id))
+        .bind(format!("dropped_table:{}", table_id))
         .execute(&mut *tx)
         .await?;
 
@@ -522,12 +613,28 @@ impl PostgresMetadataWriter {
         mut tx: sqlx::Transaction<'_, sqlx::Postgres>,
         schema_id: i64,
     ) -> Result<i64> {
+        // Increment schema_version for DDL (F-012)
+        let prev_sv_row =
+            sqlx::query("SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot")
+                .fetch_one(&mut *tx)
+                .await?;
+        let new_schema_version: i64 = prev_sv_row.try_get::<i64, _>(0)? + 1;
+
         let row = sqlx::query(
-            "INSERT INTO ducklake_snapshot (snapshot_time) VALUES (CURRENT_TIMESTAMP) RETURNING snapshot_id",
+            "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES (CURRENT_TIMESTAMP, $1) RETURNING snapshot_id",
         )
+        .bind(new_schema_version)
         .fetch_one(&mut *tx)
         .await?;
         let snapshot_id: i64 = row.try_get(0)?;
+
+        sqlx::query(
+            "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version) VALUES ($1, $2)",
+        )
+        .bind(snapshot_id)
+        .bind(new_schema_version)
+        .execute(&mut *tx)
+        .await?;
 
         // Cascade: end columns for all active tables in this schema
         sqlx::query(
@@ -591,13 +698,14 @@ impl PostgresMetadataWriter {
         .execute(&mut *tx)
         .await?;
 
+        // Record in spec-compliant snapshot changes (F-027)
         sqlx::query(
             "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made)
              VALUES ($1, $2)
              ON CONFLICT (snapshot_id) DO UPDATE SET changes_made = EXCLUDED.changes_made",
         )
         .bind(snapshot_id)
-        .bind(format!("Dropped schema (id={})", schema_id))
+        .bind(format!("dropped_schema:{}", schema_id))
         .execute(&mut *tx)
         .await?;
 
@@ -647,9 +755,10 @@ impl MetadataWriter for PostgresMetadataWriter {
             } else {
                 format!("{}/", base_path)
             };
+            // F-026: generate UUID
             let row = sqlx::query(
-                "INSERT INTO ducklake_schema (schema_name, path, path_is_relative, begin_snapshot)
-                 VALUES ($1, $2, TRUE, $3) RETURNING schema_id",
+                "INSERT INTO ducklake_schema (schema_uuid, schema_name, path, path_is_relative, begin_snapshot)
+                 VALUES (gen_random_uuid(), $1, $2, TRUE, $3) RETURNING schema_id",
             )
             .bind(name)
             .bind(&schema_path)
@@ -697,9 +806,10 @@ impl MetadataWriter for PostgresMetadataWriter {
                 .await?;
             let next_table_id: i64 = next_tid_row.try_get(0)?;
 
+            // F-026: generate UUID
             sqlx::query(
-                "INSERT INTO ducklake_table (table_id, schema_id, table_name, path, path_is_relative, begin_snapshot)
-                 VALUES ($1, $2, $3, $4, TRUE, $5)",
+                "INSERT INTO ducklake_table (table_id, table_uuid, schema_id, table_name, path, path_is_relative, begin_snapshot)
+                 VALUES ($1, gen_random_uuid(), $2, $3, $4, TRUE, $5)",
             )
             .bind(next_table_id)
             .bind(schema_id)
@@ -1036,6 +1146,15 @@ impl MetadataWriter for PostgresMetadataWriter {
                 .execute(&self.pool)
                 .await?;
 
+            // Insert initial schema_version entry (F-012)
+            sqlx::query(
+                "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version)
+                 SELECT 0, 0
+                 WHERE NOT EXISTS (SELECT 1 FROM ducklake_schema_versions WHERE begin_snapshot = 0)",
+            )
+            .execute(&self.pool)
+            .await?;
+
             // Sync sequences with existing data (handles migration from MAX+1 pattern).
             // Only advances the sequence if there's existing data; otherwise leaves at default start=1.
             sqlx::query(
@@ -1272,27 +1391,68 @@ impl MetadataWriter for PostgresMetadataWriter {
         block_on(async {
             let mut tx = self.pool.begin().await?;
 
+            // Increment schema_version for DDL (F-012)
+            let prev_sv_row =
+                sqlx::query("SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot")
+                    .fetch_one(&mut *tx)
+                    .await?;
+            let new_schema_version: i64 = prev_sv_row.try_get::<i64, _>(0)? + 1;
+
             let row = sqlx::query(
-                "INSERT INTO ducklake_snapshot (snapshot_time) VALUES (CURRENT_TIMESTAMP) RETURNING snapshot_id",
+                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES (CURRENT_TIMESTAMP, $1) RETURNING snapshot_id",
             )
+            .bind(new_schema_version)
             .fetch_one(&mut *tx)
             .await?;
             let snapshot_id: i64 = row.try_get(0)?;
+
+            sqlx::query(
+                "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version) VALUES ($1, $2)",
+            )
+            .bind(snapshot_id)
+            .bind(new_schema_version)
+            .execute(&mut *tx)
+            .await?;
 
             let vid_row = sqlx::query("SELECT nextval('ducklake_view_id_seq')")
                 .fetch_one(&mut *tx)
                 .await?;
             let view_id: i64 = vid_row.try_get(0)?;
 
+            // F-026: generate UUID for view
             sqlx::query(
-                "INSERT INTO ducklake_view (view_id, schema_id, view_name, sql, begin_snapshot)
-                 VALUES ($1, $2, $3, $4, $5)",
+                "INSERT INTO ducklake_view (view_id, view_uuid, schema_id, view_name, sql, begin_snapshot)
+                 VALUES ($1, gen_random_uuid(), $2, $3, $4, $5)",
             )
             .bind(view_id)
             .bind(schema_id)
             .bind(view_name)
             .bind(sql)
             .bind(snapshot_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // Record changes_made in DuckDB format (F-027)
+            let schema_row = sqlx::query(
+                "SELECT schema_name FROM ducklake_schema WHERE schema_id = $1 AND end_snapshot IS NULL",
+            )
+            .bind(schema_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let schema_name = schema_row
+                .map(|r| r.try_get::<String, _>(0).unwrap_or_default())
+                .unwrap_or_default();
+
+            sqlx::query(
+                "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made)
+                 VALUES ($1, $2)
+                 ON CONFLICT (snapshot_id) DO UPDATE SET changes_made = EXCLUDED.changes_made",
+            )
+            .bind(snapshot_id)
+            .bind(format!(
+                "created_view:\"{}\".\"{}\"",
+                schema_name, view_name
+            ))
             .execute(&mut *tx)
             .await?;
 
@@ -1305,12 +1465,28 @@ impl MetadataWriter for PostgresMetadataWriter {
         block_on(async {
             let mut tx = self.pool.begin().await?;
 
+            // Increment schema_version for DDL (F-012)
+            let prev_sv_row =
+                sqlx::query("SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot")
+                    .fetch_one(&mut *tx)
+                    .await?;
+            let new_schema_version: i64 = prev_sv_row.try_get::<i64, _>(0)? + 1;
+
             let row = sqlx::query(
-                "INSERT INTO ducklake_snapshot (snapshot_time) VALUES (CURRENT_TIMESTAMP) RETURNING snapshot_id",
+                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES (CURRENT_TIMESTAMP, $1) RETURNING snapshot_id",
             )
+            .bind(new_schema_version)
             .fetch_one(&mut *tx)
             .await?;
             let snapshot_id: i64 = row.try_get(0)?;
+
+            sqlx::query(
+                "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version) VALUES ($1, $2)",
+            )
+            .bind(snapshot_id)
+            .bind(new_schema_version)
+            .execute(&mut *tx)
+            .await?;
 
             sqlx::query(
                 "UPDATE ducklake_view SET end_snapshot = $1
@@ -1318,6 +1494,17 @@ impl MetadataWriter for PostgresMetadataWriter {
             )
             .bind(snapshot_id)
             .bind(view_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // Record changes_made in DuckDB format (F-027)
+            sqlx::query(
+                "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made)
+                 VALUES ($1, $2)
+                 ON CONFLICT (snapshot_id) DO UPDATE SET changes_made = EXCLUDED.changes_made",
+            )
+            .bind(snapshot_id)
+            .bind(format!("dropped_view:{}", view_id))
             .execute(&mut *tx)
             .await?;
 
@@ -1353,13 +1540,28 @@ impl MetadataWriter for PostgresMetadataWriter {
             let dialect: Option<String> = view_row.try_get(3)?;
             let column_aliases: Option<String> = view_row.try_get(4)?;
 
-            // Create a new snapshot
+            // Increment schema_version for DDL (F-012)
+            let prev_sv_row =
+                sqlx::query("SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot")
+                    .fetch_one(&mut *tx)
+                    .await?;
+            let new_schema_version: i64 = prev_sv_row.try_get::<i64, _>(0)? + 1;
+
             let row = sqlx::query(
-                "INSERT INTO ducklake_snapshot (snapshot_time) VALUES (CURRENT_TIMESTAMP) RETURNING snapshot_id",
+                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES (CURRENT_TIMESTAMP, $1) RETURNING snapshot_id",
             )
+            .bind(new_schema_version)
             .fetch_one(&mut *tx)
             .await?;
             let snapshot_id: i64 = row.try_get(0)?;
+
+            sqlx::query(
+                "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version) VALUES ($1, $2)",
+            )
+            .bind(snapshot_id)
+            .bind(new_schema_version)
+            .execute(&mut *tx)
+            .await?;
 
             // End the existing view row
             sqlx::query(
@@ -1404,7 +1606,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                  ON CONFLICT (snapshot_id) DO UPDATE SET changes_made = EXCLUDED.changes_made",
             )
             .bind(snapshot_id)
-            .bind(format!("Renamed view (id={})", view_id))
+            .bind(format!("altered_view:{}", view_id))
             .execute(&mut *tx)
             .await?;
 
@@ -1450,13 +1652,28 @@ impl MetadataWriter for PostgresMetadataWriter {
             validate_table_has_columns(&columns)?;
             let action = validate_alter_table(&columns, op)?;
 
-            // Create a new snapshot
+            // Increment schema_version for DDL (F-012)
+            let prev_sv_row =
+                sqlx::query("SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot")
+                    .fetch_one(&mut *tx)
+                    .await?;
+            let new_schema_version: i64 = prev_sv_row.try_get::<i64, _>(0)? + 1;
+
             let row = sqlx::query(
-                "INSERT INTO ducklake_snapshot (snapshot_time) VALUES (CURRENT_TIMESTAMP) RETURNING snapshot_id",
+                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES (CURRENT_TIMESTAMP, $1) RETURNING snapshot_id",
             )
+            .bind(new_schema_version)
             .fetch_one(&mut *tx)
             .await?;
             let snapshot_id: i64 = row.try_get(0)?;
+
+            sqlx::query(
+                "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version) VALUES ($1, $2)",
+            )
+            .bind(snapshot_id)
+            .bind(new_schema_version)
+            .execute(&mut *tx)
+            .await?;
 
             match action {
                 AlterTableAction::InsertColumn {
@@ -1639,7 +1856,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                  ON CONFLICT (snapshot_id) DO UPDATE SET changes_made = EXCLUDED.changes_made",
             )
             .bind(snapshot_id)
-            .bind(format!("Altered table (id={})", table_id))
+            .bind(format!("altered_table:{}", table_id))
             .execute(&mut *tx)
             .await?;
 
@@ -1697,13 +1914,28 @@ impl MetadataWriter for PostgresMetadataWriter {
             let path: String = table_row.try_get(2)?;
             let path_is_relative: bool = table_row.try_get(3)?;
 
-            // Create a new snapshot
+            // Increment schema_version for DDL (F-012)
+            let prev_sv_row =
+                sqlx::query("SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot")
+                    .fetch_one(&mut *tx)
+                    .await?;
+            let new_schema_version: i64 = prev_sv_row.try_get::<i64, _>(0)? + 1;
+
             let row = sqlx::query(
-                "INSERT INTO ducklake_snapshot (snapshot_time) VALUES (CURRENT_TIMESTAMP) RETURNING snapshot_id",
+                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES (CURRENT_TIMESTAMP, $1) RETURNING snapshot_id",
             )
+            .bind(new_schema_version)
             .fetch_one(&mut *tx)
             .await?;
             let snapshot_id: i64 = row.try_get(0)?;
+
+            sqlx::query(
+                "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version) VALUES ($1, $2)",
+            )
+            .bind(snapshot_id)
+            .bind(new_schema_version)
+            .execute(&mut *tx)
+            .await?;
 
             // End the existing table row
             sqlx::query(
@@ -1747,7 +1979,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                  ON CONFLICT (snapshot_id) DO UPDATE SET changes_made = EXCLUDED.changes_made",
             )
             .bind(snapshot_id)
-            .bind(format!("Renamed table (id={})", table_id))
+            .bind(format!("altered_table:{}", table_id))
             .execute(&mut *tx)
             .await?;
 
@@ -1760,13 +1992,28 @@ impl MetadataWriter for PostgresMetadataWriter {
         block_on(async {
             let mut tx = self.pool.begin().await?;
 
-            // Create a new snapshot
+            // Increment schema_version for DDL (F-012)
+            let prev_sv_row =
+                sqlx::query("SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot")
+                    .fetch_one(&mut *tx)
+                    .await?;
+            let new_schema_version: i64 = prev_sv_row.try_get::<i64, _>(0)? + 1;
+
             let row = sqlx::query(
-                "INSERT INTO ducklake_snapshot (snapshot_time) VALUES (CURRENT_TIMESTAMP) RETURNING snapshot_id",
+                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES (CURRENT_TIMESTAMP, $1) RETURNING snapshot_id",
             )
+            .bind(new_schema_version)
             .fetch_one(&mut *tx)
             .await?;
             let snapshot_id: i64 = row.try_get(0)?;
+
+            sqlx::query(
+                "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version) VALUES ($1, $2)",
+            )
+            .bind(snapshot_id)
+            .bind(new_schema_version)
+            .execute(&mut *tx)
+            .await?;
 
             // End any existing comment tag for this table
             sqlx::query(
@@ -1806,7 +2053,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                  ON CONFLICT (snapshot_id) DO UPDATE SET changes_made = EXCLUDED.changes_made",
             )
             .bind(snapshot_id)
-            .bind(format!("Altered table (id={})", table_id))
+            .bind(format!("altered_table:{}", table_id))
             .execute(&mut *tx)
             .await?;
 
@@ -1837,13 +2084,28 @@ impl MetadataWriter for PostgresMetadataWriter {
             };
             let column_id: i64 = col_row.try_get(0)?;
 
-            // Create a new snapshot
+            // Increment schema_version for DDL (F-012)
+            let prev_sv_row =
+                sqlx::query("SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot")
+                    .fetch_one(&mut *tx)
+                    .await?;
+            let new_schema_version: i64 = prev_sv_row.try_get::<i64, _>(0)? + 1;
+
             let row = sqlx::query(
-                "INSERT INTO ducklake_snapshot (snapshot_time) VALUES (CURRENT_TIMESTAMP) RETURNING snapshot_id",
+                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES (CURRENT_TIMESTAMP, $1) RETURNING snapshot_id",
             )
+            .bind(new_schema_version)
             .fetch_one(&mut *tx)
             .await?;
             let snapshot_id: i64 = row.try_get(0)?;
+
+            sqlx::query(
+                "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version) VALUES ($1, $2)",
+            )
+            .bind(snapshot_id)
+            .bind(new_schema_version)
+            .execute(&mut *tx)
+            .await?;
 
             // End any existing comment tag for this column
             sqlx::query(
@@ -1885,7 +2147,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                  ON CONFLICT (snapshot_id) DO UPDATE SET changes_made = EXCLUDED.changes_made",
             )
             .bind(snapshot_id)
-            .bind(format!("Altered table (id={})", table_id))
+            .bind(format!("altered_table:{}", table_id))
             .execute(&mut *tx)
             .await?;
 
