@@ -289,7 +289,7 @@ impl DuckLakeTableWriter {
 
                     if current_inline + total_new_rows <= limit {
                         // Inline path: store data directly in catalog
-                        let rows = batches_to_inlined_rows(batches, arrow_schema);
+                        let rows = batches_to_inlined_rows(batches, arrow_schema)?;
                         let stored = self.metadata.store_inlined_data(
                             setup.table_id,
                             setup.snapshot_id,
@@ -482,7 +482,9 @@ impl DuckLakeTableWriter {
         let column_stats = extract_column_stats(writer.flushed_row_groups(), &setup.column_ids);
         let buffer = writer.into_inner()?;
 
-        let file_size = buffer.len() as i64;
+        let file_size = i64::try_from(buffer.len()).map_err(|e| {
+            crate::error::DuckLakeError::Internal(format!("File size overflow: {}", e))
+        })?;
         let footer_size = calculate_footer_size_from_bytes(&buffer)?;
 
         self.object_store
@@ -605,7 +607,12 @@ impl DuckLakeTableWriter {
                 self.metadata.register_file_partition_value(
                     data_file_id,
                     setup.table_id,
-                    key_index as i32,
+                    i32::try_from(key_index).map_err(|e| {
+                        crate::error::DuckLakeError::Internal(format!(
+                            "Partition key index overflow: {}",
+                            e
+                        ))
+                    })?,
                     pval.as_deref(),
                 )?;
             }
@@ -691,7 +698,9 @@ impl TableWriteSession {
 
         let batch_with_ids =
             RecordBatch::try_new(self.schema_with_ids.clone(), batch.columns().to_vec())?;
-        let writer = self.writer.as_mut().unwrap();
+        let writer = self.writer.as_mut().ok_or_else(|| {
+            crate::error::DuckLakeError::Internal("Writer already closed".to_string())
+        })?;
         writer.write(&batch_with_ids)?;
         self.row_count += i64::try_from(batch.num_rows()).map_err(|_| {
             crate::error::DuckLakeError::Internal(format!(
@@ -884,7 +893,7 @@ impl TableWriteSession {
 pub(crate) fn batches_to_inlined_rows(
     batches: &[RecordBatch],
     schema: &Schema,
-) -> Vec<InlinedDataRow> {
+) -> crate::Result<Vec<InlinedDataRow>> {
     let column_names: Arc<Vec<String>> =
         Arc::new(schema.fields().iter().map(|f| f.name().clone()).collect());
     let mut rows = Vec::new();
@@ -897,7 +906,7 @@ pub(crate) fn batches_to_inlined_rows(
                 if col.is_null(row_idx) {
                     values.push(None);
                 } else {
-                    values.push(Some(arrow_array_value_to_string(col.as_ref(), row_idx)));
+                    values.push(Some(arrow_array_value_to_string(col.as_ref(), row_idx)?));
                 }
             }
             rows.push(InlinedDataRow {
@@ -907,89 +916,62 @@ pub(crate) fn batches_to_inlined_rows(
         }
     }
 
-    rows
+    Ok(rows)
 }
 
 /// Convert an Arrow array value at a given index to a string representation.
 ///
 /// This produces strings compatible with the `parse_inlined_column` function
 /// in `table.rs` for round-tripping through the catalog database.
-fn arrow_array_value_to_string(array: &dyn arrow::array::Array, idx: usize) -> String {
+fn arrow_array_value_to_string(
+    array: &dyn arrow::array::Array,
+    idx: usize,
+) -> crate::Result<String> {
     use arrow::array::*;
     use arrow::datatypes::DataType;
 
+    macro_rules! downcast_value {
+        ($array_type:ty) => {{
+            let a = array.as_any().downcast_ref::<$array_type>().ok_or_else(|| {
+                crate::error::DuckLakeError::Internal(format!(
+                    "Failed to downcast {:?} array",
+                    array.data_type()
+                ))
+            })?;
+            Ok(a.value(idx).to_string())
+        }};
+    }
+
     match array.data_type() {
         DataType::Boolean => {
-            let a = array.as_any().downcast_ref::<BooleanArray>().unwrap();
-            if a.value(idx) {
-                "true"
-            } else {
-                "false"
-            }
-            .to_string()
+            let a = array.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
+                crate::error::DuckLakeError::Internal(
+                    "Failed to downcast Boolean array".to_string(),
+                )
+            })?;
+            Ok(if a.value(idx) { "true" } else { "false" }.to_string())
         },
-        DataType::Int8 => {
-            let a = array.as_any().downcast_ref::<Int8Array>().unwrap();
-            a.value(idx).to_string()
-        },
-        DataType::Int16 => {
-            let a = array.as_any().downcast_ref::<Int16Array>().unwrap();
-            a.value(idx).to_string()
-        },
-        DataType::Int32 => {
-            let a = array.as_any().downcast_ref::<Int32Array>().unwrap();
-            a.value(idx).to_string()
-        },
-        DataType::Int64 => {
-            let a = array.as_any().downcast_ref::<Int64Array>().unwrap();
-            a.value(idx).to_string()
-        },
-        DataType::UInt8 => {
-            let a = array.as_any().downcast_ref::<UInt8Array>().unwrap();
-            a.value(idx).to_string()
-        },
-        DataType::UInt16 => {
-            let a = array.as_any().downcast_ref::<UInt16Array>().unwrap();
-            a.value(idx).to_string()
-        },
-        DataType::UInt32 => {
-            let a = array.as_any().downcast_ref::<UInt32Array>().unwrap();
-            a.value(idx).to_string()
-        },
-        DataType::UInt64 => {
-            let a = array.as_any().downcast_ref::<UInt64Array>().unwrap();
-            a.value(idx).to_string()
-        },
-        DataType::Float32 => {
-            let a = array.as_any().downcast_ref::<Float32Array>().unwrap();
-            a.value(idx).to_string()
-        },
-        DataType::Float64 => {
-            let a = array.as_any().downcast_ref::<Float64Array>().unwrap();
-            a.value(idx).to_string()
-        },
-        DataType::Utf8 => {
-            let a = array.as_any().downcast_ref::<StringArray>().unwrap();
-            a.value(idx).to_string()
-        },
-        DataType::LargeUtf8 => {
-            let a = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
-            a.value(idx).to_string()
-        },
-        DataType::Date32 => {
-            let a = array.as_any().downcast_ref::<Date32Array>().unwrap();
-            let days = a.value(idx);
-            match arrow::temporal_conversions::date32_to_datetime(days) {
-                Some(dt) => dt.format("%Y-%m-%d").to_string(),
-                None => days.to_string(),
-            }
-        },
-        DataType::Date64 => {
-            let a = array.as_any().downcast_ref::<Date64Array>().unwrap();
-            let ms = a.value(idx);
-            match arrow::temporal_conversions::date64_to_datetime(ms) {
-                Some(dt) => dt.format("%Y-%m-%d").to_string(),
-                None => ms.to_string(),
+        DataType::Int8 => downcast_value!(Int8Array),
+        DataType::Int16 => downcast_value!(Int16Array),
+        DataType::Int32 => downcast_value!(Int32Array),
+        DataType::Int64 => downcast_value!(Int64Array),
+        DataType::UInt8 => downcast_value!(UInt8Array),
+        DataType::UInt16 => downcast_value!(UInt16Array),
+        DataType::UInt32 => downcast_value!(UInt32Array),
+        DataType::UInt64 => downcast_value!(UInt64Array),
+        DataType::Float32 => downcast_value!(Float32Array),
+        DataType::Float64 => downcast_value!(Float64Array),
+        DataType::Utf8 => downcast_value!(StringArray),
+        DataType::LargeUtf8 => downcast_value!(LargeStringArray),
+        DataType::Date32 => downcast_value!(Date32Array),
+        DataType::Date64 => downcast_value!(Date64Array),
+        DataType::Timestamp(unit, _) => {
+            use arrow::datatypes::TimeUnit;
+            match unit {
+                TimeUnit::Second => downcast_value!(TimestampSecondArray),
+                TimeUnit::Millisecond => downcast_value!(TimestampMillisecondArray),
+                TimeUnit::Microsecond => downcast_value!(TimestampMicrosecondArray),
+                TimeUnit::Nanosecond => downcast_value!(TimestampNanosecondArray),
             }
         },
         _ => {
@@ -999,8 +981,8 @@ fn arrow_array_value_to_string(array: &dyn arrow::array::Array, idx: usize) -> S
                 &arrow::util::display::FormatOptions::default(),
             );
             match formatter {
-                Ok(f) => f.value(idx).to_string(),
-                Err(_) => String::new(),
+                Ok(f) => Ok(f.value(idx).to_string()),
+                Err(_) => Ok(String::new()),
             }
         },
     }
@@ -1126,6 +1108,41 @@ fn parse_string_to_array(
         },
         DataType::Date32 => parse_primitive!(Date32Builder, values),
         DataType::Date64 => parse_primitive!(Date64Builder, values),
+        DataType::Timestamp(unit, tz) => {
+            use arrow::datatypes::TimeUnit;
+
+            macro_rules! build_timestamp {
+                ($builder_ty:ty) => {{
+                    let mut builder = <$builder_ty>::with_capacity(values.len());
+                    for val in values {
+                        match val {
+                            Some(s) => match s.parse::<i64>() {
+                                Ok(v) => builder.append_value(v),
+                                Err(_) => {
+                                    return Err(crate::error::DuckLakeError::Internal(format!(
+                                        "Failed to parse inlined value '{}' as Timestamp",
+                                        s
+                                    )));
+                                },
+                            },
+                            None => builder.append_null(),
+                        }
+                    }
+                    let arr = builder.finish();
+                    match tz {
+                        Some(tz) => Arc::new(arr.with_timezone(tz.as_ref())) as Arc<dyn Array>,
+                        None => Arc::new(arr) as Arc<dyn Array>,
+                    }
+                }};
+            }
+
+            match unit {
+                TimeUnit::Second => build_timestamp!(TimestampSecondBuilder),
+                TimeUnit::Millisecond => build_timestamp!(TimestampMillisecondBuilder),
+                TimeUnit::Microsecond => build_timestamp!(TimestampMicrosecondBuilder),
+                TimeUnit::Nanosecond => build_timestamp!(TimestampNanosecondBuilder),
+            }
+        },
         _ => {
             // Fallback: store as strings
             let mut builder = StringBuilder::new();
@@ -1368,7 +1385,7 @@ pub(crate) fn calculate_footer_size_from_bytes(buffer: &[u8]) -> Result<i64> {
             metadata_len
         )));
     }
-    Ok(metadata_len as i64)
+    Ok(i64::from(metadata_len))
 }
 
 /// Best-effort cleanup of uploaded files after a metadata commit failure.
@@ -1588,26 +1605,29 @@ mod tests {
     }
 
     #[test]
-    fn test_arrow_array_value_to_string_date32_iso8601() {
+    fn test_arrow_array_value_to_string_date32_epoch_days() {
         use arrow::array::Date32Array;
-        // 2024-06-15 is 19889 days since epoch
+        // 2024-06-15 is 19889 days since epoch — serialized as epoch-days integer
         let array = Date32Array::from(vec![19889]);
-        assert_eq!(arrow_array_value_to_string(&array, 0), "2024-06-15");
+        assert_eq!(arrow_array_value_to_string(&array, 0).unwrap(), "19889");
     }
 
     #[test]
-    fn test_arrow_array_value_to_string_date64_iso8601() {
+    fn test_arrow_array_value_to_string_date64_epoch_ms() {
         use arrow::array::Date64Array;
         let ms: i64 = 19889 * 86400 * 1000;
         let array = Date64Array::from(vec![ms]);
-        assert_eq!(arrow_array_value_to_string(&array, 0), "2024-06-15");
+        assert_eq!(
+            arrow_array_value_to_string(&array, 0).unwrap(),
+            ms.to_string()
+        );
     }
 
     #[test]
-    fn test_arrow_array_value_to_string_epoch_date32() {
+    fn test_arrow_array_value_to_string_epoch_date32_zero() {
         use arrow::array::Date32Array;
         let array = Date32Array::from(vec![0]);
-        assert_eq!(arrow_array_value_to_string(&array, 0), "1970-01-01");
+        assert_eq!(arrow_array_value_to_string(&array, 0).unwrap(), "0");
     }
 
     #[test]
@@ -1643,6 +1663,68 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("Failed to parse"));
+    }
+
+    #[test]
+    fn test_date32_inlined_roundtrip() {
+        use arrow::array::Date32Array;
+        // Write: Date32 value 19889 (2024-06-15) -> string "19889"
+        let array = Date32Array::from(vec![19889]);
+        let serialized = arrow_array_value_to_string(&array, 0).unwrap();
+        assert_eq!(serialized, "19889");
+
+        // Read: string "19889" -> Date32 value 19889
+        let values = vec![Some(serialized)];
+        let result = parse_string_to_array(&values, &DataType::Date32).unwrap();
+        let date_array = result.as_any().downcast_ref::<Date32Array>().unwrap();
+        assert_eq!(date_array.value(0), 19889);
+    }
+
+    #[test]
+    fn test_timestamp_inlined_roundtrip() {
+        use arrow::array::TimestampMicrosecondArray;
+        use arrow::datatypes::TimeUnit;
+        // Write: Timestamp microseconds value -> string of epoch value
+        let epoch_us: i64 = 1_718_451_000_000_000; // ~2024-06-15T12:30:00
+        let array = TimestampMicrosecondArray::from(vec![epoch_us]);
+        let serialized = arrow_array_value_to_string(&array, 0).unwrap();
+        assert_eq!(serialized, epoch_us.to_string());
+
+        // Read: string -> Timestamp microseconds
+        let values = vec![Some(serialized)];
+        let result = parse_string_to_array(
+            &values,
+            &DataType::Timestamp(TimeUnit::Microsecond, None),
+        )
+        .unwrap();
+        let ts_array = result
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(ts_array.value(0), epoch_us);
+    }
+
+    #[test]
+    fn test_timestamp_with_tz_inlined_roundtrip() {
+        use arrow::array::TimestampMicrosecondArray;
+        use arrow::datatypes::TimeUnit;
+        let epoch_us: i64 = 1_718_451_000_000_000;
+        let values = vec![Some(epoch_us.to_string())];
+        let result = parse_string_to_array(
+            &values,
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+        )
+        .unwrap();
+        let ts_array = result
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(ts_array.value(0), epoch_us);
+        // Verify timezone is set
+        assert_eq!(
+            result.data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
     }
 
     #[test]

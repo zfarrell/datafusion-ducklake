@@ -664,10 +664,6 @@ impl DuckLakeTable {
             )
         })?;
 
-        let schema_name = self.schema_name.as_ref().ok_or_else(|| {
-            DataFusionError::Internal("Schema name not set for writable table".to_string())
-        })?;
-
         // Pre-load existing delete positions for files that have delete files
         let mut existing_deletes = HashMap::new();
         for table_file in &self.table_files {
@@ -683,7 +679,6 @@ impl DuckLakeTable {
         Ok(Arc::new(DuckLakeUpdateExec::new(
             self.table_id,
             self.table_name.clone(),
-            schema_name.clone(),
             self.schema.clone(),
             column_ids,
             self.table_files.clone(),
@@ -722,10 +717,6 @@ impl DuckLakeTable {
             )
         })?;
 
-        let schema_name = self.schema_name.as_ref().ok_or_else(|| {
-            DataFusionError::Internal("Schema name not set for writable table".to_string())
-        })?;
-
         let mut existing_deletes = HashMap::new();
         for table_file in &self.table_files {
             if let Some(ref delete_file) = table_file.delete_file {
@@ -740,7 +731,6 @@ impl DuckLakeTable {
         Ok(Arc::new(DuckLakeMergeExec::new(
             self.table_id,
             self.table_name.clone(),
-            schema_name.clone(),
             self.schema.clone(),
             column_ids,
             self.table_files.clone(),
@@ -1868,7 +1858,36 @@ fn parse_inlined_column(
         },
         DataType::Date32 => parse_primitive!(Date32Builder, values),
         DataType::Date64 => parse_primitive!(Date64Builder, values),
-        DataType::Timestamp(_, _) => parse_primitive!(Int64Builder, values),
+        DataType::Timestamp(unit, tz) => {
+            use arrow::datatypes::TimeUnit;
+
+            macro_rules! build_timestamp {
+                ($builder_ty:ty) => {{
+                    let mut builder = <$builder_ty>::with_capacity(values.len());
+                    for val in values {
+                        match val {
+                            Some(s) => match s.parse::<i64>() {
+                                Ok(v) => builder.append_value(v),
+                                Err(_) => builder.append_null(),
+                            },
+                            None => builder.append_null(),
+                        }
+                    }
+                    let arr = builder.finish();
+                    match tz {
+                        Some(tz) => Arc::new(arr.with_timezone(tz.as_ref())) as Arc<dyn Array>,
+                        None => Arc::new(arr) as Arc<dyn Array>,
+                    }
+                }};
+            }
+
+            match unit {
+                TimeUnit::Second => build_timestamp!(TimestampSecondBuilder),
+                TimeUnit::Millisecond => build_timestamp!(TimestampMillisecondBuilder),
+                TimeUnit::Microsecond => build_timestamp!(TimestampMicrosecondBuilder),
+                TimeUnit::Nanosecond => build_timestamp!(TimestampNanosecondBuilder),
+            }
+        },
         _ => {
             // Fallback: store as strings
             let mut builder = StringBuilder::new();

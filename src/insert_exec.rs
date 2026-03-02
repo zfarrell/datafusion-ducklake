@@ -260,7 +260,9 @@ impl ExecutionPlan for DuckLakeInsertExec {
                     )
                     .await
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                result.records_written as u64
+                u64::try_from(result.records_written).map_err(|e| {
+                    DataFusionError::Execution(format!("Record count overflow: {}", e))
+                })?
             } else {
                 // Partitioned write: route rows to per-partition files
                 write_partitioned(
@@ -590,7 +592,15 @@ fn precompute_identity_values(
 
     macro_rules! extract_all {
         ($array_type:ty) => {{
-            let a = array.as_any().downcast_ref::<$array_type>().unwrap();
+            let a = array
+                .as_any()
+                .downcast_ref::<$array_type>()
+                .ok_or_else(|| {
+                    DuckLakeError::Internal(format!(
+                        "Failed to downcast {:?} array",
+                        array.data_type()
+                    ))
+                })?;
             for i in 0..len {
                 values.push(if a.is_null(i) {
                     None
@@ -616,7 +626,13 @@ fn precompute_identity_values(
         DataType::LargeUtf8 => extract_all!(LargeStringArray),
         DataType::Boolean => extract_all!(BooleanArray),
         DataType::Date32 => {
-            let a = array.as_any().downcast_ref::<Date32Array>().unwrap();
+            let a =
+                array
+                    .as_any()
+                    .downcast_ref::<Date32Array>()
+                    .ok_or_else(|| {
+                        DuckLakeError::Internal("Failed to downcast Date32 array".to_string())
+                    })?;
             for i in 0..len {
                 values.push(if a.is_null(i) {
                     None
@@ -627,7 +643,13 @@ fn precompute_identity_values(
             }
         },
         DataType::Date64 => {
-            let a = array.as_any().downcast_ref::<Date64Array>().unwrap();
+            let a =
+                array
+                    .as_any()
+                    .downcast_ref::<Date64Array>()
+                    .ok_or_else(|| {
+                        DuckLakeError::Internal("Failed to downcast Date64 array".to_string())
+                    })?;
             for i in 0..len {
                 values.push(if a.is_null(i) {
                     None
@@ -708,7 +730,9 @@ fn extract_rows(
                 }
                 current_batch_idx = Some(batch_idx);
             }
-            take_indices.push(row_idx as u32);
+            take_indices.push(u32::try_from(row_idx).map_err(|e| {
+                DuckLakeError::Internal(format!("Row index overflow: {}", e))
+            })?);
         }
         if let Some(prev) = current_batch_idx {
             if !take_indices.is_empty() {
@@ -800,7 +824,9 @@ async fn write_partitioned(
         .commit_uploaded_files(&setup, uploaded_files, write_mode)
         .await?;
 
-    Ok(result.records_written as u64)
+    Ok(u64::try_from(result.records_written).map_err(|e| {
+        DataFusionError::Execution(format!("Record count overflow: {}", e))
+    })?)
 }
 
 #[cfg(test)]
@@ -883,9 +909,11 @@ mod tests {
     #[test]
     fn test_compute_partition_value_year() {
         let date = chrono::NaiveDate::from_ymd_opt(2024, 6, 15).unwrap();
-        let days_since_epoch = date
+        let days_since_epoch: i32 = date
             .signed_duration_since(chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
-            .num_days() as i32;
+            .num_days()
+            .try_into()
+            .expect("test date within i32 range");
         let array = arrow::array::Date32Array::from(vec![days_since_epoch]);
         assert_eq!(
             compute_partition_value(&array, 0, Some("year")).unwrap(),
@@ -896,9 +924,11 @@ mod tests {
     #[test]
     fn test_compute_partition_value_month() {
         let date = chrono::NaiveDate::from_ymd_opt(2024, 3, 15).unwrap();
-        let days_since_epoch = date
+        let days_since_epoch: i32 = date
             .signed_duration_since(chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
-            .num_days() as i32;
+            .num_days()
+            .try_into()
+            .expect("test date within i32 range");
         let array = arrow::array::Date32Array::from(vec![days_since_epoch]);
         assert_eq!(
             compute_partition_value(&array, 0, Some("month")).unwrap(),

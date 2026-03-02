@@ -280,7 +280,9 @@ impl ExecutionPlan for DuckLakeDeleteExec {
 
                     // Collect matching row positions (excluding already-deleted rows)
                     for i in 0..num_rows {
-                        let global_pos = global_row_offset + i as i64;
+                        let i_i64 = i64::try_from(i)
+                            .map_err(|e| DataFusionError::Execution(format!("Row index overflow: {}", e)))?;
+                        let global_pos = global_row_offset + i_i64;
 
                         // Skip if already deleted
                         if let Some(existing) = existing_positions
@@ -300,7 +302,8 @@ impl ExecutionPlan for DuckLakeDeleteExec {
                         }
                     }
 
-                    global_row_offset += num_rows as i64;
+                    global_row_offset += i64::try_from(num_rows)
+                        .map_err(|e| DataFusionError::Execution(format!("Row count overflow: {}", e)))?;
                 }
 
                 // Skip this file if no rows to delete
@@ -308,8 +311,10 @@ impl ExecutionPlan for DuckLakeDeleteExec {
                     continue;
                 }
 
-                let delete_count = positions_to_delete.len() as i64;
-                total_deleted += delete_count as u64;
+                let delete_count = i64::try_from(positions_to_delete.len())
+                    .map_err(|e| DataFusionError::Execution(format!("Delete count overflow: {}", e)))?;
+                total_deleted += u64::try_from(delete_count)
+                    .map_err(|e| DataFusionError::Execution(format!("Delete count overflow: {}", e)))?;
 
                 // Merge with existing deletes if any
                 if let Some(existing) = existing_positions {
@@ -350,7 +355,8 @@ impl ExecutionPlan for DuckLakeDeleteExec {
                     .into_inner()
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-                let file_size = buffer.len() as i64;
+                let file_size = i64::try_from(buffer.len())
+                    .map_err(|e| DataFusionError::Execution(format!("File size overflow: {}", e)))?;
                 let footer_size = calculate_footer_size_from_bytes(&buffer)
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
@@ -376,6 +382,14 @@ impl ExecutionPlan for DuckLakeDeleteExec {
                 cleanup_orphaned_files(&*object_store, &uploaded_files).await;
                 return Err(DataFusionError::External(Box::new(e)));
             }
+
+            // R3F-013: Record snapshot changes for DELETE
+            writer
+                .record_snapshot_changes(
+                    snapshot_id,
+                    &format!("deleted_from_table:{}", table_id),
+                )
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
             // Return the count of deleted rows
             let count_array: ArrayRef = Arc::new(UInt64Array::from(vec![total_deleted]));

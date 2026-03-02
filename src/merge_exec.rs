@@ -39,7 +39,9 @@ use crate::metadata_provider::DuckLakeTableFile;
 use crate::metadata_writer::{DataFileInfo, DeleteFileInfo, MetadataWriter};
 use crate::path_resolver::join_paths;
 use crate::table::delete_file_schema;
-use crate::table_writer::{build_schema_with_field_ids, calculate_footer_size_from_bytes};
+use crate::table_writer::{
+    build_schema_with_field_ids, calculate_footer_size_from_bytes, cleanup_orphaned_files,
+};
 
 /// Schema for the output of merge operations (count of rows affected)
 fn make_merge_count_schema() -> SchemaRef {
@@ -73,8 +75,6 @@ pub struct DuckLakeMergeExec {
     table_id: i64,
     /// Table name (for display)
     table_name: String,
-    /// Schema name (for data file registration)
-    schema_name: String,
     /// Arrow schema of the target table
     table_schema: SchemaRef,
     /// Column IDs from catalog metadata
@@ -107,7 +107,6 @@ impl DuckLakeMergeExec {
     pub fn new(
         table_id: i64,
         table_name: String,
-        schema_name: String,
         table_schema: SchemaRef,
         column_ids: Vec<i64>,
         table_files: Vec<DuckLakeTableFile>,
@@ -124,7 +123,6 @@ impl DuckLakeMergeExec {
         Self {
             table_id,
             table_name,
-            schema_name,
             table_schema,
             column_ids,
             table_files,
@@ -304,8 +302,6 @@ impl ExecutionPlan for DuckLakeMergeExec {
         let writer = Arc::clone(&self.writer);
         let object_store_url = self.object_store_url.clone();
         let table_path = self.table_path.clone();
-        let _schema_name = self.schema_name.clone();
-        let _table_name = self.table_name.clone();
         let existing_deletes = self.existing_deletes.clone();
         let output_schema = make_merge_count_schema();
 
@@ -324,6 +320,8 @@ impl ExecutionPlan for DuckLakeMergeExec {
             let mut new_data_batches: Vec<RecordBatch> = Vec::new();
             // Collect file metadata for atomic registration
             let mut pending_delete_files: Vec<DeleteFileInfo> = Vec::new();
+            // R3F-003: Track uploaded files for cleanup on metadata failure
+            let mut uploaded_files: Vec<ObjectPath> = Vec::new();
 
             // Track which source rows have been matched (for NOT MATCHED INSERT)
             let total_source_rows: usize = source_batches.iter().map(|b| b.num_rows()).sum();
@@ -376,7 +374,9 @@ impl ExecutionPlan for DuckLakeMergeExec {
                     let num_rows = batch.num_rows();
 
                     for target_row_idx in 0..num_rows {
-                        let global_pos = global_row_offset + target_row_idx as i64;
+                        let target_row_i64 = i64::try_from(target_row_idx)
+                            .map_err(|e| DataFusionError::Execution(format!("Row index overflow: {}", e)))?;
+                        let global_pos = global_row_offset + target_row_i64;
 
                         // Skip already-deleted rows
                         if let Some(existing) = existing_positions {
@@ -421,7 +421,8 @@ impl ExecutionPlan for DuckLakeMergeExec {
                         }
                     }
 
-                    global_row_offset += num_rows as i64;
+                    global_row_offset += i64::try_from(num_rows)
+                        .map_err(|e| DataFusionError::Execution(format!("Row count overflow: {}", e)))?;
                 }
 
                 // Skip writing delete files if no positions to delete
@@ -429,7 +430,8 @@ impl ExecutionPlan for DuckLakeMergeExec {
                     continue;
                 }
 
-                let match_count = positions_to_delete.len() as u64;
+                let match_count = u64::try_from(positions_to_delete.len())
+                    .map_err(|e| DataFusionError::Execution(format!("Delete count overflow: {}", e)))?;
                 total_affected += match_count;
 
                 // For UPDATE: collect the matched source rows (these replace the deleted target rows)
@@ -481,7 +483,8 @@ impl ExecutionPlan for DuckLakeMergeExec {
                     .into_inner()
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-                let file_size = buffer.len() as i64;
+                let file_size = i64::try_from(buffer.len())
+                    .map_err(|e| DataFusionError::Execution(format!("File size overflow: {}", e)))?;
                 let footer_size = calculate_footer_size_from_bytes(&buffer)
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
@@ -489,12 +492,15 @@ impl ExecutionPlan for DuckLakeMergeExec {
                     .put(&delete_object_path, PutPayload::from(buffer))
                     .await
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                uploaded_files.push(delete_object_path);
 
+                let match_count_i64 = i64::try_from(match_count)
+                    .map_err(|e| DataFusionError::Execution(format!("Match count overflow: {}", e)))?;
                 let delete_file_info = DeleteFileInfo::new(
                     data_file_id,
                     &delete_file_name,
                     file_size,
-                    match_count as i64,
+                    match_count_i64,
                 )
                 .with_footer_size(footer_size);
 
@@ -518,7 +524,8 @@ impl ExecutionPlan for DuckLakeMergeExec {
                     if unmatched_mask.true_count() > 0 {
                         let filtered = compute::filter_record_batch(src_batch, &unmatched_mask)
                             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-                        total_affected += filtered.num_rows() as u64;
+                        total_affected += u64::try_from(filtered.num_rows())
+                            .map_err(|e| DataFusionError::Execution(format!("Row count overflow: {}", e)))?;
                         new_data_batches.push(filtered);
                     }
                     source_global_idx += src_batch.num_rows();
@@ -551,7 +558,8 @@ impl ExecutionPlan for DuckLakeMergeExec {
                 for batch in &new_data_batches {
                     let batch_with_ids =
                         RecordBatch::try_new(write_schema.clone(), batch.columns().to_vec())?;
-                    total_records += batch_with_ids.num_rows() as i64;
+                    total_records += i64::try_from(batch_with_ids.num_rows())
+                        .map_err(|e| DataFusionError::Execution(format!("Row count overflow: {}", e)))?;
                     arrow_writer
                         .write(&batch_with_ids)
                         .map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -561,7 +569,8 @@ impl ExecutionPlan for DuckLakeMergeExec {
                     .into_inner()
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-                let file_size = buffer.len() as i64;
+                let file_size = i64::try_from(buffer.len())
+                    .map_err(|e| DataFusionError::Execution(format!("File size overflow: {}", e)))?;
                 let footer_size = calculate_footer_size_from_bytes(&buffer)
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
@@ -569,6 +578,7 @@ impl ExecutionPlan for DuckLakeMergeExec {
                     .put(&data_object_path, PutPayload::from(buffer))
                     .await
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                uploaded_files.push(data_object_path);
 
                 let data_file_info = DataFileInfo::new(&data_file_name, file_size, total_records)
                     .with_footer_size(footer_size);
@@ -576,14 +586,20 @@ impl ExecutionPlan for DuckLakeMergeExec {
                 pending_data_files.push(data_file_info);
             }
 
-            // Atomically register all delete files and data files
+            // R3F-003: Atomically register all delete files and data files with cleanup on failure
+            if let Err(e) = writer.register_dml_files(
+                table_id,
+                snapshot_id,
+                &pending_delete_files,
+                &pending_data_files,
+            ) {
+                cleanup_orphaned_files(&*object_store, &uploaded_files).await;
+                return Err(DataFusionError::External(Box::new(e)));
+            }
+
+            // R3F-013: Record snapshot changes for MERGE
             writer
-                .register_dml_files(
-                    table_id,
-                    snapshot_id,
-                    &pending_delete_files,
-                    &pending_data_files,
-                )
+                .record_snapshot_changes(snapshot_id, &format!("merged_into_table:{}", table_id))
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
             let count_array: ArrayRef = Arc::new(UInt64Array::from(vec![total_affected]));

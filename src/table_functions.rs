@@ -103,7 +103,6 @@ impl TableFunctionImpl for DucklakeListFilesFunction {
         let resolved = resolve_table_for_function(
             &*self.provider,
             &table_name,
-            "ducklake_list_files",
             self.snapshot_id,
         )?;
 
@@ -224,7 +223,6 @@ impl TableFunctionImpl for DucklakeTableChangesFunction {
         let resolved = resolve_table_for_function(
             &*self.provider,
             &table_name,
-            "ducklake_table_changes",
             self.snapshot_id,
         )?;
 
@@ -263,7 +261,6 @@ impl TableFunctionImpl for DucklakeTableDeletionsFunction {
         let resolved = resolve_table_for_function(
             &*self.provider,
             &table_name,
-            "ducklake_table_deletions",
             self.snapshot_id,
         )?;
 
@@ -291,7 +288,6 @@ struct ResolvedTable {
 fn resolve_table_for_function(
     provider: &dyn MetadataProvider,
     table_name: &str,
-    _func_name: &str,
     snapshot_id: i64,
 ) -> DataFusionResult<ResolvedTable> {
     let (schema_name, table_name_only) = parse_table_name(table_name);
@@ -434,7 +430,6 @@ impl TableFunctionImpl for DucklakeTableInsertionsFunction {
         let resolved = resolve_table_for_function(
             &*self.provider,
             &table_name,
-            "ducklake_table_insertions",
             self.snapshot_id,
         )?;
 
