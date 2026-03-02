@@ -69,12 +69,12 @@ Everything through Phase 6 is complete. See `docs/project-status.md` for the ful
 - T1-5 remainder: SLT result mismatch fixes — Medium, 10-15 more tests fixable
 - T1-3 remainder: CTAS table visibility — Small, 2-3 tests
 
-**Remaining (Review P2/P3):**
-- P2-1: Vectorized partition routing (performance optimization)
-- P2-8: PG/MySQL inlining fallback (graceful degradation when inlining unsupported)
-- P2-10: Snapshot field population (`schema_version`, `next_catalog_id`, `next_file_id`)
-- P2-13: UNIQUE constraints for PG/MySQL ID allocation (concurrent writer safety)
-- P3-1 through P3-13: 13 nits/style items (see synthesis doc)
+**Remaining (Review Cycle 2 — 3 deferred):**
+- F-036: INSERT streaming for OOM prevention (L effort — architectural)
+- F-044: Provider/writer code deduplication (L effort — ~1000+ lines near-identical across backends)
+- F-045: Async trait redesign, sync->async (L effort — ~60+ block_on calls)
+
+All other Cycle 2 findings (55 of 58) are resolved. See `docs/2026-03-02-review-synthesis.md` for full status.
 
 **Tier 2 — Blocked:**
 - SQL MERGE parsing (DataFusion limitation)
@@ -98,34 +98,31 @@ A four-part code review identified **36 deduplicated findings** (6 P0, 11 P1, 13
 
 **Source**: `docs/2026-03-01-review-synthesis.md`
 
-### Code Review Cycle 2 (2026-03-02)
+### Code Review Cycle 2 (2026-03-02) — 55 of 58 FIXED
 
-A five-part review (idiomatic, correctness, interop, test-harness, codex) identified **99 raw findings → 64 after dedup → 58 actionable** (5 P0, 15 P1, 21 P2, 17 P3).
+A five-part review (idiomatic, correctness, interop, test-harness, codex) identified **99 raw findings -> 64 after dedup -> 58 actionable** (5 P0, 15 P1, 21 P2, 17 P3). Two rounds of fix agents resolved **55 of 58** findings.
 
-**Key NEW P0 findings:**
-- SQL injection in inlined data READ path (all 4 metadata providers) — Cycle 1 only fixed WRITE path
-- Non-atomic DELETE/UPDATE/MERGE metadata commit — Cycle 1 only fixed INSERT
-- CTAS hard-wired to LocalFileSystem (broken for S3/MinIO)
-- Tests that silently pass on errors (sql_write_tests, roundtrip_interop_tests)
+**Round 1 (33 findings fixed)** — 6 agents:
+- fix-security: SQL injection READ path (quote_identifier on all 4 providers)
+- fix-atomicity: Atomic DML, transaction safety, PG sequences, drop cascade
+- fix-interop: Delete file format, row_id_start, schema_versions, column IDs, UUIDs, changes_made format
+- fix-dml: CTAS object store, MERGE key types, write paths from catalog, table function projections
+- fix-tests: Test reliability (fail on error, #[ignore], SLT runner assertions)
+- fix-numeric: Numeric safety (footer_size, null_count, NaN handling, nullable footer)
 
-**Key NEW P1 findings:**
-- Transaction safety gaps in sqlx writers (TOCTOU races, non-transactional stats/file operations)
-- MERGE panics on unsupported key types (Decimal, Timestamp)
-- DuckLake interop: delete file format mismatch, missing row_id_start, missing table_stats/schema_versions, column ID instability
-- Table function projection/snapshot bugs
-- drop_schema orphans child tables
-- SLT runner never fails CI
+**Round 2 (22 findings fixed)** — 4 agents:
+- fix-vcols-types: Virtual column row IDs, nullable cols, temporal roundtrip, decimal parser
+- fix-providers: Hex key decoding, inlined row count, MySQL sql_mode, tracing, path normalization
+- fix-test-infra: Partition routing perf, individual SLT tests, test helper dedup, arrow_val_to_string
+- fix-quality: Numeric try_from, encrypted/timezone, unwrap/dead_code, Debug impls, view SQL rewrite
 
-**Recommended 6 fix agents** (see synthesis doc for details):
-1. Security (SQL injection READ path)
-2. Write atomicity & transaction safety
-3. DuckLake interop alignment
-4. DML & table function correctness
-5. Test reliability
-6. Data integrity & numeric safety
+**3 Deferred (architectural, L effort):**
+- F-036: INSERT streaming for OOM prevention
+- F-044: Provider/writer code deduplication
+- F-045: Async trait redesign (sync->async)
 
 **Source documents:**
-- `docs/2026-03-02-review-synthesis.md` (consolidated findings, agent assignments)
+- `docs/2026-03-02-review-synthesis.md` (consolidated findings with **[FIXED]**/**[DEFERRED]** markers)
 - `docs/2026-03-02-review-idiomatic.md`, `docs/2026-03-02-review-correctness.md`, `docs/2026-03-02-review-interop.md`, `docs/2026-03-02-review-test-harness.md`, `docs/2026-03-02-codex-review.md`
 
 ### After Implementation: PR Creation

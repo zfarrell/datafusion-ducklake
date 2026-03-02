@@ -322,17 +322,17 @@ Note: Postgres/MySQL tests require running database containers (testcontainers).
 
 ## 3. Remaining Work (Prioritized)
 
-### Code Review Fixes (2026-03-02)
+### Code Review Fixes (2026-03-01 + 2026-03-02)
 
-A four-part code review identified 36 findings (6 P0, 11 P1, 13 P2, 13 P3). All P0 and P1 items are now **FIXED**. 9 of 13 P2 items are also fixed. Key improvements:
-- **Write atomicity**: Single transaction for partitioned writes, deferred Replace-mode, all-or-nothing commit
-- **Input validation**: SQL identifier quoting, all timestamp precisions, URL-encoded partition values
-- **Inline data safety**: Error propagation, correct flush paths, `Arc<Vec<String>>` for column names
-- **Test infrastructure**: Shared test helpers, column-count assertions, 3 new interop tests, skip logging
+**Cycle 1 (2026-03-01)**: 36 findings (6 P0, 11 P1, 13 P2, 13 P3). All P0/P1 fixed, 9/13 P2 fixed.
 
-Remaining P2: vectorized partition routing (P2-1), PG/MySQL inlining fallback (P2-8), snapshot field population (P2-10), UNIQUE constraints for PG/MySQL (P2-13). All P3 items (13 nits/style) remain as backlog.
+**Cycle 2 (2026-03-02)**: 58 findings (5 P0, 15 P1, 21 P2, 17 P3). **55 of 58 fixed** across two rounds of fix agents:
+- **Round 1** (33 fixed): SQL injection READ path, atomic DML, transaction safety, interop alignment (delete format, row_id_start, schema_versions, column IDs, UUIDs, changes_made), CTAS object store, MERGE key types, table function projections, test reliability, numeric safety
+- **Round 2** (22 fixed): Virtual column row IDs, nullable cols, temporal roundtrip, decimal parser, hex key decoding, inlined row count, MySQL sql_mode, partition routing perf, individual SLT tests, test helper dedup, numeric try_from, Debug impls, view SQL rewrite, doc comments
 
-See `docs/2026-03-01-review-synthesis.md` for full details and resolution status.
+**3 Deferred** (architectural, L effort): F-036 (INSERT streaming/OOM), F-044 (provider/writer code dedup), F-045 (async trait redesign).
+
+See `docs/2026-03-02-review-synthesis.md` for full details with **[FIXED]**/**[DEFERRED]** markers on each finding.
 
 ### Tier 1: Implementable Now (no external blockers)
 

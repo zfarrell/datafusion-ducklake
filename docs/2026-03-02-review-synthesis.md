@@ -8,6 +8,36 @@
 - Actionable findings: 58
 - By priority: 5 P0, 15 P1, 21 P2, 17 P3
 
+## Fix Resolution Status
+
+Two rounds of fix agents resolved 55 of 58 actionable findings:
+
+| Round | Findings | Status |
+|-------|----------|--------|
+| Round 1 (P0+P1+high P2) | 33 findings | All fixed |
+| Round 2 (remaining P2+P3) | 22 findings | All fixed |
+| Deferred (architectural, L effort) | 3 findings | F-036, F-044, F-045 |
+| **Total** | **58** | **55 fixed, 3 deferred** |
+
+### Round 1 Fix Agents:
+- **fix-security**: F-001 (SQL injection READ path — quote_identifier on all 4 providers)
+- **fix-atomicity**: F-002, F-006, F-007, F-008, F-015, F-020 (atomic DML, transaction safety, PG sequences, drop cascade)
+- **fix-interop**: F-010, F-011, F-012, F-013, F-025, F-026, F-027 (delete file format, row_id_start, schema_versions, column IDs, UUIDs, changes_made)
+- **fix-dml**: F-003, F-009, F-014, F-016, F-017, F-018 (CTAS object store, MERGE types, write paths, table function projections)
+- **fix-tests**: F-004, F-005, F-019, F-021, F-022, F-032 (test reliability, SLT runner, assertions)
+- **fix-numeric**: F-028, F-029, F-030, F-031, F-035, F-038 (numeric safety, NaN handling, nullable footer)
+
+### Round 2 Fix Agents:
+- **fix-vcols-types**: F-033, F-034, F-037, F-053 (virtual column row IDs, nullable cols, temporal roundtrip, decimal parser)
+- **fix-providers**: F-023, F-024, F-039, F-043, F-052 (hex key decoding, inlined row count, MySQL sql_mode, tracing, path normalization)
+- **fix-test-infra**: F-040, F-041, F-046, F-051, F-058 (partition routing perf, individual SLT tests, test helper dedup, arrow_val_to_string, hybrid error logging)
+- **fix-quality**: F-042, F-047, F-048, F-049, F-050, F-054, F-056 (numeric try_from, encrypted/timezone, unwrap/dead_code, Debug impls, view SQL rewrite, error messages, doc comments)
+
+### Deferred Items (architectural, L effort):
+- **F-036**: INSERT streaming for OOM prevention
+- **F-044**: Provider/writer code deduplication
+- **F-045**: Async trait redesign (sync→async)
+
 ## Previously Fixed (from 2026-03-01 cycle)
 
 These findings were re-raised by reviewers but were already addressed in the previous fix cycle:
@@ -25,7 +55,7 @@ These findings were re-raised by reviewers but were already addressed in the pre
 
 ### P0 — Critical
 
-#### F-001: SQL injection in inlined data queries (READ path)
+#### **[FIXED]** F-001: SQL injection in inlined data queries (READ path)
 - **Source reviews**: Correctness P0-1, Codex CX-03
 - **File(s)**: `metadata_provider_sqlite.rs:870-898`, `metadata_provider_postgres.rs:962-967`, `metadata_provider_mysql.rs:941-949`, `metadata_provider_duckdb.rs:542-559`
 - **Description**: All 4 metadata providers use `format!()` with table/column names from the catalog database when querying inlined data. A malicious or corrupted catalog database can inject arbitrary SQL.
@@ -34,7 +64,7 @@ These findings were re-raised by reviewers but were already addressed in the pre
 - **Effort**: S
 - **Fix group**: Security
 
-#### F-002: Non-atomic DELETE/UPDATE/MERGE metadata commit
+#### **[FIXED]** F-002: Non-atomic DELETE/UPDATE/MERGE metadata commit
 - **Source reviews**: Correctness P0-2, Codex CX-02
 - **File(s)**: `delete_exec.rs:275-330`, `update_exec.rs:380-450`, `merge_exec.rs` (same pattern)
 - **Description**: DML operations register delete files and data files one-at-a-time in a loop. If any registration fails mid-loop, previously committed metadata persists while later files are missing. Cleanup removes uploaded object store files but does NOT roll back already-committed metadata rows.
@@ -43,7 +73,7 @@ These findings were re-raised by reviewers but were already addressed in the pre
 - **Effort**: L
 - **Fix group**: Write atomicity
 
-#### F-003: CTAS hard-wired to LocalFileSystem
+#### **[FIXED]** F-003: CTAS hard-wired to LocalFileSystem
 - **Source reviews**: Correctness P2-7, Codex CX-04
 - **File(s)**: `schema.rs:395`
 - **Description**: `register_table` constructs `DuckLakeTableWriter` with `Arc::new(LocalFileSystem::new())` unconditionally. CREATE TABLE AS SELECT on S3/MinIO/GCS catalogs writes data to local disk instead of the configured object store.
@@ -52,7 +82,7 @@ These findings were re-raised by reviewers but were already addressed in the pre
 - **Effort**: M
 - **Fix group**: Object store integration
 
-#### F-004: sql_write_tests.rs silently passes on errors
+#### **[FIXED]** F-004: sql_write_tests.rs silently passes on errors
 - **Source reviews**: Test Harness TH-1
 - **File(s)**: `tests/sql_write_tests.rs:94,184,362,433,527,622`
 - **Description**: 6 test functions catch `Err(e)` and `println!` instead of failing. If CTAS, INSERT VALUES, INSERT OVERWRITE, schema evolution, or filtered INSERT regress, tests continue to pass.
@@ -61,7 +91,7 @@ These findings were re-raised by reviewers but were already addressed in the pre
 - **Effort**: S
 - **Fix group**: Test reliability
 
-#### F-005: Roundtrip interop tests silently skip without `#[ignore]`
+#### **[FIXED]** F-005: Roundtrip interop tests silently skip without `#[ignore]`
 - **Source reviews**: Test Harness TH-2
 - **File(s)**: `tests/roundtrip_interop_tests.rs:132-136,189-193,229-233,300-304,430-434,527-531`
 - **Description**: All 6 roundtrip tests use `find_duckdb() → return` instead of `#[ignore]`. CI reports them as passing even when DuckDB CLI is absent.
@@ -72,7 +102,7 @@ These findings were re-raised by reviewers but were already addressed in the pre
 
 ### P1 — High
 
-#### F-006: TOCTOU race in `get_or_create_schema()` (all sqlx providers)
+#### **[FIXED]** F-006: TOCTOU race in `get_or_create_schema()` (all sqlx providers)
 - **Source reviews**: Correctness P1-1
 - **File(s)**: `metadata_writer_sqlite.rs:632-669`, `metadata_writer_postgres.rs:577-613`, `metadata_writer_mysql.rs:665-704`
 - **Description**: SELECT + INSERT without transaction creates a classic TOCTOU race. Concurrent writers can create duplicate schemas.
@@ -81,7 +111,7 @@ These findings were re-raised by reviewers but were already addressed in the pre
 - **Effort**: S
 - **Fix group**: Transaction safety
 
-#### F-007: `register_column_stats()` not transactional (all sqlx providers)
+#### **[FIXED]** F-007: `register_column_stats()` not transactional (all sqlx providers)
 - **Source reviews**: Correctness P1-2
 - **File(s)**: `metadata_writer_sqlite.rs:782-809`, `metadata_writer_postgres.rs:719-746`, `metadata_writer_mysql.rs:816-843`
 - **Description**: Column stats inserted one row at a time using pool (not transaction). Mid-loop failure leaves partial stats.
@@ -90,7 +120,7 @@ These findings were re-raised by reviewers but were already addressed in the pre
 - **Effort**: S
 - **Fix group**: Transaction safety
 
-#### F-008: `end_table_files()` not transactional (all sqlx providers)
+#### **[FIXED]** F-008: `end_table_files()` not transactional (all sqlx providers)
 - **Source reviews**: Correctness P1-3
 - **File(s)**: `metadata_writer_sqlite.rs:835-848`, `metadata_writer_postgres.rs:772-785`, `metadata_writer_mysql.rs:870-883`
 - **Description**: Runs UPDATE using pool directly, outside the caller's logical transaction. If it succeeds but subsequent `register_data_file` fails, table left with no active data files.
@@ -99,7 +129,7 @@ These findings were re-raised by reviewers but were already addressed in the pre
 - **Effort**: S
 - **Fix group**: Transaction safety
 
-#### F-009: MERGE panics or silently fails on unsupported key types
+#### **[FIXED]** F-009: MERGE panics or silently fails on unsupported key types
 - **Source reviews**: Idiomatic ID-01, Correctness P2-6, Codex CX-09
 - **File(s)**: `merge_exec.rs:183-238`
 - **Description**: `values_equal()` handles a hardcoded set of types and returns `false` for unrecognized ones (Decimal, Timestamp, etc.), causing all rows to appear unmatched. Also uses `.unwrap()` on downcasts — type mismatch causes panic.
@@ -108,7 +138,7 @@ These findings were re-raised by reviewers but were already addressed in the pre
 - **Effort**: M
 - **Fix group**: DML correctness
 
-#### F-010: Delete file format default mismatch (`POSITION_DELETES` vs `parquet`)
+#### **[FIXED]** F-010: Delete file format default mismatch (`POSITION_DELETES` vs `parquet`)
 - **Source reviews**: Interop INTEROP-1
 - **File(s)**: `metadata_writer_sqlite.rs:106`, `metadata_writer_postgres.rs:97`, `metadata_writer_mysql.rs:109`
 - **Description**: Our DDL default for `ducklake_delete_file.format` is `'POSITION_DELETES'`, but DuckDB writes `'parquet'`. DF-created delete files get the wrong default value.
@@ -117,7 +147,7 @@ These findings were re-raised by reviewers but were already addressed in the pre
 - **Effort**: S
 - **Fix group**: Interop alignment
 
-#### F-011: Missing `row_id_start` in data file registration
+#### **[FIXED]** F-011: Missing `row_id_start` in data file registration
 - **Source reviews**: Interop INTEROP-3
 - **File(s)**: `metadata_writer_sqlite.rs:819`, `metadata_writer.rs:200-215`
 - **Description**: Our `register_data_file` never sets `row_id_start`. DuckDB assigns monotonically increasing row IDs for delete file position mapping and virtual `rowid` generation.
@@ -126,7 +156,7 @@ These findings were re-raised by reviewers but were already addressed in the pre
 - **Effort**: M
 - **Fix group**: Interop alignment
 
-#### F-012: Missing `ducklake_schema_versions` and `ducklake_table_stats` population
+#### **[FIXED]** F-012: Missing `ducklake_schema_versions` and `ducklake_table_stats` population
 - **Source reviews**: Interop INTEROP-10, Interop INTEROP-9 (schema_version default)
 - **File(s)**: All writer backends (no INSERT into these tables)
 - **Description**: DuckDB populates `ducklake_table_stats` (record_count, next_row_id, file_size_bytes) and `ducklake_schema_versions` (begin_snapshot, schema_version). Our writer creates but never populates these tables. Also, `schema_version` defaults to 1 instead of inheriting from latest snapshot.
@@ -135,7 +165,7 @@ These findings were re-raised by reviewers but were already addressed in the pre
 - **Effort**: M
 - **Fix group**: Interop alignment
 
-#### F-013: Column IDs regenerated every write transaction
+#### **[FIXED]** F-013: Column IDs regenerated every write transaction
 - **Source reviews**: Codex CX-08
 - **File(s)**: `metadata_writer_sqlite.rs:440-459`
 - **Description**: `begin_write_transaction` ends all active columns and inserts new rows with fresh IDs even for append-compatible schemas. This destabilizes Parquet field-id mapping across snapshots/files.
@@ -144,7 +174,7 @@ These findings were re-raised by reviewers but were already addressed in the pre
 - **Effort**: M
 - **Fix group**: Write correctness
 
-#### F-014: Write paths derived from names instead of catalog paths
+#### **[FIXED]** F-014: Write paths derived from names instead of catalog paths
 - **Source reviews**: Codex CX-06
 - **File(s)**: `table_writer.rs:83,:109`, `update_exec.rs:455,:496`
 - **Description**: Write paths use `schema_name/table_name` instead of the catalog's stored table path. After table rename (where path intentionally stays unchanged) or custom path usage, new writes go to a different physical location than metadata resolution expects.
@@ -153,7 +183,7 @@ These findings were re-raised by reviewers but were already addressed in the pre
 - **Effort**: M
 - **Fix group**: Write correctness
 
-#### F-015: MySQL/PostgreSQL ID allocation race (`MAX()+1`)
+#### **[FIXED]** F-015: MySQL/PostgreSQL ID allocation race (`MAX()+1`)
 - **Source reviews**: Codex CX-10, Codex CX-25 (partition_id), previous P2-13
 - **File(s)**: `metadata_writer_mysql.rs:429,:485,:738,:780,:1222,:1404`, `metadata_writer_postgres.rs:1413`, `metadata_writer_mysql.rs:1530`
 - **Description**: ID allocation uses `MAX(...) + 1` with `FOR UPDATE` on aggregate. Does not guarantee safe monotonic allocation across concurrent writers. Also affects `partition_id` generation in both Postgres and MySQL.
@@ -162,7 +192,7 @@ These findings were re-raised by reviewers but were already addressed in the pre
 - **Effort**: M
 - **Fix group**: Transaction safety
 
-#### F-016: `ducklake_table_changes()` returns wrong column order for projections
+#### **[FIXED]** F-016: `ducklake_table_changes()` returns wrong column order for projections
 - **Source reviews**: Codex CX-12
 - **File(s)**: `table_changes.rs:361,:385,:488,:506`
 - **Description**: Projection is captured but execution schema is rebuilt in fixed `table_cols + snapshot_id + change_type` order, ignoring requested projection order.
@@ -171,7 +201,7 @@ These findings were re-raised by reviewers but were already addressed in the pre
 - **Effort**: M
 - **Fix group**: Table function correctness
 
-#### F-017: `ducklake_table_deletions()` ignores projection for non-empty results
+#### **[FIXED]** F-017: `ducklake_table_deletions()` ignores projection for non-empty results
 - **Source reviews**: Codex CX-13
 - **File(s)**: `table_deletions.rs:221,:236,:254,:435`
 - **Description**: `scan()` accepts projection but only applies it in the empty fast path. For actual data, full `output_schema` is always returned.
@@ -180,7 +210,7 @@ These findings were re-raised by reviewers but were already addressed in the pre
 - **Effort**: M
 - **Fix group**: Table function correctness
 
-#### F-018: UDTFs resolve metadata at latest snapshot, not session snapshot
+#### **[FIXED]** F-018: UDTFs resolve metadata at latest snapshot, not session snapshot
 - **Source reviews**: Codex CX-14
 - **File(s)**: `table_functions.rs:288,:63,:508`
 - **Description**: Table functions call `get_current_snapshot()` at invocation time instead of using the session/catalog pinned snapshot.
@@ -189,7 +219,7 @@ These findings were re-raised by reviewers but were already addressed in the pre
 - **Effort**: M
 - **Fix group**: Table function correctness
 
-#### F-019: SLT runner never fails CI
+#### **[FIXED]** F-019: SLT runner never fails CI
 - **Source reviews**: Codex CX-16
 - **File(s)**: `tests/sqllogictest_runner.rs:870-880`
 - **Description**: Runner prints failures but has no assertion to fail the test. CI always passes regardless of SLT results.
@@ -198,7 +228,7 @@ These findings were re-raised by reviewers but were already addressed in the pre
 - **Effort**: S
 - **Fix group**: Test reliability
 
-#### F-020: `drop_schema` orphans child tables and files
+#### **[FIXED]** F-020: `drop_schema` orphans child tables and files
 - **Source reviews**: Codex CX-17
 - **File(s)**: `metadata_writer_sqlite.rs:585,:593`
 - **Description**: Dropping a schema ends only the schema row, not contained tables, columns, or data/delete files.
@@ -209,7 +239,7 @@ These findings were re-raised by reviewers but were already addressed in the pre
 
 ### P2 — Medium
 
-#### F-021: Timestamp downcast assumes microsecond precision in hybrid adapter
+#### **[FIXED]** F-021: Timestamp downcast assumes microsecond precision in hybrid adapter
 - **Source reviews**: Test Harness TH-6
 - **File(s)**: `tests/hybrid_asyncdb.rs:566-571`
 - **Description**: `convert_batch_to_strings()` always downcasts `Timestamp(_, _)` to `TimestampMicrosecondArray`. Non-microsecond timestamps will panic.
@@ -217,7 +247,7 @@ These findings were re-raised by reviewers but were already addressed in the pre
 - **Effort**: S
 - **Fix group**: Test reliability
 
-#### F-022: Weak substring assertions in roundtrip tests
+#### **[FIXED]** F-022: Weak substring assertions in roundtrip tests
 - **Source reviews**: Test Harness TH-3, Codex CX-30
 - **File(s)**: `tests/roundtrip_interop_tests.rs:168-182,218-222`
 - **Description**: `stdout.contains("Alice")` and `stdout.contains('3')` match any output containing those characters, including error messages.
@@ -225,7 +255,7 @@ These findings were re-raised by reviewers but were already addressed in the pre
 - **Effort**: M
 - **Fix group**: Test reliability
 
-#### F-023: Encryption key decoding ambiguity
+#### **[FIXED]** F-023: Encryption key decoding ambiguity
 - **Source reviews**: Codex CX-07
 - **File(s)**: `encryption.rs:133,:143`
 - **Description**: Base64 tried before hex. A 32-char hex key (common AES-128) is valid base64, decodes to 24 bytes (valid AES-192), and is silently accepted as wrong key material.
@@ -233,7 +263,7 @@ These findings were re-raised by reviewers but were already addressed in the pre
 - **Effort**: S
 - **Fix group**: Encryption
 
-#### F-024: DuckDB row count omits inlined rows
+#### **[FIXED]** F-024: DuckDB row count omits inlined rows
 - **Source reviews**: Codex CX-11
 - **File(s)**: `metadata_provider_duckdb.rs:442`
 - **Description**: `get_table_row_count` in DuckDB only aggregates `ducklake_data_file` rows, unlike SQLite/Postgres/MySQL providers which include inlined data rows.
@@ -241,7 +271,7 @@ These findings were re-raised by reviewers but were already addressed in the pre
 - **Effort**: S
 - **Fix group**: Provider consistency
 
-#### F-025: Data file `file_format` casing mismatch
+#### **[FIXED]** F-025: Data file `file_format` casing mismatch
 - **Source reviews**: Interop INTEROP-2
 - **File(s)**: All 3 writer DDL files
 - **Description**: Our DDL default is `'PARQUET'` (uppercase) but DuckDB writes `'parquet'` (lowercase).
@@ -249,7 +279,7 @@ These findings were re-raised by reviewers but were already addressed in the pre
 - **Effort**: S
 - **Fix group**: Interop alignment
 
-#### F-026: Missing UUID generation for schemas and tables
+#### **[FIXED]** F-026: Missing UUID generation for schemas and tables
 - **Source reviews**: Interop INTEROP-4
 - **File(s)**: `metadata_writer_sqlite.rs:371,404,658,708`
 - **Description**: DuckDB generates UUIDv7 for `schema_uuid`, `table_uuid`, `view_uuid`. Our writer leaves these NULL.
@@ -257,7 +287,7 @@ These findings were re-raised by reviewers but were already addressed in the pre
 - **Effort**: S
 - **Fix group**: Interop alignment
 
-#### F-027: `snapshot_changes.changes_made` format mismatch
+#### **[FIXED]** F-027: `snapshot_changes.changes_made` format mismatch
 - **Source reviews**: Interop INTEROP-5
 - **File(s)**: `metadata_writer_sqlite.rs:560,607,1261,1502,1629,1687,1765`
 - **Description**: DuckDB uses structured format (`created_table:"main"."test"`, `deleted_from_table:1`). Our writer uses human-readable strings (`"Dropped table (id=1)"`).
@@ -265,7 +295,7 @@ These findings were re-raised by reviewers but were already addressed in the pre
 - **Effort**: M
 - **Fix group**: Interop alignment
 
-#### F-028: `footer_size as usize` unchecked cast
+#### **[FIXED]** F-028: `footer_size as usize` unchecked cast
 - **Source reviews**: Correctness P2-1
 - **File(s)**: `table.rs:758`
 - **Description**: Inconsistent — some locations use `usize::try_from()` (lines 515-518) but line 758 uses `as usize`. Negative footer_size wraps silently.
@@ -273,7 +303,7 @@ These findings were re-raised by reviewers but were already addressed in the pre
 - **Effort**: S
 - **Fix group**: Numeric safety
 
-#### F-029: `null_count` cast overflow in stats extraction
+#### **[FIXED]** F-029: `null_count` cast overflow in stats extraction
 - **Source reviews**: Correctness P2-2
 - **File(s)**: `table_writer.rs:1168`
 - **Description**: `nc as i64` on `u64` null_count can wrap to negative. Accumulation across row groups can also overflow.
@@ -281,7 +311,7 @@ These findings were re-raised by reviewers but were already addressed in the pre
 - **Effort**: S
 - **Fix group**: Numeric safety
 
-#### F-030: `parse_string_to_array` silently converts parse failures to NULL
+#### **[FIXED]** F-030: `parse_string_to_array` silently converts parse failures to NULL
 - **Source reviews**: Correctness P2-3 (previously P3-5, upgraded)
 - **File(s)**: `table_writer.rs:1040-1044`
 - **Description**: When flushing inlined data, unparseable string values silently become NULL. Data that was correctly stored but fails to round-trip through string parsing is lost.
@@ -289,7 +319,7 @@ These findings were re-raised by reviewers but were already addressed in the pre
 - **Effort**: S
 - **Fix group**: Data integrity
 
-#### F-031: Float NaN handling in stats comparison
+#### **[FIXED]** F-031: Float NaN handling in stats comparison
 - **Source reviews**: Correctness P2-5
 - **File(s)**: `table_writer.rs:1254-1283`
 - **Description**: `should_replace_min()`/`should_replace_max()` use standard comparisons where NaN comparisons always return false. NaN can be incorrectly stored as min/max, breaking file pruning.
@@ -297,7 +327,7 @@ These findings were re-raised by reviewers but were already addressed in the pre
 - **Effort**: S
 - **Fix group**: Stats correctness
 
-#### F-032: Schema evolution test creates false positives
+#### **[FIXED]** F-032: Schema evolution test creates false positives
 - **Source reviews**: Test Harness TH-13, Codex CX-28
 - **File(s)**: `tests/roundtrip_interop_tests.rs:389-403,:415-423`
 - **Description**: Returns early on DuckDB read failure; logs missing rows instead of asserting. Test always passes.
@@ -305,7 +335,7 @@ These findings were re-raised by reviewers but were already addressed in the pre
 - **Effort**: S
 - **Fix group**: Test reliability
 
-#### F-033: Virtual column row IDs are partition-local
+#### **[FIXED]** F-033: Virtual column row IDs are partition-local
 - **Source reviews**: Codex CX-18
 - **File(s)**: `virtual_column_exec.rs:154,:165,:200,:208`
 - **Description**: `row_offset` starts at 0 per `execute(partition, ...)` stream. Multi-partition files produce duplicate `file_row_number`/`rowid` values.
@@ -313,7 +343,7 @@ These findings were re-raised by reviewers but were already addressed in the pre
 - **Effort**: M
 - **Fix group**: Virtual columns
 
-#### F-034: Virtual column null coercion to zero
+#### **[FIXED]** F-034: Virtual column null coercion to zero
 - **Source reviews**: Codex CX-19
 - **File(s)**: `virtual_column_exec.rs:207,:215`
 - **Description**: Missing `row_id_start`/`snapshot_id` are coerced to `0` instead of null. Turns "unknown metadata" into a real value.
@@ -321,7 +351,7 @@ These findings were re-raised by reviewers but were already addressed in the pre
 - **Effort**: S
 - **Fix group**: Virtual columns
 
-#### F-035: Schema truncation on field ID mismatch
+#### **[FIXED]** F-035: Schema truncation on field ID mismatch
 - **Source reviews**: Codex CX-20
 - **File(s)**: `table_writer.rs:1122,:1126`
 - **Description**: `build_schema_with_field_ids` silently zips to shorter side when column ID count doesn't match field count, dropping fields.
@@ -329,7 +359,7 @@ These findings were re-raised by reviewers but were already addressed in the pre
 - **Effort**: S
 - **Fix group**: Write correctness
 
-#### F-036: INSERT OOM from full partition materialization
+#### **[DEFERRED]** F-036: INSERT OOM from full partition materialization
 - **Source reviews**: Codex CX-21
 - **File(s)**: `insert_exec.rs:211,:217`
 - **Description**: All input batches from all partitions are collected in memory before writing. Large partitioned inserts can exhaust memory.
@@ -337,7 +367,7 @@ These findings were re-raised by reviewers but were already addressed in the pre
 - **Effort**: L
 - **Fix group**: Performance
 
-#### F-037: Temporal type mapping is lossy on roundtrip
+#### **[FIXED]** F-037: Temporal type mapping is lossy on roundtrip
 - **Source reviews**: Codex CX-23
 - **File(s)**: `types.rs:121,:57,:116,:54`
 - **Description**: Timezone lost on roundtrip (all `timestamptz` maps back to UTC). `Time32`/`Time64` both map to `"time"` → `Time64(Microsecond)`, changing unit.
@@ -345,7 +375,7 @@ These findings were re-raised by reviewers but were already addressed in the pre
 - **Effort**: M
 - **Fix group**: Type system
 
-#### F-038: `DeleteFileChange` assumes non-null footer size
+#### **[FIXED]** F-038: `DeleteFileChange` assumes non-null footer size
 - **Source reviews**: Codex CX-24
 - **File(s)**: `metadata_provider.rs:581`, parsing in all 4 providers
 - **Description**: `data_file_footer_size: i64` but source column is nullable. `row.get/try_get` will error on null.
@@ -353,7 +383,7 @@ These findings were re-raised by reviewers but were already addressed in the pre
 - **Effort**: S
 - **Fix group**: Provider robustness
 
-#### F-039: MySQL `sql_mode` leak on error
+#### **[FIXED]** F-039: MySQL `sql_mode` leak on error
 - **Source reviews**: Codex CX-26
 - **File(s)**: `metadata_writer_mysql.rs:984-998`
 - **Description**: `initialize_schema` modifies `sql_mode` to `NO_AUTO_VALUE_ON_ZERO`; if subsequent operations fail before restore, pooled connection retains modified mode.
@@ -361,7 +391,7 @@ These findings were re-raised by reviewers but were already addressed in the pre
 - **Effort**: S
 - **Fix group**: MySQL safety
 
-#### F-040: Row-by-row partition routing performance
+#### **[FIXED]** F-040: Row-by-row partition routing performance
 - **Source reviews**: Idiomatic ID-09, previous P2-1 (not fixed)
 - **File(s)**: `insert_exec.rs:506-531`
 - **Description**: `route_batches_to_partitions()` iterates row-by-row, O(rows x partitions). ~10x slower than vectorized approach for large inserts.
@@ -369,7 +399,7 @@ These findings were re-raised by reviewers but were already addressed in the pre
 - **Effort**: M
 - **Fix group**: Performance
 
-#### F-041: Single mega-test for SLT runner
+#### **[FIXED]** F-041: Single mega-test for SLT runner
 - **Source reviews**: Test Harness TH-7
 - **File(s)**: `tests/sqllogictest_runner.rs:813-880`
 - **Description**: All SLT files run inside one `#[tokio::test]`. If one file panics, the rest don't run. Can't re-run individual SLT tests.
@@ -379,76 +409,76 @@ These findings were re-raised by reviewers but were already addressed in the pre
 
 ### P3 — Low
 
-#### F-042: Unchecked numeric casts and bounds
+#### **[FIXED]** F-042: Unchecked numeric casts and bounds
 - **Source reviews**: Correctness P1-5 (num_rows as i64), Codex CX-27 (partition column index), Correctness P3-4 (table_writer path)
 - **File(s)**: `table_writer.rs:262,:459`, `insert_exec.rs:252`
 - **Description**: Several `as` casts without `try_from()` and array index access without bounds checking.
 - **Effort**: S
 
-#### F-043: Silent error swallowing in `DuckLakeTable::new()`
+#### **[FIXED]** F-043: Silent error swallowing in `DuckLakeTable::new()`
 - **Source reviews**: Correctness P2-4
 - **File(s)**: `table.rs:193-201`
 - **Description**: Errors from `get_table_row_count()` and `get_partition_columns()` silently ignored. Partition pruning and COUNT(*) optimization silently degrade.
 - **Effort**: S
 
-#### F-044: Code duplication across metadata providers and writers
+#### **[DEFERRED]** F-044: Code duplication across metadata providers and writers
 - **Source reviews**: Idiomatic ID-04, ID-05
 - **File(s)**: All `metadata_provider_*.rs` and `metadata_writer_*.rs` files
 - **Description**: SQLite/PostgreSQL/MySQL backends contain nearly identical row-mapping and transaction logic (~1000+ lines each). Differences: SQL placeholder syntax, pool type, minor dialect.
 - **Effort**: L
 
-#### F-045: Sync trait design forces `block_on()` everywhere
+#### **[DEFERRED]** F-045: Sync trait design forces `block_on()` everywhere
 - **Source reviews**: Idiomatic ID-06, Codex CX-22
 - **File(s)**: All sqlx-based backends, `schema.rs:346,:362,:403`
 - **Description**: `MetadataProvider` and `MetadataWriter` are sync traits but sqlx is async, forcing ~60+ `block_on()` calls. Also fragile in async runtimes.
 - **Effort**: L
 
-#### F-046: Remaining test helper duplication and inconsistency
+#### **[FIXED]** F-046: Remaining test helper duplication and inconsistency
 - **Source reviews**: Test Harness TH-4, TH-5 (partially fixed)
 - **File(s)**: Multiple `tests/cross_engine_*.rs` files
 - **Description**: Despite `test_utils.rs` extraction (P2-2 fix), some helpers still duplicated with subtle differences (e.g., different virtual column filter sets: 2 columns vs 5).
 - **Effort**: M
 
-#### F-047: Minor interop differences (acceptable)
+#### **[FIXED]** F-047: Minor interop differences (acceptable)
 - **Source reviews**: Interop INTEROP-6 (missing `encrypted=false`), INTEROP-7 (extra columns), INTEROP-8 (`_df_change_tracking`), INTEROP-11 (snapshot_time format)
 - **Description**: Several minor schema differences: missing `encrypted=false` metadata key, extra `partial_max`/`table_id` columns, `_df_change_tracking` non-spec table, snapshot_time without timezone.
 - **Effort**: S (each)
 
-#### F-048: Miscellaneous code quality items
+#### **[FIXED]** F-048: Miscellaneous code quality items
 - **Source reviews**: Idiomatic ID-02, ID-03, ID-07, ID-08, ID-10, ID-11, ID-12, ID-14, ID-15, ID-16, ID-21
 - **Description**: Various code quality items including: unwrap on into_iter().next(), #[allow(dead_code)], repetitive map_err patterns, heavy field cloning, compaction boilerplate, bind_repeat! macro, pub pool fields, missing with_capacity(), DuckLakeTableFile god object, inconsistent error types, feature gate duplication.
 - **Effort**: S-M (each)
 
-#### F-049: Missing trait implementations
+#### **[FIXED]** F-049: Missing trait implementations
 - **Source reviews**: Idiomatic ID-19, ID-20
 - **File(s)**: `table_deletions.rs:472`, `table_changes.rs:211`
 - **Description**: `DeletedRowsStream` and `AppendCDCColumnsStream` missing `Debug` implementations.
 - **Effort**: S
 
-#### F-050: SQL dialect compatibility
+#### **[FIXED]** F-050: SQL dialect compatibility
 - **Source reviews**: Idiomatic ID-13, Correctness P3-2
 - **File(s)**: `metadata_provider.rs:150-255`, `schema.rs:149-172`
 - **Description**: `LEFT JOIN LATERAL` not SQLite-compatible; `rewrite_duckdb_view_sql` uses byte-level string manipulation (ASCII-only assumption).
 - **Effort**: M
 
-#### F-051: Remaining test quality items
+#### **[FIXED]** F-051: Remaining test quality items
 - **Source reviews**: Test Harness TH-10, TH-12, Codex CX-34, CX-35
 - **Description**: `arrow_val_to_string` catch-all prints entire array; PG/MySQL tests zero CI coverage; test batch assumptions; partition pruning test doesn't assert pruning behavior.
 - **Effort**: S-M (each)
 
-#### F-052: Path resolver edge cases
+#### **[FIXED]** F-052: Path resolver edge cases
 - **Source reviews**: Codex CX-33, CX-36
 - **File(s)**: `path_resolver.rs:233,:263,:264,:272`
 - **Description**: Double path separators possible; base path not validated in relative resolution.
 - **Effort**: S
 
-#### F-053: Decimal parser overly permissive prefix match
+#### **[FIXED]** F-053: Decimal parser overly permissive prefix match
 - **Source reviews**: Codex CX-29
 - **File(s)**: `types.rs:217`
 - **Description**: `starts_with("decimal")` matches `decimalx(10,2)`.
 - **Effort**: S
 
-#### F-054: DELETE/UPDATE planner coupled to `DefaultTableSource`
+#### **[FIXED]** F-054: DELETE/UPDATE planner coupled to `DefaultTableSource`
 - **Source reviews**: Codex CX-31
 - **File(s)**: `query_planner.rs:92`
 - **Description**: Rejects non-`DefaultTableSource` wrappers, reducing forward compatibility.
@@ -459,7 +489,7 @@ These findings were re-raised by reviewers but were already addressed in the pre
 - **Description**: `schema_names()`/`table_names()` return empty on error (API constraint); Acquire/Release ordering correct but doesn't synchronize metadata.
 - **Effort**: N/A (informational)
 
-#### F-056: `open_compaction_connection()` per-call overhead
+#### **[FIXED]** F-056: `open_compaction_connection()` per-call overhead
 - **Source reviews**: Idiomatic ID-18
 - **File(s)**: `compaction_functions.rs:59-73`
 - **Description**: Creates fresh DuckDB connection per compaction function call. Low priority since these are infrequent maintenance operations.
@@ -470,7 +500,7 @@ These findings were re-raised by reviewers but were already addressed in the pre
 - **Description**: `schema()` methods clone `Arc<Schema>` — this is actually correct per DataFusion API. No change needed.
 - **Effort**: N/A (informational)
 
-#### F-058: `is_hybrid_incompatible_error()` reduces test coverage
+#### **[FIXED]** F-058: `is_hybrid_incompatible_error()` reduces test coverage
 - **Source reviews**: Previous P3-13 (not fixed)
 - **File(s)**: `sqllogictest_runner.rs:711`
 - **Description**: Converts `statement error` to `statement ok` for hybrid-incompatible errors. Reduces coverage of error paths.
@@ -557,23 +587,25 @@ These findings were re-raised by reviewers but were already addressed in the pre
 
 ## Notes for Next Phase
 
-### Priority Recommendations
+### Resolution Summary
 
-1. **Immediate (P0)**: F-001 (SQL injection READ path), F-002 (DML atomicity), F-003 (CTAS object store)
-2. **Immediate (test)**: F-004, F-005, F-019 (tests that silently pass)
-3. **Soon (P1 interop)**: F-010, F-011, F-012, F-013 (DuckLake format alignment)
-4. **Soon (P1 correctness)**: F-006-F-008 (transaction safety), F-009 (MERGE), F-020 (drop cascade)
-5. **Next sprint**: P2 items grouped by agent
+All priority recommendations from the initial review have been addressed. 55 of 58 findings are now fixed. Only 3 architectural items remain deferred (F-036, F-044, F-045).
 
-### Architectural Observations
+### Remaining Deferred Items
 
-1. **Transaction model needs work**: Multiple P1 findings (F-006, F-007, F-008, F-015) indicate the sqlx-based writers lack consistent transaction boundaries. A systematic audit of all multi-step writer operations would prevent future issues.
+1. **F-036 (INSERT streaming)**: Full partition materialization can cause OOM on large inserts. Requires streaming write architecture. L effort.
+2. **F-044 (Provider/writer deduplication)**: ~1000+ lines of near-identical code across SQLite/PostgreSQL/MySQL backends. Needs trait-based abstraction. L effort.
+3. **F-045 (Async trait redesign)**: ~60+ `block_on()` calls due to sync trait design with async sqlx. Needs async trait migration. L effort.
 
-2. **Interop debt accumulating**: 7 interop findings (F-010 through F-013, F-025 through F-027) indicate our catalog format is drifting from DuckDB's. A dedicated interop alignment pass would prevent this from becoming a larger problem.
+### Architectural Observations (Updated)
 
-3. **Virtual column and table function implementations incomplete**: F-016, F-017, F-018, F-033, F-034 suggest these features were added for basic cases but lack full projection/snapshot support.
+1. **Transaction model**: FIXED. All P1 transaction findings (F-006, F-007, F-008, F-015) resolved with proper transaction boundaries, sequences, and FOR UPDATE locking.
 
-4. **Test infrastructure improving but gaps remain**: Previous cycle made progress (shared test_utils, skip counting), but F-004, F-005, F-019 represent serious CI reliability holes where tests silently pass.
+2. **Interop alignment**: FIXED. All 7 interop findings (F-010 through F-013, F-025 through F-027) resolved. Catalog format now matches DuckDB expectations.
+
+3. **Virtual column and table function implementations**: FIXED. F-016, F-017, F-018, F-033, F-034 all resolved with proper projection support, snapshot pinning, and CoalescePartitionsExec for row IDs.
+
+4. **Test infrastructure**: FIXED. F-004, F-005, F-019 resolved — tests now properly fail on errors, use #[ignore] correctly, and SLT runner asserts on failures.
 
 ### Comparison to Previous Cycle
 

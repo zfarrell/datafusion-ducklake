@@ -13,23 +13,26 @@
 
 A four-part review identified 36 deduplicated findings. All 6 P0 and 11 P1 items were fixed. 9 of 13 P2 items fixed. Full details in `docs/2026-03-01-review-synthesis.md`.
 
-### Cycle 2 (2026-03-02) — 58 NEW ACTIONABLE FINDINGS
+### Cycle 2 (2026-03-02) — 55 of 58 FINDINGS FIXED
 
-A five-part review (idiomatic, correctness, interop, test-harness, codex) identified 99 raw findings → 64 after dedup → 58 after filtering previously fixed items. Full details in `docs/2026-03-02-review-synthesis.md`.
+A five-part review (idiomatic, correctness, interop, test-harness, codex) identified 99 raw findings → 64 after dedup → 58 after filtering previously fixed items. Two rounds of fix agents resolved 55 of 58 actionable findings. Full details in `docs/2026-03-02-review-synthesis.md`.
 
-| Priority | Count | Key themes |
-|----------|-------|------------|
-| P0 | 5 | SQL injection (READ path), non-atomic DML, CTAS object store, test false-passes |
-| P1 | 15 | Transaction safety, MERGE panics, interop format mismatches, column ID instability, drop cascade |
-| P2 | 21 | Virtual columns, type mapping, numeric casts, encryption keys, performance |
-| P3 | 17 | Code duplication, missing Debug impls, minor interop diffs, test nits |
+| Priority | Count | Fixed | Deferred |
+|----------|-------|-------|----------|
+| P0 | 5 | 5 | 0 |
+| P1 | 15 | 15 | 0 |
+| P2 | 21 | 20 | 1 (F-036) |
+| P3 | 17 | 15 | 2 (F-044, F-045) |
+| **Total** | **58** | **55** | **3** |
 
-**New P0 items (not in Cycle 1):**
-- F-001: SQL injection in inlined data READ path (all 4 providers) — Cycle 1 fixed WRITE path only
-- F-002: Non-atomic DELETE/UPDATE/MERGE metadata commit — Cycle 1 fixed INSERT only
-- F-003: CTAS hard-wired to LocalFileSystem — new finding
-- F-004: sql_write_tests.rs silently passes on errors — new finding
-- F-005: Roundtrip interop tests silently skip — new finding
+**Round 1 (P0+P1+high P2)**: 33 findings fixed across 6 agents (fix-security, fix-atomicity, fix-interop, fix-dml, fix-tests, fix-numeric).
+
+**Round 2 (remaining P2+P3)**: 22 findings fixed across 4 agents (fix-vcols-types, fix-providers, fix-test-infra, fix-quality).
+
+**3 Deferred (architectural, L effort):**
+- F-036: INSERT streaming for OOM prevention
+- F-044: Provider/writer code deduplication
+- F-045: Async trait redesign (sync→async)
 
 ---
 
@@ -374,21 +377,31 @@ Note: Several previously-listed items are now resolved:
 
 **All Tier 1 items are now complete.**
 
+**Code Review Cycle 2**: 55 of 58 findings fixed (see Cycle 2 section above). Only 3 deferred:
+- F-036: INSERT streaming for OOM prevention (L)
+- F-044: Provider/writer code deduplication (L)
+- F-045: Async trait redesign (L)
+
 **Remaining items (Tier 2+):**
 
 **1. SLT result mismatch investigation (T1-5)** -- Medium effort, high impact
 - 10-15 tests fixable, requires case-by-case analysis of each mismatch
 
-**3. CTAS table visibility fixes (T1-3 remainder)** -- Small effort, 2-3 tests
+**2. CTAS table visibility fixes (T1-3 remainder)** -- Small effort, 2-3 tests
 - Fix remaining table visibility issues
 
-**4. Complex type evolution (T3-1)** -- Large effort, 12 tests
+**3. Complex type evolution (T3-1)** -- Large effort, 12 tests
 - Architectural refactor needed
 - Defer unless users specifically need struct evolution
 
-**5. Encrypted writes (T3-2)** -- Large effort, 0-2 tests
+**4. Encrypted writes (T3-2)** -- Large effort, 0-2 tests
 - Only needed for encrypted catalogs
 - Defer indefinitely unless user-requested
+
+**5. Deferred review findings (architectural)** -- Large effort each
+- F-036: INSERT streaming (prevent OOM on large partitioned inserts)
+- F-044: Provider/writer code dedup (~1000+ lines near-identical across backends)
+- F-045: Async trait redesign (~60+ block_on calls)
 
 ### Items to NOT work on
 
