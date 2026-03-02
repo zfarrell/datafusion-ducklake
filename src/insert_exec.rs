@@ -7,7 +7,7 @@
 //! are routed to per-partition Parquet files in Hive-style directory layout.
 
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fmt::{self, Debug};
 use std::sync::Arc;
 
@@ -523,9 +523,9 @@ fn build_hive_dir(partition_columns: &[WritePartitionColumn], values: &[Option<S
 fn route_batches_to_partitions(
     batches: &[RecordBatch],
     partition_columns: &[WritePartitionColumn],
-) -> crate::Result<HashMap<String, (Vec<Option<String>>, Vec<(usize, usize)>)>> {
-    let mut partitions: HashMap<String, (Vec<Option<String>>, Vec<(usize, usize)>)> =
-        HashMap::new();
+) -> crate::Result<BTreeMap<String, (Vec<Option<String>>, Vec<(usize, usize)>)>> {
+    let mut partitions: BTreeMap<String, (Vec<Option<String>>, Vec<(usize, usize)>)> =
+        BTreeMap::new();
 
     for (batch_idx, batch) in batches.iter().enumerate() {
         for row_idx in 0..batch.num_rows() {
@@ -606,10 +606,13 @@ fn extract_rows(
 
 /// Write batches partitioned by the configured partition columns.
 ///
-/// For each unique partition value combination:
-/// 1. Extract matching rows into a sub-batch
-/// 2. Write to a Hive-style directory (e.g., category=A/year=2024/uuid.parquet)
-/// 3. Register partition values in metadata
+/// Uses a single write transaction for ALL partitions to ensure atomicity:
+/// 1. Set up catalog metadata once (single snapshot, single set of column IDs)
+/// 2. Upload all partition files (Parquet serialization + object store upload)
+/// 3. Commit all files atomically (end old files for Replace, register all new files)
+///
+/// If any upload fails, previously uploaded files are cleaned up and no metadata
+/// is committed.
 async fn write_partitioned(
     table_writer: &DuckLakeTableWriter,
     metadata_writer: &Arc<dyn MetadataWriter>,
@@ -620,10 +623,17 @@ async fn write_partitioned(
     partition_columns: &[WritePartitionColumn],
     write_mode: WriteMode,
 ) -> crate::Result<u64> {
+    use crate::table_writer::arrow_schema_to_column_defs;
+
     let partition_map = route_batches_to_partitions(batches, partition_columns)?;
 
-    let mut total_rows: u64 = 0;
-    let mut first_partition = true;
+    // 1. Single write transaction setup for ALL partitions
+    let columns = arrow_schema_to_column_defs(arrow_schema)?;
+    let setup =
+        metadata_writer.begin_write_transaction(schema_name, table_name, &columns, write_mode)?;
+
+    // 2. Upload phase: write and upload all partition files (no metadata commit yet)
+    let mut uploaded_files = Vec::with_capacity(partition_map.len());
 
     for (hive_dir, (partition_values, row_indices)) in &partition_map {
         let sub_batch = extract_rows(batches, row_indices).map_err(|e| {
@@ -633,41 +643,35 @@ async fn write_partitioned(
             ))
         })?;
 
-        // First partition handles Replace mode (ends existing files); subsequent partitions append
-        let mode = if first_partition {
-            write_mode
-        } else {
-            WriteMode::Append
-        };
-        first_partition = false;
-
-        let mut session = table_writer.begin_write_partitioned(
+        let mut session = table_writer.begin_write_partitioned_with_setup(
             schema_name,
             table_name,
             arrow_schema,
             hive_dir,
-            mode,
+            &setup,
         )?;
 
         session.write_batch(&sub_batch)?;
-        let row_count = session.row_count();
-        let result = session.finish().await?;
 
-        // Register partition values for this file
-        let data_file_id = result.last_data_file_id;
-        for (key_index, pval) in partition_values.iter().enumerate() {
-            metadata_writer.register_file_partition_value(
-                data_file_id,
-                result.table_id,
-                key_index as i32,
-                pval.as_deref(),
-            )?;
+        match session.upload().await {
+            Ok(upload) => {
+                uploaded_files.push((upload, partition_values.clone()));
+            },
+            Err(e) => {
+                // Clean up any files already uploaded before this failure
+                let already_uploaded: Vec<_> = uploaded_files.into_iter().map(|(u, _)| u).collect();
+                table_writer.cleanup_uploaded_files(&already_uploaded).await;
+                return Err(e);
+            },
         }
-
-        total_rows += row_count as u64;
     }
 
-    Ok(total_rows)
+    // 3. Atomic commit: end old files (if Replace) and register all new files + partition values
+    let result = table_writer
+        .commit_uploaded_files(&setup, uploaded_files, write_mode)
+        .await?;
+
+    Ok(result.records_written as u64)
 }
 
 #[cfg(test)]

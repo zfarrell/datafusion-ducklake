@@ -514,17 +514,9 @@ impl MySqlMetadataWriter {
             column_ids.push(column_id);
         }
 
-        // For Replace mode, end existing data files
-        if mode == WriteMode::Replace {
-            sqlx::query(
-                "UPDATE ducklake_data_file SET end_snapshot = ?
-                 WHERE table_id = ? AND end_snapshot IS NULL",
-            )
-            .bind(snapshot_id)
-            .bind(table_id)
-            .execute(&mut *tx)
-            .await?;
-        }
+        // Note: Replace-mode file ending is NOT done here. The caller is
+        // responsible for calling end_table_files() after the Parquet upload
+        // succeeds. This prevents data loss if the upload fails.
 
         tx.commit().await?;
 

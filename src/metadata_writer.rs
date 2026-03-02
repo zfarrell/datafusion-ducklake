@@ -400,7 +400,10 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
 
     /// Atomically set up catalog metadata for a write operation.
     /// Creates snapshot, schema, table, columns in a single transaction.
-    /// If mode is `WriteMode::Replace`, ends existing data files.
+    ///
+    /// Does NOT end existing data files for Replace mode. The caller must
+    /// call `end_table_files()` separately after the Parquet upload succeeds
+    /// to prevent data loss on upload failure.
     fn begin_write_transaction(
         &self,
         schema_name: &str,

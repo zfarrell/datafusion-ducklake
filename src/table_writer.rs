@@ -187,6 +187,7 @@ impl DuckLakeTableWriter {
             catalog_path,
             path_is_relative,
             row_count: 0,
+            write_mode: mode,
         })
     }
 
@@ -489,6 +490,152 @@ impl DuckLakeTableWriter {
             last_data_file_id: data_file_id,
         })
     }
+
+    /// Begin a streaming write session for a partition using an existing write setup.
+    ///
+    /// Reuses the snapshot, table, and column IDs from a previous `begin_write_transaction`
+    /// call, avoiding per-partition snapshot/column creation. This is critical for
+    /// partitioned writes where all partitions must share the same column IDs.
+    pub fn begin_write_partitioned_with_setup(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        arrow_schema: &Schema,
+        partition_dir: &str,
+        setup: &crate::metadata_writer::WriteSetupResult,
+    ) -> Result<TableWriteSession> {
+        let table_key = join_paths(&join_paths(&self.base_key_path, schema_name)?, table_name)?;
+        let partition_key = join_paths(&table_key, partition_dir)?;
+        let file_name = format!("{}.parquet", Uuid::new_v4());
+        let catalog_path = join_paths(partition_dir, &file_name)?;
+
+        let schema_with_ids =
+            Arc::new(build_schema_with_field_ids(arrow_schema, &setup.column_ids));
+
+        let object_path_str = join_paths(&partition_key, &file_name)?;
+        let object_path = ObjectPath::from(object_path_str.trim_start_matches('/'));
+
+        let props = WriterProperties::builder()
+            .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
+            .build();
+        let writer = ArrowWriter::try_new(Vec::new(), schema_with_ids.clone(), Some(props))?;
+
+        Ok(TableWriteSession {
+            metadata: Arc::clone(&self.metadata),
+            object_store: Arc::clone(&self.object_store),
+            object_path,
+            snapshot_id: setup.snapshot_id,
+            schema_id: setup.schema_id,
+            table_id: setup.table_id,
+            column_ids: setup.column_ids.clone(),
+            schema_with_ids,
+            writer: Some(writer),
+            catalog_path,
+            path_is_relative: true,
+            row_count: 0,
+            // Always Append — Replace-mode file ending is handled by the caller
+            // after all partition uploads succeed.
+            write_mode: WriteMode::Append,
+        })
+    }
+
+    /// Commit uploaded files and register partition values in the catalog.
+    ///
+    /// For Replace mode, ends existing data files before registering new ones.
+    /// This ensures atomicity: old files are only ended after ALL new files are
+    /// uploaded, and partition values are registered alongside their files.
+    pub async fn commit_uploaded_files(
+        &self,
+        setup: &crate::metadata_writer::WriteSetupResult,
+        uploaded_files: Vec<(UploadedFile, Vec<Option<String>>)>,
+        write_mode: WriteMode,
+    ) -> Result<WriteResult> {
+        // End existing data files for Replace mode AFTER all uploads succeeded.
+        if write_mode == WriteMode::Replace {
+            self.metadata
+                .end_table_files(setup.table_id, setup.snapshot_id)?;
+        }
+
+        let mut total_rows: i64 = 0;
+        let mut last_data_file_id: i64 = -1;
+
+        for (upload, partition_values) in &uploaded_files {
+            let mut file_info =
+                DataFileInfo::new(&upload.catalog_path, upload.file_size, upload.row_count)
+                    .with_footer_size(upload.footer_size);
+            if !upload.path_is_relative {
+                file_info = file_info.with_absolute_path();
+            }
+
+            let data_file_id =
+                self.metadata
+                    .register_data_file(setup.table_id, setup.snapshot_id, &file_info)?;
+
+            if !upload.column_stats.is_empty() {
+                self.metadata.register_column_stats(
+                    data_file_id,
+                    setup.table_id,
+                    &upload.column_stats,
+                )?;
+            }
+
+            // Register partition values for this file
+            for (key_index, pval) in partition_values.iter().enumerate() {
+                self.metadata.register_file_partition_value(
+                    data_file_id,
+                    setup.table_id,
+                    key_index as i32,
+                    pval.as_deref(),
+                )?;
+            }
+
+            total_rows += upload.row_count;
+            last_data_file_id = data_file_id;
+        }
+
+        Ok(WriteResult {
+            snapshot_id: setup.snapshot_id,
+            table_id: setup.table_id,
+            schema_id: setup.schema_id,
+            files_written: uploaded_files.len(),
+            records_written: total_rows,
+            last_data_file_id,
+        })
+    }
+
+    /// Best-effort cleanup of uploaded files that failed to commit.
+    pub async fn cleanup_uploaded_files(&self, files: &[UploadedFile]) {
+        for upload in files {
+            if let Err(e) = self.object_store.delete(&upload.object_path).await {
+                tracing::warn!(
+                    path = %upload.object_path,
+                    error = %e,
+                    "Failed to clean up orphaned Parquet file after commit failure"
+                );
+            }
+        }
+    }
+}
+
+/// Result of uploading a Parquet file (before metadata commit).
+///
+/// Used by partitioned writes to separate the upload phase from the commit phase.
+#[derive(Debug)]
+pub struct UploadedFile {
+    /// Path to register in catalog
+    pub catalog_path: String,
+    /// Whether the path is relative to table path
+    pub path_is_relative: bool,
+    /// Size of the uploaded file in bytes
+    pub file_size: i64,
+    /// Size of the Parquet footer in bytes
+    pub footer_size: i64,
+    /// Number of rows written
+    pub row_count: i64,
+    /// Column-level statistics
+    pub column_stats: Vec<ColumnStatInfo>,
+    /// Object store path (for cleanup on failure)
+    pub object_path: ObjectPath,
 }
 
 /// Streaming write session. Buffer is dropped if not finished (no data uploaded).
@@ -509,6 +656,8 @@ pub struct TableWriteSession {
     /// Whether the catalog_path is relative to table path
     path_is_relative: bool,
     row_count: i64,
+    /// Write mode (Append or Replace) - determines whether old files are ended on commit
+    write_mode: WriteMode,
 }
 
 impl TableWriteSession {
@@ -584,6 +733,46 @@ impl TableWriteSession {
         self.object_path.as_ref()
     }
 
+    /// Upload the Parquet file to the object store without committing metadata.
+    ///
+    /// Used by partitioned writes to separate the upload phase from the commit phase,
+    /// ensuring all partition files are uploaded before any metadata is committed.
+    pub async fn upload(mut self) -> Result<UploadedFile> {
+        let mut writer = self.writer.take().ok_or_else(|| {
+            crate::error::DuckLakeError::Internal("Writer already closed".to_string())
+        })?;
+
+        writer.flush()?;
+        let column_stats = extract_column_stats(writer.flushed_row_groups(), &self.column_ids);
+        let buffer = writer.into_inner()?;
+
+        let file_size = i64::try_from(buffer.len()).map_err(|_| {
+            crate::error::DuckLakeError::Internal(format!(
+                "file size {} exceeds i64::MAX",
+                buffer.len()
+            ))
+        })?;
+        let footer_size = calculate_footer_size_from_bytes(&buffer)?;
+
+        self.object_store
+            .put(&self.object_path, PutPayload::from(buffer))
+            .await?;
+
+        Ok(UploadedFile {
+            catalog_path: self.catalog_path,
+            path_is_relative: self.path_is_relative,
+            file_size,
+            footer_size,
+            row_count: self.row_count,
+            column_stats,
+            object_path: self.object_path,
+        })
+    }
+
+    /// Upload, then commit metadata (including ending old files for Replace mode).
+    ///
+    /// For non-partitioned writes, this is the standard finish path. Old files
+    /// are ended only AFTER the upload succeeds, preventing data loss on upload failure.
     pub async fn finish(mut self) -> Result<WriteResult> {
         let mut writer = self.writer.take().ok_or_else(|| {
             crate::error::DuckLakeError::Internal("Writer already closed".to_string())
@@ -625,14 +814,25 @@ impl TableWriteSession {
             },
         }
     }
+
     /// Commit file metadata to the catalog. Separated from `finish()` so that
     /// cleanup of orphaned files can happen if this step fails.
+    ///
+    /// For Replace mode, ends existing data files before registering the new file.
+    /// This ensures old files are only ended after the upload succeeds.
     fn commit_metadata(
         &self,
         file_size: i64,
         footer_size: i64,
         column_stats: &[ColumnStatInfo],
     ) -> Result<WriteResult> {
+        // End existing data files for Replace mode AFTER upload succeeded.
+        // This ensures the table is never left empty if the upload fails.
+        if self.write_mode == WriteMode::Replace {
+            self.metadata
+                .end_table_files(self.table_id, self.snapshot_id)?;
+        }
+
         let mut file_info = DataFileInfo::new(&self.catalog_path, file_size, self.row_count)
             .with_footer_size(footer_size);
         if !self.path_is_relative {
@@ -911,7 +1111,7 @@ fn parse_string_to_array(
     Ok(array)
 }
 
-fn arrow_schema_to_column_defs(schema: &Schema) -> Result<Vec<ColumnDef>> {
+pub(crate) fn arrow_schema_to_column_defs(schema: &Schema) -> Result<Vec<ColumnDef>> {
     schema
         .fields()
         .iter()
