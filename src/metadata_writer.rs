@@ -423,6 +423,30 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         file: &DeleteFileInfo,
     ) -> Result<i64>;
 
+    /// Atomically register multiple delete files and data files for DML operations.
+    ///
+    /// Ensures that all metadata registrations for a single DML operation
+    /// (DELETE, UPDATE, MERGE) are committed atomically. If any registration
+    /// fails, none of them take effect.
+    ///
+    /// Default implementation calls individual methods (non-atomic, for backward
+    /// compatibility). Backends should override for true atomicity.
+    fn register_dml_files(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        delete_files: &[DeleteFileInfo],
+        data_files: &[DataFileInfo],
+    ) -> Result<()> {
+        for file in delete_files {
+            self.register_delete_file(table_id, snapshot_id, file)?;
+        }
+        for file in data_files {
+            self.register_data_file(table_id, snapshot_id, file)?;
+        }
+        Ok(())
+    }
+
     /// Drop a table by setting its end_snapshot.
     /// Creates a new snapshot and marks the table as dropped.
     /// Data files are NOT deleted (preserved for time travel).

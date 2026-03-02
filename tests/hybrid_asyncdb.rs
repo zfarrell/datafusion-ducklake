@@ -563,12 +563,38 @@ fn convert_batch_to_strings(batch: &RecordBatch) -> Result<Vec<Vec<String>>, Hyb
                         let arr = column.as_any().downcast_ref::<Date32Array>().unwrap();
                         arr.value_as_date(row_idx).unwrap().to_string()
                     },
-                    DataType::Timestamp(_, _) => {
-                        let arr = column
-                            .as_any()
-                            .downcast_ref::<TimestampMicrosecondArray>()
-                            .unwrap();
-                        format!("{}", arr.value_as_datetime(row_idx).unwrap())
+                    DataType::Timestamp(unit, _) => {
+                        use datafusion::arrow::datatypes::TimeUnit;
+                        match unit {
+                            TimeUnit::Second => {
+                                let arr = column
+                                    .as_any()
+                                    .downcast_ref::<TimestampSecondArray>()
+                                    .unwrap();
+                                format!("{}", arr.value_as_datetime(row_idx).unwrap())
+                            },
+                            TimeUnit::Millisecond => {
+                                let arr = column
+                                    .as_any()
+                                    .downcast_ref::<TimestampMillisecondArray>()
+                                    .unwrap();
+                                format!("{}", arr.value_as_datetime(row_idx).unwrap())
+                            },
+                            TimeUnit::Microsecond => {
+                                let arr = column
+                                    .as_any()
+                                    .downcast_ref::<TimestampMicrosecondArray>()
+                                    .unwrap();
+                                format!("{}", arr.value_as_datetime(row_idx).unwrap())
+                            },
+                            TimeUnit::Nanosecond => {
+                                let arr = column
+                                    .as_any()
+                                    .downcast_ref::<TimestampNanosecondArray>()
+                                    .unwrap();
+                                format!("{}", arr.value_as_datetime(row_idx).unwrap())
+                            },
+                        }
                     },
                     DataType::Decimal128(_, scale) => {
                         let arr = column.as_any().downcast_ref::<Decimal128Array>().unwrap();

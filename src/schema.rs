@@ -78,6 +78,10 @@ pub struct DuckLakeSchema {
     /// Metadata writer for write operations (when write feature is enabled)
     #[cfg(feature = "write")]
     writer: Option<Arc<dyn MetadataWriter>>,
+    /// Object store for CTAS write operations (when write feature is enabled).
+    /// If None, defaults to LocalFileSystem.
+    #[cfg(feature = "write")]
+    write_object_store: Option<Arc<dyn object_store::ObjectStore>>,
 }
 
 impl DuckLakeSchema {
@@ -99,6 +103,8 @@ impl DuckLakeSchema {
             schema_path,
             #[cfg(feature = "write")]
             writer: None,
+            #[cfg(feature = "write")]
+            write_object_store: None,
         }
     }
 
@@ -112,6 +118,17 @@ impl DuckLakeSchema {
     #[cfg(feature = "write")]
     pub fn with_writer(mut self, writer: Arc<dyn MetadataWriter>) -> Self {
         self.writer = Some(writer);
+        self
+    }
+
+    /// Set the object store used for CTAS write operations.
+    ///
+    /// If not set, defaults to `LocalFileSystem`. For S3/MinIO/GCS catalogs,
+    /// call this method with the appropriate object store so that CTAS writes
+    /// data to the correct storage backend.
+    #[cfg(feature = "write")]
+    pub fn with_object_store(mut self, object_store: Arc<dyn object_store::ObjectStore>) -> Self {
+        self.write_object_store = Some(object_store);
         self
     }
 
@@ -392,8 +409,11 @@ impl SchemaProvider for DuckLakeSchema {
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
         } else {
             // CTAS with data — write to Parquet and create metadata in one operation.
-            let object_store: Arc<dyn object_store::ObjectStore> =
-                Arc::new(object_store::local::LocalFileSystem::new());
+            // Use the configured object store, falling back to LocalFileSystem.
+            let object_store: Arc<dyn object_store::ObjectStore> = self
+                .write_object_store
+                .clone()
+                .unwrap_or_else(|| Arc::new(object_store::local::LocalFileSystem::new()));
             let table_writer = DuckLakeTableWriter::new(Arc::clone(writer), object_store)
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
 

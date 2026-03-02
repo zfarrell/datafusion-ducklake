@@ -8,7 +8,7 @@ use crate::metadata_provider::{
     DuckLakeTableFile, FileColumnStats, FilePartitionValue, FileWithTable, InlinedDataRow,
     MetadataProvider, PartitionColumn, SQL_GET_FILE_COLUMN_STATS, SQL_GET_FILE_PARTITION_VALUES,
     SQL_GET_PARTITION_COLUMNS, SchemaMetadata, SnapshotMetadata, TableMetadata, TableWithSchema,
-    ViewMetadata, block_on,
+    ViewMetadata, block_on, quote_mysql_identifier,
 };
 use sqlx::Row;
 use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
@@ -937,15 +937,15 @@ WHERE data.table_id = ?
                 return Ok(Vec::new());
             }
 
-            // Build select query for user columns, filtering by snapshot
+            // Build select query with quoted identifiers to prevent SQL injection
             let col_list: Vec<String> = user_columns
                 .iter()
-                .map(|c| format!("CAST(`{}` AS CHAR)", c))
+                .map(|c| format!("CAST({} AS CHAR)", quote_mysql_identifier(c)))
                 .collect();
             let select_sql = format!(
-                "SELECT {} FROM `{}` WHERE begin_snapshot <= ? AND (end_snapshot IS NULL OR ? < end_snapshot)",
+                "SELECT {} FROM {} WHERE begin_snapshot <= ? AND (end_snapshot IS NULL OR ? < end_snapshot)",
                 col_list.join(", "),
-                inlined_table_name,
+                quote_mysql_identifier(&inlined_table_name),
             );
 
             let rows = sqlx::query(&select_sql)

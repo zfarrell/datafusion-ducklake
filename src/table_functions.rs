@@ -3,7 +3,6 @@
 use datafusion::catalog::TableFunctionImpl;
 use datafusion::common::{Result as DataFusionResult, ScalarValue, plan_err};
 use datafusion::datasource::TableProvider;
-use datafusion::error::DataFusionError;
 use datafusion::logical_expr::Expr;
 use std::sync::Arc;
 
@@ -44,12 +43,14 @@ impl TableFunctionImpl for DucklakeSnapshotsFunction {
 #[derive(Debug)]
 pub struct DucklakeTableInfoFunction {
     provider: Arc<dyn MetadataProvider>,
+    snapshot_id: i64,
 }
 
 impl DucklakeTableInfoFunction {
-    pub fn new(provider: Arc<dyn MetadataProvider>) -> Self {
+    pub fn new(provider: Arc<dyn MetadataProvider>, snapshot_id: i64) -> Self {
         Self {
             provider,
+            snapshot_id,
         }
     }
 }
@@ -60,13 +61,9 @@ impl TableFunctionImpl for DucklakeTableInfoFunction {
             return plan_err!("ducklake_table_info() takes no arguments");
         }
 
-        let snapshot_id = self
-            .provider
-            .get_current_snapshot()
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
         Ok(Arc::new(TableInfoTable::new(
             self.provider.clone(),
-            snapshot_id,
+            self.snapshot_id,
         )))
     }
 }
@@ -74,12 +71,14 @@ impl TableFunctionImpl for DucklakeTableInfoFunction {
 #[derive(Debug)]
 pub struct DucklakeListFilesFunction {
     provider: Arc<dyn MetadataProvider>,
+    snapshot_id: i64,
 }
 
 impl DucklakeListFilesFunction {
-    pub fn new(provider: Arc<dyn MetadataProvider>) -> Self {
+    pub fn new(provider: Arc<dyn MetadataProvider>, snapshot_id: i64) -> Self {
         Self {
             provider,
+            snapshot_id,
         }
     }
 }
@@ -101,17 +100,16 @@ impl TableFunctionImpl for DucklakeListFilesFunction {
             },
         };
 
-        let resolved =
-            resolve_table_for_function(&*self.provider, &table_name, "ducklake_list_files")?;
-
-        let snapshot_id = self
-            .provider
-            .get_current_snapshot()
-            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        let resolved = resolve_table_for_function(
+            &*self.provider,
+            &table_name,
+            "ducklake_list_files",
+            self.snapshot_id,
+        )?;
 
         let files = self
             .provider
-            .get_table_files_for_select(resolved.table_id, snapshot_id)
+            .get_table_files_for_select(resolved.table_id, self.snapshot_id)
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
 
         // Build the DuckDB-compatible schema
@@ -206,12 +204,14 @@ impl TableFunctionImpl for DucklakeListFilesFunction {
 #[derive(Debug)]
 pub struct DucklakeTableChangesFunction {
     provider: Arc<dyn MetadataProvider>,
+    snapshot_id: i64,
 }
 
 impl DucklakeTableChangesFunction {
-    pub fn new(provider: Arc<dyn MetadataProvider>) -> Self {
+    pub fn new(provider: Arc<dyn MetadataProvider>, snapshot_id: i64) -> Self {
         Self {
             provider,
+            snapshot_id,
         }
     }
 }
@@ -221,8 +221,12 @@ impl TableFunctionImpl for DucklakeTableChangesFunction {
         let (table_name, start_snapshot, end_snapshot) =
             parse_change_function_args(exprs, "ducklake_table_changes")?;
 
-        let resolved =
-            resolve_table_for_function(&*self.provider, &table_name, "ducklake_table_changes")?;
+        let resolved = resolve_table_for_function(
+            &*self.provider,
+            &table_name,
+            "ducklake_table_changes",
+            self.snapshot_id,
+        )?;
 
         Ok(Arc::new(TableChangesTable::new(
             self.provider.clone(),
@@ -239,12 +243,14 @@ impl TableFunctionImpl for DucklakeTableChangesFunction {
 #[derive(Debug)]
 pub struct DucklakeTableDeletionsFunction {
     provider: Arc<dyn MetadataProvider>,
+    snapshot_id: i64,
 }
 
 impl DucklakeTableDeletionsFunction {
-    pub fn new(provider: Arc<dyn MetadataProvider>) -> Self {
+    pub fn new(provider: Arc<dyn MetadataProvider>, snapshot_id: i64) -> Self {
         Self {
             provider,
+            snapshot_id,
         }
     }
 }
@@ -254,8 +260,12 @@ impl TableFunctionImpl for DucklakeTableDeletionsFunction {
         let (table_name, start_snapshot, end_snapshot) =
             parse_change_function_args(exprs, "ducklake_table_deletions")?;
 
-        let resolved =
-            resolve_table_for_function(&*self.provider, &table_name, "ducklake_table_deletions")?;
+        let resolved = resolve_table_for_function(
+            &*self.provider,
+            &table_name,
+            "ducklake_table_deletions",
+            self.snapshot_id,
+        )?;
 
         Ok(Arc::new(TableDeletionsTable::new(
             self.provider.clone(),
@@ -282,12 +292,9 @@ fn resolve_table_for_function(
     provider: &dyn MetadataProvider,
     table_name: &str,
     _func_name: &str,
+    snapshot_id: i64,
 ) -> DataFusionResult<ResolvedTable> {
     let (schema_name, table_name_only) = parse_table_name(table_name);
-
-    let snapshot_id = provider
-        .get_current_snapshot()
-        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
 
     let schema = provider
         .get_schema_by_name(schema_name, snapshot_id)
@@ -407,12 +414,14 @@ fn parse_change_function_args(
 #[derive(Debug)]
 pub struct DucklakeTableInsertionsFunction {
     provider: Arc<dyn MetadataProvider>,
+    snapshot_id: i64,
 }
 
 impl DucklakeTableInsertionsFunction {
-    pub fn new(provider: Arc<dyn MetadataProvider>) -> Self {
+    pub fn new(provider: Arc<dyn MetadataProvider>, snapshot_id: i64) -> Self {
         Self {
             provider,
+            snapshot_id,
         }
     }
 }
@@ -422,8 +431,12 @@ impl TableFunctionImpl for DucklakeTableInsertionsFunction {
         let (table_name, start_snapshot, end_snapshot) =
             parse_change_function_args(exprs, "ducklake_table_insertions")?;
 
-        let resolved =
-            resolve_table_for_function(&*self.provider, &table_name, "ducklake_table_insertions")?;
+        let resolved = resolve_table_for_function(
+            &*self.provider,
+            &table_name,
+            "ducklake_table_insertions",
+            self.snapshot_id,
+        )?;
 
         Ok(Arc::new(TableInsertionsTable::new(
             self.provider.clone(),
@@ -488,13 +501,13 @@ impl TableProvider for SingleValueTable {
 
 #[derive(Debug)]
 pub struct DucklakeCurrentSnapshotFunction {
-    provider: Arc<dyn MetadataProvider>,
+    snapshot_id: i64,
 }
 
 impl DucklakeCurrentSnapshotFunction {
-    pub fn new(provider: Arc<dyn MetadataProvider>) -> Self {
+    pub fn new(snapshot_id: i64) -> Self {
         Self {
-            provider,
+            snapshot_id,
         }
     }
 }
@@ -505,24 +518,19 @@ impl TableFunctionImpl for DucklakeCurrentSnapshotFunction {
             return plan_err!("ducklake_current_snapshot() takes no arguments");
         }
 
-        let snapshot_id = self
-            .provider
-            .get_current_snapshot()
-            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
-
-        Ok(Arc::new(SingleValueTable::new(snapshot_id)))
+        Ok(Arc::new(SingleValueTable::new(self.snapshot_id)))
     }
 }
 
 #[derive(Debug)]
 pub struct DucklakeLastCommittedSnapshotFunction {
-    provider: Arc<dyn MetadataProvider>,
+    snapshot_id: i64,
 }
 
 impl DucklakeLastCommittedSnapshotFunction {
-    pub fn new(provider: Arc<dyn MetadataProvider>) -> Self {
+    pub fn new(snapshot_id: i64) -> Self {
         Self {
-            provider,
+            snapshot_id,
         }
     }
 }
@@ -533,21 +541,19 @@ impl TableFunctionImpl for DucklakeLastCommittedSnapshotFunction {
             return plan_err!("ducklake_last_committed_snapshot() takes no arguments");
         }
 
-        // In read-only mode, current snapshot equals last committed.
-        // With write support, this would track the last snapshot committed by this session.
-        let snapshot_id = self
-            .provider
-            .get_current_snapshot()
-            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
-
-        Ok(Arc::new(SingleValueTable::new(snapshot_id)))
+        Ok(Arc::new(SingleValueTable::new(self.snapshot_id)))
     }
 }
 
 /// Registers all ducklake_*() table functions with a SessionContext.
+///
+/// The `snapshot_id` parameter pins all metadata lookups to a specific snapshot,
+/// ensuring consistency with the catalog's pinned snapshot. Use
+/// `DuckLakeCatalog::snapshot_id()` to obtain the pinned snapshot ID.
 pub fn register_ducklake_functions(
     ctx: &datafusion::execution::context::SessionContext,
     provider: Arc<dyn MetadataProvider>,
+    snapshot_id: i64,
 ) {
     ctx.register_udtf(
         "ducklake_snapshots",
@@ -555,30 +561,45 @@ pub fn register_ducklake_functions(
     );
     ctx.register_udtf(
         "ducklake_table_info",
-        Arc::new(DucklakeTableInfoFunction::new(provider.clone())),
+        Arc::new(DucklakeTableInfoFunction::new(
+            provider.clone(),
+            snapshot_id,
+        )),
     );
     ctx.register_udtf(
         "ducklake_list_files",
-        Arc::new(DucklakeListFilesFunction::new(provider.clone())),
+        Arc::new(DucklakeListFilesFunction::new(
+            provider.clone(),
+            snapshot_id,
+        )),
     );
     ctx.register_udtf(
         "ducklake_table_changes",
-        Arc::new(DucklakeTableChangesFunction::new(provider.clone())),
+        Arc::new(DucklakeTableChangesFunction::new(
+            provider.clone(),
+            snapshot_id,
+        )),
     );
     ctx.register_udtf(
         "ducklake_table_deletions",
-        Arc::new(DucklakeTableDeletionsFunction::new(provider.clone())),
+        Arc::new(DucklakeTableDeletionsFunction::new(
+            provider.clone(),
+            snapshot_id,
+        )),
     );
     ctx.register_udtf(
         "ducklake_table_insertions",
-        Arc::new(DucklakeTableInsertionsFunction::new(provider.clone())),
+        Arc::new(DucklakeTableInsertionsFunction::new(
+            provider.clone(),
+            snapshot_id,
+        )),
     );
     ctx.register_udtf(
         "ducklake_current_snapshot",
-        Arc::new(DucklakeCurrentSnapshotFunction::new(provider.clone())),
+        Arc::new(DucklakeCurrentSnapshotFunction::new(snapshot_id)),
     );
     ctx.register_udtf(
         "ducklake_last_committed_snapshot",
-        Arc::new(DucklakeLastCommittedSnapshotFunction::new(provider.clone())),
+        Arc::new(DucklakeLastCommittedSnapshotFunction::new(snapshot_id)),
     );
 }

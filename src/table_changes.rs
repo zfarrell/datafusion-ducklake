@@ -84,6 +84,8 @@ pub struct AppendCDCColumnsExec {
     skip_input_columns: bool,
     /// Output schema (projected input schema + requested CDC columns)
     output_schema: SchemaRef,
+    /// Reorder mapping: output_pos -> natural_pos. None if no reordering needed.
+    reorder_indices: Option<Vec<usize>>,
     /// Cached plan properties with updated schema
     properties: PlanProperties,
 }
@@ -97,6 +99,28 @@ impl AppendCDCColumnsExec {
         include_change_type: bool,
         skip_input_columns: bool,
         output_schema: SchemaRef,
+    ) -> Self {
+        Self::new_with_reorder(
+            input,
+            snapshot_id,
+            change_type,
+            include_snapshot_id,
+            include_change_type,
+            skip_input_columns,
+            output_schema,
+            None,
+        )
+    }
+
+    pub fn new_with_reorder(
+        input: Arc<dyn ExecutionPlan>,
+        snapshot_id: i64,
+        change_type: ChangeType,
+        include_snapshot_id: bool,
+        include_change_type: bool,
+        skip_input_columns: bool,
+        output_schema: SchemaRef,
+        reorder_indices: Option<Vec<usize>>,
     ) -> Self {
         // Create new equivalence properties with the output schema.
         // We preserve partitioning and execution semantics from input.
@@ -120,6 +144,7 @@ impl AppendCDCColumnsExec {
             include_change_type,
             skip_input_columns,
             output_schema,
+            reorder_indices,
             properties,
         }
     }
@@ -173,7 +198,7 @@ impl ExecutionPlan for AppendCDCColumnsExec {
             ));
         }
 
-        Ok(Arc::new(AppendCDCColumnsExec::new(
+        Ok(Arc::new(AppendCDCColumnsExec::new_with_reorder(
             children[0].clone(),
             self.snapshot_id,
             self.change_type,
@@ -181,6 +206,7 @@ impl ExecutionPlan for AppendCDCColumnsExec {
             self.include_change_type,
             self.skip_input_columns,
             self.output_schema.clone(),
+            self.reorder_indices.clone(),
         )))
     }
 
@@ -202,6 +228,7 @@ impl ExecutionPlan for AppendCDCColumnsExec {
             include_snapshot_id: self.include_snapshot_id,
             include_change_type: self.include_change_type,
             skip_input_columns: self.skip_input_columns,
+            reorder_indices: self.reorder_indices.clone(),
             output_schema: self.output_schema.clone(),
         }))
     }
@@ -215,6 +242,7 @@ struct AppendCDCColumnsStream {
     include_snapshot_id: bool,
     include_change_type: bool,
     skip_input_columns: bool,
+    reorder_indices: Option<Vec<usize>>,
     output_schema: SchemaRef,
 }
 
@@ -239,7 +267,7 @@ impl AppendCDCColumnsStream {
         let num_rows = batch.num_rows();
         let mut columns: Vec<ArrayRef> = Vec::new();
 
-        // Include input columns unless we're skipping them
+        // Build columns in natural order: table columns, then CDC columns
         if !self.skip_input_columns {
             columns.extend(batch.columns().iter().cloned());
         }
@@ -254,6 +282,13 @@ impl AppendCDCColumnsStream {
                 num_rows
             ])));
         }
+
+        // Apply reorder if projection requested non-natural column order
+        let columns = if let Some(ref reorder) = self.reorder_indices {
+            reorder.iter().map(|&i| columns[i].clone()).collect()
+        } else {
+            columns
+        };
 
         RecordBatch::try_new(self.output_schema.clone(), columns)
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
@@ -276,6 +311,9 @@ struct ProjectionInfo {
     need_change_type: bool,
     /// The projected output schema
     output_schema: SchemaRef,
+    /// Maps from natural column order (table_cols + CDC cols) to projection order.
+    /// None when no reordering is needed (columns already in natural order).
+    reorder_indices: Option<Vec<usize>>,
 }
 
 #[derive(Debug)]
@@ -340,6 +378,7 @@ impl TableChangesTable {
                     need_snapshot_id: true,
                     need_change_type: true,
                     output_schema: self.output_schema.clone(),
+                    reorder_indices: None,
                 }
             },
             Some(indices) => {
@@ -365,11 +404,47 @@ impl TableChangesTable {
                 }
                 let output_schema = Arc::new(Schema::new(fields));
 
+                // Compute reorder mapping from natural order to projection order.
+                // Natural order: [table_cols in table_indices order, snapshot_id?, change_type?]
+                // We need to map each projection entry to its position in natural order.
+                let mut natural_pos_map: Vec<usize> = Vec::with_capacity(indices.len());
+                // Build lookup: table column index -> position in table_indices
+                let table_idx_pos: std::collections::HashMap<usize, usize> = table_indices
+                    .iter()
+                    .enumerate()
+                    .map(|(pos, &idx)| (idx, pos))
+                    .collect();
+                let snapshot_natural_pos = table_indices.len();
+                let change_type_natural_pos = table_indices.len()
+                    + if need_snapshot_id {
+                        1
+                    } else {
+                        0
+                    };
+
+                for &idx in indices {
+                    if idx < num_table_cols {
+                        natural_pos_map.push(table_idx_pos[&idx]);
+                    } else if idx == snapshot_id_idx {
+                        natural_pos_map.push(snapshot_natural_pos);
+                    } else if idx == change_type_idx {
+                        natural_pos_map.push(change_type_natural_pos);
+                    }
+                }
+
+                // Check if reordering is actually needed (identity mapping)
+                let needs_reorder = natural_pos_map.iter().enumerate().any(|(i, &pos)| i != pos);
+
                 ProjectionInfo {
                     table_indices,
                     need_snapshot_id,
                     need_change_type,
                     output_schema,
+                    reorder_indices: if needs_reorder {
+                        Some(natural_pos_map)
+                    } else {
+                        None
+                    },
                 }
             },
         }
@@ -503,14 +578,22 @@ impl TableChangesTable {
             )
         };
 
-        Ok(Arc::new(AppendCDCColumnsExec::new(
+        // Use the projection-ordered schema when reordering is needed
+        let exec_output_schema = if proj_info.reorder_indices.is_some() {
+            proj_info.output_schema.clone()
+        } else {
+            cdc_exec_schema
+        };
+
+        Ok(Arc::new(AppendCDCColumnsExec::new_with_reorder(
             parquet_exec,
             data_file.begin_snapshot,
             ChangeType::Insert,
             proj_info.need_snapshot_id,
             proj_info.need_change_type,
             skip_input_columns,
-            cdc_exec_schema,
+            exec_output_schema,
+            proj_info.reorder_indices.clone(),
         )))
     }
 }

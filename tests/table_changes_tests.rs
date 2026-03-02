@@ -90,7 +90,8 @@ mod integration_tests {
         ctx.register_catalog("ducklake", Arc::new(catalog));
 
         // Register the table functions including ducklake_table_changes
-        register_ducklake_functions(&ctx, provider_arc);
+        let snapshot_id = provider_arc.get_current_snapshot()?;
+        register_ducklake_functions(&ctx, provider_arc, snapshot_id);
 
         Ok(ctx)
     }
@@ -367,7 +368,8 @@ mod table_deletions_tests {
         ctx.register_catalog("ducklake", Arc::new(catalog));
 
         // Register the table functions including ducklake_table_deletions
-        register_ducklake_functions(&ctx, provider_arc);
+        let snapshot_id = provider_arc.get_current_snapshot()?;
+        register_ducklake_functions(&ctx, provider_arc, snapshot_id);
 
         Ok(ctx)
     }

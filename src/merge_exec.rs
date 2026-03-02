@@ -179,64 +179,76 @@ impl DisplayAs for DuckLakeMergeExec {
 }
 
 /// Compare a single value from two arrays for equality.
-/// Returns true if the values at the given indices are equal.
+/// Returns Ok(true) if the values at the given indices are equal,
+/// Ok(false) if not equal or either is null,
+/// Err if the data type is not supported for comparison.
 fn values_equal(
     target_col: &dyn arrow::array::Array,
     target_row: usize,
     source_col: &dyn arrow::array::Array,
     source_row: usize,
-) -> bool {
+) -> DataFusionResult<bool> {
     use arrow::array::*;
+    use arrow::datatypes::TimeUnit;
+
     if target_col.is_null(target_row) || source_col.is_null(source_row) {
-        return false; // NULL != NULL in SQL semantics
+        return Ok(false); // NULL != NULL in SQL semantics
     }
+
+    macro_rules! compare_typed {
+        ($arr_type:ty) => {{
+            let t = target_col
+                .as_any()
+                .downcast_ref::<$arr_type>()
+                .ok_or_else(|| {
+                    DataFusionError::Internal(format!(
+                        "MERGE: failed to downcast target column to {}",
+                        stringify!($arr_type)
+                    ))
+                })?;
+            let s = source_col
+                .as_any()
+                .downcast_ref::<$arr_type>()
+                .ok_or_else(|| {
+                    DataFusionError::Internal(format!(
+                        "MERGE: failed to downcast source column to {}",
+                        stringify!($arr_type)
+                    ))
+                })?;
+            Ok(t.value(target_row) == s.value(source_row))
+        }};
+    }
+
     match target_col.data_type() {
-        DataType::Int8 => {
-            let t = target_col.as_any().downcast_ref::<Int8Array>().unwrap();
-            let s = source_col.as_any().downcast_ref::<Int8Array>().unwrap();
-            t.value(target_row) == s.value(source_row)
+        DataType::Boolean => compare_typed!(BooleanArray),
+        DataType::Int8 => compare_typed!(Int8Array),
+        DataType::Int16 => compare_typed!(Int16Array),
+        DataType::Int32 => compare_typed!(Int32Array),
+        DataType::Int64 => compare_typed!(Int64Array),
+        DataType::UInt8 => compare_typed!(UInt8Array),
+        DataType::UInt16 => compare_typed!(UInt16Array),
+        DataType::UInt32 => compare_typed!(UInt32Array),
+        DataType::UInt64 => compare_typed!(UInt64Array),
+        DataType::Float32 => compare_typed!(Float32Array),
+        DataType::Float64 => compare_typed!(Float64Array),
+        DataType::Utf8 => compare_typed!(StringArray),
+        DataType::LargeUtf8 => compare_typed!(LargeStringArray),
+        DataType::Date32 => compare_typed!(Date32Array),
+        DataType::Date64 => compare_typed!(Date64Array),
+        DataType::Timestamp(TimeUnit::Second, _) => compare_typed!(TimestampSecondArray),
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            compare_typed!(TimestampMillisecondArray)
         },
-        DataType::Int16 => {
-            let t = target_col.as_any().downcast_ref::<Int16Array>().unwrap();
-            let s = source_col.as_any().downcast_ref::<Int16Array>().unwrap();
-            t.value(target_row) == s.value(source_row)
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            compare_typed!(TimestampMicrosecondArray)
         },
-        DataType::Int32 => {
-            let t = target_col.as_any().downcast_ref::<Int32Array>().unwrap();
-            let s = source_col.as_any().downcast_ref::<Int32Array>().unwrap();
-            t.value(target_row) == s.value(source_row)
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            compare_typed!(TimestampNanosecondArray)
         },
-        DataType::Int64 => {
-            let t = target_col.as_any().downcast_ref::<Int64Array>().unwrap();
-            let s = source_col.as_any().downcast_ref::<Int64Array>().unwrap();
-            t.value(target_row) == s.value(source_row)
-        },
-        DataType::UInt32 => {
-            let t = target_col.as_any().downcast_ref::<UInt32Array>().unwrap();
-            let s = source_col.as_any().downcast_ref::<UInt32Array>().unwrap();
-            t.value(target_row) == s.value(source_row)
-        },
-        DataType::UInt64 => {
-            let t = target_col.as_any().downcast_ref::<UInt64Array>().unwrap();
-            let s = source_col.as_any().downcast_ref::<UInt64Array>().unwrap();
-            t.value(target_row) == s.value(source_row)
-        },
-        DataType::Utf8 => {
-            let t = target_col.as_any().downcast_ref::<StringArray>().unwrap();
-            let s = source_col.as_any().downcast_ref::<StringArray>().unwrap();
-            t.value(target_row) == s.value(source_row)
-        },
-        DataType::Float32 => {
-            let t = target_col.as_any().downcast_ref::<Float32Array>().unwrap();
-            let s = source_col.as_any().downcast_ref::<Float32Array>().unwrap();
-            t.value(target_row) == s.value(source_row)
-        },
-        DataType::Float64 => {
-            let t = target_col.as_any().downcast_ref::<Float64Array>().unwrap();
-            let s = source_col.as_any().downcast_ref::<Float64Array>().unwrap();
-            t.value(target_row) == s.value(source_row)
-        },
-        _ => false, // unsupported type for join comparison
+        DataType::Decimal128(_, _) => compare_typed!(Decimal128Array),
+        dt => Err(DataFusionError::NotImplemented(format!(
+            "MERGE join key comparison not supported for data type: {dt:?}"
+        ))),
     }
 }
 
@@ -292,8 +304,8 @@ impl ExecutionPlan for DuckLakeMergeExec {
         let writer = Arc::clone(&self.writer);
         let object_store_url = self.object_store_url.clone();
         let table_path = self.table_path.clone();
-        let schema_name = self.schema_name.clone();
-        let table_name = self.table_name.clone();
+        let _schema_name = self.schema_name.clone();
+        let _table_name = self.table_name.clone();
         let existing_deletes = self.existing_deletes.clone();
         let output_schema = make_merge_count_schema();
 
@@ -310,6 +322,8 @@ impl ExecutionPlan for DuckLakeMergeExec {
 
             let mut total_affected: u64 = 0;
             let mut new_data_batches: Vec<RecordBatch> = Vec::new();
+            // Collect file metadata for atomic registration
+            let mut pending_delete_files: Vec<DeleteFileInfo> = Vec::new();
 
             // Track which source rows have been matched (for NOT MATCHED INSERT)
             let total_source_rows: usize = source_batches.iter().map(|b| b.num_rows()).sum();
@@ -386,7 +400,7 @@ impl ExecutionPlan for DuckLakeMergeExec {
                                         target_row_idx,
                                         source_arr.as_ref(),
                                         src_row_idx,
-                                    ) {
+                                    )? {
                                         all_keys_match = false;
                                         break;
                                     }
@@ -484,9 +498,7 @@ impl ExecutionPlan for DuckLakeMergeExec {
                 )
                 .with_footer_size(footer_size);
 
-                writer
-                    .register_delete_file(table_id, snapshot_id, &delete_file_info)
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                pending_delete_files.push(delete_file_info);
             }
 
             // Add matched source rows as replacement data (for UPDATE)
@@ -514,23 +526,19 @@ impl ExecutionPlan for DuckLakeMergeExec {
             }
 
             // Write new data file(s) for updated + inserted rows
+            let mut pending_data_files: Vec<DataFileInfo> = Vec::new();
             if !new_data_batches.is_empty() {
                 let data_file_name = format!("{}.parquet", Uuid::new_v4());
 
-                let data_path_str = writer
-                    .get_data_path()
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                let (_, base_key_path) =
-                    crate::path_resolver::parse_object_store_url(&data_path_str)
-                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-                let table_key =
-                    join_paths(&join_paths(&base_key_path, &schema_name)?, &table_name)?;
-                let object_key = join_paths(&table_key, &data_file_name)?;
+                // Use the catalog's stored table_path instead of deriving from names,
+                // so writes go to the correct location even after table rename.
+                let object_key = join_paths(table_path.trim_start_matches('/'), &data_file_name)?;
                 let data_object_path = ObjectPath::from(object_key.trim_start_matches('/'));
 
-                let write_schema =
-                    Arc::new(build_schema_with_field_ids(&table_schema, &column_ids));
+                let write_schema = Arc::new(
+                    build_schema_with_field_ids(&table_schema, &column_ids)
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?,
+                );
 
                 let props = WriterProperties::builder()
                     .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
@@ -565,10 +573,18 @@ impl ExecutionPlan for DuckLakeMergeExec {
                 let data_file_info = DataFileInfo::new(&data_file_name, file_size, total_records)
                     .with_footer_size(footer_size);
 
-                writer
-                    .register_data_file(table_id, snapshot_id, &data_file_info)
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                pending_data_files.push(data_file_info);
             }
+
+            // Atomically register all delete files and data files
+            writer
+                .register_dml_files(
+                    table_id,
+                    snapshot_id,
+                    &pending_delete_files,
+                    &pending_data_files,
+                )
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
             let count_array: ArrayRef = Arc::new(UInt64Array::from(vec![total_affected]));
             Ok(RecordBatch::try_new(output_schema, vec![count_array])?)

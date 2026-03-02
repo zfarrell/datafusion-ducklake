@@ -218,8 +218,8 @@ impl ExecutionPlan for DuckLakeUpdateExec {
         let writer = Arc::clone(&self.writer);
         let object_store_url = self.object_store_url.clone();
         let table_path = self.table_path.clone();
-        let schema_name = self.schema_name.clone();
-        let table_name = self.table_name.clone();
+        let _schema_name = self.schema_name.clone();
+        let _table_name = self.table_name.clone();
         let existing_deletes = self.existing_deletes.clone();
         let output_schema = make_update_count_schema();
 
@@ -254,6 +254,8 @@ impl ExecutionPlan for DuckLakeUpdateExec {
             let mut updated_batches: Vec<RecordBatch> = Vec::new();
             // Track uploaded files for cleanup if metadata commit fails
             let mut uploaded_files: Vec<ObjectPath> = Vec::new();
+            // Collect file metadata for atomic registration
+            let mut pending_delete_files: Vec<DeleteFileInfo> = Vec::new();
 
             // Process each data file
             for table_file in &table_files {
@@ -432,34 +434,24 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                     DeleteFileInfo::new(data_file_id, &delete_file_name, file_size, update_count)
                         .with_footer_size(footer_size);
 
-                if let Err(e) =
-                    writer.register_delete_file(table_id, snapshot_id, &delete_file_info)
-                {
-                    cleanup_orphaned_files(&*object_store, &uploaded_files).await;
-                    return Err(DataFusionError::External(Box::new(e)));
-                }
+                pending_delete_files.push(delete_file_info);
             }
 
             // Write updated rows as new data file(s)
+            let mut pending_data_files: Vec<DataFileInfo> = Vec::new();
             if !updated_batches.is_empty() {
                 let data_file_name = format!("{}.parquet", Uuid::new_v4());
 
-                // Get the data_path to determine where to write
-                let data_path_str = writer
-                    .get_data_path()
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                let (_, base_key_path) =
-                    crate::path_resolver::parse_object_store_url(&data_path_str)
-                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-                let table_key =
-                    join_paths(&join_paths(&base_key_path, &schema_name)?, &table_name)?;
-                let object_key = join_paths(&table_key, &data_file_name)?;
+                // Use the catalog's stored table_path instead of deriving from names,
+                // so writes go to the correct location even after table rename.
+                let object_key = join_paths(table_path.trim_start_matches('/'), &data_file_name)?;
                 let data_object_path = ObjectPath::from(object_key.trim_start_matches('/'));
 
                 // Build schema with field IDs for DuckDB compatibility
-                let write_schema =
-                    Arc::new(build_schema_with_field_ids(&table_schema, &column_ids));
+                let write_schema = Arc::new(
+                    build_schema_with_field_ids(&table_schema, &column_ids)
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?,
+                );
 
                 // Write all updated rows to a single Parquet file
                 let props = WriterProperties::builder()
@@ -496,10 +488,18 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                 let data_file_info = DataFileInfo::new(&data_file_name, file_size, total_records)
                     .with_footer_size(footer_size);
 
-                if let Err(e) = writer.register_data_file(table_id, snapshot_id, &data_file_info) {
-                    cleanup_orphaned_files(&*object_store, &uploaded_files).await;
-                    return Err(DataFusionError::External(Box::new(e)));
-                }
+                pending_data_files.push(data_file_info);
+            }
+
+            // Atomically register all delete files and data files
+            if let Err(e) = writer.register_dml_files(
+                table_id,
+                snapshot_id,
+                &pending_delete_files,
+                &pending_data_files,
+            ) {
+                cleanup_orphaned_files(&*object_store, &uploaded_files).await;
+                return Err(DataFusionError::External(Box::new(e)));
             }
 
             // Return the count of updated rows

@@ -19,10 +19,22 @@ use datafusion::error::{DataFusionError, Result as DataFusionResult};
 
 /// Configuration for write operations (when write feature is enabled)
 #[cfg(feature = "write")]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct WriteConfig {
     /// Metadata writer for catalog operations
     writer: Arc<dyn MetadataWriter>,
+    /// Object store for CTAS writes. If None, defaults to LocalFileSystem.
+    object_store: Option<Arc<dyn object_store::ObjectStore>>,
+}
+
+#[cfg(feature = "write")]
+impl std::fmt::Debug for WriteConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WriteConfig")
+            .field("writer", &self.writer)
+            .field("has_object_store", &self.object_store.is_some())
+            .finish()
+    }
 }
 
 /// DuckLake catalog provider
@@ -126,6 +138,34 @@ impl DuckLakeCatalog {
             catalog_path,
             write_config: Some(WriteConfig {
                 writer,
+                object_store: None,
+            }),
+        })
+    }
+
+    /// Create a catalog with write support and an explicit object store.
+    ///
+    /// Like `with_writer()`, but also sets the object store used for CTAS
+    /// writes. This is necessary for S3/MinIO/GCS catalogs where data must
+    /// be written to the configured object store rather than local disk.
+    #[cfg(feature = "write")]
+    pub fn with_writer_and_object_store(
+        provider: Arc<dyn MetadataProvider>,
+        writer: Arc<dyn MetadataWriter>,
+        object_store: Arc<dyn object_store::ObjectStore>,
+    ) -> Result<Self> {
+        let snapshot_id = provider.get_current_snapshot()?;
+        let data_path_str = provider.get_data_path()?;
+        let (object_store_url, catalog_path) = parse_object_store_url(&data_path_str)?;
+
+        Ok(Self {
+            provider,
+            snapshot_id: Arc::new(AtomicI64::new(snapshot_id)),
+            object_store_url: Arc::new(object_store_url),
+            catalog_path,
+            write_config: Some(WriteConfig {
+                writer,
+                object_store: Some(object_store),
             }),
         })
     }
@@ -135,6 +175,11 @@ impl DuckLakeCatalog {
     /// This is useful when you need to register table functions separately.
     pub fn provider(&self) -> Arc<dyn MetadataProvider> {
         self.provider.clone()
+    }
+
+    /// Get the pinned snapshot ID for this catalog.
+    pub fn snapshot_id(&self) -> i64 {
+        self.snapshot_id.load(Ordering::Acquire)
     }
 }
 
@@ -272,7 +317,7 @@ impl CatalogProvider for DuckLakeCatalog {
         // Build the schema provider
         let schema_path = resolve_path(&self.catalog_path, name, true)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let schema = DuckLakeSchema::new(
+        let mut schema = DuckLakeSchema::new(
             schema_id,
             name,
             Arc::clone(&self.provider),
@@ -281,6 +326,10 @@ impl CatalogProvider for DuckLakeCatalog {
             schema_path,
         )
         .with_writer(Arc::clone(&config.writer));
+
+        if let Some(ref store) = config.object_store {
+            schema = schema.with_object_store(Arc::clone(store));
+        }
 
         Ok(Some(Arc::new(schema) as Arc<dyn SchemaProvider>))
     }
@@ -353,10 +402,15 @@ impl CatalogProvider for DuckLakeCatalog {
                     schema_path,
                 );
 
-                // Configure writer if this catalog is writable
+                // Configure writer and object store if this catalog is writable
                 #[cfg(feature = "write")]
                 let schema = if let Some(ref config) = self.write_config {
-                    schema.with_writer(Arc::clone(&config.writer))
+                    let s = schema.with_writer(Arc::clone(&config.writer));
+                    if let Some(ref store) = config.object_store {
+                        s.with_object_store(Arc::clone(store))
+                    } else {
+                        s
+                    }
                 } else {
                     schema
                 };

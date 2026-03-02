@@ -349,7 +349,8 @@ async fn test_ducklake_snapshots_function() -> Result<(), Box<dyn std::error::Er
     let ctx = SessionContext::new();
 
     // Register table functions
-    register_ducklake_functions(&ctx, Arc::new(provider));
+    let snapshot_id = provider.get_current_snapshot().unwrap();
+    register_ducklake_functions(&ctx, Arc::new(provider), snapshot_id);
 
     // Query using function syntax
     let df = ctx.sql("SELECT * FROM ducklake_snapshots()").await?;
@@ -370,7 +371,8 @@ async fn test_ducklake_table_info_function() -> Result<(), Box<dyn std::error::E
     let provider = DuckdbMetadataProvider::new(catalog_path.to_str().unwrap())?;
     let ctx = SessionContext::new();
 
-    register_ducklake_functions(&ctx, Arc::new(provider));
+    let snapshot_id = provider.get_current_snapshot().unwrap();
+    register_ducklake_functions(&ctx, Arc::new(provider), snapshot_id);
 
     let df = ctx
         .sql("SELECT table_name, file_count, file_size_bytes FROM ducklake_table_info()")
@@ -392,7 +394,8 @@ async fn test_ducklake_list_files_function() -> Result<(), Box<dyn std::error::E
     let provider = DuckdbMetadataProvider::new(catalog_path.to_str().unwrap())?;
     let ctx = SessionContext::new();
 
-    register_ducklake_functions(&ctx, Arc::new(provider));
+    let snapshot_id = provider.get_current_snapshot().unwrap();
+    register_ducklake_functions(&ctx, Arc::new(provider), snapshot_id);
 
     let df = ctx
         .sql("SELECT data_file, data_file_size_bytes FROM ducklake_list_files('users')")
@@ -414,7 +417,8 @@ async fn test_table_info_aggregation() -> Result<(), Box<dyn std::error::Error>>
     let provider = DuckdbMetadataProvider::new(catalog_path.to_str().unwrap())?;
     let ctx = SessionContext::new();
 
-    register_ducklake_functions(&ctx, Arc::new(provider));
+    let snapshot_id = provider.get_current_snapshot().unwrap();
+    register_ducklake_functions(&ctx, Arc::new(provider), snapshot_id);
 
     // Get total storage
     let df = ctx
@@ -437,7 +441,8 @@ async fn test_function_rejects_arguments() -> Result<(), Box<dyn std::error::Err
     let provider = DuckdbMetadataProvider::new(catalog_path.to_str().unwrap())?;
     let ctx = SessionContext::new();
 
-    register_ducklake_functions(&ctx, Arc::new(provider));
+    let snapshot_id = provider.get_current_snapshot().unwrap();
+    register_ducklake_functions(&ctx, Arc::new(provider), snapshot_id);
 
     // These functions should reject arguments
     let result = ctx.sql("SELECT * FROM ducklake_snapshots('arg')").await;

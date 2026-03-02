@@ -30,7 +30,8 @@ async fn create_context(path: &str) -> DataFusionResult<SessionContext> {
 
     let ctx = SessionContext::new();
     ctx.register_catalog("ducklake", Arc::new(catalog));
-    register_ducklake_functions(&ctx, provider_arc);
+    let snapshot_id = provider_arc.get_current_snapshot()?;
+    register_ducklake_functions(&ctx, provider_arc, snapshot_id);
 
     Ok(ctx)
 }

@@ -753,10 +753,11 @@ impl DuckLakeTable {
             &resolved_path,
             validated_file_size(table_file.file.file_size_bytes, &resolved_path)?,
         );
-        if let Some(footer_size) = table_file.file.footer_size {
-            if footer_size > 0 {
-                pf = pf.with_metadata_size_hint(footer_size as usize);
-            }
+        if let Some(footer_size) = table_file.file.footer_size
+            && footer_size > 0
+            && let Ok(hint) = usize::try_from(footer_size)
+        {
+            pf = pf.with_metadata_size_hint(hint);
         }
         let mut builder = FileScanConfigBuilder::new(
             self.object_store_url.as_ref().clone(),

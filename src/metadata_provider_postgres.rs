@@ -7,7 +7,7 @@ use crate::metadata_provider::{
     ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileData, DuckLakeTableColumn,
     DuckLakeTableFile, FileColumnStats, FilePartitionValue, FileWithTable, InlinedDataRow,
     MetadataProvider, PartitionColumn, SchemaMetadata, SnapshotMetadata, TableMetadata,
-    TableWithSchema, ViewMetadata, block_on,
+    TableWithSchema, ViewMetadata, block_on, quote_identifier,
 };
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -958,15 +958,15 @@ WHERE data.table_id = $1
                 return Ok(Vec::new());
             }
 
-            // Build select query for user columns, filtering by snapshot
+            // Build select query with quoted identifiers to prevent SQL injection
             let col_list: Vec<String> = user_columns
                 .iter()
-                .map(|c| format!("CAST(\"{}\" AS TEXT)", c))
+                .map(|c| format!("CAST({} AS TEXT)", quote_identifier(c)))
                 .collect();
             let select_sql = format!(
-                "SELECT {} FROM \"{}\" WHERE begin_snapshot <= $1 AND (end_snapshot IS NULL OR $2 < end_snapshot)",
+                "SELECT {} FROM {} WHERE begin_snapshot <= $1 AND (end_snapshot IS NULL OR $2 < end_snapshot)",
                 col_list.join(", "),
-                inlined_table_name,
+                quote_identifier(&inlined_table_name),
             );
 
             let rows = sqlx::query(&select_sql)

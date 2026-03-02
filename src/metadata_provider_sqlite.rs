@@ -9,6 +9,7 @@ use crate::metadata_provider::{
     MetadataProvider, PartitionColumn, SQL_GET_FILE_COLUMN_STATS, SQL_GET_FILE_PARTITION_VALUES,
     SQL_GET_PARTITION_COLUMNS, SQL_GET_VIEW_BY_NAME, SQL_LIST_VIEWS, SQL_VIEW_EXISTS,
     SchemaMetadata, SnapshotMetadata, TableMetadata, TableWithSchema, ViewMetadata, block_on,
+    quote_identifier,
 };
 use sqlx::Row;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
@@ -867,7 +868,10 @@ WHERE data.table_id = ?
             }
 
             // Query the inlined data table - get column names dynamically
-            let pragma_query = format!("PRAGMA table_info('{}')", inlined_table_name);
+            let pragma_query = format!(
+                "PRAGMA table_info({})",
+                quote_identifier(&inlined_table_name)
+            );
             let columns = sqlx::query(&pragma_query).fetch_all(&self.pool).await?;
 
             // Column layout: row_id, begin_snapshot, end_snapshot, then user columns
@@ -887,15 +891,15 @@ WHERE data.table_id = ?
                 return Ok(Vec::new());
             }
 
-            // Build select query for user columns, filtering by snapshot
+            // Build select query with quoted identifiers to prevent SQL injection
             let col_list: Vec<String> = user_columns
                 .iter()
-                .map(|c| format!("CAST(\"{}\" AS TEXT)", c))
+                .map(|c| format!("CAST({} AS TEXT)", quote_identifier(c)))
                 .collect();
             let select_sql = format!(
-                "SELECT {} FROM \"{}\" WHERE begin_snapshot <= ? AND (end_snapshot IS NULL OR ? < end_snapshot)",
+                "SELECT {} FROM {} WHERE begin_snapshot <= ? AND (end_snapshot IS NULL OR ? < end_snapshot)",
                 col_list.join(", "),
-                inlined_table_name,
+                quote_identifier(&inlined_table_name),
             );
 
             let rows = sqlx::query(&select_sql)

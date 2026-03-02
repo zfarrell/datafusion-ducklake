@@ -578,7 +578,7 @@ pub struct DeleteFileChange {
     pub data_file_path: String,
     pub data_file_path_is_relative: bool,
     pub data_file_size_bytes: i64,
-    pub data_file_footer_size: i64,
+    pub data_file_footer_size: Option<i64>,
     pub data_row_id_start: i64,
     pub data_record_count: i64,
     pub data_mapping_id: Option<i64>,
@@ -768,4 +768,20 @@ where
     F: std::future::Future<Output = T>,
 {
     tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
+}
+
+/// Escape a SQL identifier for safe use in double-quoted contexts (SQL standard).
+///
+/// Doubles any internal double-quotes, then wraps in double quotes.
+/// Works for DuckDB, SQLite, and PostgreSQL.
+pub(crate) fn quote_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Escape a SQL identifier for safe use in backtick-quoted contexts (MySQL).
+///
+/// Doubles any internal backticks, then wraps in backticks.
+#[cfg(feature = "metadata-mysql")]
+pub(crate) fn quote_mysql_identifier(name: &str) -> String {
+    format!("`{}`", name.replace('`', "``"))
 }

@@ -210,6 +210,8 @@ impl ExecutionPlan for DuckLakeDeleteExec {
             let mut total_deleted: u64 = 0;
             // Track uploaded files for cleanup if metadata commit fails
             let mut uploaded_files: Vec<ObjectPath> = Vec::new();
+            // Collect delete file metadata for atomic registration
+            let mut pending_delete_files: Vec<DeleteFileInfo> = Vec::new();
 
             // Process each data file
             for table_file in &table_files {
@@ -359,17 +361,20 @@ impl ExecutionPlan for DuckLakeDeleteExec {
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
                 uploaded_files.push(delete_object_path);
 
-                // Register the delete file in metadata; clean up on failure
+                // Collect delete file info for atomic batch registration
                 let delete_file_info =
                     DeleteFileInfo::new(data_file_id, &delete_file_name, file_size, delete_count)
                         .with_footer_size(footer_size);
 
-                if let Err(e) =
-                    writer.register_delete_file(table_id, snapshot_id, &delete_file_info)
-                {
-                    cleanup_orphaned_files(&*object_store, &uploaded_files).await;
-                    return Err(DataFusionError::External(Box::new(e)));
-                }
+                pending_delete_files.push(delete_file_info);
+            }
+
+            // Atomically register all delete files
+            if let Err(e) =
+                writer.register_dml_files(table_id, snapshot_id, &pending_delete_files, &[])
+            {
+                cleanup_orphaned_files(&*object_store, &uploaded_files).await;
+                return Err(DataFusionError::External(Box::new(e)));
             }
 
             // Return the count of deleted rows

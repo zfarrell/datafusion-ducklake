@@ -127,15 +127,11 @@ async fn create_catalog_with_our_writer(temp_dir: &TempDir) -> (PathBuf, PathBuf
 ///
 /// This is the critical roundtrip test. If DuckDB can't read our catalogs,
 /// the MetadataWriter is not interoperable.
+#[ignore = "requires DuckDB CLI — run with: cargo test -- --ignored"]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_datafusion_writes_duckdb_reads() {
-    let duckdb_bin = match find_duckdb() {
-        Some(p) => p,
-        None => {
-            eprintln!("SKIPPED: DuckDB CLI not found. Install it to run roundtrip tests.");
-            return;
-        },
-    };
+    let duckdb_bin =
+        find_duckdb().expect("DuckDB CLI not found. Install it to run roundtrip tests.");
 
     let temp_dir = TempDir::new().unwrap();
     let (db_path, _data_path) = create_catalog_with_our_writer(&temp_dir).await;
@@ -164,35 +160,43 @@ async fn test_datafusion_writes_duckdb_reads() {
         );
     }
 
-    // Verify the output contains expected data
-    assert!(
-        stdout.contains("Alice"),
-        "Expected 'Alice' in output, got:\n{}",
+    // Parse DuckDB CSV output and verify exact values per row
+    let data_lines: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+    // DuckDB CLI outputs a header row + separator + data rows; find data rows
+    // by looking for lines containing our expected IDs
+    let rows: Vec<Vec<&str>> = data_lines
+        .iter()
+        .filter_map(|line| {
+            let cols: Vec<&str> = line.split('|').map(|s| s.trim()).collect();
+            // Data rows have 3 columns (id, name, score) and a numeric first column
+            if cols.len() >= 3 && cols[0].parse::<i32>().is_ok() {
+                Some(cols)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        rows.len(),
+        3,
+        "Expected 3 data rows from DuckDB output, got {}:\n{}",
+        rows.len(),
         stdout
     );
-    assert!(
-        stdout.contains("Bob"),
-        "Expected 'Bob' in output, got:\n{}",
-        stdout
-    );
-    assert!(
-        stdout.contains("Charlie"),
-        "Expected 'Charlie' in output, got:\n{}",
-        stdout
-    );
+    assert_eq!(rows[0][0], "1");
+    assert_eq!(rows[0][1], "Alice");
+    assert_eq!(rows[1][0], "2");
+    assert_eq!(rows[1][1], "Bob");
+    assert_eq!(rows[2][0], "3");
+    assert_eq!(rows[2][1], "Charlie");
 }
 
 /// Test: DuckDB writes a catalog → DuckDB reads it → verify row count.
 /// This also verifies DuckDB can see the correct column count and types.
+#[ignore = "requires DuckDB CLI — run with: cargo test -- --ignored"]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_datafusion_writes_duckdb_reads_count() {
-    let duckdb_bin = match find_duckdb() {
-        Some(p) => p,
-        None => {
-            eprintln!("SKIPPED: DuckDB CLI not found.");
-            return;
-        },
-    };
+    let duckdb_bin = find_duckdb().expect("DuckDB CLI not found.");
 
     let temp_dir = TempDir::new().unwrap();
     let (db_path, _data_path) = create_catalog_with_our_writer(&temp_dir).await;
@@ -214,9 +218,14 @@ async fn test_datafusion_writes_duckdb_reads_count() {
         );
     }
 
-    // The output should contain "3"
-    assert!(
-        stdout.contains('3'),
+    // Parse count value from DuckDB output
+    let count_value: Option<i64> = stdout
+        .lines()
+        .filter_map(|line| line.trim().parse::<i64>().ok())
+        .next();
+    assert_eq!(
+        count_value,
+        Some(3),
         "Expected count of 3 in output:\n{}",
         stdout
     );
@@ -224,15 +233,10 @@ async fn test_datafusion_writes_duckdb_reads_count() {
 
 /// Test: DuckDB writes a catalog → DataFusion reads it (reverse direction).
 /// This should already work per existing interop tests, but included for completeness.
+#[ignore = "requires DuckDB CLI — run with: cargo test -- --ignored"]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_duckdb_writes_datafusion_reads() {
-    let duckdb_bin = match find_duckdb() {
-        Some(p) => p,
-        None => {
-            eprintln!("SKIPPED: DuckDB CLI not found.");
-            return;
-        },
-    };
+    let duckdb_bin = find_duckdb().expect("DuckDB CLI not found.");
 
     let temp_dir = TempDir::new().unwrap();
     let catalog_path = temp_dir.path().join("duckdb_created.ducklake");
@@ -295,15 +299,10 @@ async fn test_duckdb_writes_datafusion_reads() {
 
 /// Test: DataFusion writes, does ALTER TABLE ADD COLUMN, writes more data → DuckDB reads.
 /// This tests schema evolution interop.
+#[ignore = "requires DuckDB CLI — run with: cargo test -- --ignored"]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_schema_evolution_roundtrip() {
-    let duckdb_bin = match find_duckdb() {
-        Some(p) => p,
-        None => {
-            eprintln!("SKIPPED: DuckDB CLI not found.");
-            return;
-        },
-    };
+    let duckdb_bin = find_duckdb().expect("DuckDB CLI not found.");
 
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("catalog.db");
@@ -386,54 +385,39 @@ async fn test_schema_evolution_roundtrip() {
 
     let (stdout, stderr, success) = run_duckdb(&duckdb_bin, &sql);
 
-    if !success {
-        // Document exact error — this is valuable even if it fails
-        eprintln!(
-            "DuckDB FAILED to read evolved schema catalog.\n\
-             STDOUT: {}\nSTDERR: {}\n\
-             This documents a schema evolution interop gap.",
-            stdout, stderr
-        );
-        // Don't panic here — document the finding
-        println!(
-            "FINDING: DuckDB cannot read our schema-evolved catalog.\nError: {}",
-            stderr.trim()
-        );
-        return;
-    }
+    assert!(
+        success,
+        "DuckDB FAILED to read evolved schema catalog.\n\
+         --- STDOUT ---\n{}\n\
+         --- STDERR ---\n{}\n\
+         This means our MetadataWriter produces schema-evolved catalogs that DuckDB rejects.",
+        stdout, stderr
+    );
 
-    // DuckDB can read the catalog — verify it sees data.
-    // Note: schema evolution may cause older rows (written before ADD COLUMN) to appear
-    // with NULLs for all columns due to column_id mapping differences between
-    // our writer and DuckDB's expectations. This is a known interop gap.
+    // DuckDB can read the catalog — verify it sees all data including evolved rows
     assert!(
         stdout.contains("Charlie"),
         "Expected 'Charlie' in output:\n{}",
         stdout
     );
-
-    // Check if Alice is visible (may be NULL if column mapping differs)
-    if !stdout.contains("Alice") {
-        eprintln!(
-            "NOTE: Older rows (Alice, Bob) appear as NULL after schema evolution.\n\
-             This indicates a column_id mapping gap between our writer and DuckDB.\n\
-             DuckDB output:\n{}",
-            stdout
-        );
-    }
+    assert!(
+        stdout.contains("Alice"),
+        "Expected 'Alice' in output (older rows should be visible after schema evolution):\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("Bob"),
+        "Expected 'Bob' in output (older rows should be visible after schema evolution):\n{}",
+        stdout
+    );
 }
 
 /// Test: Full roundtrip — DataFusion writes → DuckDB reads → DuckDB writes more → DataFusion reads.
 /// Proves both directions work on the same catalog.
+#[ignore = "requires DuckDB CLI — run with: cargo test -- --ignored"]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_full_bidirectional_roundtrip() {
-    let duckdb_bin = match find_duckdb() {
-        Some(p) => p,
-        None => {
-            eprintln!("SKIPPED: DuckDB CLI not found.");
-            return;
-        },
-    };
+    let duckdb_bin = find_duckdb().expect("DuckDB CLI not found.");
 
     let temp_dir = TempDir::new().unwrap();
     let catalog_path = temp_dir.path().join("roundtrip.ducklake");
@@ -522,15 +506,10 @@ async fn test_full_bidirectional_roundtrip() {
 
 /// Test: Inspect what our catalog looks like in raw form and document any gaps.
 /// This doesn't assert on DuckDB readability — it dumps diagnostic info.
+#[ignore = "requires DuckDB CLI — run with: cargo test -- --ignored"]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_catalog_metadata_diagnostic() {
-    let duckdb_bin = match find_duckdb() {
-        Some(p) => p,
-        None => {
-            eprintln!("SKIPPED: DuckDB CLI not found.");
-            return;
-        },
-    };
+    let duckdb_bin = find_duckdb().expect("DuckDB CLI not found.");
 
     let temp_dir = TempDir::new().unwrap();
     let (db_path, _data_path) = create_catalog_with_our_writer(&temp_dir).await;

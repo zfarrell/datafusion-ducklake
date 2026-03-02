@@ -868,13 +868,13 @@ async fn run_all_sqllogictests() {
     println!("========================================");
 
     if !failed_tests.is_empty() {
-        println!("\nFailed tests:");
+        let mut summary = format!("\n{} sqllogictest(s) failed:\n", failed_tests.len());
         for (name, error) in &failed_tests {
-            println!("  - {}", name);
-            // Print first line of error only
+            summary.push_str(&format!("  - {}\n", name));
             if let Some(first_line) = error.lines().next() {
-                println!("    {}", first_line);
+                summary.push_str(&format!("    {}\n", first_line));
             }
         }
+        panic!("{}", summary);
     }
 }

@@ -24,7 +24,8 @@ fn setup_context(catalog_path: &str) -> Result<SessionContext, Box<dyn std::erro
     ctx.register_catalog("ducklake", Arc::new(catalog));
 
     let provider2 = DuckdbMetadataProvider::new(catalog_path)?;
-    register_ducklake_functions(&ctx, Arc::new(provider2));
+    let snapshot_id = provider2.get_current_snapshot()?;
+    register_ducklake_functions(&ctx, Arc::new(provider2), snapshot_id);
     register_ducklake_compaction_functions(&ctx, catalog_path);
     Ok(ctx)
 }

@@ -38,6 +38,21 @@ use crate::metadata_provider::{DeleteFileChange, MetadataProvider};
 use crate::path_resolver::resolve_path;
 use crate::table::{delete_file_schema, validated_file_size};
 
+/// Projection analysis result for deletions table
+struct DeletionProjectionInfo {
+    /// Table column indices to read from Parquet (in original order)
+    table_indices: Vec<usize>,
+    /// Whether snapshot_id is requested
+    need_snapshot_id: bool,
+    /// Whether change_type is requested
+    need_change_type: bool,
+    /// The projected output schema
+    output_schema: SchemaRef,
+    /// Maps from natural column order (table_cols + CDC cols) to projection order.
+    /// None when no reordering is needed.
+    reorder_indices: Option<Vec<usize>>,
+}
+
 /// TableProvider that exposes deleted rows between snapshots
 ///
 /// For each data file with deletions:
@@ -91,10 +106,91 @@ impl TableDeletionsTable {
         }
     }
 
+    /// Analyze projection and split into table columns and CDC columns
+    fn analyze_projection(&self, projection: Option<&Vec<usize>>) -> DeletionProjectionInfo {
+        let num_table_cols = self.table_schema.fields().len();
+        let snapshot_id_idx = num_table_cols;
+        let change_type_idx = num_table_cols + 1;
+
+        match projection {
+            None => DeletionProjectionInfo {
+                table_indices: (0..num_table_cols).collect(),
+                need_snapshot_id: true,
+                need_change_type: true,
+                output_schema: self.output_schema.clone(),
+                reorder_indices: None,
+            },
+            Some(indices) => {
+                let mut table_indices: Vec<usize> = Vec::new();
+                let mut need_snapshot_id = false;
+                let mut need_change_type = false;
+
+                for &idx in indices {
+                    if idx < num_table_cols {
+                        table_indices.push(idx);
+                    } else if idx == snapshot_id_idx {
+                        need_snapshot_id = true;
+                    } else if idx == change_type_idx {
+                        need_change_type = true;
+                    }
+                }
+
+                // Build projected output schema in requested order
+                let fields: Vec<Field> = indices
+                    .iter()
+                    .map(|&idx| self.output_schema.field(idx).clone())
+                    .collect();
+                let output_schema = Arc::new(Schema::new(fields));
+
+                // Compute reorder mapping
+                let table_idx_pos: std::collections::HashMap<usize, usize> = table_indices
+                    .iter()
+                    .enumerate()
+                    .map(|(pos, &idx)| (idx, pos))
+                    .collect();
+                let snapshot_natural_pos = table_indices.len();
+                let change_type_natural_pos = table_indices.len()
+                    + if need_snapshot_id {
+                        1
+                    } else {
+                        0
+                    };
+
+                let natural_pos_map: Vec<usize> = indices
+                    .iter()
+                    .map(|&idx| {
+                        if idx < num_table_cols {
+                            table_idx_pos[&idx]
+                        } else if idx == snapshot_id_idx {
+                            snapshot_natural_pos
+                        } else {
+                            change_type_natural_pos
+                        }
+                    })
+                    .collect();
+
+                let needs_reorder = natural_pos_map.iter().enumerate().any(|(i, &pos)| i != pos);
+
+                DeletionProjectionInfo {
+                    table_indices,
+                    need_snapshot_id,
+                    need_change_type,
+                    output_schema,
+                    reorder_indices: if needs_reorder {
+                        Some(natural_pos_map)
+                    } else {
+                        None
+                    },
+                }
+            },
+        }
+    }
+
     /// Build execution plan for a single delete file entry
     fn build_exec_for_delete_entry(
         &self,
         delete_file: &DeleteFileChange,
+        proj_info: &DeletionProjectionInfo,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         // Resolve data file path
         let data_file_path = resolve_path(
@@ -128,11 +224,16 @@ impl TableDeletionsTable {
             None
         };
 
-        // Create scan for data file
+        // Push table column projection to data file scan
         let data_file_exec = self.build_data_file_scan(
             &data_file_path,
             delete_file.data_file_size_bytes,
             delete_file.data_file_footer_size,
+            if proj_info.table_indices.len() == self.table_schema.fields().len() {
+                None
+            } else {
+                Some(&proj_info.table_indices)
+            },
         )?;
 
         Ok(Arc::new(DeletedRowsExec::new(
@@ -141,7 +242,10 @@ impl TableDeletionsTable {
             data_file_exec,
             delete_file.data_record_count,
             delete_file.snapshot_id,
-            self.output_schema.clone(),
+            proj_info.output_schema.clone(),
+            proj_info.need_snapshot_id,
+            proj_info.need_change_type,
+            proj_info.reorder_indices.clone(),
         )))
     }
 
@@ -176,26 +280,32 @@ impl TableDeletionsTable {
         Ok(DataSourceExec::from_data_source(builder.build()))
     }
 
-    /// Build a ParquetExec for a data file
+    /// Build a ParquetExec for a data file with optional projection
     fn build_data_file_scan(
         &self,
         path: &str,
         size_bytes: i64,
-        footer_size: i64,
+        footer_size: Option<i64>,
+        projection: Option<&[usize]>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let mut pf = PartitionedFile::new(path, validated_file_size(size_bytes, path)?);
-        if footer_size > 0
-            && let Ok(hint) = usize::try_from(footer_size)
+        if let Some(fs) = footer_size
+            && fs > 0
+            && let Ok(hint) = usize::try_from(fs)
         {
             pf = pf.with_metadata_size_hint(hint);
         }
 
-        let builder = FileScanConfigBuilder::new(
+        let mut builder = FileScanConfigBuilder::new(
             self.object_store_url.as_ref().clone(),
             self.table_schema.clone(),
             Arc::new(ParquetSource::default()),
         )
         .with_file_group(FileGroup::new(vec![pf]));
+
+        if let Some(proj) = projection {
+            builder = builder.with_projection_indices(Some(proj.to_vec()));
+        }
 
         Ok(DataSourceExec::from_data_source(builder.build()))
     }
@@ -222,6 +332,9 @@ impl TableProvider for TableDeletionsTable {
         _filters: &[datafusion::prelude::Expr],
         _limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        // Analyze projection to determine what to read
+        let proj_info = self.analyze_projection(projection);
+
         // Get delete files added between snapshots
         let delete_files = self
             .provider
@@ -235,23 +348,13 @@ impl TableProvider for TableDeletionsTable {
         // Handle empty case
         if delete_files.is_empty() {
             use datafusion::physical_plan::empty::EmptyExec;
-            let output_schema = match projection {
-                Some(indices) => {
-                    let fields: Vec<Field> = indices
-                        .iter()
-                        .map(|&i| self.output_schema.field(i).clone())
-                        .collect();
-                    Arc::new(Schema::new(fields))
-                },
-                None => self.output_schema.clone(),
-            };
-            return Ok(Arc::new(EmptyExec::new(output_schema)));
+            return Ok(Arc::new(EmptyExec::new(proj_info.output_schema)));
         }
 
-        // Build execution plan for each delete entry
+        // Build execution plan for each delete entry with projection pushdown
         let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(delete_files.len());
         for delete_file in &delete_files {
-            let exec = self.build_exec_for_delete_entry(delete_file)?;
+            let exec = self.build_exec_for_delete_entry(delete_file, &proj_info)?;
             execs.push(exec);
         }
 
@@ -283,8 +386,14 @@ pub struct DeletedRowsExec {
     record_count: i64,
     /// Snapshot ID for CDC column
     snapshot_id: i64,
-    /// Output schema (table columns + snapshot_id + change_type)
+    /// Output schema (projected table columns + requested CDC columns)
     output_schema: SchemaRef,
+    /// Whether to include snapshot_id in output
+    include_snapshot_id: bool,
+    /// Whether to include change_type in output
+    include_change_type: bool,
+    /// Reorder mapping: output_pos -> natural_pos. None if no reordering needed.
+    reorder_indices: Option<Vec<usize>>,
     /// Cached plan properties
     properties: PlanProperties,
 }
@@ -297,6 +406,9 @@ impl DeletedRowsExec {
         record_count: i64,
         snapshot_id: i64,
         output_schema: SchemaRef,
+        include_snapshot_id: bool,
+        include_change_type: bool,
+        reorder_indices: Option<Vec<usize>>,
     ) -> Self {
         let eq_properties = EquivalenceProperties::new(output_schema.clone());
         let data_props = data_file_scan.properties();
@@ -314,6 +426,9 @@ impl DeletedRowsExec {
             record_count,
             snapshot_id,
             output_schema,
+            include_snapshot_id,
+            include_change_type,
+            reorder_indices,
             properties,
         }
     }
@@ -402,6 +517,9 @@ impl ExecutionPlan for DeletedRowsExec {
             self.record_count,
             self.snapshot_id,
             self.output_schema.clone(),
+            self.include_snapshot_id,
+            self.include_change_type,
+            self.reorder_indices.clone(),
         )))
     }
 
@@ -429,6 +547,9 @@ impl ExecutionPlan for DeletedRowsExec {
             self.record_count,
             self.snapshot_id,
             self.output_schema.clone(),
+            self.include_snapshot_id,
+            self.include_change_type,
+            self.reorder_indices.clone(),
         )))
     }
 
@@ -480,6 +601,12 @@ struct DeletedRowsStream {
     snapshot_id: i64,
     /// Output schema
     output_schema: SchemaRef,
+    /// Whether to include snapshot_id in output
+    include_snapshot_id: bool,
+    /// Whether to include change_type in output
+    include_change_type: bool,
+    /// Reorder mapping: output_pos -> natural_pos. None if no reordering needed.
+    reorder_indices: Option<Vec<usize>>,
     /// Collected current positions (or All for full delete)
     current_positions: CurrentDeletePositions,
     /// Collected previous positions
@@ -500,6 +627,9 @@ impl DeletedRowsStream {
         record_count: i64,
         snapshot_id: i64,
         output_schema: SchemaRef,
+        include_snapshot_id: bool,
+        include_change_type: bool,
+        reorder_indices: Option<Vec<usize>>,
     ) -> Self {
         // Determine initial state and compute positions if needed
         let (initial_state, current_positions, deleted_positions) =
@@ -535,6 +665,9 @@ impl DeletedRowsStream {
             data_stream,
             snapshot_id,
             output_schema,
+            include_snapshot_id,
+            include_change_type,
+            reorder_indices,
             current_positions,
             previous_positions: HashSet::new(),
             deleted_positions,
@@ -644,13 +777,24 @@ impl DeletedRowsStream {
             columns.push(filtered);
         }
 
-        // Append CDC columns
+        // Append only requested CDC columns
         let num_output_rows = keep_indices.len();
-        columns.push(Arc::new(Int64Array::from(vec![
-            self.snapshot_id;
-            num_output_rows
-        ])));
-        columns.push(Arc::new(StringArray::from(vec!["delete"; num_output_rows])));
+        if self.include_snapshot_id {
+            columns.push(Arc::new(Int64Array::from(vec![
+                self.snapshot_id;
+                num_output_rows
+            ])));
+        }
+        if self.include_change_type {
+            columns.push(Arc::new(StringArray::from(vec!["delete"; num_output_rows])));
+        }
+
+        // Apply reorder if projection requested non-natural column order
+        let columns = if let Some(ref reorder) = self.reorder_indices {
+            reorder.iter().map(|&i| columns[i].clone()).collect()
+        } else {
+            columns
+        };
 
         RecordBatch::try_new(self.output_schema.clone(), columns)
             .map(Some)

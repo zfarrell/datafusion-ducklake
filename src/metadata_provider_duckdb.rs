@@ -10,7 +10,7 @@ use crate::metadata_provider::{
     SQL_GET_VIEW_BY_NAME, SQL_LIST_ALL_COLUMNS, SQL_LIST_ALL_FILES, SQL_LIST_ALL_TABLES,
     SQL_LIST_SCHEMAS, SQL_LIST_SNAPSHOTS, SQL_LIST_TABLES, SQL_LIST_VIEWS, SQL_TABLE_EXISTS,
     SQL_VIEW_EXISTS, SchemaMetadata, SnapshotMetadata, TableMetadata, TableWithSchema,
-    ViewMetadata,
+    ViewMetadata, quote_identifier,
 };
 use duckdb::AccessMode::ReadOnly;
 use duckdb::{Config, Connection, params};
@@ -539,7 +539,10 @@ impl MetadataProvider for DuckdbMetadataProvider {
         };
 
         // Get column names from the inlined data table (skip row_id, begin_snapshot, end_snapshot)
-        let pragma_sql = format!("PRAGMA table_info('{}')", inlined_table_name);
+        let pragma_sql = format!(
+            "PRAGMA table_info({})",
+            quote_identifier(&inlined_table_name)
+        );
         let mut pragma_stmt = conn.prepare(&pragma_sql)?;
         let user_columns: Vec<String> = pragma_stmt
             .query_map([], |row| row.get::<_, String>(1))?
@@ -551,15 +554,15 @@ impl MetadataProvider for DuckdbMetadataProvider {
             return Ok(Vec::new());
         }
 
-        // Build select query
+        // Build select query with quoted identifiers to prevent SQL injection
         let col_list: Vec<String> = user_columns
             .iter()
-            .map(|c| format!("CAST(\"{}\" AS VARCHAR)", c))
+            .map(|c| format!("CAST({} AS VARCHAR)", quote_identifier(c)))
             .collect();
         let select_sql = format!(
-            "SELECT {} FROM \"{}\" WHERE begin_snapshot <= ? AND (end_snapshot IS NULL OR ? < end_snapshot)",
+            "SELECT {} FROM {} WHERE begin_snapshot <= ? AND (end_snapshot IS NULL OR ? < end_snapshot)",
             col_list.join(", "),
-            inlined_table_name,
+            quote_identifier(&inlined_table_name),
         );
 
         let num_columns = user_columns.len();

@@ -162,8 +162,10 @@ impl DuckLakeTableWriter {
         let setup =
             self.metadata
                 .begin_write_transaction(schema_name, table_name, &columns, mode)?;
-        let schema_with_ids =
-            Arc::new(build_schema_with_field_ids(arrow_schema, &setup.column_ids));
+        let schema_with_ids = Arc::new(build_schema_with_field_ids(
+            arrow_schema,
+            &setup.column_ids,
+        )?);
 
         let object_path_str = join_paths(&file_dir, &file_name)?;
         // Strip leading slash for object_store Path (it expects relative keys)
@@ -296,8 +298,10 @@ impl DuckLakeTableWriter {
 
                     // Threshold exceeded: flush existing inline data + write new data to Parquet.
                     // Use the setup we already have (snapshot, table, columns created).
-                    let schema_with_ids =
-                        Arc::new(build_schema_with_field_ids(arrow_schema, &setup.column_ids));
+                    let schema_with_ids = Arc::new(build_schema_with_field_ids(
+                        arrow_schema,
+                        &setup.column_ids,
+                    )?);
 
                     // Collect all data: existing inline + new batches
                     let mut all_batches: Vec<RecordBatch> = Vec::new();
@@ -403,7 +407,7 @@ impl DuckLakeTableWriter {
         let schema_with_ids = Arc::new(build_schema_with_field_ids(
             &arrow_schema,
             &setup.column_ids,
-        ));
+        )?);
 
         // Clear the inlined data
         self.metadata
@@ -509,8 +513,10 @@ impl DuckLakeTableWriter {
         let file_name = format!("{}.parquet", Uuid::new_v4());
         let catalog_path = join_paths(partition_dir, &file_name)?;
 
-        let schema_with_ids =
-            Arc::new(build_schema_with_field_ids(arrow_schema, &setup.column_ids));
+        let schema_with_ids = Arc::new(build_schema_with_field_ids(
+            arrow_schema,
+            &setup.column_ids,
+        )?);
 
         let object_path_str = join_paths(&partition_key, &file_name)?;
         let object_path = ObjectPath::from(object_path_str.trim_start_matches('/'));
@@ -1039,7 +1045,13 @@ fn parse_string_to_array(
                 match val {
                     Some(s) => match s.parse() {
                         Ok(v) => builder.append_value(v),
-                        Err(_) => builder.append_null(),
+                        Err(_) => {
+                            return Err(crate::error::DuckLakeError::Internal(format!(
+                                "Failed to parse inlined value '{}' as {}",
+                                s,
+                                std::any::type_name::<$builder_ty>()
+                            )));
+                        },
                     },
                     None => builder.append_null(),
                 }
@@ -1056,7 +1068,12 @@ fn parse_string_to_array(
                     Some(s) => match s.to_lowercase().as_str() {
                         "true" | "1" | "t" => builder.append_value(true),
                         "false" | "0" | "f" => builder.append_value(false),
-                        _ => builder.append_null(),
+                        _ => {
+                            return Err(crate::error::DuckLakeError::Internal(format!(
+                                "Failed to parse inlined value '{}' as Boolean",
+                                s
+                            )));
+                        },
                     },
                     None => builder.append_null(),
                 }
@@ -1119,7 +1136,14 @@ pub(crate) fn arrow_schema_to_column_defs(schema: &Schema) -> Result<Vec<ColumnD
         .collect()
 }
 
-pub(crate) fn build_schema_with_field_ids(schema: &Schema, column_ids: &[i64]) -> Schema {
+pub(crate) fn build_schema_with_field_ids(schema: &Schema, column_ids: &[i64]) -> Result<Schema> {
+    if schema.fields().len() != column_ids.len() {
+        return Err(crate::error::DuckLakeError::Internal(format!(
+            "Schema field count ({}) does not match column ID count ({})",
+            schema.fields().len(),
+            column_ids.len()
+        )));
+    }
     let fields: Vec<Field> = schema
         .fields()
         .iter()
@@ -1132,7 +1156,7 @@ pub(crate) fn build_schema_with_field_ids(schema: &Schema, column_ids: &[i64]) -
         })
         .collect();
 
-    Schema::new_with_metadata(fields, schema.metadata().clone())
+    Ok(Schema::new_with_metadata(fields, schema.metadata().clone()))
 }
 
 /// Extract column-level statistics from flushed Parquet row groups.
@@ -1165,7 +1189,8 @@ fn extract_column_stats(
                 has_stats[col_idx] = true;
 
                 if let Some(nc) = stats.null_count_opt() {
-                    null_counts[col_idx] += nc as i64;
+                    let nc_i64 = i64::try_from(nc).unwrap_or(i64::MAX);
+                    null_counts[col_idx] = null_counts[col_idx].saturating_add(nc_i64);
                 }
 
                 let (batch_min, batch_max) = parquet_stats_min_max(stats);
@@ -1225,12 +1250,12 @@ fn parquet_stats_min_max(
             vs.max_opt().map(|v| v.to_string()),
         ),
         Statistics::Float(vs) => (
-            vs.min_opt().map(|v| v.to_string()),
-            vs.max_opt().map(|v| v.to_string()),
+            vs.min_opt().filter(|v| !v.is_nan()).map(|v| v.to_string()),
+            vs.max_opt().filter(|v| !v.is_nan()).map(|v| v.to_string()),
         ),
         Statistics::Double(vs) => (
-            vs.min_opt().map(|v| v.to_string()),
-            vs.max_opt().map(|v| v.to_string()),
+            vs.min_opt().filter(|v| !v.is_nan()).map(|v| v.to_string()),
+            vs.max_opt().filter(|v| !v.is_nan()).map(|v| v.to_string()),
         ),
         Statistics::ByteArray(vs) => (
             vs.min_opt()
@@ -1260,8 +1285,20 @@ fn should_replace_min(
     match stats {
         Statistics::Int32(_) => new_val.parse::<i32>().ok() < current.parse::<i32>().ok(),
         Statistics::Int64(_) => new_val.parse::<i64>().ok() < current.parse::<i64>().ok(),
-        Statistics::Float(_) => new_val.parse::<f32>().ok() < current.parse::<f32>().ok(),
-        Statistics::Double(_) => new_val.parse::<f64>().ok() < current.parse::<f64>().ok(),
+        Statistics::Float(_) => {
+            match (new_val.parse::<f32>().ok(), current.parse::<f32>().ok()) {
+                (Some(n), Some(c)) if !n.is_nan() && !c.is_nan() => n.total_cmp(&c).is_lt(),
+                (Some(n), Some(_)) if !n.is_nan() => true, // new is non-NaN, current is NaN → replace
+                _ => false,
+            }
+        },
+        Statistics::Double(_) => {
+            match (new_val.parse::<f64>().ok(), current.parse::<f64>().ok()) {
+                (Some(n), Some(c)) if !n.is_nan() && !c.is_nan() => n.total_cmp(&c).is_lt(),
+                (Some(n), Some(_)) if !n.is_nan() => true, // new is non-NaN, current is NaN → replace
+                _ => false,
+            }
+        },
         _ => new_val < current,
     }
 }
@@ -1276,8 +1313,20 @@ fn should_replace_max(
     match stats {
         Statistics::Int32(_) => new_val.parse::<i32>().ok() > current.parse::<i32>().ok(),
         Statistics::Int64(_) => new_val.parse::<i64>().ok() > current.parse::<i64>().ok(),
-        Statistics::Float(_) => new_val.parse::<f32>().ok() > current.parse::<f32>().ok(),
-        Statistics::Double(_) => new_val.parse::<f64>().ok() > current.parse::<f64>().ok(),
+        Statistics::Float(_) => {
+            match (new_val.parse::<f32>().ok(), current.parse::<f32>().ok()) {
+                (Some(n), Some(c)) if !n.is_nan() && !c.is_nan() => n.total_cmp(&c).is_gt(),
+                (Some(n), Some(_)) if !n.is_nan() => true, // new is non-NaN, current is NaN → replace
+                _ => false,
+            }
+        },
+        Statistics::Double(_) => {
+            match (new_val.parse::<f64>().ok(), current.parse::<f64>().ok()) {
+                (Some(n), Some(c)) if !n.is_nan() && !c.is_nan() => n.total_cmp(&c).is_gt(),
+                (Some(n), Some(_)) if !n.is_nan() => true, // new is non-NaN, current is NaN → replace
+                _ => false,
+            }
+        },
         _ => new_val > current,
     }
 }
@@ -1444,7 +1493,7 @@ mod tests {
         ]);
 
         let column_ids = vec![1, 2];
-        let schema_with_ids = build_schema_with_field_ids(&schema, &column_ids);
+        let schema_with_ids = build_schema_with_field_ids(&schema, &column_ids).unwrap();
 
         // Check that field_ids are embedded in metadata
         let field0_metadata = schema_with_ids.field(0).metadata();
@@ -1477,7 +1526,7 @@ mod tests {
         .unwrap();
 
         let column_ids = vec![10, 20];
-        let schema_with_ids = Arc::new(build_schema_with_field_ids(&schema, &column_ids));
+        let schema_with_ids = Arc::new(build_schema_with_field_ids(&schema, &column_ids).unwrap());
 
         let props = WriterProperties::builder()
             .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
@@ -1508,7 +1557,7 @@ mod tests {
         let props = WriterProperties::builder()
             .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
             .build();
-        let schema_with_ids = Arc::new(build_schema_with_field_ids(&batch.schema(), &[1]));
+        let schema_with_ids = Arc::new(build_schema_with_field_ids(&batch.schema(), &[1]).unwrap());
         let mut writer =
             ArrowWriter::try_new(Vec::new(), schema_with_ids.clone(), Some(props)).unwrap();
 
@@ -1545,5 +1594,80 @@ mod tests {
         use arrow::array::Date32Array;
         let array = Date32Array::from(vec![0]);
         assert_eq!(arrow_array_value_to_string(&array, 0), "1970-01-01");
+    }
+
+    #[test]
+    fn test_build_schema_with_field_ids_mismatch() {
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Utf8, true),
+        ]);
+        // Fewer IDs than fields
+        let result = build_schema_with_field_ids(&schema, &[1]);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("does not match"));
+
+        // More IDs than fields
+        let result = build_schema_with_field_ids(&schema, &[1, 2, 3]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_string_to_array_error_on_invalid() {
+        let values = vec![Some("not_a_number".to_string())];
+        let result = parse_string_to_array(&values, &DataType::Int32);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Failed to parse"));
+    }
+
+    #[test]
+    fn test_parse_string_to_array_bool_error_on_invalid() {
+        let values = vec![Some("maybe".to_string())];
+        let result = parse_string_to_array(&values, &DataType::Boolean);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Failed to parse"));
+    }
+
+    #[test]
+    fn test_nan_skipped_in_stats_min_max() {
+        use parquet::file::statistics::Statistics;
+        // NaN as current should be replaced by non-NaN new value
+        assert!(should_replace_min(
+            &Statistics::Float(parquet::file::statistics::ValueStatistics::new(
+                Some(0.0f32),
+                Some(0.0f32),
+                None,
+                None,
+                false,
+            )),
+            "1.0",
+            "NaN",
+        ));
+        assert!(should_replace_max(
+            &Statistics::Double(parquet::file::statistics::ValueStatistics::new(
+                Some(0.0f64),
+                Some(0.0f64),
+                None,
+                None,
+                false,
+            )),
+            "1.0",
+            "NaN",
+        ));
+        // NaN as new value should not replace current
+        assert!(!should_replace_min(
+            &Statistics::Float(parquet::file::statistics::ValueStatistics::new(
+                Some(0.0f32),
+                Some(0.0f32),
+                None,
+                None,
+                false,
+            )),
+            "NaN",
+            "1.0",
+        ));
     }
 }

@@ -193,7 +193,8 @@ async fn run_query(
     ctx.register_catalog("ducklake", Arc::new(ducklake_catalog));
 
     // Register table functions (ducklake_snapshots, ducklake_table_info, ducklake_list_files)
-    register_ducklake_functions(&ctx, provider);
+    // Pass the pinned snapshot_id so UDTFs resolve metadata consistently
+    register_ducklake_functions(&ctx, provider, snapshot_id);
 
     println!("✓ Registered DuckLake catalog with DataFusion");
     println!(

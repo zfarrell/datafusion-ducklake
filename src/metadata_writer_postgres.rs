@@ -77,7 +77,7 @@ const SQL_CREATE_TABLES: &[&str] = &[
         row_id_start BIGINT,
         mapping_id BIGINT,
         file_order INTEGER,
-        file_format VARCHAR DEFAULT 'PARQUET',
+        file_format VARCHAR DEFAULT 'parquet',
         partition_id BIGINT,
         partial_max BIGINT,
         partial_file_info VARCHAR,
@@ -94,7 +94,7 @@ const SQL_CREATE_TABLES: &[&str] = &[
         footer_size BIGINT,
         encryption_key VARCHAR,
         delete_count BIGINT,
-        format VARCHAR DEFAULT 'POSITION_DELETES',
+        format VARCHAR DEFAULT 'parquet',
         partial_max BIGINT,
         begin_snapshot BIGINT NOT NULL,
         end_snapshot BIGINT
@@ -529,6 +529,50 @@ impl PostgresMetadataWriter {
         .await?;
         let snapshot_id: i64 = row.try_get(0)?;
 
+        // Cascade: end columns for all active tables in this schema
+        sqlx::query(
+            "UPDATE ducklake_column SET end_snapshot = $1
+             WHERE table_id IN (SELECT table_id FROM ducklake_table WHERE schema_id = $2 AND end_snapshot IS NULL)
+             AND end_snapshot IS NULL",
+        )
+        .bind(snapshot_id)
+        .bind(schema_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // Cascade: end data files for all active tables in this schema
+        sqlx::query(
+            "UPDATE ducklake_data_file SET end_snapshot = $1
+             WHERE table_id IN (SELECT table_id FROM ducklake_table WHERE schema_id = $2 AND end_snapshot IS NULL)
+             AND end_snapshot IS NULL",
+        )
+        .bind(snapshot_id)
+        .bind(schema_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // Cascade: end delete files for all active tables in this schema
+        sqlx::query(
+            "UPDATE ducklake_delete_file SET end_snapshot = $1
+             WHERE table_id IN (SELECT table_id FROM ducklake_table WHERE schema_id = $2 AND end_snapshot IS NULL)
+             AND end_snapshot IS NULL",
+        )
+        .bind(snapshot_id)
+        .bind(schema_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // End all active tables in this schema
+        sqlx::query(
+            "UPDATE ducklake_table SET end_snapshot = $1
+             WHERE schema_id = $2 AND end_snapshot IS NULL",
+        )
+        .bind(snapshot_id)
+        .bind(schema_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // Mark the schema as dropped
         sqlx::query(
             "UPDATE ducklake_schema SET end_snapshot = $1
              WHERE schema_id = $2 AND end_snapshot IS NULL",
@@ -581,15 +625,19 @@ impl MetadataWriter for PostgresMetadataWriter {
         snapshot_id: i64,
     ) -> Result<(i64, bool)> {
         block_on(async {
+            // Use a transaction to prevent TOCTOU race between SELECT and INSERT
+            let mut tx = self.pool.begin().await?;
+
             let existing = sqlx::query(
                 "SELECT schema_id FROM ducklake_schema
                  WHERE schema_name = $1 AND end_snapshot IS NULL",
             )
             .bind(name)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?;
 
             if let Some(row) = existing {
+                tx.commit().await?;
                 return Ok((row.try_get(0)?, false));
             }
 
@@ -606,9 +654,10 @@ impl MetadataWriter for PostgresMetadataWriter {
             .bind(name)
             .bind(&schema_path)
             .bind(snapshot_id)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *tx)
             .await?;
 
+            tx.commit().await?;
             Ok((row.try_get(0)?, true))
         })
     }
@@ -726,6 +775,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             return Ok(());
         }
         block_on(async {
+            let mut tx = self.pool.begin().await?;
             for stat in stats {
                 sqlx::query(
                     "INSERT INTO ducklake_file_column_stats
@@ -738,9 +788,10 @@ impl MetadataWriter for PostgresMetadataWriter {
                 .bind(stat.null_count)
                 .bind(&stat.min_value)
                 .bind(&stat.max_value)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await?;
             }
+            tx.commit().await?;
             Ok(())
         })
     }
@@ -752,9 +803,22 @@ impl MetadataWriter for PostgresMetadataWriter {
         file: &DataFileInfo,
     ) -> Result<i64> {
         block_on(async {
+            let mut tx = self.pool.begin().await?;
+
+            // Get current next_row_id from table_stats (F-011: row_id_start)
+            let stats_row =
+                sqlx::query("SELECT next_row_id FROM ducklake_table_stats WHERE table_id = $1")
+                    .bind(table_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            let row_id_start: i64 = match stats_row {
+                Some(r) => r.try_get::<Option<i64>, _>(0)?.unwrap_or(0),
+                None => 0,
+            };
+
             let row = sqlx::query(
-                "INSERT INTO ducklake_data_file (table_id, path, path_is_relative, file_size_bytes, footer_size, record_count, begin_snapshot)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING data_file_id",
+                "INSERT INTO ducklake_data_file (table_id, path, path_is_relative, file_size_bytes, footer_size, record_count, row_id_start, file_format, begin_snapshot)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, 'parquet', $8) RETURNING data_file_id",
             )
             .bind(table_id)
             .bind(&file.path)
@@ -762,25 +826,123 @@ impl MetadataWriter for PostgresMetadataWriter {
             .bind(file.file_size_bytes)
             .bind(file.footer_size)
             .bind(file.record_count)
+            .bind(row_id_start)
             .bind(snapshot_id)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *tx)
             .await?;
-            Ok(row.try_get(0)?)
+            let data_file_id: i64 = row.try_get(0)?;
+
+            // Update ducklake_table_stats (F-012: table_stats population)
+            let new_next_row_id = row_id_start + file.record_count;
+            let updated = sqlx::query(
+                "UPDATE ducklake_table_stats
+                 SET record_count = COALESCE(record_count, 0) + $1,
+                     next_row_id = $2,
+                     file_size_bytes = COALESCE(file_size_bytes, 0) + $3
+                 WHERE table_id = $4",
+            )
+            .bind(file.record_count)
+            .bind(new_next_row_id)
+            .bind(file.file_size_bytes)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            if updated.rows_affected() == 0 {
+                sqlx::query(
+                    "INSERT INTO ducklake_table_stats (table_id, record_count, next_row_id, file_size_bytes)
+                     VALUES ($1, $2, $3, $4)",
+                )
+                .bind(table_id)
+                .bind(file.record_count)
+                .bind(new_next_row_id)
+                .bind(file.file_size_bytes)
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            tx.commit().await?;
+            Ok(data_file_id)
         })
     }
 
     fn end_table_files(&self, table_id: i64, snapshot_id: i64) -> Result<u64> {
         block_on(async {
+            let mut tx = self.pool.begin().await?;
             let result = sqlx::query(
                 "UPDATE ducklake_data_file SET end_snapshot = $1
                  WHERE table_id = $2 AND end_snapshot IS NULL",
             )
             .bind(snapshot_id)
             .bind(table_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
 
+            tx.commit().await?;
             Ok(result.rows_affected())
+        })
+    }
+
+    fn register_dml_files(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        delete_files: &[DeleteFileInfo],
+        data_files: &[DataFileInfo],
+    ) -> Result<()> {
+        if delete_files.is_empty() && data_files.is_empty() {
+            return Ok(());
+        }
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+
+            for file in delete_files {
+                // End any existing active delete file for this data file
+                sqlx::query(
+                    "UPDATE ducklake_delete_file SET end_snapshot = $1
+                     WHERE data_file_id = $2 AND table_id = $3 AND end_snapshot IS NULL",
+                )
+                .bind(snapshot_id)
+                .bind(file.data_file_id)
+                .bind(table_id)
+                .execute(&mut *tx)
+                .await?;
+
+                // Insert the new delete file
+                sqlx::query(
+                    "INSERT INTO ducklake_delete_file (data_file_id, table_id, path, path_is_relative, file_size_bytes, footer_size, delete_count, begin_snapshot)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                )
+                .bind(file.data_file_id)
+                .bind(table_id)
+                .bind(&file.path)
+                .bind(file.path_is_relative)
+                .bind(file.file_size_bytes)
+                .bind(file.footer_size)
+                .bind(file.delete_count)
+                .bind(snapshot_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            for file in data_files {
+                sqlx::query(
+                    "INSERT INTO ducklake_data_file (table_id, path, path_is_relative, file_size_bytes, footer_size, record_count, begin_snapshot)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                )
+                .bind(table_id)
+                .bind(&file.path)
+                .bind(file.path_is_relative)
+                .bind(file.file_size_bytes)
+                .bind(file.footer_size)
+                .bind(file.record_count)
+                .bind(snapshot_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            tx.commit().await?;
+            Ok(())
         })
     }
 
@@ -861,6 +1023,9 @@ impl MetadataWriter for PostgresMetadataWriter {
             sqlx::query("CREATE SEQUENCE IF NOT EXISTS ducklake_view_id_seq")
                 .execute(&self.pool)
                 .await?;
+            sqlx::query("CREATE SEQUENCE IF NOT EXISTS ducklake_partition_id_seq")
+                .execute(&self.pool)
+                .await?;
 
             // Sync sequences with existing data (handles migration from MAX+1 pattern).
             // Only advances the sequence if there's existing data; otherwise leaves at default start=1.
@@ -876,6 +1041,11 @@ impl MetadataWriter for PostgresMetadataWriter {
             .await?;
             sqlx::query(
                 "SELECT setval('ducklake_view_id_seq', MAX(view_id)) FROM ducklake_view HAVING MAX(view_id) IS NOT NULL",
+            )
+            .fetch_optional(&self.pool)
+            .await?;
+            sqlx::query(
+                "SELECT setval('ducklake_partition_id_seq', MAX(partition_id)) FROM ducklake_partition_info HAVING MAX(partition_id) IS NOT NULL",
             )
             .fetch_optional(&self.pool)
             .await?;
@@ -906,8 +1076,8 @@ impl MetadataWriter for PostgresMetadataWriter {
 
             // Insert the new delete file
             let row = sqlx::query(
-                "INSERT INTO ducklake_delete_file (data_file_id, table_id, path, path_is_relative, file_size_bytes, footer_size, delete_count, begin_snapshot)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING delete_file_id",
+                "INSERT INTO ducklake_delete_file (data_file_id, table_id, path, path_is_relative, file_size_bytes, footer_size, delete_count, format, begin_snapshot)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, 'parquet', $8) RETURNING delete_file_id",
             )
             .bind(file.data_file_id)
             .bind(table_id)
@@ -1409,11 +1579,9 @@ impl MetadataWriter for PostgresMetadataWriter {
                     .await?;
 
                     // Create new partition_info entry
-                    let pid_row = sqlx::query(
-                        "SELECT COALESCE(MAX(partition_id), 0) + 1 FROM ducklake_partition_info",
-                    )
-                    .fetch_one(&mut *tx)
-                    .await?;
+                    let pid_row = sqlx::query("SELECT nextval('ducklake_partition_id_seq')")
+                        .fetch_one(&mut *tx)
+                        .await?;
                     let partition_id: i64 = pid_row.try_get(0)?;
 
                     sqlx::query(
