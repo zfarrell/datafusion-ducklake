@@ -145,6 +145,29 @@ A five-part review of the post-R2 codebase identified **67 raw -> 50 after dedup
 - `docs/2026-03-02-r3-review-synthesis.md` (deduplicated + prioritized, with **[FIXED]**/**[OPEN]** markers)
 - `docs/2026-03-02-r3-review-idiomatic.md`, `docs/2026-03-02-r3-review-correctness.md`, `docs/2026-03-02-r3-review-interop.md`, `docs/2026-03-02-r3-review-test-harness.md`, `docs/2026-03-02-r3-codex-review.md`
 
+### Code Review Cycle 4 (2026-03-03 R4) — 46 FINDINGS
+
+A five-part review of the post-R3 codebase identified **74 raw → 46 after dedup** (1 P0, 12 P1, 20 P2, 13 P3). The codex review claimed 3 P0s; synthesis validation downgraded 2 to P1 (inline flush path mismatch is narrower than "all writes"; partitioned commit requires unlikely mid-transaction failure).
+
+**P0 validated**: `clear_inlined_data()` called before Parquet commit — data loss on flush failure.
+
+**Key P1 findings (12)**:
+- Inline flush write path uses `t{table_id}/` mismatching stored `table_name/`
+- Partitioned commit not transactional (end_table_files + register loop)
+- DML missing: next_file_id, column stats, record_count decrements, Replace-mode stats reset
+- PG/MySQL register_dml_files missing row_id_start (R3F-002 not ported)
+- UPDATE/MERGE snapshot_changes use non-standard tokens (CDC broken)
+- Delete file file_path uses relative path (interop contract violation)
+- NULL filter predicate treated as match in DELETE/UPDATE
+- UPDATE/MERGE skip NOT NULL constraint validation
+- LIMIT pushed into Parquet scan before DeleteFilterExec
+
+**Recommended fix agents**: 8 (DML metadata integrity, DML correctness, interop format, PG/MySQL parity, atomicity/validation, code quality, interop conventions, test infrastructure).
+
+**Source documents:**
+- `docs/2026-03-03-review-synthesis.md` (consolidated, deduplicated, prioritized)
+- `docs/2026-03-03-review-idiomatic.md`, `docs/2026-03-03-review-correctness.md`, `docs/2026-03-03-review-interop.md`, `docs/2026-03-03-review-test-harness.md`, `docs/2026-03-03-codex-review.md`
+
 ### After Implementation: PR Creation
 Follow `/home/zac/ducklake-pr-strategy.md`:
 - Each PR is a coherent unit re-implemented on branches off main
