@@ -394,12 +394,17 @@ impl ExecutionPlan for DuckLakeDeleteExec {
             }
 
             // R3F-013: Record snapshot changes for DELETE
-            writer
-                .record_snapshot_changes(
+            // R4-S-016: Non-fatal — DML data is already committed
+            if let Err(e) = writer.record_snapshot_changes(
+                snapshot_id,
+                &format!("deleted_from_table:{}", table_id),
+            ) {
+                tracing::warn!(
                     snapshot_id,
-                    &format!("deleted_from_table:{}", table_id),
-                )
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                    error = %e,
+                    "Failed to record snapshot changes after DELETE commit"
+                );
+            }
 
             // Return the count of deleted rows
             let count_array: ArrayRef = Arc::new(UInt64Array::from(vec![total_deleted]));

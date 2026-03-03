@@ -43,6 +43,7 @@ use crate::path_resolver::join_paths;
 use crate::table::delete_file_schema;
 use crate::table_writer::{
     build_schema_with_field_ids, calculate_footer_size_from_bytes, cleanup_orphaned_files,
+    extract_column_stats,
 };
 
 /// Schema for the output of update operations (count of rows updated)
@@ -477,6 +478,13 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                         .map_err(|e| DataFusionError::External(Box::new(e)))?;
                 }
 
+                // R4-S-005: Extract column stats before consuming the writer
+                arrow_writer
+                    .flush()
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                let column_stats =
+                    extract_column_stats(arrow_writer.flushed_row_groups(), &column_ids);
+
                 let buffer = arrow_writer
                     .into_inner()
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -493,7 +501,8 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                 uploaded_files.push(data_object_path);
 
                 let data_file_info = DataFileInfo::new(&data_file_name, file_size, total_records)
-                    .with_footer_size(footer_size);
+                    .with_footer_size(footer_size)
+                    .with_column_stats(column_stats);
 
                 pending_data_files.push(data_file_info);
             }
@@ -522,15 +531,20 @@ impl ExecutionPlan for DuckLakeUpdateExec {
 
             // R3F-013: Record snapshot changes for UPDATE
             // R4-S-008: Use standard DuckDB tokens (inserted + deleted) instead of non-standard "updated_table"
-            writer
-                .record_snapshot_changes(
+            // R4-S-016: Non-fatal — DML data is already committed
+            if let Err(e) = writer.record_snapshot_changes(
+                snapshot_id,
+                &format!(
+                    "inserted_into_table:{},deleted_from_table:{}",
+                    table_id, table_id
+                ),
+            ) {
+                tracing::warn!(
                     snapshot_id,
-                    &format!(
-                        "inserted_into_table:{},deleted_from_table:{}",
-                        table_id, table_id
-                    ),
-                )
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                    error = %e,
+                    "Failed to record snapshot changes after UPDATE commit"
+                );
+            }
 
             // Return the count of updated rows
             let count_array: ArrayRef = Arc::new(UInt64Array::from(vec![total_updated]));

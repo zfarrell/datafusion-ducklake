@@ -43,7 +43,8 @@ use uuid::Uuid;
 use crate::Result;
 use crate::metadata_provider::InlinedDataRow;
 use crate::metadata_writer::{
-    ColumnDef, ColumnStatInfo, DataFileInfo, MetadataWriter, WriteMode, WriteResult,
+    ColumnDef, ColumnStatInfo, DataFileInfo, MetadataWriter, ReplaceFileEntry, WriteMode,
+    WriteResult,
 };
 use crate::path_resolver::join_paths;
 
@@ -81,7 +82,7 @@ impl DuckLakeTableWriter {
         mode: WriteMode,
     ) -> Result<TableWriteSession> {
         let table_key = join_paths(&join_paths(&self.base_key_path, schema_name)?, table_name)?;
-        let file_name = format!("{}.parquet", Uuid::new_v4());
+        let file_name = format!("ducklake-{}.parquet", Uuid::new_v4());
         self.begin_write_internal(
             schema_name,
             table_name,
@@ -108,7 +109,7 @@ impl DuckLakeTableWriter {
     ) -> Result<TableWriteSession> {
         let table_key = join_paths(&join_paths(&self.base_key_path, schema_name)?, table_name)?;
         let partition_key = join_paths(&table_key, partition_dir)?;
-        let file_name = format!("{}.parquet", Uuid::new_v4());
+        let file_name = format!("ducklake-{}.parquet", Uuid::new_v4());
         // Catalog path includes the partition directory
         let catalog_path = join_paths(partition_dir, &file_name)?;
         self.begin_write_internal(
@@ -315,8 +316,9 @@ impl DuckLakeTableWriter {
 
                     // Collect all data: existing inline + new batches
                     let mut all_batches: Vec<RecordBatch> = Vec::new();
+                    let had_inline = current_inline > 0;
 
-                    if current_inline > 0 {
+                    if had_inline {
                         // Get existing inline data and convert to RecordBatch
                         if let Ok(inline_rows) = self.get_inlined_data_as_batch(
                             setup.table_id,
@@ -325,22 +327,31 @@ impl DuckLakeTableWriter {
                         ) {
                             all_batches.push(inline_rows);
                         }
-                        // Clear the inlined data
-                        self.metadata
-                            .clear_inlined_data(setup.table_id, setup.snapshot_id)?;
                     }
 
                     all_batches.extend(batches.iter().cloned());
 
+                    // Save IDs before setup is moved
+                    let table_id = setup.table_id;
+                    let snapshot_id = setup.snapshot_id;
+
                     // Write combined data to Parquet using the existing setup
-                    return self
+                    let result = self
                         .write_parquet_with_setup(
                             schema_name,
+                            table_name,
                             &all_batches,
                             &schema_with_ids,
                             setup,
                         )
-                        .await;
+                        .await?;
+
+                    // R4-S-001: Clear inlined data only AFTER successful Parquet write
+                    if had_inline {
+                        self.metadata.clear_inlined_data(table_id, snapshot_id)?;
+                    }
+
+                    return Ok(result);
                 }
             }
         }
@@ -419,13 +430,19 @@ impl DuckLakeTableWriter {
             &setup.column_ids,
         )?);
 
-        // Clear the inlined data
-        self.metadata
-            .clear_inlined_data(setup.table_id, setup.snapshot_id)?;
+        // Save IDs before setup is moved
+        let table_id = setup.table_id;
+        let snapshot_id = setup.snapshot_id;
 
         // Write to Parquet
-        self.write_parquet_with_setup(schema_name, &[batch], &schema_with_ids, setup)
-            .await
+        let result = self
+            .write_parquet_with_setup(schema_name, table_name, &[batch], &schema_with_ids, setup)
+            .await?;
+
+        // R4-S-001: Clear inlined data only AFTER successful Parquet write
+        self.metadata.clear_inlined_data(table_id, snapshot_id)?;
+
+        Ok(result)
     }
 
     /// Get inlined data from the catalog and convert to a RecordBatch.
@@ -447,16 +464,17 @@ impl DuckLakeTableWriter {
     async fn write_parquet_with_setup(
         &self,
         schema_name: &str,
+        table_name: &str,
         batches: &[RecordBatch],
         schema_with_ids: &SchemaRef,
         setup: crate::metadata_writer::WriteSetupResult,
     ) -> Result<WriteResult> {
+        // R4-S-002: Use table_name to match the stored table path
         let table_key = join_paths(
             &join_paths(&self.base_key_path, schema_name)?,
-            // Use table_id-based path since we don't have table_name separately
-            &format!("t{}/", setup.table_id),
+            &format!("{}/", table_name),
         )?;
-        let file_name = format!("{}.parquet", Uuid::new_v4());
+        let file_name = format!("ducklake-{}.parquet", Uuid::new_v4());
         let object_path_str = join_paths(&table_key, &file_name)?;
         let object_path = ObjectPath::from(object_path_str.trim_start_matches('/'));
 
@@ -527,7 +545,7 @@ impl DuckLakeTableWriter {
     ) -> Result<TableWriteSession> {
         let table_key = join_paths(&join_paths(&self.base_key_path, schema_name)?, table_name)?;
         let partition_key = join_paths(&table_key, partition_dir)?;
-        let file_name = format!("{}.parquet", Uuid::new_v4());
+        let file_name = format!("ducklake-{}.parquet", Uuid::new_v4());
         let catalog_path = join_paths(partition_dir, &file_name)?;
 
         let schema_with_ids = Arc::new(build_schema_with_field_ids(
@@ -564,61 +582,84 @@ impl DuckLakeTableWriter {
 
     /// Commit uploaded files and register partition values in the catalog.
     ///
-    /// For Replace mode, ends existing data files before registering new ones.
-    /// This ensures atomicity: old files are only ended after ALL new files are
-    /// uploaded, and partition values are registered alongside their files.
+    /// For Replace mode, ends existing data files and registers new ones atomically
+    /// via `replace_table_files`. For Append mode, registers files individually.
     pub async fn commit_uploaded_files(
         &self,
         setup: &crate::metadata_writer::WriteSetupResult,
         uploaded_files: Vec<(UploadedFile, Vec<Option<String>>)>,
         write_mode: WriteMode,
     ) -> Result<WriteResult> {
-        // End existing data files for Replace mode AFTER all uploads succeeded.
-        if write_mode == WriteMode::Replace {
-            self.metadata
-                .end_table_files(setup.table_id, setup.snapshot_id)?;
-        }
-
         let mut total_rows: i64 = 0;
         let mut last_data_file_id: i64 = -1;
 
+        // Build file entries with partition values
+        let mut entries: Vec<ReplaceFileEntry> = Vec::with_capacity(uploaded_files.len());
         for (upload, partition_values) in &uploaded_files {
             let mut file_info =
                 DataFileInfo::new(&upload.catalog_path, upload.file_size, upload.row_count)
-                    .with_footer_size(upload.footer_size);
+                    .with_footer_size(upload.footer_size)
+                    .with_column_stats(upload.column_stats.clone());
             if !upload.path_is_relative {
                 file_info = file_info.with_absolute_path();
             }
 
-            let data_file_id =
-                self.metadata
-                    .register_data_file(setup.table_id, setup.snapshot_id, &file_info)?;
-
-            if !upload.column_stats.is_empty() {
-                self.metadata.register_column_stats(
-                    data_file_id,
-                    setup.table_id,
-                    &upload.column_stats,
-                )?;
-            }
-
-            // Register partition values for this file
+            let mut pvals = Vec::with_capacity(partition_values.len());
             for (key_index, pval) in partition_values.iter().enumerate() {
-                self.metadata.register_file_partition_value(
-                    data_file_id,
-                    setup.table_id,
-                    i32::try_from(key_index).map_err(|e| {
-                        crate::error::DuckLakeError::Internal(format!(
-                            "Partition key index overflow: {}",
-                            e
-                        ))
-                    })?,
-                    pval.as_deref(),
-                )?;
+                let idx = i32::try_from(key_index).map_err(|e| {
+                    crate::error::DuckLakeError::Internal(format!(
+                        "Partition key index overflow: {}",
+                        e
+                    ))
+                })?;
+                pvals.push((idx, pval.clone()));
             }
 
+            entries.push(ReplaceFileEntry {
+                file_info,
+                partition_values: pvals,
+            });
             total_rows += upload.row_count;
-            last_data_file_id = data_file_id;
+        }
+
+        if write_mode == WriteMode::Replace {
+            // Atomic: end existing files + register all new files in one transaction
+            let ids = self.metadata.replace_table_files(
+                setup.table_id,
+                setup.snapshot_id,
+                &entries,
+            )?;
+            if let Some(&id) = ids.last() {
+                last_data_file_id = id;
+            }
+        } else {
+            // Append mode: register files individually
+            for entry in &entries {
+                let data_file_id = self.metadata.register_data_file(
+                    setup.table_id,
+                    setup.snapshot_id,
+                    &entry.file_info,
+                )?;
+
+                if !entry.file_info.column_stats.is_empty() {
+                    self.metadata.register_column_stats(
+                        data_file_id,
+                        setup.table_id,
+                        &entry.file_info.column_stats,
+                    )?;
+                }
+
+                for (key_index, val) in &entry.partition_values {
+                    self.metadata.register_file_partition_value(
+                        data_file_id,
+                        setup.table_id,
+                        *key_index,
+                        val.as_deref(),
+                    )?;
+                }
+
+                last_data_file_id = data_file_id;
+            }
         }
 
         Ok(WriteResult {
@@ -826,40 +867,23 @@ impl TableWriteSession {
             .put(&self.object_path, PutPayload::from(buffer))
             .await?;
 
-        // Attempt to commit metadata. If this fails, the uploaded file is orphaned
-        // and we make a best-effort attempt to clean it up.
-        match self.commit_metadata(file_size, footer_size, &column_stats) {
-            Ok(result) => Ok(result),
-            Err(commit_err) => {
-                // Best-effort cleanup: delete the orphaned Parquet file
+        // Stage 1: Register data file (critical path).
+        // If this fails, the file is orphaned and can be safely cleaned up.
+        if self.write_mode == WriteMode::Replace {
+            if let Err(e) = self
+                .metadata
+                .end_table_files(self.table_id, self.snapshot_id)
+            {
+                // end_table_files failed — file not referenced, safe to clean up
                 if let Err(cleanup_err) = self.object_store.delete(&self.object_path).await {
                     tracing::warn!(
                         path = %self.object_path,
                         error = %cleanup_err,
-                        "Failed to clean up orphaned Parquet file after metadata commit failure"
+                        "Failed to clean up orphaned Parquet file after end_table_files failure"
                     );
                 }
-                Err(commit_err)
-            },
-        }
-    }
-
-    /// Commit file metadata to the catalog. Separated from `finish()` so that
-    /// cleanup of orphaned files can happen if this step fails.
-    ///
-    /// For Replace mode, ends existing data files before registering the new file.
-    /// This ensures old files are only ended after the upload succeeds.
-    fn commit_metadata(
-        &self,
-        file_size: i64,
-        footer_size: i64,
-        column_stats: &[ColumnStatInfo],
-    ) -> Result<WriteResult> {
-        // End existing data files for Replace mode AFTER upload succeeded.
-        // This ensures the table is never left empty if the upload fails.
-        if self.write_mode == WriteMode::Replace {
-            self.metadata
-                .end_table_files(self.table_id, self.snapshot_id)?;
+                return Err(e);
+            }
         }
 
         let mut file_info = DataFileInfo::new(&self.catalog_path, file_size, self.row_count)
@@ -867,13 +891,39 @@ impl TableWriteSession {
         if !self.path_is_relative {
             file_info = file_info.with_absolute_path();
         }
-        let data_file_id =
-            self.metadata
-                .register_data_file(self.table_id, self.snapshot_id, &file_info)?;
 
+        let data_file_id = match self
+            .metadata
+            .register_data_file(self.table_id, self.snapshot_id, &file_info)
+        {
+            Ok(id) => id,
+            Err(e) => {
+                // register_data_file failed — file not referenced, safe to clean up
+                if let Err(cleanup_err) = self.object_store.delete(&self.object_path).await {
+                    tracing::warn!(
+                        path = %self.object_path,
+                        error = %cleanup_err,
+                        "Failed to clean up orphaned Parquet file after register_data_file failure"
+                    );
+                }
+                return Err(e);
+            },
+        };
+
+        // Stage 2: Register column stats (non-critical).
+        // R4-S-017: If this fails, the data file is already committed in metadata.
+        // Do NOT clean up the file — metadata already references it.
         if !column_stats.is_empty() {
-            self.metadata
-                .register_column_stats(data_file_id, self.table_id, column_stats)?;
+            if let Err(e) = self
+                .metadata
+                .register_column_stats(data_file_id, self.table_id, &column_stats)
+            {
+                tracing::warn!(
+                    data_file_id,
+                    error = %e,
+                    "Failed to register column stats; data file already committed, skipping cleanup"
+                );
+            }
         }
 
         Ok(WriteResult {
@@ -1189,7 +1239,7 @@ pub(crate) fn build_schema_with_field_ids(schema: &Schema, column_ids: &[i64]) -
 ///
 /// Merges statistics across multiple row groups by summing null counts
 /// and taking the overall min/max across all groups.
-fn extract_column_stats(
+pub(crate) fn extract_column_stats(
     row_groups: &[parquet::file::metadata::RowGroupMetaData],
     column_ids: &[i64],
 ) -> Vec<ColumnStatInfo> {
@@ -1381,6 +1431,30 @@ pub(crate) fn calculate_footer_size_from_bytes(buffer: &[u8]) -> Result<i64> {
         )));
     }
     Ok(i64::from(metadata_len))
+}
+
+/// Validate NOT NULL constraints on a set of record batches.
+///
+/// Returns an error if any non-nullable column contains null values.
+/// Used by INSERT, UPDATE, and MERGE to enforce schema constraints before writing.
+pub(crate) fn validate_not_null_constraints(
+    schema: &Schema,
+    batches: &[RecordBatch],
+) -> datafusion::common::Result<()> {
+    for batch in batches {
+        for (i, field) in schema.fields().iter().enumerate() {
+            if !field.is_nullable() {
+                let column = batch.column(i);
+                if column.null_count() > 0 {
+                    return Err(datafusion::error::DataFusionError::Execution(format!(
+                        "NOT NULL constraint failed: {}",
+                        field.name()
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Best-effort cleanup of uploaded files after a metadata commit failure.

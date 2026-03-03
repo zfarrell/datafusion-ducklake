@@ -80,9 +80,18 @@ pub(crate) fn validated_file_size(file_size_bytes: i64, file_path: &str) -> Data
 /// The file_path column is metadata/documentation only (for Iceberg compatibility).
 /// The pos column contains the row positions to delete.
 pub fn delete_file_schema() -> SchemaRef {
+    // R4-S-024: Add PARQUET:field_id metadata matching DuckDB's sentinel values
+    // for delete file columns (0x7FFFFFFE for file_path, 0x7FFFFFFD for pos)
+    let mut file_path_metadata = HashMap::new();
+    file_path_metadata.insert("PARQUET:field_id".to_string(), "2147483646".to_string()); // 0x7FFFFFFE
+    let mut pos_metadata = HashMap::new();
+    pos_metadata.insert("PARQUET:field_id".to_string(), "2147483645".to_string()); // 0x7FFFFFFD
+
     Arc::new(Schema::new(vec![
-        Field::new(DELETE_FILE_PATH_COL, DataType::Utf8, false),
-        Field::new(DELETE_POS_COL, DataType::Int64, false),
+        Field::new(DELETE_FILE_PATH_COL, DataType::Utf8, false)
+            .with_metadata(file_path_metadata),
+        Field::new(DELETE_POS_COL, DataType::Int64, false)
+            .with_metadata(pos_metadata),
     ]))
 }
 
@@ -217,9 +226,18 @@ impl DuckLakeTable {
             },
         };
         let file_partition_values = if !partition_columns.is_empty() {
-            let raw_values = provider
-                .get_file_partition_values(table_id, snapshot_id)
-                .unwrap_or_default();
+            let raw_values = match provider.get_file_partition_values(table_id, snapshot_id) {
+                Ok(vals) => vals,
+                Err(e) => {
+                    tracing::warn!(
+                        table_id,
+                        snapshot_id,
+                        error = %e,
+                        "Failed to load file partition values; partition pruning disabled"
+                    );
+                    Vec::new()
+                },
+            };
             let mut map: HashMap<i64, Vec<(i32, Option<String>)>> = HashMap::new();
             for v in raw_values {
                 map.entry(v.data_file_id)
@@ -232,9 +250,18 @@ impl DuckLakeTable {
         };
 
         // Load inlined data from catalog database
-        let inlined_data = provider
-            .get_inlined_data(table_id, snapshot_id)
-            .unwrap_or_default();
+        let inlined_data = match provider.get_inlined_data(table_id, snapshot_id) {
+            Ok(data) => data,
+            Err(e) => {
+                tracing::warn!(
+                    table_id,
+                    snapshot_id,
+                    error = %e,
+                    "Failed to load inlined data from catalog"
+                );
+                Vec::new()
+            },
+        };
 
         // Build encryption factory from file encryption keys (when encryption feature is enabled)
         #[cfg(feature = "encryption")]
@@ -584,6 +611,7 @@ impl DuckLakeTable {
     /// * `schema_name` - Name of the schema this table belongs to
     /// * `writer` - Metadata writer for catalog operations
     #[cfg(feature = "write")]
+    #[must_use]
     pub fn with_writer(mut self, schema_name: String, writer: Arc<dyn MetadataWriter>) -> Self {
         self.schema_name = Some(schema_name);
         self.writer = Some(writer);
@@ -630,7 +658,7 @@ impl DuckLakeTable {
             self.table_files.clone(),
             filters.to_vec(),
             Arc::clone(writer),
-            self.object_store_url.clone(),
+            Arc::clone(&self.object_store_url),
             self.table_path.clone(),
             existing_deletes,
         )))
@@ -685,7 +713,7 @@ impl DuckLakeTable {
             filters.to_vec(),
             assignments,
             Arc::clone(writer),
-            self.object_store_url.clone(),
+            Arc::clone(&self.object_store_url),
             self.table_path.clone(),
             existing_deletes,
         )))
@@ -739,7 +767,7 @@ impl DuckLakeTable {
             matched_action,
             insert_unmatched,
             Arc::clone(writer),
-            self.object_store_url.clone(),
+            Arc::clone(&self.object_store_url),
             self.table_path.clone(),
             existing_deletes,
         )))
@@ -1335,15 +1363,17 @@ impl TableProvider for DuckLakeTable {
             }
         }
 
-        // Set null counts
+        // Set null counts (clamp negative values to 0 to avoid wrapping)
         for (i, cs) in col_stats.iter_mut().enumerate() {
             if has_null_count[i] {
-                cs.null_count = Precision::Inexact(null_counts[i] as usize);
+                cs.null_count = Precision::Inexact(null_counts[i].max(0) as usize);
             }
         }
 
         let num_rows = match self.cached_row_count {
-            Some(count) if count >= 0 => Precision::Exact(count as usize),
+            Some(count) if count >= 0 => {
+                Precision::Exact(usize::try_from(count).unwrap_or(usize::MAX))
+            },
             _ => Precision::Absent,
         };
 
@@ -1432,7 +1462,10 @@ impl TableProvider for DuckLakeTable {
             }
             for table_file in files_with_deletes {
                 execs.push(
-                    self.build_exec_for_file_with_deletes(state, table_file, projection, limit)
+                    // Don't push limit into Parquet scan for files with deletes:
+                    // DeleteFilterExec may remove rows after the scan, yielding fewer than N.
+                    // DataFusion will apply the limit after DeleteFilterExec.
+                    self.build_exec_for_file_with_deletes(state, table_file, projection, None)
                         .await?,
                 );
             }
@@ -1516,7 +1549,8 @@ impl TableProvider for DuckLakeTable {
                 file_index: file_idx as u64,
             };
             let file_exec = if table_file.delete_file.is_some() {
-                self.build_exec_for_file_with_deletes(state, table_file, real_proj_ref, limit)
+                // Don't push limit for files with deletes (same as non-virtual path)
+                self.build_exec_for_file_with_deletes(state, table_file, real_proj_ref, None)
                     .await?
             } else {
                 self.build_exec_for_single_file(state, table_file, real_proj_ref, limit)
@@ -1702,7 +1736,7 @@ impl TableProvider for DuckLakeTable {
             self.table_name.clone(),
             Arc::clone(&self.schema),
             write_mode,
-            self.object_store_url.clone(),
+            Arc::clone(&self.object_store_url),
         )
         .with_partition_columns(write_partition_cols);
 

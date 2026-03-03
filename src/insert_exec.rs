@@ -223,19 +223,7 @@ impl ExecutionPlan for DuckLakeInsertExec {
             }
 
             // Enforce NOT NULL constraints before writing
-            for batch in &batches {
-                for (i, field) in arrow_schema.fields().iter().enumerate() {
-                    if !field.is_nullable() {
-                        let column = batch.column(i);
-                        if column.null_count() > 0 {
-                            return Err(DataFusionError::Execution(format!(
-                                "NOT NULL constraint failed: {}",
-                                field.name()
-                            )));
-                        }
-                    }
-                }
-            }
+            crate::table_writer::validate_not_null_constraints(&arrow_schema, &batches)?;
 
             // Get object store from runtime environment
             let object_store = context
