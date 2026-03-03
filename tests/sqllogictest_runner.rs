@@ -705,7 +705,8 @@ fn is_hybrid_incompatible_error(error_upper: &str) -> bool {
         if error_upper.contains(pattern) {
             tracing::warn!(
                 "Converting 'statement error' to 'statement ok': pattern '{}' ({})",
-                pattern, reason
+                pattern,
+                reason
             );
             return true;
         }
@@ -780,15 +781,24 @@ async fn run_hybrid_test(test_file: &str) -> Result<(), Box<dyn std::error::Erro
     let test_dir_str = temp_dir.path().to_string_lossy().to_string();
     let processed_content = preprocess_test_file(&original_content, &test_dir_str);
 
-    // Verify that preprocessing didn't eliminate all statements
-    let has_statements = processed_content.lines().any(|line| {
-        let t = line.trim();
-        t.starts_with("statement") || t.starts_with("query") || t == "halt"
-    });
+    // Verify that preprocessing didn't eliminate all meaningful statements.
+    // Count actual test directives (not just "halt" which stops the test early).
+    let meaningful_count = processed_content
+        .lines()
+        .filter(|line| {
+            let t = line.trim();
+            t.starts_with("statement") || t.starts_with("query")
+        })
+        .count();
     assert!(
-        has_statements,
+        meaningful_count > 0,
         "Preprocessed test file has zero statements/queries — test would pass vacuously: {test_file}"
     );
+    if meaningful_count < 3 {
+        eprintln!(
+            "Warning: test file '{test_file}' has only {meaningful_count} meaningful statement(s) after preprocessing — consider reviewing for excessive filtering"
+        );
+    }
 
     // Write preprocessed test to temp file
     let temp_test_file = temp_dir.path().join("test.slt");

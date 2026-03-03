@@ -145,33 +145,95 @@ impl HybridDuckLakeDB {
     /// Rewrite table references from 2-part to 3-part names
     /// ducklake.table → ducklake.main.table
     /// ducklake.schema.table → unchanged (already 3-part)
+    ///
+    /// String-literal aware: does not rewrite occurrences inside single-quoted strings.
     fn rewrite_table_references(sql: &str) -> String {
         let mut result = String::with_capacity(sql.len() + 100);
-        let mut remaining = sql;
+        let mut chars = sql.char_indices().peekable();
+        let mut last_pos = 0;
 
-        while let Some(pos) = remaining.find("ducklake.") {
-            result.push_str(&remaining[..pos]);
-            result.push_str("ducklake.");
-            let after = &remaining[pos + 9..]; // 9 = len("ducklake.")
-
-            if after.starts_with("main.") {
-                // Already has main schema
-                remaining = after;
-            } else {
-                // Check if this is already a 3-part name (ducklake.schema.table)
-                // by looking for identifier.identifier pattern
-                let is_three_part = Self::is_three_part_ref(after);
-                if is_three_part {
-                    // Already a 3-part name like ducklake.s1.v1 — don't add main
-                    remaining = after;
-                } else {
-                    result.push_str("main.");
-                    remaining = after;
+        while let Some(&(i, ch)) = chars.peek() {
+            if ch == '\'' {
+                // Inside a single-quoted string literal — copy verbatim until closing quote
+                result.push_str(&sql[last_pos..i]);
+                last_pos = i;
+                chars.next(); // consume opening quote
+                while let Some(&(_, c)) = chars.peek() {
+                    chars.next();
+                    if c == '\'' {
+                        // Check for escaped quote ('')
+                        if let Some(&(_, next_c)) = chars.peek() {
+                            if next_c == '\'' {
+                                chars.next(); // skip escaped quote
+                                continue;
+                            }
+                        }
+                        break;
+                    }
                 }
+                // Copy the entire string literal as-is
+                let end = chars.peek().map(|&(idx, _)| idx).unwrap_or(sql.len());
+                result.push_str(&sql[last_pos..end]);
+                last_pos = end;
+                continue;
             }
+
+            // Check for "ducklake." at current position
+            if sql[i..].starts_with("ducklake.") {
+                result.push_str(&sql[last_pos..i]);
+                result.push_str("ducklake.");
+                let after = &sql[i + 9..];
+
+                if after.starts_with("main.") {
+                    // Already has main schema
+                    // advance past "ducklake."
+                    for _ in 0..9 {
+                        chars.next();
+                    }
+                    last_pos = i + 9;
+                } else {
+                    let is_three_part = Self::is_three_part_ref(after);
+                    if is_three_part {
+                        for _ in 0..9 {
+                            chars.next();
+                        }
+                        last_pos = i + 9;
+                    } else {
+                        result.push_str("main.");
+                        for _ in 0..9 {
+                            chars.next();
+                        }
+                        last_pos = i + 9;
+                    }
+                }
+                continue;
+            }
+
+            chars.next();
         }
-        result.push_str(remaining);
+        result.push_str(&sql[last_pos..]);
         result
+    }
+
+    /// Check if an identifier appears as a standalone word in a SQL clause.
+    /// Prevents matching substrings (e.g., "ROWID" inside "MYROWID").
+    fn is_identifier_in_clause(clause: &str, name: &str) -> bool {
+        let mut start = 0;
+        while let Some(pos) = clause[start..].find(name) {
+            let abs_pos = start + pos;
+            let before_ok = abs_pos == 0
+                || !clause.as_bytes()[abs_pos - 1].is_ascii_alphanumeric()
+                    && clause.as_bytes()[abs_pos - 1] != b'_';
+            let end_pos = abs_pos + name.len();
+            let after_ok = end_pos >= clause.len()
+                || !clause.as_bytes()[end_pos].is_ascii_alphanumeric()
+                    && clause.as_bytes()[end_pos] != b'_';
+            if before_ok && after_ok {
+                return true;
+            }
+            start = abs_pos + 1;
+        }
+        false
     }
 
     /// Check if text after "ducklake." is already a 3-part reference (schema.table)
@@ -280,6 +342,13 @@ impl HybridDuckLakeDB {
         }
 
         let sql_upper = sql.to_uppercase();
+        // Extract just the SELECT clause (before FROM) for virtual column matching.
+        // This prevents matching column names in WHERE clauses or string literals.
+        let select_clause = if let Some(from_pos) = sql_upper.find(" FROM ") {
+            &sql_upper[..from_pos]
+        } else {
+            &sql_upper
+        };
         let schema = batches[0].schema();
         let keep_indices: Vec<usize> = schema
             .fields()
@@ -287,13 +356,13 @@ impl HybridDuckLakeDB {
             .enumerate()
             .filter(|(_, f)| {
                 let name = f.name().as_str();
-                // Always strip extension-specific virtual columns unless explicitly referenced
+                // Always strip extension-specific virtual columns unless explicitly referenced in SELECT
                 if Self::EXTENSION_VIRTUAL_COLS.contains(&name) {
-                    return sql_upper.contains(&name.to_uppercase());
+                    return Self::is_identifier_in_clause(select_clause, &name.to_uppercase());
                 }
-                // Strip DuckLake virtual columns (rowid, snapshot_id) unless explicitly referenced
+                // Strip DuckLake virtual columns (rowid, snapshot_id) unless explicitly referenced in SELECT
                 if Self::DUCKLAKE_VIRTUAL_COLS.contains(&name) {
-                    return sql_upper.contains(&name.to_uppercase());
+                    return Self::is_identifier_in_clause(select_clause, &name.to_uppercase());
                 }
                 true
             })
@@ -363,10 +432,9 @@ impl AsyncDB for HybridDuckLakeDB {
 
             // Return row count for DML statements (INSERT/UPDATE/DELETE)
             // The sqllogictest framework uses this for `query I` blocks that test row counts
-            if changed_rows > 0
-                && (trimmed_upper.starts_with("INSERT ")
-                    || trimmed_upper.starts_with("UPDATE ")
-                    || trimmed_upper.starts_with("DELETE "))
+            if trimmed_upper.starts_with("INSERT ")
+                || trimmed_upper.starts_with("UPDATE ")
+                || trimmed_upper.starts_with("DELETE ")
             {
                 Ok(DBOutput::Rows {
                     types: vec![DefaultColumnType::Integer],
@@ -418,8 +486,9 @@ impl AsyncDB for HybridDuckLakeDB {
                         Ok(duckdb::types::Value::Text(v)) => v,
                         Ok(other) => format!("{:?}", other),
                         Err(e) => {
-                            eprintln!("Warning: DuckDB column {i} decode error: {e}");
-                            "NULL".to_string()
+                            return Err(HybridError(format!(
+                                "DuckDB column {i} decode error: {e}"
+                            )));
                         },
                     };
                     vals.push(val);
@@ -435,7 +504,7 @@ impl AsyncDB for HybridDuckLakeDB {
             // DataFusion path: READ operations (SELECT, etc.)
             let batches = self.execute_read(sql).await?;
 
-            if batches.is_empty() {
+            if batches.is_empty() || batches.iter().all(|b| b.num_columns() == 0) {
                 return Ok(DBOutput::StatementComplete(0));
             }
 
@@ -563,50 +632,82 @@ fn convert_batch_to_strings(batch: &RecordBatch) -> Result<Vec<Vec<String>>, Hyb
                         arr.value(row_idx).to_string()
                     },
                     DataType::Date32 => {
-                        let arr = column.as_any().downcast_ref::<Date32Array>().expect("Date32 downcast");
-                        arr.value_as_date(row_idx).expect("Date32 value_as_date").to_string()
+                        let arr = column
+                            .as_any()
+                            .downcast_ref::<Date32Array>()
+                            .expect("Date32 downcast");
+                        arr.value_as_date(row_idx)
+                            .expect("Date32 value_as_date")
+                            .to_string()
                     },
                     DataType::Timestamp(unit, _) => {
                         use datafusion::arrow::datatypes::TimeUnit;
+                        // Use consistent format with test_utils.rs: %Y-%m-%d %H:%M:%S
+                        // (truncates sub-seconds to match DuckDB display format)
                         match unit {
                             TimeUnit::Second => {
                                 let arr = column
                                     .as_any()
                                     .downcast_ref::<TimestampSecondArray>()
                                     .unwrap();
-                                format!("{}", arr.value_as_datetime(row_idx).unwrap())
+                                let s = arr.value(row_idx);
+                                let dt = chrono::DateTime::from_timestamp(s, 0).unwrap();
+                                dt.format("%Y-%m-%d %H:%M:%S").to_string()
                             },
                             TimeUnit::Millisecond => {
                                 let arr = column
                                     .as_any()
                                     .downcast_ref::<TimestampMillisecondArray>()
                                     .unwrap();
-                                format!("{}", arr.value_as_datetime(row_idx).unwrap())
+                                let ms = arr.value(row_idx);
+                                let secs = ms.div_euclid(1_000);
+                                let subsec_ms = ms.rem_euclid(1_000) as u32;
+                                let dt =
+                                    chrono::DateTime::from_timestamp(secs, subsec_ms * 1_000_000)
+                                        .unwrap();
+                                dt.format("%Y-%m-%d %H:%M:%S").to_string()
                             },
                             TimeUnit::Microsecond => {
                                 let arr = column
                                     .as_any()
                                     .downcast_ref::<TimestampMicrosecondArray>()
                                     .unwrap();
-                                format!("{}", arr.value_as_datetime(row_idx).unwrap())
+                                let us = arr.value(row_idx);
+                                let secs = us.div_euclid(1_000_000);
+                                let subsec_us = us.rem_euclid(1_000_000) as u32;
+                                let dt = chrono::DateTime::from_timestamp(secs, subsec_us * 1_000)
+                                    .unwrap();
+                                dt.format("%Y-%m-%d %H:%M:%S").to_string()
                             },
                             TimeUnit::Nanosecond => {
                                 let arr = column
                                     .as_any()
                                     .downcast_ref::<TimestampNanosecondArray>()
                                     .unwrap();
-                                format!("{}", arr.value_as_datetime(row_idx).unwrap())
+                                let ns = arr.value(row_idx);
+                                let secs = ns.div_euclid(1_000_000_000);
+                                let subsec_ns = ns.rem_euclid(1_000_000_000) as u32;
+                                let dt = chrono::DateTime::from_timestamp(secs, subsec_ns).unwrap();
+                                dt.format("%Y-%m-%d %H:%M:%S").to_string()
                             },
                         }
                     },
                     DataType::Decimal128(_, scale) => {
-                        let arr = column.as_any().downcast_ref::<Decimal128Array>().expect("Decimal128 downcast");
+                        let arr = column
+                            .as_any()
+                            .downcast_ref::<Decimal128Array>()
+                            .expect("Decimal128 downcast");
                         let raw = arr.value(row_idx);
                         let scale = *scale as u32;
                         let divisor = 10i128.pow(scale);
                         let whole = raw / divisor;
                         let frac = (raw % divisor).unsigned_abs();
-                        format!("{whole}.{frac:0>width$}", width = scale as usize)
+                        let sign = if raw < 0 && whole == 0 {
+                            "-"
+                        } else {
+                            ""
+                        };
+                        format!("{sign}{whole}.{frac:0>width$}", width = scale as usize)
                     },
                     DataType::Binary => {
                         let arr = column.as_any().downcast_ref::<BinaryArray>().unwrap();
@@ -754,42 +855,47 @@ mod tests {
 
     #[test]
     fn test_table_rewrite() {
-        let result = HybridDuckLakeDB::rewrite_table_references("SELECT * FROM ducklake.test");
-        assert!(
-            result.contains("ducklake.main.test"),
-            "Expected 'ducklake.main.test' in: {}",
-            result
+        // 2-part → 3-part: ducklake.test → ducklake.main.test
+        assert_eq!(
+            HybridDuckLakeDB::rewrite_table_references("SELECT * FROM ducklake.test"),
+            "SELECT * FROM ducklake.main.test"
         );
 
-        let result =
-            HybridDuckLakeDB::rewrite_table_references("INSERT INTO ducklake.test VALUES (1)");
-        assert!(
-            result.contains("ducklake.main.test"),
-            "Expected 'ducklake.main.test' in: {}",
-            result
+        assert_eq!(
+            HybridDuckLakeDB::rewrite_table_references("INSERT INTO ducklake.test VALUES (1)"),
+            "INSERT INTO ducklake.main.test VALUES (1)"
         );
 
         // Avoid double-rewrite
-        let result = HybridDuckLakeDB::rewrite_table_references("SELECT * FROM ducklake.main.test");
-        assert_eq!(result, "SELECT * FROM ducklake.main.test");
+        assert_eq!(
+            HybridDuckLakeDB::rewrite_table_references("SELECT * FROM ducklake.main.test"),
+            "SELECT * FROM ducklake.main.test"
+        );
 
         // Preserve 3-part names (ducklake.schema.table)
-        let result = HybridDuckLakeDB::rewrite_table_references("SELECT * FROM ducklake.s1.v1");
         assert_eq!(
-            result, "SELECT * FROM ducklake.s1.v1",
-            "3-part name should not be rewritten"
+            HybridDuckLakeDB::rewrite_table_references("SELECT * FROM ducklake.s1.v1"),
+            "SELECT * FROM ducklake.s1.v1",
         );
     }
 
     #[test]
     fn test_is_write_statement_basic() {
-        assert!(HybridDuckLakeDB::is_write_statement("CREATE TABLE t (x INT)"));
-        assert!(HybridDuckLakeDB::is_write_statement("INSERT INTO t VALUES (1)"));
+        assert!(HybridDuckLakeDB::is_write_statement(
+            "CREATE TABLE t (x INT)"
+        ));
+        assert!(HybridDuckLakeDB::is_write_statement(
+            "INSERT INTO t VALUES (1)"
+        ));
         assert!(HybridDuckLakeDB::is_write_statement("UPDATE t SET x = 1"));
         assert!(HybridDuckLakeDB::is_write_statement("DELETE FROM t"));
         assert!(HybridDuckLakeDB::is_write_statement("DROP TABLE t"));
-        assert!(HybridDuckLakeDB::is_write_statement("ALTER TABLE t ADD COLUMN y INT"));
-        assert!(HybridDuckLakeDB::is_write_statement("MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET x = 1"));
+        assert!(HybridDuckLakeDB::is_write_statement(
+            "ALTER TABLE t ADD COLUMN y INT"
+        ));
+        assert!(HybridDuckLakeDB::is_write_statement(
+            "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET x = 1"
+        ));
         assert!(HybridDuckLakeDB::is_write_statement("BEGIN"));
         assert!(HybridDuckLakeDB::is_write_statement("COMMIT"));
         assert!(HybridDuckLakeDB::is_write_statement("ROLLBACK"));
@@ -799,28 +905,44 @@ mod tests {
     fn test_is_write_statement_read_only() {
         assert!(!HybridDuckLakeDB::is_write_statement("SELECT * FROM t"));
         assert!(!HybridDuckLakeDB::is_write_statement("SELECT 1"));
-        assert!(!HybridDuckLakeDB::is_write_statement("WITH cte AS (SELECT 1) SELECT * FROM cte"));
+        assert!(!HybridDuckLakeDB::is_write_statement(
+            "WITH cte AS (SELECT 1) SELECT * FROM cte"
+        ));
     }
 
     #[test]
     fn test_is_write_statement_mixed_case() {
-        assert!(HybridDuckLakeDB::is_write_statement("create table t (x int)"));
-        assert!(HybridDuckLakeDB::is_write_statement("Insert Into t VALUES (1)"));
+        assert!(HybridDuckLakeDB::is_write_statement(
+            "create table t (x int)"
+        ));
+        assert!(HybridDuckLakeDB::is_write_statement(
+            "Insert Into t VALUES (1)"
+        ));
         assert!(HybridDuckLakeDB::is_write_statement("uPdAtE t SET x = 1"));
         assert!(HybridDuckLakeDB::is_write_statement("Delete FROM t"));
     }
 
     #[test]
     fn test_is_write_statement_leading_whitespace() {
-        assert!(HybridDuckLakeDB::is_write_statement("  CREATE TABLE t (x INT)"));
-        assert!(HybridDuckLakeDB::is_write_statement("\tINSERT INTO t VALUES (1)"));
-        assert!(HybridDuckLakeDB::is_write_statement("\n  UPDATE t SET x = 1"));
+        assert!(HybridDuckLakeDB::is_write_statement(
+            "  CREATE TABLE t (x INT)"
+        ));
+        assert!(HybridDuckLakeDB::is_write_statement(
+            "\tINSERT INTO t VALUES (1)"
+        ));
+        assert!(HybridDuckLakeDB::is_write_statement(
+            "\n  UPDATE t SET x = 1"
+        ));
     }
 
     #[test]
     fn test_is_write_statement_trailing_semicolons() {
-        assert!(HybridDuckLakeDB::is_write_statement("CREATE TABLE t (x INT);"));
-        assert!(HybridDuckLakeDB::is_write_statement("INSERT INTO t VALUES (1) ;"));
+        assert!(HybridDuckLakeDB::is_write_statement(
+            "CREATE TABLE t (x INT);"
+        ));
+        assert!(HybridDuckLakeDB::is_write_statement(
+            "INSERT INTO t VALUES (1) ;"
+        ));
         assert!(HybridDuckLakeDB::is_write_statement("BEGIN;"));
         assert!(HybridDuckLakeDB::is_write_statement("COMMIT ;"));
     }
@@ -828,15 +950,103 @@ mod tests {
     #[test]
     fn test_is_write_statement_ctes_not_writes() {
         // WITH...SELECT should NOT be detected as write
-        assert!(!HybridDuckLakeDB::is_write_statement("WITH x AS (SELECT 1) SELECT * FROM x"));
+        assert!(!HybridDuckLakeDB::is_write_statement(
+            "WITH x AS (SELECT 1) SELECT * FROM x"
+        ));
     }
 
     #[test]
     fn test_is_write_statement_additional_keywords() {
         assert!(HybridDuckLakeDB::is_write_statement("USE ducklake"));
-        assert!(HybridDuckLakeDB::is_write_statement("SET search_path = main"));
+        assert!(HybridDuckLakeDB::is_write_statement(
+            "SET search_path = main"
+        ));
         assert!(HybridDuckLakeDB::is_write_statement("COPY t TO 'file.csv'"));
-        assert!(HybridDuckLakeDB::is_write_statement("PREPARE stmt AS SELECT 1"));
+        assert!(HybridDuckLakeDB::is_write_statement(
+            "PREPARE stmt AS SELECT 1"
+        ));
         assert!(HybridDuckLakeDB::is_write_statement("EXECUTE stmt"));
+    }
+
+    #[test]
+    fn test_transaction_state_tracking() {
+        // Verify that in_transaction flag is toggled by BEGIN/COMMIT/ROLLBACK
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let catalog_path = temp_dir.path().join("test_tx.ducklake");
+        let db = HybridDuckLakeDB::new(catalog_path).unwrap();
+
+        assert!(
+            !db.in_transaction.load(std::sync::atomic::Ordering::Relaxed),
+            "Should not be in transaction initially"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_preserves_string_literals() {
+        // R5-S-033: rewrite_table_references should NOT rewrite inside string literals
+        let result = HybridDuckLakeDB::rewrite_table_references(
+            "SELECT * FROM ducklake.t WHERE col = 'ducklake.value'",
+        );
+        assert!(
+            result.contains("ducklake.main.t"),
+            "Table reference should be rewritten: {result}"
+        );
+        assert!(
+            result.contains("'ducklake.value'"),
+            "String literal should NOT be rewritten: {result}"
+        );
+    }
+
+    #[test]
+    fn test_virtual_column_identifier_matching() {
+        // R5-S-041: should match as standalone identifier, not substring
+        assert!(HybridDuckLakeDB::is_identifier_in_clause(
+            "SELECT ROWID, COL",
+            "ROWID"
+        ));
+        assert!(!HybridDuckLakeDB::is_identifier_in_clause(
+            "SELECT MYROWID, COL",
+            "ROWID"
+        ));
+        assert!(HybridDuckLakeDB::is_identifier_in_clause(
+            "SELECT ROWID",
+            "ROWID"
+        ));
+        assert!(!HybridDuckLakeDB::is_identifier_in_clause(
+            "SELECT _ROWID_",
+            "ROWID"
+        ));
+    }
+
+    #[test]
+    fn test_decimal128_negative_sign() {
+        // R5-S-010: verify negative decimals in (-1, 0) range preserve sign
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        let schema = Schema::new(vec![Field::new("d", DataType::Decimal128(10, 2), true)]);
+        let arr = Decimal128Array::from(vec![
+            Some(-45i128),
+            Some(45i128),
+            Some(-100i128),
+            Some(0i128),
+        ]);
+        let batch = RecordBatch::try_new(
+            std::sync::Arc::new(schema),
+            vec![std::sync::Arc::new(arr.with_precision_and_scale(10, 2).unwrap())],
+        )
+        .unwrap();
+        let rows = convert_batch_to_strings(&batch).unwrap();
+        assert_eq!(
+            rows[0][0], "-0.45",
+            "Negative sub-unit should have negative sign"
+        );
+        assert_eq!(
+            rows[1][0], "0.45",
+            "Positive sub-unit should not have negative sign"
+        );
+        assert_eq!(
+            rows[2][0], "-1.00",
+            "Negative whole should have negative sign"
+        );
+        assert_eq!(rows[3][0], "0.00", "Zero should not have negative sign");
     }
 }

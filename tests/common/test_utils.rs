@@ -32,15 +32,18 @@ pub fn duckdb_value_to_string(v: &duckdb::types::Value) -> String {
         duckdb::types::Value::Timestamp(unit, val) => {
             let (secs, nsecs) = match unit {
                 duckdb::types::TimeUnit::Second => (*val, 0u32),
-                duckdb::types::TimeUnit::Millisecond => {
-                    (val / 1000, ((val % 1000) * 1_000_000) as u32)
-                },
-                duckdb::types::TimeUnit::Microsecond => {
-                    (val / 1_000_000, ((val % 1_000_000) * 1_000) as u32)
-                },
-                duckdb::types::TimeUnit::Nanosecond => {
-                    (val / 1_000_000_000, (val % 1_000_000_000) as u32)
-                },
+                duckdb::types::TimeUnit::Millisecond => (
+                    val.div_euclid(1000),
+                    (val.rem_euclid(1000) * 1_000_000) as u32,
+                ),
+                duckdb::types::TimeUnit::Microsecond => (
+                    val.div_euclid(1_000_000),
+                    (val.rem_euclid(1_000_000) * 1_000) as u32,
+                ),
+                duckdb::types::TimeUnit::Nanosecond => (
+                    val.div_euclid(1_000_000_000),
+                    val.rem_euclid(1_000_000_000) as u32,
+                ),
             };
             let dt = chrono::DateTime::from_timestamp(secs, nsecs).unwrap();
             dt.format("%Y-%m-%d %H:%M:%S").to_string()
@@ -100,11 +103,24 @@ pub fn arrow_value_to_string(array: &dyn Array, idx: usize) -> String {
         },
         DataType::Float32 => {
             let a = array.as_any().downcast_ref::<Float32Array>().unwrap();
-            format!("{}", a.value(idx))
+            let v = a.value(idx);
+            let s = v.to_string();
+            // Ensure float values always have a decimal point (e.g., "20" → "20.0")
+            if !s.contains('.') {
+                format!("{s}.0")
+            } else {
+                s
+            }
         },
         DataType::Float64 => {
             let a = array.as_any().downcast_ref::<Float64Array>().unwrap();
-            format!("{}", a.value(idx))
+            let v = a.value(idx);
+            let s = v.to_string();
+            if !s.contains('.') {
+                format!("{s}.0")
+            } else {
+                s
+            }
         },
         DataType::Utf8 => {
             let a = array.as_any().downcast_ref::<StringArray>().unwrap();
@@ -127,8 +143,8 @@ pub fn arrow_value_to_string(array: &dyn Array, idx: usize) -> String {
                     .downcast_ref::<TimestampMicrosecondArray>()
                     .unwrap();
                 let us = a.value(idx);
-                let secs = us / 1_000_000;
-                let subsec_us = (us % 1_000_000) as u32;
+                let secs = us.div_euclid(1_000_000);
+                let subsec_us = us.rem_euclid(1_000_000) as u32;
                 let dt = chrono::DateTime::from_timestamp(secs, subsec_us * 1000).unwrap();
                 dt.format("%Y-%m-%d %H:%M:%S").to_string()
             },
@@ -138,8 +154,8 @@ pub fn arrow_value_to_string(array: &dyn Array, idx: usize) -> String {
                     .downcast_ref::<TimestampNanosecondArray>()
                     .unwrap();
                 let ns = a.value(idx);
-                let secs = ns / 1_000_000_000;
-                let subsec_ns = (ns % 1_000_000_000) as u32;
+                let secs = ns.div_euclid(1_000_000_000);
+                let subsec_ns = ns.rem_euclid(1_000_000_000) as u32;
                 let dt = chrono::DateTime::from_timestamp(secs, subsec_ns).unwrap();
                 dt.format("%Y-%m-%d %H:%M:%S").to_string()
             },
@@ -149,8 +165,8 @@ pub fn arrow_value_to_string(array: &dyn Array, idx: usize) -> String {
                     .downcast_ref::<TimestampMillisecondArray>()
                     .unwrap();
                 let ms = a.value(idx);
-                let secs = ms / 1_000;
-                let subsec_ms = (ms % 1_000) as u32;
+                let secs = ms.div_euclid(1_000);
+                let subsec_ms = ms.rem_euclid(1_000) as u32;
                 let dt = chrono::DateTime::from_timestamp(secs, subsec_ms * 1_000_000).unwrap();
                 dt.format("%Y-%m-%d %H:%M:%S").to_string()
             },
@@ -171,7 +187,12 @@ pub fn arrow_value_to_string(array: &dyn Array, idx: usize) -> String {
             let divisor = 10i128.pow(scale);
             let whole = raw / divisor;
             let frac = (raw % divisor).unsigned_abs();
-            format!("{whole}.{frac:0>width$}", width = scale as usize)
+            let sign = if raw < 0 && whole == 0 {
+                "-"
+            } else {
+                ""
+            };
+            format!("{sign}{whole}.{frac:0>width$}", width = scale as usize)
         },
         other => format!("<unsupported:{other:?}>"),
     }
@@ -273,16 +294,18 @@ pub fn get_int_column(batch: &RecordBatch, col_idx: usize) -> Vec<i32> {
 
 /// Normalize a string value for comparison (handle float precision differences).
 ///
-/// Only normalizes values that look like floats (contain '.') to avoid
-/// collapsing distinct integer/float representations (e.g. "100" vs "100.0000001").
+/// Only normalizes values that look like floats (contain '.' or 'e'/'E') to avoid
+/// collapsing distinct integer/float representations or losing large-integer precision.
 pub fn normalize_value(s: &str) -> String {
     if s == "NULL" {
         return s.to_string();
     }
-    // Normalize any numeric value to a canonical float form so that
-    // cross-engine representation differences (e.g. "0" vs "0.0") match.
-    if let Ok(f) = s.parse::<f64>() {
-        return format!("{:.6}", f);
+    // Only normalize values that look like floats — containing '.' or scientific notation.
+    // Integer strings are compared exactly to preserve precision and detect type confusion.
+    if s.contains('.') || s.contains('e') || s.contains('E') {
+        if let Ok(f) = s.parse::<f64>() {
+            return format!("{:.6}", f);
+        }
     }
     s.to_string()
 }
@@ -347,12 +370,11 @@ impl DuckDbConn {
             .expect("install ducklake");
         conn.execute("LOAD ducklake;", []).expect("load ducklake");
         let attach_path = format!("ducklake:sqlite:{}", catalog_db_path.display());
-        conn.execute(
-            &format!("ATTACH '{}' AS ducklake;", attach_path),
-            [],
-        )
-        .expect("attach ducklake catalog");
-        DuckDbConn { conn }
+        conn.execute(&format!("ATTACH '{}' AS ducklake;", attach_path), [])
+            .expect("attach ducklake catalog");
+        DuckDbConn {
+            conn,
+        }
     }
 
     /// Open a DuckLake catalog in DuckDB using the native DuckDB backend.
@@ -363,12 +385,11 @@ impl DuckDbConn {
             .expect("install ducklake");
         conn.execute("LOAD ducklake;", []).expect("load ducklake");
         let attach_path = format!("ducklake:{}", catalog_path.display());
-        conn.execute(
-            &format!("ATTACH '{}' AS ducklake;", attach_path),
-            [],
-        )
-        .expect("attach ducklake catalog");
-        DuckDbConn { conn }
+        conn.execute(&format!("ATTACH '{}' AS ducklake;", attach_path), [])
+            .expect("attach ducklake catalog");
+        DuckDbConn {
+            conn,
+        }
     }
 
     /// Open/create a DuckLake catalog in DuckDB with a specified DATA_PATH.
@@ -390,7 +411,9 @@ impl DuckDbConn {
             [],
         )
         .expect("attach ducklake catalog with data path");
-        DuckDbConn { conn }
+        DuckDbConn {
+            conn,
+        }
     }
 
     /// Execute a SQL statement (no results expected).
@@ -401,21 +424,25 @@ impl DuckDbConn {
     }
 
     /// Query and return results as Vec<Vec<String>>.
+    ///
+    /// Uses the Rows column_count() API (available after execution) to iterate
+    /// columns precisely instead of trial-and-error.
     pub fn query(&self, sql: &str) -> Vec<Vec<String>> {
         let mut stmt = self
             .conn
             .prepare(sql)
             .unwrap_or_else(|e| panic!("DuckDB prepare failed: {e}\nSQL: {sql}"));
         let mut rows = stmt.query([]).expect("DuckDB query failed");
+        let col_count = rows.as_ref().map(|r| r.column_count()).unwrap_or(0);
 
         let mut results = Vec::new();
         while let Some(row) = rows.next().expect("DuckDB row iteration") {
             let mut vals = Vec::new();
-            for i in 0.. {
-                match row.get::<_, duckdb::types::Value>(i) {
-                    Ok(v) => vals.push(duckdb_value_to_string(&v)),
-                    Err(_) => break,
-                }
+            for i in 0..col_count {
+                let v: duckdb::types::Value = row
+                    .get(i)
+                    .unwrap_or_else(|e| panic!("DuckDB column {i} decode error: {e}\nSQL: {sql}"));
+                vals.push(duckdb_value_to_string(&v));
             }
             results.push(vals);
         }
@@ -438,20 +465,16 @@ impl DuckDbConn {
     }
 
     /// Fallible query — returns Result instead of panicking.
-    pub fn try_query(
-        &self,
-        sql: &str,
-    ) -> std::result::Result<Vec<Vec<String>>, duckdb::Error> {
+    pub fn try_query(&self, sql: &str) -> std::result::Result<Vec<Vec<String>>, duckdb::Error> {
         let mut stmt = self.conn.prepare(sql)?;
         let mut rows = stmt.query([])?;
+        let col_count = rows.as_ref().map(|r| r.column_count()).unwrap_or(0);
         let mut results = Vec::new();
         while let Some(row) = rows.next()? {
             let mut vals = Vec::new();
-            for i in 0.. {
-                match row.get::<_, duckdb::types::Value>(i) {
-                    Ok(v) => vals.push(duckdb_value_to_string(&v)),
-                    Err(_) => break,
-                }
+            for i in 0..col_count {
+                let v: duckdb::types::Value = row.get(i)?;
+                vals.push(duckdb_value_to_string(&v));
             }
             results.push(vals);
         }
