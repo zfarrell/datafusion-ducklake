@@ -272,7 +272,18 @@ impl DuckLakeTableWriter {
                     ))
                 })
             })
-            .try_fold(0i64, |acc, r| r.and_then(|n| Ok(acc.saturating_add(n))))?;
+            // R5-S-019: Use checked_add to detect overflow instead of silently
+            // clipping to i64::MAX with saturating_add.
+            .try_fold(0i64, |acc, r| {
+                r.and_then(|n| {
+                    acc.checked_add(n).ok_or_else(|| {
+                        crate::error::DuckLakeError::Internal(format!(
+                            "Total row count overflow: {} + {} exceeds i64::MAX",
+                            acc, n
+                        ))
+                    })
+                })
+            })?;
 
         // Only try inlining for Append mode
         if mode == WriteMode::Append {
@@ -319,14 +330,16 @@ impl DuckLakeTableWriter {
                     let had_inline = current_inline > 0;
 
                     if had_inline {
-                        // Get existing inline data and convert to RecordBatch
-                        if let Ok(inline_rows) = self.get_inlined_data_as_batch(
+                        // R5-S-004: Propagate error instead of swallowing it.
+                        // If get_inlined_data_as_batch fails and we continue, the
+                        // subsequent clear_inlined_data would discard existing inline
+                        // rows, causing silent data loss.
+                        let inline_rows = self.get_inlined_data_as_batch(
                             setup.table_id,
                             setup.snapshot_id,
                             arrow_schema,
-                        ) {
-                            all_batches.push(inline_rows);
-                        }
+                        )?;
+                        all_batches.push(inline_rows);
                     }
 
                     all_batches.extend(batches.iter().cloned());
@@ -408,11 +421,10 @@ impl DuckLakeTableWriter {
         let arrow_fields: Vec<Field> = active_columns
             .iter()
             .map(|(name, dtype, nullable)| {
-                let arrow_type = crate::types::ducklake_to_arrow_type(dtype)
-                    .unwrap_or(arrow::datatypes::DataType::Utf8);
-                Field::new(name, arrow_type, *nullable)
+                let arrow_type = crate::types::ducklake_to_arrow_type(dtype)?;
+                Ok(Field::new(name, arrow_type, *nullable))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         let arrow_schema = Schema::new(arrow_fields);
 
         // Begin a write transaction with the proper columns
@@ -515,9 +527,22 @@ impl DuckLakeTableWriter {
             self.metadata
                 .register_data_file(setup.table_id, setup.snapshot_id, &file_info)?;
 
+        // R5-S-025: Treat column-stats as non-fatal after data file is committed.
+        // The data file is already registered; failing here would roll back only the
+        // stats (if in the same transaction) but propagating the error could cause
+        // callers to retry and re-register the data file.
         if !column_stats.is_empty() {
-            self.metadata
-                .register_column_stats(data_file_id, setup.table_id, &column_stats)?;
+            if let Err(e) =
+                self.metadata
+                    .register_column_stats(data_file_id, setup.table_id, &column_stats)
+            {
+                tracing::warn!(
+                    data_file_id,
+                    table_id = setup.table_id,
+                    error = %e,
+                    "Failed to register column stats; file-level pruning may be less effective"
+                );
+            }
         }
 
         Ok(WriteResult {
@@ -624,16 +649,18 @@ impl DuckLakeTableWriter {
 
         if write_mode == WriteMode::Replace {
             // Atomic: end existing files + register all new files in one transaction
-            let ids = self.metadata.replace_table_files(
-                setup.table_id,
-                setup.snapshot_id,
-                &entries,
-            )?;
+            let ids =
+                self.metadata
+                    .replace_table_files(setup.table_id, setup.snapshot_id, &entries)?;
             if let Some(&id) = ids.last() {
                 last_data_file_id = id;
             }
         } else {
-            // Append mode: register files individually
+            // Append mode: register files individually.
+            // R5-S-024: Each register_data_file call is a separate transaction.
+            // A mid-loop failure leaves previously registered files committed.
+            // This is acceptable for append mode since partial results are valid
+            // (no old data is removed), and the caller can retry the remaining files.
             for entry in &entries {
                 let data_file_id = self.metadata.register_data_file(
                     setup.table_id,
@@ -869,6 +896,12 @@ impl TableWriteSession {
 
         // Stage 1: Register data file (critical path).
         // If this fails, the file is orphaned and can be safely cleaned up.
+        // R5-S-022: Note — end_table_files and register_data_file use separate
+        // transactions. If register_data_file fails after end_table_files commits,
+        // old data is gone but the new file isn't registered. The multi-file
+        // commit_uploaded_files path uses replace_table_files (single transaction)
+        // which is fully atomic. This single-file path accepts the small risk
+        // since a register_data_file failure after successful upload+end is unlikely.
         if self.write_mode == WriteMode::Replace {
             if let Err(e) = self
                 .metadata
@@ -892,10 +925,11 @@ impl TableWriteSession {
             file_info = file_info.with_absolute_path();
         }
 
-        let data_file_id = match self
-            .metadata
-            .register_data_file(self.table_id, self.snapshot_id, &file_info)
-        {
+        let data_file_id = match self.metadata.register_data_file(
+            self.table_id,
+            self.snapshot_id,
+            &file_info,
+        ) {
             Ok(id) => id,
             Err(e) => {
                 // register_data_file failed — file not referenced, safe to clean up
@@ -914,9 +948,9 @@ impl TableWriteSession {
         // R4-S-017: If this fails, the data file is already committed in metadata.
         // Do NOT clean up the file — metadata already references it.
         if !column_stats.is_empty() {
-            if let Err(e) = self
-                .metadata
-                .register_column_stats(data_file_id, self.table_id, &column_stats)
+            if let Err(e) =
+                self.metadata
+                    .register_column_stats(data_file_id, self.table_id, &column_stats)
             {
                 tracing::warn!(
                     data_file_id,
@@ -982,24 +1016,35 @@ fn arrow_array_value_to_string(
 
     macro_rules! downcast_value {
         ($array_type:ty) => {{
-            let a = array.as_any().downcast_ref::<$array_type>().ok_or_else(|| {
-                crate::error::DuckLakeError::Internal(format!(
-                    "Failed to downcast {:?} array",
-                    array.data_type()
-                ))
-            })?;
+            let a = array
+                .as_any()
+                .downcast_ref::<$array_type>()
+                .ok_or_else(|| {
+                    crate::error::DuckLakeError::Internal(format!(
+                        "Failed to downcast {:?} array",
+                        array.data_type()
+                    ))
+                })?;
             Ok(a.value(idx).to_string())
         }};
     }
 
     match array.data_type() {
         DataType::Boolean => {
-            let a = array.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
-                crate::error::DuckLakeError::Internal(
-                    "Failed to downcast Boolean array".to_string(),
-                )
-            })?;
-            Ok(if a.value(idx) { "true" } else { "false" }.to_string())
+            let a = array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| {
+                    crate::error::DuckLakeError::Internal(
+                        "Failed to downcast Boolean array".to_string(),
+                    )
+                })?;
+            Ok(if a.value(idx) {
+                "true"
+            } else {
+                "false"
+            }
+            .to_string())
         },
         DataType::Int8 => downcast_value!(Int8Array),
         DataType::Int16 => downcast_value!(Int16Array),
@@ -1013,16 +1058,104 @@ fn arrow_array_value_to_string(
         DataType::Float64 => downcast_value!(Float64Array),
         DataType::Utf8 => downcast_value!(StringArray),
         DataType::LargeUtf8 => downcast_value!(LargeStringArray),
-        DataType::Date32 => downcast_value!(Date32Array),
-        DataType::Date64 => downcast_value!(Date64Array),
+        DataType::Date32 => {
+            let a = array
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .ok_or_else(|| {
+                    crate::error::DuckLakeError::Internal(
+                        "Failed to downcast Date32 array".to_string(),
+                    )
+                })?;
+            let epoch_days = a.value(idx);
+            let date = chrono::NaiveDate::from_num_days_from_ce_opt(epoch_days + 719_163)
+                .ok_or_else(|| {
+                    crate::error::DuckLakeError::Internal(format!(
+                        "Invalid Date32 epoch days: {}",
+                        epoch_days
+                    ))
+                })?;
+            Ok(date.format("%Y-%m-%d").to_string())
+        },
+        DataType::Date64 => {
+            let a = array
+                .as_any()
+                .downcast_ref::<Date64Array>()
+                .ok_or_else(|| {
+                    crate::error::DuckLakeError::Internal(
+                        "Failed to downcast Date64 array".to_string(),
+                    )
+                })?;
+            let epoch_ms = a.value(idx);
+            let epoch_days = (epoch_ms / 86_400_000) as i32;
+            let date = chrono::NaiveDate::from_num_days_from_ce_opt(epoch_days + 719_163)
+                .ok_or_else(|| {
+                    crate::error::DuckLakeError::Internal(format!(
+                        "Invalid Date64 epoch ms: {}",
+                        epoch_ms
+                    ))
+                })?;
+            Ok(date.format("%Y-%m-%d").to_string())
+        },
         DataType::Timestamp(unit, _) => {
             use arrow::datatypes::TimeUnit;
-            match unit {
-                TimeUnit::Second => downcast_value!(TimestampSecondArray),
-                TimeUnit::Millisecond => downcast_value!(TimestampMillisecondArray),
-                TimeUnit::Microsecond => downcast_value!(TimestampMicrosecondArray),
-                TimeUnit::Nanosecond => downcast_value!(TimestampNanosecondArray),
-            }
+            let epoch_us = {
+                match unit {
+                    TimeUnit::Second => {
+                        let a = array
+                            .as_any()
+                            .downcast_ref::<TimestampSecondArray>()
+                            .ok_or_else(|| {
+                                crate::error::DuckLakeError::Internal(
+                                    "Failed to downcast TimestampSecond array".to_string(),
+                                )
+                            })?;
+                        a.value(idx) * 1_000_000
+                    },
+                    TimeUnit::Millisecond => {
+                        let a = array
+                            .as_any()
+                            .downcast_ref::<TimestampMillisecondArray>()
+                            .ok_or_else(|| {
+                                crate::error::DuckLakeError::Internal(
+                                    "Failed to downcast TimestampMillisecond array".to_string(),
+                                )
+                            })?;
+                        a.value(idx) * 1_000
+                    },
+                    TimeUnit::Microsecond => {
+                        let a = array
+                            .as_any()
+                            .downcast_ref::<TimestampMicrosecondArray>()
+                            .ok_or_else(|| {
+                                crate::error::DuckLakeError::Internal(
+                                    "Failed to downcast TimestampMicrosecond array".to_string(),
+                                )
+                            })?;
+                        a.value(idx)
+                    },
+                    TimeUnit::Nanosecond => {
+                        let a = array
+                            .as_any()
+                            .downcast_ref::<TimestampNanosecondArray>()
+                            .ok_or_else(|| {
+                                crate::error::DuckLakeError::Internal(
+                                    "Failed to downcast TimestampNanosecond array".to_string(),
+                                )
+                            })?;
+                        a.value(idx) / 1_000
+                    },
+                }
+            };
+            let secs = epoch_us.div_euclid(1_000_000);
+            let sub_us = epoch_us.rem_euclid(1_000_000) as u32;
+            let dt = chrono::DateTime::from_timestamp(secs, sub_us * 1_000).ok_or_else(|| {
+                crate::error::DuckLakeError::Internal(format!(
+                    "Invalid timestamp epoch microseconds: {}",
+                    epoch_us
+                ))
+            })?;
+            Ok(dt.format("%Y-%m-%d %H:%M:%S").to_string())
         },
         _ => {
             // Fallback: use Arrow's default display
@@ -1074,6 +1207,63 @@ pub(crate) fn inlined_rows_to_batch(
         Arc::new(schema.clone()),
         column_arrays,
     )?)
+}
+
+/// Parse a decimal string (e.g. "123.45") to an i128 value scaled by 10^scale.
+fn parse_decimal_string(s: &str, scale: i8) -> Result<i128> {
+    let negative = s.starts_with('-');
+    let s = if negative {
+        &s[1..]
+    } else {
+        s
+    };
+
+    let (integer_part, frac_part) = if let Some(dot_pos) = s.find('.') {
+        (&s[..dot_pos], &s[dot_pos + 1..])
+    } else {
+        (s, "")
+    };
+
+    let integer: i128 = if integer_part.is_empty() {
+        0
+    } else {
+        integer_part.parse::<i128>().map_err(|_| {
+            crate::error::DuckLakeError::Internal(format!(
+                "Failed to parse decimal integer part '{}'",
+                integer_part
+            ))
+        })?
+    };
+
+    let scale_u = scale.max(0) as u32;
+    let frac_len = frac_part.len() as u32;
+    let frac: i128 = if frac_part.is_empty() {
+        0
+    } else if frac_len <= scale_u {
+        let frac_val: i128 = frac_part.parse::<i128>().map_err(|_| {
+            crate::error::DuckLakeError::Internal(format!(
+                "Failed to parse decimal fraction part '{}'",
+                frac_part
+            ))
+        })?;
+        frac_val * 10i128.pow(scale_u - frac_len)
+    } else {
+        // Truncate extra digits
+        let truncated = &frac_part[..scale_u as usize];
+        truncated.parse::<i128>().map_err(|_| {
+            crate::error::DuckLakeError::Internal(format!(
+                "Failed to parse decimal fraction part '{}'",
+                truncated
+            ))
+        })?
+    };
+
+    let unscaled = integer * 10i128.pow(scale_u) + frac;
+    Ok(if negative {
+        -unscaled
+    } else {
+        unscaled
+    })
 }
 
 /// Parse string values into an Arrow array of the given data type.
@@ -1156,23 +1346,87 @@ fn parse_string_to_array(
             }
             Arc::new(builder.finish())
         },
-        DataType::Date32 => parse_primitive!(Date32Builder, values),
-        DataType::Date64 => parse_primitive!(Date64Builder, values),
+        DataType::Date32 => {
+            let mut builder = Date32Builder::with_capacity(values.len());
+            for val in values {
+                match val {
+                    Some(s) => {
+                        // Try ISO date string first ("2024-06-15"), then epoch days
+                        let epoch_days =
+                            if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+                                let epoch: chrono::NaiveDate =
+                                    chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+                                date.signed_duration_since(epoch).num_days() as i32
+                            } else if let Ok(v) = s.parse::<i32>() {
+                                v
+                            } else {
+                                return Err(crate::error::DuckLakeError::Internal(format!(
+                                    "Failed to parse inlined value '{}' as Date32",
+                                    s
+                                )));
+                            };
+                        builder.append_value(epoch_days);
+                    },
+                    None => builder.append_null(),
+                }
+            }
+            Arc::new(builder.finish()) as Arc<dyn Array>
+        },
+        DataType::Date64 => {
+            let mut builder = Date64Builder::with_capacity(values.len());
+            for val in values {
+                match val {
+                    Some(s) => {
+                        let epoch_ms =
+                            if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+                                let epoch: chrono::NaiveDate =
+                                    chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+                                date.signed_duration_since(epoch).num_days() as i64 * 86_400_000
+                            } else if let Ok(v) = s.parse::<i64>() {
+                                v
+                            } else {
+                                return Err(crate::error::DuckLakeError::Internal(format!(
+                                    "Failed to parse inlined value '{}' as Date64",
+                                    s
+                                )));
+                            };
+                        builder.append_value(epoch_ms);
+                    },
+                    None => builder.append_null(),
+                }
+            }
+            Arc::new(builder.finish()) as Arc<dyn Array>
+        },
         DataType::Timestamp(unit, tz) => {
             use arrow::datatypes::TimeUnit;
 
+            /// Parse a timestamp string (ISO or epoch integer) to epoch microseconds.
+            fn parse_timestamp_to_us(s: &str) -> std::result::Result<i64, String> {
+                // Try ISO format first: "2024-06-15 12:30:00"
+                if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+                    let utc: chrono::DateTime<chrono::Utc> = dt.and_utc();
+                    return Ok(utc.timestamp_micros());
+                }
+                // Try with fractional seconds: "2024-06-15 12:30:00.123456"
+                if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
+                    let utc: chrono::DateTime<chrono::Utc> = dt.and_utc();
+                    return Ok(utc.timestamp_micros());
+                }
+                // Fallback: raw integer (epoch microseconds)
+                s.parse::<i64>()
+                    .map_err(|_| format!("Failed to parse '{}' as Timestamp", s))
+            }
+
             macro_rules! build_timestamp {
-                ($builder_ty:ty) => {{
+                ($builder_ty:ty, $convert:expr) => {{
                     let mut builder = <$builder_ty>::with_capacity(values.len());
+                    let convert_fn: fn(i64) -> i64 = $convert;
                     for val in values {
                         match val {
-                            Some(s) => match s.parse::<i64>() {
-                                Ok(v) => builder.append_value(v),
-                                Err(_) => {
-                                    return Err(crate::error::DuckLakeError::Internal(format!(
-                                        "Failed to parse inlined value '{}' as Timestamp",
-                                        s
-                                    )));
+                            Some(s) => match parse_timestamp_to_us(s) {
+                                Ok(us) => builder.append_value(convert_fn(us)),
+                                Err(msg) => {
+                                    return Err(crate::error::DuckLakeError::Internal(msg));
                                 },
                             },
                             None => builder.append_null(),
@@ -1187,11 +1441,65 @@ fn parse_string_to_array(
             }
 
             match unit {
-                TimeUnit::Second => build_timestamp!(TimestampSecondBuilder),
-                TimeUnit::Millisecond => build_timestamp!(TimestampMillisecondBuilder),
-                TimeUnit::Microsecond => build_timestamp!(TimestampMicrosecondBuilder),
-                TimeUnit::Nanosecond => build_timestamp!(TimestampNanosecondBuilder),
+                TimeUnit::Second => {
+                    build_timestamp!(TimestampSecondBuilder, |us: i64| us / 1_000_000)
+                },
+                TimeUnit::Millisecond => {
+                    build_timestamp!(TimestampMillisecondBuilder, |us: i64| us / 1_000)
+                },
+                TimeUnit::Microsecond => {
+                    build_timestamp!(TimestampMicrosecondBuilder, |us: i64| us)
+                },
+                TimeUnit::Nanosecond => {
+                    build_timestamp!(TimestampNanosecondBuilder, |us: i64| us * 1_000)
+                },
             }
+        },
+        DataType::Decimal128(precision, scale) => {
+            let mut builder = Decimal128Builder::with_capacity(values.len());
+            for val in values {
+                match val {
+                    Some(s) => {
+                        let i128_val = parse_decimal_string(s, *scale)?;
+                        builder.append_value(i128_val);
+                    },
+                    None => builder.append_null(),
+                }
+            }
+            Arc::new(
+                builder
+                    .finish()
+                    .with_precision_and_scale(*precision, *scale)
+                    .map_err(|e| {
+                        crate::error::DuckLakeError::Internal(format!(
+                            "Invalid Decimal128 precision/scale: {}",
+                            e
+                        ))
+                    })?,
+            ) as Arc<dyn Array>
+        },
+        DataType::Decimal256(precision, scale) => {
+            let mut builder = Decimal256Builder::with_capacity(values.len());
+            for val in values {
+                match val {
+                    Some(s) => {
+                        let i128_val = parse_decimal_string(s, *scale)?;
+                        builder.append_value(arrow::datatypes::i256::from_i128(i128_val));
+                    },
+                    None => builder.append_null(),
+                }
+            }
+            Arc::new(
+                builder
+                    .finish()
+                    .with_precision_and_scale(*precision, *scale)
+                    .map_err(|e| {
+                        crate::error::DuckLakeError::Internal(format!(
+                            "Invalid Decimal256 precision/scale: {}",
+                            e
+                        ))
+                    })?,
+            ) as Arc<dyn Array>
         },
         other => {
             return Err(crate::error::DuckLakeError::UnsupportedType(format!(
@@ -1269,7 +1577,7 @@ pub(crate) fn extract_column_stats(
                     null_counts[col_idx] = null_counts[col_idx].saturating_add(nc_i64);
                 }
 
-                let (batch_min, batch_max) = parquet_stats_min_max(stats);
+                let (batch_min, batch_max) = parquet_stats_min_max(stats, col_chunk.column_descr());
 
                 if let Some(ref bm) = batch_min {
                     match &min_values[col_idx] {
@@ -1310,6 +1618,7 @@ pub(crate) fn extract_column_stats(
 /// Extract min/max values from Parquet statistics as strings.
 fn parquet_stats_min_max(
     stats: &parquet::file::statistics::Statistics,
+    col_descr: &parquet::schema::types::ColumnDescriptor,
 ) -> (Option<String>, Option<String>) {
     use parquet::file::statistics::Statistics;
     match stats {
@@ -1339,14 +1648,47 @@ fn parquet_stats_min_max(
             vs.max_opt()
                 .and_then(|v| String::from_utf8(v.data().to_vec()).ok()),
         ),
-        Statistics::FixedLenByteArray(vs) => (
-            vs.min_opt()
-                .and_then(|v| String::from_utf8(v.data().to_vec()).ok()),
-            vs.max_opt()
-                .and_then(|v| String::from_utf8(v.data().to_vec()).ok()),
-        ),
+        Statistics::FixedLenByteArray(vs) => {
+            // Check if this is a Decimal column — decode as big-endian two's complement
+            let is_decimal = matches!(
+                col_descr.logical_type_ref(),
+                Some(parquet::basic::LogicalType::Decimal { .. })
+            );
+            if is_decimal {
+                (
+                    vs.min_opt().map(|v| decode_decimal_bytes(v.data())),
+                    vs.max_opt().map(|v| decode_decimal_bytes(v.data())),
+                )
+            } else {
+                (
+                    vs.min_opt()
+                        .and_then(|v| String::from_utf8(v.data().to_vec()).ok()),
+                    vs.max_opt()
+                        .and_then(|v| String::from_utf8(v.data().to_vec()).ok()),
+                )
+            }
+        },
         Statistics::Int96(_) => (None, None),
     }
+}
+
+/// Decode a big-endian two's complement byte array to a decimal string.
+fn decode_decimal_bytes(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return "0".to_string();
+    }
+    // Sign-extend to 16 bytes for i128
+    let negative = bytes[0] & 0x80 != 0;
+    let fill = if negative {
+        0xFF
+    } else {
+        0x00
+    };
+    let mut padded = [fill; 16];
+    let start = 16usize.saturating_sub(bytes.len());
+    padded[start..].copy_from_slice(bytes);
+    let value = i128::from_be_bytes(padded);
+    value.to_string()
 }
 
 /// Decide whether a new min value should replace the current one.
@@ -1375,6 +1717,13 @@ fn should_replace_min(
                 _ => false,
             }
         },
+        Statistics::FixedLenByteArray(_) => {
+            // Decoded decimal values: compare numerically
+            match (new_val.parse::<i128>().ok(), current.parse::<i128>().ok()) {
+                (Some(n), Some(c)) => n < c,
+                _ => new_val < current,
+            }
+        },
         _ => new_val < current,
     }
 }
@@ -1401,6 +1750,12 @@ fn should_replace_max(
                 (Some(n), Some(c)) if !n.is_nan() && !c.is_nan() => n.total_cmp(&c).is_gt(),
                 (Some(n), Some(_)) if !n.is_nan() => true, // new is non-NaN, current is NaN → replace
                 _ => false,
+            }
+        },
+        Statistics::FixedLenByteArray(_) => {
+            match (new_val.parse::<i128>().ok(), current.parse::<i128>().ok()) {
+                (Some(n), Some(c)) => n > c,
+                _ => new_val > current,
             }
         },
         _ => new_val > current,
@@ -1674,21 +2029,24 @@ mod tests {
     }
 
     #[test]
-    fn test_arrow_array_value_to_string_date32_epoch_days() {
+    fn test_arrow_array_value_to_string_date32_iso() {
         use arrow::array::Date32Array;
-        // 2024-06-15 is 19889 days since epoch — serialized as epoch-days integer
+        // 2024-06-15 is 19889 days since epoch — serialized as ISO date string
         let array = Date32Array::from(vec![19889]);
-        assert_eq!(arrow_array_value_to_string(&array, 0).unwrap(), "19889");
+        assert_eq!(
+            arrow_array_value_to_string(&array, 0).unwrap(),
+            "2024-06-15"
+        );
     }
 
     #[test]
-    fn test_arrow_array_value_to_string_date64_epoch_ms() {
+    fn test_arrow_array_value_to_string_date64_iso() {
         use arrow::array::Date64Array;
         let ms: i64 = 19889 * 86400 * 1000;
         let array = Date64Array::from(vec![ms]);
         assert_eq!(
             arrow_array_value_to_string(&array, 0).unwrap(),
-            ms.to_string()
+            "2024-06-15"
         );
     }
 
@@ -1696,7 +2054,10 @@ mod tests {
     fn test_arrow_array_value_to_string_epoch_date32_zero() {
         use arrow::array::Date32Array;
         let array = Date32Array::from(vec![0]);
-        assert_eq!(arrow_array_value_to_string(&array, 0).unwrap(), "0");
+        assert_eq!(
+            arrow_array_value_to_string(&array, 0).unwrap(),
+            "1970-01-01"
+        );
     }
 
     #[test]
@@ -1737,12 +2098,12 @@ mod tests {
     #[test]
     fn test_date32_inlined_roundtrip() {
         use arrow::array::Date32Array;
-        // Write: Date32 value 19889 (2024-06-15) -> string "19889"
+        // Write: Date32 value 19889 (2024-06-15) -> ISO string "2024-06-15"
         let array = Date32Array::from(vec![19889]);
         let serialized = arrow_array_value_to_string(&array, 0).unwrap();
-        assert_eq!(serialized, "19889");
+        assert_eq!(serialized, "2024-06-15");
 
-        // Read: string "19889" -> Date32 value 19889
+        // Read: ISO string "2024-06-15" -> Date32 value 19889
         let values = vec![Some(serialized)];
         let result = parse_string_to_array(&values, &DataType::Date32).unwrap();
         let date_array = result.as_any().downcast_ref::<Date32Array>().unwrap();
@@ -1753,19 +2114,44 @@ mod tests {
     fn test_timestamp_inlined_roundtrip() {
         use arrow::array::TimestampMicrosecondArray;
         use arrow::datatypes::TimeUnit;
-        // Write: Timestamp microseconds value -> string of epoch value
-        let epoch_us: i64 = 1_718_451_000_000_000; // ~2024-06-15T12:30:00
+        // Write: Timestamp microseconds value -> ISO string "2024-06-15 11:30:00"
+        let epoch_us: i64 = 1_718_451_000_000_000; // 2024-06-15T11:30:00 UTC
         let array = TimestampMicrosecondArray::from(vec![epoch_us]);
         let serialized = arrow_array_value_to_string(&array, 0).unwrap();
-        assert_eq!(serialized, epoch_us.to_string());
+        assert_eq!(serialized, "2024-06-15 11:30:00");
 
-        // Read: string -> Timestamp microseconds
+        // Read: ISO string -> Timestamp microseconds
         let values = vec![Some(serialized)];
-        let result = parse_string_to_array(
-            &values,
-            &DataType::Timestamp(TimeUnit::Microsecond, None),
-        )
-        .unwrap();
+        let result =
+            parse_string_to_array(&values, &DataType::Timestamp(TimeUnit::Microsecond, None))
+                .unwrap();
+        let ts_array = result
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(ts_array.value(0), epoch_us);
+    }
+
+    #[test]
+    fn test_date32_backward_compat_epoch_days_parsing() {
+        use arrow::array::Date32Array;
+        // Verify that old epoch-day strings ("19889") are still parseable
+        let values = vec![Some("19889".to_string())];
+        let result = parse_string_to_array(&values, &DataType::Date32).unwrap();
+        let date_array = result.as_any().downcast_ref::<Date32Array>().unwrap();
+        assert_eq!(date_array.value(0), 19889);
+    }
+
+    #[test]
+    fn test_timestamp_backward_compat_epoch_us_parsing() {
+        use arrow::array::TimestampMicrosecondArray;
+        use arrow::datatypes::TimeUnit;
+        // Verify that old epoch-microsecond strings are still parseable
+        let epoch_us: i64 = 1_718_451_000_000_000;
+        let values = vec![Some(epoch_us.to_string())];
+        let result =
+            parse_string_to_array(&values, &DataType::Timestamp(TimeUnit::Microsecond, None))
+                .unwrap();
         let ts_array = result
             .as_any()
             .downcast_ref::<TimestampMicrosecondArray>()

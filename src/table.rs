@@ -88,10 +88,8 @@ pub fn delete_file_schema() -> SchemaRef {
     pos_metadata.insert("PARQUET:field_id".to_string(), "2147483645".to_string()); // 0x7FFFFFFD
 
     Arc::new(Schema::new(vec![
-        Field::new(DELETE_FILE_PATH_COL, DataType::Utf8, false)
-            .with_metadata(file_path_metadata),
-        Field::new(DELETE_POS_COL, DataType::Int64, false)
-            .with_metadata(pos_metadata),
+        Field::new(DELETE_FILE_PATH_COL, DataType::Utf8, false).with_metadata(file_path_metadata),
+        Field::new(DELETE_POS_COL, DataType::Int64, false).with_metadata(pos_metadata),
     ]))
 }
 
@@ -332,6 +330,21 @@ impl DuckLakeTable {
         let schema = &self.schema;
         let num_rows = self.inlined_data.len();
 
+        // R5-S-061: Pre-build column name→index maps to avoid O(n²) lookup.
+        // Each row's column_names are mapped to positions once, then field
+        // lookups are O(1) instead of O(columns) per row per field.
+        let row_col_maps: Vec<HashMap<&str, usize>> = self
+            .inlined_data
+            .iter()
+            .map(|row| {
+                row.column_names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| (name.as_str(), i))
+                    .collect()
+            })
+            .collect();
+
         // Build column arrays from inlined data
         let mut column_arrays: Vec<Arc<dyn Array>> = Vec::new();
         for field in schema.fields().iter() {
@@ -340,12 +353,10 @@ impl DuckLakeTable {
 
             // Collect values for this column from all inlined rows
             let mut string_values: Vec<Option<String>> = Vec::with_capacity(num_rows);
-            for row in &self.inlined_data {
-                let value = row
-                    .column_names
-                    .iter()
-                    .position(|n| n == col_name)
-                    .and_then(|pos| row.values.get(pos))
+            for (row, col_map) in self.inlined_data.iter().zip(row_col_maps.iter()) {
+                let value = col_map
+                    .get(col_name.as_str())
+                    .and_then(|&pos| row.values.get(pos))
                     .and_then(|v| v.clone());
                 string_values.push(value);
             }
@@ -1266,8 +1277,13 @@ fn scalar_value_to_partition_string(value: &datafusion::common::ScalarValue) -> 
         ScalarValue::Float32(Some(v)) => Some(v.to_string()),
         ScalarValue::Float64(Some(v)) => Some(v.to_string()),
         ScalarValue::Boolean(Some(v)) => Some(v.to_string()),
-        ScalarValue::Date32(Some(v)) => Some(v.to_string()),
-        ScalarValue::Date64(Some(v)) => Some(v.to_string()),
+        // R5-S-005: Format dates as ISO 8601 strings (YYYY-MM-DD) instead of
+        // raw epoch-day/ms integers. DuckDB stores partition values as ISO date
+        // strings, so using integer representations breaks cross-engine partition pruning.
+        ScalarValue::Date32(Some(v)) => arrow::temporal_conversions::date32_to_datetime(*v)
+            .map(|dt| dt.format("%Y-%m-%d").to_string()),
+        ScalarValue::Date64(Some(v)) => arrow::temporal_conversions::date64_to_datetime(*v)
+            .map(|dt| dt.format("%Y-%m-%d").to_string()),
         _ => None,
     }
 }
@@ -1376,6 +1392,13 @@ impl TableProvider for DuckLakeTable {
             },
             _ => Precision::Absent,
         };
+
+        // Append unknown stats for virtual columns so column_statistics length
+        // matches full_schema (which schema() returns)
+        let virtual_col_count = self.full_schema.fields().len() - self.columns.len();
+        for _ in 0..virtual_col_count {
+            col_stats.push(ColumnStatistics::new_unknown());
+        }
 
         Some(Statistics {
             num_rows,
@@ -1890,19 +1913,78 @@ fn parse_inlined_column(
             }
             Arc::new(builder.finish())
         },
-        DataType::Date32 => parse_primitive!(Date32Builder, values),
-        DataType::Date64 => parse_primitive!(Date64Builder, values),
+        DataType::Date32 => {
+            let mut builder = Date32Builder::with_capacity(values.len());
+            for val in values {
+                match val {
+                    Some(s) => {
+                        // Try ISO date string ("2024-06-15"), then epoch days
+                        let epoch_days =
+                            if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+                                let epoch: chrono::NaiveDate =
+                                    chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+                                date.signed_duration_since(epoch).num_days() as i32
+                            } else if let Ok(v) = s.parse::<i32>() {
+                                v
+                            } else {
+                                builder.append_null();
+                                continue;
+                            };
+                        builder.append_value(epoch_days);
+                    },
+                    None => builder.append_null(),
+                }
+            }
+            Arc::new(builder.finish()) as Arc<dyn Array>
+        },
+        DataType::Date64 => {
+            let mut builder = Date64Builder::with_capacity(values.len());
+            for val in values {
+                match val {
+                    Some(s) => {
+                        let epoch_ms =
+                            if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+                                let epoch: chrono::NaiveDate =
+                                    chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+                                date.signed_duration_since(epoch).num_days() as i64 * 86_400_000
+                            } else if let Ok(v) = s.parse::<i64>() {
+                                v
+                            } else {
+                                builder.append_null();
+                                continue;
+                            };
+                        builder.append_value(epoch_ms);
+                    },
+                    None => builder.append_null(),
+                }
+            }
+            Arc::new(builder.finish()) as Arc<dyn Array>
+        },
         DataType::Timestamp(unit, tz) => {
             use arrow::datatypes::TimeUnit;
 
+            /// Parse a timestamp string (ISO or epoch integer) to epoch microseconds.
+            fn parse_ts_to_us(s: &str) -> Option<i64> {
+                if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+                    let dt: chrono::NaiveDateTime = dt;
+                    return Some(dt.and_utc().timestamp_micros());
+                }
+                if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
+                    let dt: chrono::NaiveDateTime = dt;
+                    return Some(dt.and_utc().timestamp_micros());
+                }
+                s.parse::<i64>().ok()
+            }
+
             macro_rules! build_timestamp {
-                ($builder_ty:ty) => {{
+                ($builder_ty:ty, $convert:expr) => {{
                     let mut builder = <$builder_ty>::with_capacity(values.len());
+                    let convert_fn: fn(i64) -> i64 = $convert;
                     for val in values {
                         match val {
-                            Some(s) => match s.parse::<i64>() {
-                                Ok(v) => builder.append_value(v),
-                                Err(_) => builder.append_null(),
+                            Some(s) => match parse_ts_to_us(s) {
+                                Some(us) => builder.append_value(convert_fn(us)),
+                                None => builder.append_null(),
                             },
                             None => builder.append_null(),
                         }
@@ -1916,10 +1998,18 @@ fn parse_inlined_column(
             }
 
             match unit {
-                TimeUnit::Second => build_timestamp!(TimestampSecondBuilder),
-                TimeUnit::Millisecond => build_timestamp!(TimestampMillisecondBuilder),
-                TimeUnit::Microsecond => build_timestamp!(TimestampMicrosecondBuilder),
-                TimeUnit::Nanosecond => build_timestamp!(TimestampNanosecondBuilder),
+                TimeUnit::Second => {
+                    build_timestamp!(TimestampSecondBuilder, |us: i64| us / 1_000_000)
+                },
+                TimeUnit::Millisecond => {
+                    build_timestamp!(TimestampMillisecondBuilder, |us: i64| us / 1_000)
+                },
+                TimeUnit::Microsecond => {
+                    build_timestamp!(TimestampMicrosecondBuilder, |us: i64| us)
+                },
+                TimeUnit::Nanosecond => {
+                    build_timestamp!(TimestampNanosecondBuilder, |us: i64| us * 1_000)
+                },
             }
         },
         _ => {
@@ -1989,5 +2079,34 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("bad.parquet"));
         assert!(msg.contains(&i64::MIN.to_string()));
+    }
+
+    /// R5-S-005: Date32 partition values should be ISO 8601 date strings, not epoch-day integers.
+    #[test]
+    fn test_scalar_value_to_partition_string_date32() {
+        use datafusion::common::ScalarValue;
+        // 2024-01-15 is day 19737 since epoch (1970-01-01)
+        let val = ScalarValue::Date32(Some(19737));
+        let result = scalar_value_to_partition_string(&val);
+        assert_eq!(result, Some("2024-01-15".to_string()));
+    }
+
+    /// R5-S-005: Date64 partition values should be ISO 8601 date strings, not epoch-ms integers.
+    #[test]
+    fn test_scalar_value_to_partition_string_date64() {
+        use datafusion::common::ScalarValue;
+        // 2024-01-15 00:00:00 UTC in milliseconds since epoch
+        let val = ScalarValue::Date64(Some(19737 * 86400 * 1000));
+        let result = scalar_value_to_partition_string(&val);
+        assert_eq!(result, Some("2024-01-15".to_string()));
+    }
+
+    /// Epoch (1970-01-01) should format correctly.
+    #[test]
+    fn test_scalar_value_to_partition_string_date32_epoch() {
+        use datafusion::common::ScalarValue;
+        let val = ScalarValue::Date32(Some(0));
+        let result = scalar_value_to_partition_string(&val);
+        assert_eq!(result, Some("1970-01-01".to_string()));
     }
 }

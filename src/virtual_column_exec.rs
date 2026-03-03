@@ -214,10 +214,13 @@ impl Stream for VirtualColumnStream {
                 }
 
                 if self.included.file_row_number {
-                    let num_rows_i64 = i64::try_from(num_rows)
-                        .map_err(|e| DataFusionError::Execution(format!("Row count overflow: {}", e)))?;
+                    let num_rows_i64 = i64::try_from(num_rows).map_err(|e| {
+                        DataFusionError::Execution(format!("Row count overflow: {}", e))
+                    })?;
                     let end = row_offset.checked_add(num_rows_i64).ok_or_else(|| {
-                        DataFusionError::Execution("Row offset overflow computing file_row_number".to_string())
+                        DataFusionError::Execution(
+                            "Row offset overflow computing file_row_number".to_string(),
+                        )
                     })?;
                     let row_numbers: Vec<i64> = (row_offset..end).collect();
                     let row_number_array = Int64Array::from(row_numbers);
@@ -227,14 +230,26 @@ impl Stream for VirtualColumnStream {
                 if self.included.rowid {
                     match self.file_info.row_id_start {
                         Some(row_id_start) => {
-                            let num_rows_i64 = i64::try_from(num_rows)
-                                .map_err(|e| DataFusionError::Execution(format!("Row count overflow: {}", e)))?;
-                            let end = row_offset.checked_add(num_rows_i64).ok_or_else(|| {
-                                DataFusionError::Execution("Row offset overflow computing rowid".to_string())
+                            let num_rows_i64 = i64::try_from(num_rows).map_err(|e| {
+                                DataFusionError::Execution(format!("Row count overflow: {}", e))
                             })?;
+                            let end = row_offset.checked_add(num_rows_i64).ok_or_else(|| {
+                                DataFusionError::Execution(
+                                    "Row offset overflow computing rowid".to_string(),
+                                )
+                            })?;
+                            // R5-S-020: Return error on rowid overflow instead of
+                            // silently clipping to i64::MAX (which causes duplicate rowids).
                             let rowids: Vec<i64> = (row_offset..end)
-                                .map(|offset| row_id_start.checked_add(offset).unwrap_or(i64::MAX))
-                                .collect();
+                                .map(|offset| {
+                                    row_id_start.checked_add(offset).ok_or_else(|| {
+                                        DataFusionError::Execution(format!(
+                                            "Rowid overflow: row_id_start={} + offset={} exceeds i64::MAX",
+                                            row_id_start, offset
+                                        ))
+                                    })
+                                })
+                                .collect::<std::result::Result<Vec<_>, _>>()?;
                             columns.push(Arc::new(Int64Array::from(rowids)));
                         },
                         None => {
@@ -262,8 +277,9 @@ impl Stream for VirtualColumnStream {
                 }
 
                 // Update row offset
-                let num_rows_incr = i64::try_from(num_rows)
-                    .map_err(|e| DataFusionError::Execution(format!("Row count overflow: {}", e)))?;
+                let num_rows_incr = i64::try_from(num_rows).map_err(|e| {
+                    DataFusionError::Execution(format!("Row count overflow: {}", e))
+                })?;
                 self.row_offset = self.row_offset.checked_add(num_rows_incr).ok_or_else(|| {
                     DataFusionError::Execution("Row offset overflow updating position".to_string())
                 })?;
