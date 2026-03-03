@@ -276,7 +276,7 @@ async fn create_postgres_provider() -> anyhow::Result<(
     let provider = PostgresMetadataProvider::new(&conn_str)
         .await
         .expect("Failed to create provider");
-    init_schema(&provider.pool).await?;
+    init_schema(provider.pool()).await?;
 
     Ok((provider, container))
 }
@@ -284,7 +284,7 @@ async fn create_postgres_provider() -> anyhow::Result<(
 /// Helper to populate test data in PostgreSQL
 async fn populate_test_data(provider: &PostgresMetadataProvider) -> anyhow::Result<()> {
     // Get the pool for direct SQL access
-    let pool = &provider.pool;
+    let pool = provider.pool();
 
     // Insert snapshots
     sqlx::query("INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time) VALUES ($1, NOW())")
@@ -482,7 +482,7 @@ async fn populate_from_duckdb_catalog(
 
     // Step 3: Populate PostgreSQL with metadata from DuckDB
     // Use a transaction for atomicity (all-or-nothing)
-    let mut tx = provider.pool.begin().await?;
+    let mut tx = provider.pool().begin().await?;
 
     // Insert snapshots
     for snapshot in &snapshots {
@@ -623,7 +623,7 @@ async fn test_schema_initialization_idempotent() {
     let (provider, _container) = create_postgres_provider().await.unwrap();
 
     // Initialize schema again - should be idempotent
-    init_schema(&provider.pool)
+    init_schema(provider.pool())
         .await
         .expect("Schema initialization should be idempotent");
 
@@ -1181,7 +1181,7 @@ async fn test_list_views() {
     .bind("test_view")
     .bind("SELECT * FROM users")
     .bind(1i64)
-    .execute(&provider.pool)
+    .execute(provider.pool())
     .await
     .unwrap();
 
@@ -1210,7 +1210,7 @@ async fn test_get_view_by_name() {
     .bind("my_view")
     .bind("SELECT 1")
     .bind(1i64)
-    .execute(&provider.pool)
+    .execute(provider.pool())
     .await
     .unwrap();
 
@@ -1240,7 +1240,7 @@ async fn test_view_exists() {
     .bind("existing_view")
     .bind("SELECT 1")
     .bind(1i64)
-    .execute(&provider.pool)
+    .execute(provider.pool())
     .await
     .unwrap();
 
@@ -1265,7 +1265,7 @@ async fn test_get_file_column_stats() {
     .bind(0i64)
     .bind("1")
     .bind("100")
-    .execute(&provider.pool)
+    .execute(provider.pool())
     .await
     .unwrap();
 
@@ -1295,13 +1295,13 @@ async fn test_get_table_row_count() {
     sqlx::query("UPDATE ducklake_data_file SET record_count = $1 WHERE data_file_id = $2")
         .bind(50i64)
         .bind(1i64)
-        .execute(&provider.pool)
+        .execute(provider.pool())
         .await
         .unwrap();
     sqlx::query("UPDATE ducklake_data_file SET record_count = $1 WHERE data_file_id = $2")
         .bind(30i64)
         .bind(2i64)
-        .execute(&provider.pool)
+        .execute(provider.pool())
         .await
         .unwrap();
 
@@ -1324,7 +1324,7 @@ async fn test_get_partition_columns() {
     .bind(1i64)
     .bind(1i64)
     .bind(1i64)
-    .execute(&provider.pool)
+    .execute(provider.pool())
     .await
     .unwrap();
 
@@ -1338,7 +1338,7 @@ async fn test_get_partition_columns() {
     .bind(0i64)
     .bind(1i64)
     .bind("identity")
-    .execute(&provider.pool)
+    .execute(provider.pool())
     .await
     .unwrap();
 
@@ -1368,7 +1368,7 @@ async fn test_get_file_partition_values() {
     .bind(1i64)
     .bind(0i64)
     .bind("42")
-    .execute(&provider.pool)
+    .execute(provider.pool())
     .await
     .unwrap();
 
@@ -1406,7 +1406,7 @@ async fn test_view_snapshot_isolation() {
     .bind("late_view")
     .bind("SELECT 1")
     .bind(2i64)
-    .execute(&provider.pool)
+    .execute(provider.pool())
     .await
     .unwrap();
 

@@ -355,26 +355,14 @@ impl TableFunctionImpl for DucklakeExpireSnapshotsFunction {
                 ])
             },
             |cols| {
-                fn to_i64_array(col: &[ScalarValue]) -> ArrayRef {
-                    Arc::new(Int64Array::from(col.iter().map(|v| match v {
-                        ScalarValue::Int64(v) => *v,
-                        _ => None,
-                    }).collect::<Vec<_>>()))
-                }
-                fn to_string_array(col: &[ScalarValue]) -> ArrayRef {
-                    Arc::new(StringArray::from(col.iter().map(|v| match v {
-                        ScalarValue::Utf8(v) => v.clone(),
-                        _ => None,
-                    }).collect::<Vec<_>>()))
-                }
                 Ok(vec![
-                    to_i64_array(&cols[0]),
-                    to_string_array(&cols[1]),
-                    to_i64_array(&cols[2]),
-                    to_string_array(&cols[3]),
-                    to_string_array(&cols[4]),
-                    to_string_array(&cols[5]),
-                    to_string_array(&cols[6]),
+                    scalar_to_i64_array(&cols[0]),
+                    scalar_to_string_array(&cols[1]),
+                    scalar_to_i64_array(&cols[2]),
+                    scalar_to_string_array(&cols[3]),
+                    scalar_to_string_array(&cols[4]),
+                    scalar_to_string_array(&cols[5]),
+                    scalar_to_string_array(&cols[6]),
                 ])
             },
         )
@@ -480,6 +468,32 @@ impl TableFunctionImpl for DucklakeDeleteOrphanedFilesFunction {
     }
 }
 
+// ==================== Array conversion helpers (R5-S-048) ====================
+
+/// Convert a column of ScalarValue::Int64 values to an Int64Array
+fn scalar_to_i64_array(col: &[ScalarValue]) -> ArrayRef {
+    Arc::new(Int64Array::from(
+        col.iter()
+            .map(|v| match v {
+                ScalarValue::Int64(v) => *v,
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+    ))
+}
+
+/// Convert a column of ScalarValue::Utf8 values to a StringArray
+fn scalar_to_string_array(col: &[ScalarValue]) -> ArrayRef {
+    Arc::new(StringArray::from(
+        col.iter()
+            .map(|v| match v {
+                ScalarValue::Utf8(v) => v.clone(),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+    ))
+}
+
 // ==================== Argument extraction helpers ====================
 
 fn extract_string_arg(expr: &Expr, func_name: &str, pos: usize) -> DataFusionResult<String> {
@@ -503,7 +517,9 @@ fn extract_float_arg(expr: &Expr, func_name: &str, pos: usize) -> DataFusionResu
             if *v > MAX_SAFE || *v < -MAX_SAFE {
                 plan_err!(
                     "Argument {} to {}() integer value {} exceeds safe f64 range (2^53)",
-                    pos, func_name, v
+                    pos,
+                    func_name,
+                    v
                 )
             } else {
                 Ok(*v as f64)
@@ -583,18 +599,12 @@ impl TableFunctionImpl for DucklakeOptionsFunction {
                 ])
             },
             |cols| {
-                fn to_string_array(col: &[ScalarValue]) -> ArrayRef {
-                    Arc::new(StringArray::from(col.iter().map(|v| match v {
-                        ScalarValue::Utf8(v) => v.clone(),
-                        _ => None,
-                    }).collect::<Vec<_>>()))
-                }
                 Ok(vec![
-                    to_string_array(&cols[0]),
-                    to_string_array(&cols[1]),
-                    to_string_array(&cols[2]),
-                    to_string_array(&cols[3]),
-                    to_string_array(&cols[4]),
+                    scalar_to_string_array(&cols[0]),
+                    scalar_to_string_array(&cols[1]),
+                    scalar_to_string_array(&cols[2]),
+                    scalar_to_string_array(&cols[3]),
+                    scalar_to_string_array(&cols[4]),
                 ])
             },
         )

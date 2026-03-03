@@ -550,14 +550,12 @@ impl SqliteMetadataWriter {
                     esc_schema, esc_schema, esc_table
                 )
             } else {
-                format!(
-                    "created_table:\"{}\".\"{}\"",
-                    esc_schema, esc_table
-                )
+                format!("created_table:\"{}\".\"{}\"", esc_schema, esc_table)
             };
             sqlx::query(
-                "INSERT OR REPLACE INTO ducklake_snapshot_changes (snapshot_id, changes_made)
-                 VALUES (?, ?)",
+                "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made)
+                 VALUES (?, ?)
+                 ON CONFLICT(snapshot_id) DO UPDATE SET changes_made = excluded.changes_made",
             )
             .bind(snapshot_id)
             .bind(&changes)
@@ -566,8 +564,9 @@ impl SqliteMetadataWriter {
         } else {
             // R3F-013: Record inserted_into_table for append to existing table
             sqlx::query(
-                "INSERT OR REPLACE INTO ducklake_snapshot_changes (snapshot_id, changes_made)
-                 VALUES (?, ?)",
+                "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made)
+                 VALUES (?, ?)
+                 ON CONFLICT(snapshot_id) DO UPDATE SET changes_made = excluded.changes_made",
             )
             .bind(snapshot_id)
             .bind(format!("inserted_into_table:{}", table_id))
@@ -701,8 +700,9 @@ impl SqliteMetadataWriter {
 
         // Record in spec-compliant snapshot changes
         sqlx::query(
-            "INSERT OR REPLACE INTO ducklake_snapshot_changes (snapshot_id, changes_made)
-             VALUES (?, ?)",
+            "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made)
+             VALUES (?, ?)
+             ON CONFLICT(snapshot_id) DO UPDATE SET changes_made = excluded.changes_made",
         )
         .bind(snapshot_id)
         .bind(format!("dropped_table:{}", table_id))
@@ -820,8 +820,9 @@ impl SqliteMetadataWriter {
 
         // Record in spec-compliant snapshot changes
         sqlx::query(
-            "INSERT OR REPLACE INTO ducklake_snapshot_changes (snapshot_id, changes_made)
-             VALUES (?, ?)",
+            "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made)
+             VALUES (?, ?)
+             ON CONFLICT(snapshot_id) DO UPDATE SET changes_made = excluded.changes_made",
         )
         .bind(snapshot_id)
         .bind(format!("dropped_schema:{}", schema_id))
@@ -831,6 +832,168 @@ impl SqliteMetadataWriter {
         tx.commit().await?;
         Ok(snapshot_id)
     }
+
+    /// Recompute `ducklake_table_column_stats` from per-file stats using
+    /// type-aware min/max comparison instead of SQL's lexicographic VARCHAR
+    /// MIN/MAX (R5-S-001).
+    async fn recompute_table_column_stats(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        table_id: i64,
+    ) -> Result<()> {
+        use std::collections::HashMap;
+
+        sqlx::query("DELETE FROM ducklake_table_column_stats WHERE table_id = ?")
+            .bind(table_id)
+            .execute(&mut **tx)
+            .await?;
+
+        // Read per-file stats with column type for type-aware comparison
+        let rows = sqlx::query(
+            "SELECT fcs.column_id, fcs.null_count, fcs.min_value, fcs.max_value, c.column_type
+             FROM ducklake_file_column_stats fcs
+             INNER JOIN ducklake_data_file df
+                 ON fcs.data_file_id = df.data_file_id
+                 AND df.table_id = fcs.table_id
+                 AND df.end_snapshot IS NULL
+             INNER JOIN ducklake_column c ON fcs.column_id = c.column_id
+             WHERE fcs.table_id = ?",
+        )
+        .bind(table_id)
+        .fetch_all(&mut **tx)
+        .await?;
+
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        struct ColumnAgg {
+            contains_null: bool,
+            min_value: Option<String>,
+            max_value: Option<String>,
+            is_numeric: bool,
+        }
+
+        let mut aggs: HashMap<i64, ColumnAgg> = HashMap::new();
+
+        for row in &rows {
+            let column_id: i64 = row.try_get(0)?;
+            let null_count: Option<i64> = row.try_get(1)?;
+            let min_value: Option<String> = row.try_get(2)?;
+            let max_value: Option<String> = row.try_get(3)?;
+            let column_type: String = row.try_get(4)?;
+
+            let is_numeric = is_numeric_type(&column_type);
+
+            let entry = aggs.entry(column_id).or_insert(ColumnAgg {
+                contains_null: false,
+                min_value: None,
+                max_value: None,
+                is_numeric,
+            });
+
+            if null_count.unwrap_or(0) > 0 {
+                entry.contains_null = true;
+            }
+
+            if let Some(ref new_min) = min_value {
+                entry.min_value = Some(match &entry.min_value {
+                    None => new_min.clone(),
+                    Some(current) => {
+                        if stat_value_less_than(new_min, current, entry.is_numeric) {
+                            new_min.clone()
+                        } else {
+                            current.clone()
+                        }
+                    },
+                });
+            }
+
+            if let Some(ref new_max) = max_value {
+                entry.max_value = Some(match &entry.max_value {
+                    None => new_max.clone(),
+                    Some(current) => {
+                        if stat_value_less_than(current, new_max, entry.is_numeric) {
+                            new_max.clone()
+                        } else {
+                            current.clone()
+                        }
+                    },
+                });
+            }
+        }
+
+        for (column_id, agg) in &aggs {
+            sqlx::query(
+                "INSERT INTO ducklake_table_column_stats
+                 (table_id, column_id, contains_null, min_value, max_value)
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(table_id)
+            .bind(column_id)
+            .bind(if agg.contains_null {
+                1
+            } else {
+                0
+            })
+            .bind(&agg.min_value)
+            .bind(&agg.max_value)
+            .execute(&mut **tx)
+            .await?;
+        }
+
+        Ok(())
+    }
+}
+
+/// Check if a DuckLake column type string represents a numeric type.
+fn is_numeric_type(column_type: &str) -> bool {
+    let t = column_type.to_uppercase();
+    let base = t.split('(').next().unwrap_or(&t).trim();
+    matches!(
+        base,
+        "TINYINT"
+            | "SMALLINT"
+            | "INTEGER"
+            | "INT"
+            | "BIGINT"
+            | "HUGEINT"
+            | "UTINYINT"
+            | "USMALLINT"
+            | "UINTEGER"
+            | "UBIGINT"
+            | "FLOAT"
+            | "REAL"
+            | "DOUBLE"
+            | "DECIMAL"
+            | "NUMERIC"
+            | "INT8"
+            | "INT16"
+            | "INT32"
+            | "INT64"
+            | "UINT8"
+            | "UINT16"
+            | "UINT32"
+            | "UINT64"
+            | "FLOAT4"
+            | "FLOAT8"
+    )
+}
+
+/// Compare two stat value strings: returns true if `a < b`.
+/// For numeric types, attempts numeric parsing; falls back to lexicographic.
+fn stat_value_less_than(a: &str, b: &str, is_numeric: bool) -> bool {
+    if is_numeric {
+        // Try i128 first (handles all integer types without precision loss)
+        if let (Ok(ia), Ok(ib)) = (a.parse::<i128>(), b.parse::<i128>()) {
+            return ia < ib;
+        }
+        // Fall back to f64 for floating point
+        if let (Ok(fa), Ok(fb)) = (a.parse::<f64>(), b.parse::<f64>()) {
+            return fa < fb;
+        }
+    }
+    // Lexicographic comparison for strings, dates, etc.
+    a < b
 }
 
 impl MetadataWriter for SqliteMetadataWriter {
@@ -904,8 +1067,9 @@ impl MetadataWriter for SqliteMetadataWriter {
 
             // R3F-014: Record created_schema change tracking
             sqlx::query(
-                "INSERT OR REPLACE INTO ducklake_snapshot_changes (snapshot_id, changes_made)
-                 VALUES (?, ?)",
+                "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made)
+                 VALUES (?, ?)
+                 ON CONFLICT(snapshot_id) DO UPDATE SET changes_made = excluded.changes_made",
             )
             .bind(snapshot_id)
             .bind(format!("created_schema:\"{}\"", name.replace('"', "\"\"")))
@@ -1057,32 +1221,9 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .await?;
             }
 
-            // R3F-001: Update ducklake_table_column_stats (aggregate table-level stats)
-            // Delete existing rows for this table and recompute from all active file stats.
-            // Uses DELETE + INSERT-SELECT to minimize the number of queries.
-            sqlx::query("DELETE FROM ducklake_table_column_stats WHERE table_id = ?")
-                .bind(table_id)
-                .execute(&mut *tx)
-                .await?;
-
-            sqlx::query(
-                "INSERT INTO ducklake_table_column_stats
-                 (table_id, column_id, contains_null, min_value, max_value)
-                 SELECT fcs.table_id, fcs.column_id,
-                     CASE WHEN COALESCE(SUM(fcs.null_count), 0) > 0 THEN 1 ELSE 0 END,
-                     MIN(fcs.min_value),
-                     MAX(fcs.max_value)
-                 FROM ducklake_file_column_stats fcs
-                 INNER JOIN ducklake_data_file df
-                     ON fcs.data_file_id = df.data_file_id
-                     AND df.table_id = fcs.table_id
-                     AND df.end_snapshot IS NULL
-                 WHERE fcs.table_id = ?
-                 GROUP BY fcs.table_id, fcs.column_id",
-            )
-            .bind(table_id)
-            .execute(&mut *tx)
-            .await?;
+            // R3F-001 + R5-S-001: Update ducklake_table_column_stats with type-aware
+            // min/max aggregation instead of lexicographic SQL MIN/MAX on VARCHAR.
+            Self::recompute_table_column_stats(&mut tx, table_id).await?;
 
             tx.commit().await?;
             Ok(())
@@ -1266,6 +1407,36 @@ impl MetadataWriter for SqliteMetadataWriter {
                 ids.push(data_file_id);
             }
 
+            // R5-S-002: Recalculate ducklake_table_stats from new files after compaction
+            let total_record_count: i64 = files.iter().map(|f| f.file_info.record_count).sum();
+            let total_file_size: i64 = files.iter().map(|f| f.file_info.file_size_bytes).sum();
+            let updated = sqlx::query(
+                "UPDATE ducklake_table_stats
+                 SET record_count = ?,
+                     next_row_id = ?,
+                     file_size_bytes = ?
+                 WHERE table_id = ?",
+            )
+            .bind(total_record_count)
+            .bind(total_record_count)
+            .bind(total_file_size)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            if updated.rows_affected() == 0 {
+                sqlx::query(
+                    "INSERT INTO ducklake_table_stats (table_id, record_count, next_row_id, file_size_bytes)
+                     VALUES (?, ?, ?, ?)",
+                )
+                .bind(table_id)
+                .bind(total_record_count)
+                .bind(total_record_count)
+                .bind(total_file_size)
+                .execute(&mut *tx)
+                .await?;
+            }
+
             tx.commit().await?;
             Ok(ids)
         })
@@ -1315,8 +1486,8 @@ impl MetadataWriter for SqliteMetadataWriter {
 
                 // Insert the new delete file
                 sqlx::query(
-                    "INSERT INTO ducklake_delete_file (data_file_id, table_id, path, path_is_relative, file_size_bytes, footer_size, delete_count, begin_snapshot)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO ducklake_delete_file (data_file_id, table_id, path, path_is_relative, file_size_bytes, footer_size, delete_count, format, begin_snapshot)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, 'parquet', ?)",
                 )
                 .bind(file.data_file_id)
                 .bind(table_id)
@@ -1426,31 +1597,9 @@ impl MetadataWriter for SqliteMetadataWriter {
                 }
             }
 
-            // R4-S-005: Recompute table-level column stats if any file stats were added
+            // R4-S-005 + R5-S-001: Recompute table-level column stats with type-aware min/max
             if has_column_stats {
-                sqlx::query("DELETE FROM ducklake_table_column_stats WHERE table_id = ?")
-                    .bind(table_id)
-                    .execute(&mut *tx)
-                    .await?;
-
-                sqlx::query(
-                    "INSERT INTO ducklake_table_column_stats
-                     (table_id, column_id, contains_null, min_value, max_value)
-                     SELECT fcs.table_id, fcs.column_id,
-                         CASE WHEN COALESCE(SUM(fcs.null_count), 0) > 0 THEN 1 ELSE 0 END,
-                         MIN(fcs.min_value),
-                         MAX(fcs.max_value)
-                     FROM ducklake_file_column_stats fcs
-                     INNER JOIN ducklake_data_file df
-                         ON fcs.data_file_id = df.data_file_id
-                         AND df.table_id = fcs.table_id
-                         AND df.end_snapshot IS NULL
-                     WHERE fcs.table_id = ?
-                     GROUP BY fcs.table_id, fcs.column_id",
-                )
-                .bind(table_id)
-                .execute(&mut *tx)
-                .await?;
+                Self::recompute_table_column_stats(&mut tx, table_id).await?;
             }
 
             // R4-S-004: Update snapshot's next_file_id
@@ -1514,8 +1663,9 @@ impl MetadataWriter for SqliteMetadataWriter {
     fn record_snapshot_changes(&self, snapshot_id: i64, changes_made: &str) -> Result<()> {
         block_on(async {
             sqlx::query(
-                "INSERT OR REPLACE INTO ducklake_snapshot_changes (snapshot_id, changes_made)
-                 VALUES (?, ?)",
+                "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made)
+                 VALUES (?, ?)
+                 ON CONFLICT(snapshot_id) DO UPDATE SET changes_made = excluded.changes_made",
             )
             .bind(snapshot_id)
             .bind(changes_made)
@@ -1673,6 +1823,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             if let Some(schema_row) = schema_row {
                 let schema_id: i64 = schema_row.try_get(0)?;
 
+                // Check DF-originated drops via change tracking
                 let schema_drop = sqlx::query(
                     "SELECT COUNT(*) FROM _df_change_tracking
                      WHERE snapshot_id > ? AND schema_id = ? AND change_type = 'DROP_SCHEMA'",
@@ -1684,6 +1835,22 @@ impl MetadataWriter for SqliteMetadataWriter {
                 if schema_drop.try_get::<i64, _>(0)? > 0 {
                     return Err(crate::error::DuckLakeError::TransactionConflict(format!(
                         "Transaction conflict: schema '{}' was dropped by another transaction since snapshot {}",
+                        schema_name, since_snapshot
+                    )));
+                }
+
+                // Check DuckDB-originated drops via catalog metadata (R5-S-018)
+                let schema_ended = sqlx::query(
+                    "SELECT COUNT(*) FROM ducklake_schema
+                     WHERE schema_id = ? AND end_snapshot IS NOT NULL AND end_snapshot > ?",
+                )
+                .bind(schema_id)
+                .bind(since_snapshot)
+                .fetch_one(&mut *tx)
+                .await?;
+                if schema_ended.try_get::<i64, _>(0)? > 0 {
+                    return Err(crate::error::DuckLakeError::TransactionConflict(format!(
+                        "Transaction conflict: schema '{}' was dropped (possibly by DuckDB) since snapshot {}",
                         schema_name, since_snapshot
                     )));
                 }
@@ -1700,6 +1867,8 @@ impl MetadataWriter for SqliteMetadataWriter {
 
                 if let Some(table_row) = table_row {
                     let table_id: i64 = table_row.try_get(0)?;
+
+                    // Check DF-originated drops via change tracking
                     let table_drop = sqlx::query(
                         "SELECT COUNT(*) FROM _df_change_tracking
                          WHERE snapshot_id > ? AND table_id = ? AND change_type = 'DROP_TABLE'",
@@ -1711,6 +1880,22 @@ impl MetadataWriter for SqliteMetadataWriter {
                     if table_drop.try_get::<i64, _>(0)? > 0 {
                         return Err(crate::error::DuckLakeError::TransactionConflict(format!(
                             "Transaction conflict: table '{}.{}' was dropped by another transaction since snapshot {}",
+                            schema_name, table_name, since_snapshot
+                        )));
+                    }
+
+                    // Check DuckDB-originated drops via catalog metadata (R5-S-018)
+                    let table_ended = sqlx::query(
+                        "SELECT COUNT(*) FROM ducklake_table
+                         WHERE table_id = ? AND end_snapshot IS NOT NULL AND end_snapshot > ?",
+                    )
+                    .bind(table_id)
+                    .bind(since_snapshot)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    if table_ended.try_get::<i64, _>(0)? > 0 {
+                        return Err(crate::error::DuckLakeError::TransactionConflict(format!(
+                            "Transaction conflict: table '{}.{}' was dropped (possibly by DuckDB) since snapshot {}",
                             schema_name, table_name, since_snapshot
                         )));
                     }
@@ -1726,6 +1911,7 @@ impl MetadataWriter for SqliteMetadataWriter {
         block_on(async {
             let mut tx = self.pool.begin().await?;
 
+            // Check DF-originated drops
             let drop_check = sqlx::query(
                 "SELECT COUNT(*) FROM _df_change_tracking
                  WHERE snapshot_id > ? AND table_id = ? AND change_type = 'DROP_TABLE'",
@@ -1741,6 +1927,22 @@ impl MetadataWriter for SqliteMetadataWriter {
                 )));
             }
 
+            // Check DuckDB-originated drops via catalog metadata (R5-S-018)
+            let table_ended = sqlx::query(
+                "SELECT COUNT(*) FROM ducklake_table
+                 WHERE table_id = ? AND end_snapshot IS NOT NULL AND end_snapshot > ?",
+            )
+            .bind(table_id)
+            .bind(since_snapshot)
+            .fetch_one(&mut *tx)
+            .await?;
+            if table_ended.try_get::<i64, _>(0)? > 0 {
+                return Err(crate::error::DuckLakeError::TransactionConflict(format!(
+                    "Transaction conflict: table (id={}) was already dropped (possibly by DuckDB) since snapshot {}",
+                    table_id, since_snapshot
+                )));
+            }
+
             // No conflict — perform drop in the same transaction.
             Self::drop_table_inner(tx, table_id).await
         })
@@ -1750,6 +1952,7 @@ impl MetadataWriter for SqliteMetadataWriter {
         block_on(async {
             let mut tx = self.pool.begin().await?;
 
+            // Check DF-originated drops
             let drop_check = sqlx::query(
                 "SELECT COUNT(*) FROM _df_change_tracking
                  WHERE snapshot_id > ? AND schema_id = ? AND change_type = 'DROP_SCHEMA'",
@@ -1761,6 +1964,22 @@ impl MetadataWriter for SqliteMetadataWriter {
             if drop_check.try_get::<i64, _>(0)? > 0 {
                 return Err(crate::error::DuckLakeError::TransactionConflict(format!(
                     "Transaction conflict: schema (id={}) was already dropped by another transaction since snapshot {}",
+                    schema_id, since_snapshot
+                )));
+            }
+
+            // Check DuckDB-originated drops via catalog metadata (R5-S-018)
+            let schema_ended = sqlx::query(
+                "SELECT COUNT(*) FROM ducklake_schema
+                 WHERE schema_id = ? AND end_snapshot IS NOT NULL AND end_snapshot > ?",
+            )
+            .bind(schema_id)
+            .bind(since_snapshot)
+            .fetch_one(&mut *tx)
+            .await?;
+            if schema_ended.try_get::<i64, _>(0)? > 0 {
+                return Err(crate::error::DuckLakeError::TransactionConflict(format!(
+                    "Transaction conflict: schema (id={}) was already dropped (possibly by DuckDB) since snapshot {}",
                     schema_id, since_snapshot
                 )));
             }
@@ -1843,8 +2062,9 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .unwrap_or_default();
 
             sqlx::query(
-                "INSERT OR REPLACE INTO ducklake_snapshot_changes (snapshot_id, changes_made)
-                 VALUES (?, ?)",
+                "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made)
+                 VALUES (?, ?)
+                 ON CONFLICT(snapshot_id) DO UPDATE SET changes_made = excluded.changes_made",
             )
             .bind(snapshot_id)
             .bind(format!(
@@ -1912,8 +2132,9 @@ impl MetadataWriter for SqliteMetadataWriter {
 
             // Record changes_made in DuckDB format (F-027)
             sqlx::query(
-                "INSERT OR REPLACE INTO ducklake_snapshot_changes (snapshot_id, changes_made)
-                 VALUES (?, ?)",
+                "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made)
+                 VALUES (?, ?)
+                 ON CONFLICT(snapshot_id) DO UPDATE SET changes_made = excluded.changes_made",
             )
             .bind(snapshot_id)
             .bind(format!("dropped_view:{}", view_id))
@@ -2029,8 +2250,9 @@ impl MetadataWriter for SqliteMetadataWriter {
 
             // Record in spec-compliant snapshot changes
             sqlx::query(
-                "INSERT OR REPLACE INTO ducklake_snapshot_changes (snapshot_id, changes_made)
-                 VALUES (?, ?)",
+                "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made)
+                 VALUES (?, ?)
+                 ON CONFLICT(snapshot_id) DO UPDATE SET changes_made = excluded.changes_made",
             )
             .bind(snapshot_id)
             .bind(format!("altered_view:{}", view_id))
@@ -2287,8 +2509,9 @@ impl MetadataWriter for SqliteMetadataWriter {
 
             // Record in spec-compliant snapshot changes
             sqlx::query(
-                "INSERT OR REPLACE INTO ducklake_snapshot_changes (snapshot_id, changes_made)
-                 VALUES (?, ?)",
+                "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made)
+                 VALUES (?, ?)
+                 ON CONFLICT(snapshot_id) DO UPDATE SET changes_made = excluded.changes_made",
             )
             .bind(snapshot_id)
             .bind(format!("altered_table:{}", table_id))
@@ -2445,8 +2668,9 @@ impl MetadataWriter for SqliteMetadataWriter {
 
             // Record in spec-compliant snapshot changes
             sqlx::query(
-                "INSERT OR REPLACE INTO ducklake_snapshot_changes (snapshot_id, changes_made)
-                 VALUES (?, ?)",
+                "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made)
+                 VALUES (?, ?)
+                 ON CONFLICT(snapshot_id) DO UPDATE SET changes_made = excluded.changes_made",
             )
             .bind(snapshot_id)
             .bind(format!("altered_table:{}", table_id))
@@ -2518,8 +2742,9 @@ impl MetadataWriter for SqliteMetadataWriter {
 
             // Record in spec-compliant snapshot changes
             sqlx::query(
-                "INSERT OR REPLACE INTO ducklake_snapshot_changes (snapshot_id, changes_made)
-                 VALUES (?, ?)",
+                "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made)
+                 VALUES (?, ?)
+                 ON CONFLICT(snapshot_id) DO UPDATE SET changes_made = excluded.changes_made",
             )
             .bind(snapshot_id)
             .bind(format!("altered_table:{}", table_id))
@@ -2611,8 +2836,9 @@ impl MetadataWriter for SqliteMetadataWriter {
 
             // Record in spec-compliant snapshot changes
             sqlx::query(
-                "INSERT OR REPLACE INTO ducklake_snapshot_changes (snapshot_id, changes_made)
-                 VALUES (?, ?)",
+                "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made)
+                 VALUES (?, ?)
+                 ON CONFLICT(snapshot_id) DO UPDATE SET changes_made = excluded.changes_made",
             )
             .bind(snapshot_id)
             .bind(format!("altered_table:{}", table_id))
@@ -2695,7 +2921,8 @@ impl MetadataWriter for SqliteMetadataWriter {
 
             // R4-S-023: Use DuckDB-compatible naming: ducklake_inlined_data_{table_id}_{schema_version}
             let schema_version: i64 = 1;
-            let inlined_table_name = format!("ducklake_inlined_data_{}_{}", table_id, schema_version);
+            let inlined_table_name =
+                format!("ducklake_inlined_data_{}_{}", table_id, schema_version);
 
             // Check if inline data table exists; create if not
             let exists =
@@ -2806,7 +3033,10 @@ impl MetadataWriter for SqliteMetadataWriter {
             }
 
             // Get column names
-            let pragma_query = format!("PRAGMA table_info({})", quote_identifier(&inlined_table_name));
+            let pragma_query = format!(
+                "PRAGMA table_info({})",
+                quote_identifier(&inlined_table_name)
+            );
             let columns = sqlx::query(&pragma_query).fetch_all(&self.pool).await?;
 
             let user_columns: Vec<String> = columns
@@ -3349,7 +3579,7 @@ mod tests {
         // Verify that ducklake_table_column_stats has a row for the new column
         let stats_rows = block_on(async {
             sqlx::query(
-                "SELECT table_id, column_id FROM ducklake_table_column_stats
+                "SELECT table_id, column_id, contains_null FROM ducklake_table_column_stats
                  WHERE table_id = ?
                  ORDER BY column_id",
             )
@@ -3372,6 +3602,16 @@ mod tests {
         assert!(
             new_col_stat.is_some(),
             "Expected a stats row for the newly added column (column_id=3)"
+        );
+
+        // R5-S-003: Verify contains_null is set to true (1), not NULL.
+        // Existing rows have NULL for the new column, so contains_null must be true.
+        // NULL contains_null causes DuckDB to crash when reading from the catalog.
+        let contains_null: Option<bool> = new_col_stat.unwrap().try_get(2).unwrap();
+        assert_eq!(
+            contains_null,
+            Some(true),
+            "contains_null must be TRUE (not NULL) for newly added columns"
         );
     }
 
@@ -3774,5 +4014,53 @@ mod tests {
         let (writer, _temp) = create_test_writer().await;
         let result = writer.rename_view(999, "new_name");
         assert!(result.is_err());
+    }
+
+    // R5-S-001: Unit tests for type-aware stat comparison
+
+    #[test]
+    fn test_is_numeric_type() {
+        assert!(is_numeric_type("INTEGER"));
+        assert!(is_numeric_type("BIGINT"));
+        assert!(is_numeric_type("FLOAT"));
+        assert!(is_numeric_type("DOUBLE"));
+        assert!(is_numeric_type("DECIMAL(10,2)"));
+        assert!(is_numeric_type("int"));
+        assert!(is_numeric_type("SMALLINT"));
+        assert!(!is_numeric_type("VARCHAR"));
+        assert!(!is_numeric_type("TEXT"));
+        assert!(!is_numeric_type("DATE"));
+        assert!(!is_numeric_type("TIMESTAMP"));
+        assert!(!is_numeric_type("BOOLEAN"));
+    }
+
+    #[test]
+    fn test_stat_value_less_than_numeric() {
+        // Numeric comparison: "9" < "10" numerically
+        assert!(stat_value_less_than("9", "10", true));
+        assert!(!stat_value_less_than("10", "9", true));
+
+        // But lexicographically "10" < "9"
+        assert!(!stat_value_less_than("9", "10", false));
+        assert!(stat_value_less_than("10", "9", false));
+
+        // Negative numbers
+        assert!(stat_value_less_than("-5", "3", true));
+        assert!(!stat_value_less_than("3", "-5", true));
+
+        // Floating point
+        assert!(stat_value_less_than("1.5", "2.5", true));
+        assert!(!stat_value_less_than("2.5", "1.5", true));
+
+        // Equal values
+        assert!(!stat_value_less_than("42", "42", true));
+    }
+
+    #[test]
+    fn test_stat_value_less_than_string() {
+        // String comparison uses lexicographic ordering
+        assert!(stat_value_less_than("apple", "banana", false));
+        assert!(!stat_value_less_than("banana", "apple", false));
+        assert!(!stat_value_less_than("banana", "banana", false));
     }
 }

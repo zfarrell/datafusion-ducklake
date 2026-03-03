@@ -100,11 +100,7 @@ impl TableFunctionImpl for DucklakeListFilesFunction {
             },
         };
 
-        let resolved = resolve_table_for_function(
-            &*self.provider,
-            &table_name,
-            self.snapshot_id,
-        )?;
+        let resolved = resolve_table_for_function(&*self.provider, &table_name, self.snapshot_id)?;
 
         let files = self
             .provider
@@ -147,10 +143,10 @@ impl TableFunctionImpl for DucklakeListFilesFunction {
                 f.file.path.clone()
             };
 
-            // Strip the data_path prefix if the file path starts with the base URL path
-            let display_path = file_path
-                .strip_prefix(&data_path)
-                .map_or_else(|| file_path.clone(), |stripped| stripped.to_string());
+            // Strip the data_path prefix if the file path starts with the base URL path.
+            // Use path-aware stripping: require data_path + "/" to avoid
+            // "/data" matching "/database/file.parquet" (R5-S-009).
+            let display_path = strip_path_prefix(&file_path, &data_path);
 
             data_file_paths.push(display_path);
             data_file_sizes.push(f.file.file_size_bytes);
@@ -164,9 +160,7 @@ impl TableFunctionImpl for DucklakeListFilesFunction {
                 } else {
                     del.path.clone()
                 };
-                let display_del = del_path
-                    .strip_prefix(&data_path)
-                    .map_or_else(|| del_path.clone(), |stripped| stripped.to_string());
+                let display_del = strip_path_prefix(&del_path, &data_path);
                 delete_file_paths.push(Some(display_del));
                 delete_file_sizes.push(Some(del.file_size_bytes));
                 delete_file_footer_sizes.push(del.footer_size);
@@ -220,11 +214,7 @@ impl TableFunctionImpl for DucklakeTableChangesFunction {
         let (table_name, start_snapshot, end_snapshot) =
             parse_change_function_args(exprs, "ducklake_table_changes")?;
 
-        let resolved = resolve_table_for_function(
-            &*self.provider,
-            &table_name,
-            self.snapshot_id,
-        )?;
+        let resolved = resolve_table_for_function(&*self.provider, &table_name, self.snapshot_id)?;
 
         Ok(Arc::new(TableChangesTable::new(
             self.provider.clone(),
@@ -258,11 +248,7 @@ impl TableFunctionImpl for DucklakeTableDeletionsFunction {
         let (table_name, start_snapshot, end_snapshot) =
             parse_change_function_args(exprs, "ducklake_table_deletions")?;
 
-        let resolved = resolve_table_for_function(
-            &*self.provider,
-            &table_name,
-            self.snapshot_id,
-        )?;
+        let resolved = resolve_table_for_function(&*self.provider, &table_name, self.snapshot_id)?;
 
         Ok(Arc::new(TableDeletionsTable::new(
             self.provider.clone(),
@@ -341,13 +327,88 @@ fn resolve_table_for_function(
     })
 }
 
+/// Strip a directory prefix from a path using path-aware matching.
+///
+/// Only strips when the path starts with `prefix + "/"` (or equals `prefix`),
+/// preventing `/data` from stripping from `/database/file.parquet`.
+fn strip_path_prefix(path: &str, prefix: &str) -> String {
+    let prefix_with_slash = if prefix.ends_with('/') {
+        prefix.to_string()
+    } else {
+        format!("{}/", prefix)
+    };
+
+    if path.starts_with(&prefix_with_slash) {
+        path[prefix_with_slash.len()..].to_string()
+    } else if path == prefix {
+        String::new()
+    } else {
+        path.to_string()
+    }
+}
+
+/// Parse a potentially qualified table name into (schema, table).
+///
+/// Handles quoted identifiers: dots inside double-quotes are not treated as
+/// separators. Empty parts (e.g., ".foo" or "foo.") are rejected.
 fn parse_table_name(table_name: &str) -> (&str, &str) {
-    if let Some(dot_pos) = table_name.find('.') {
-        let schema = &table_name[..dot_pos];
-        let table = &table_name[dot_pos + 1..];
-        (schema, table)
+    // Find the first dot that is not inside double-quotes
+    let mut in_quotes = false;
+    let mut dot_pos = None;
+    for (i, ch) in table_name.char_indices() {
+        match ch {
+            '"' => in_quotes = !in_quotes,
+            '.' if !in_quotes => {
+                dot_pos = Some(i);
+                break;
+            },
+            _ => {},
+        }
+    }
+
+    if let Some(pos) = dot_pos {
+        let schema = &table_name[..pos];
+        let table = &table_name[pos + 1..];
+        // Fall back to default if either part is empty
+        if schema.is_empty() || table.is_empty() {
+            ("main", table_name)
+        } else {
+            (schema, table)
+        }
     } else {
         ("main", table_name)
+    }
+}
+
+/// Extract a snapshot ID from a scalar expression, accepting wider numeric types (R5-S-038).
+fn extract_snapshot_arg(
+    expr: &Expr,
+    func_name: &str,
+    ordinal: &str,
+    param_name: &str,
+) -> DataFusionResult<i64> {
+    match expr {
+        Expr::Literal(ScalarValue::Int64(Some(v)), _) => Ok(*v),
+        Expr::Literal(ScalarValue::Int32(Some(v)), _) => Ok(i64::from(*v)),
+        Expr::Literal(ScalarValue::Int16(Some(v)), _) => Ok(i64::from(*v)),
+        Expr::Literal(ScalarValue::Int8(Some(v)), _) => Ok(i64::from(*v)),
+        Expr::Literal(ScalarValue::UInt64(Some(v)), _) => i64::try_from(*v).map_err(|_| {
+            datafusion::error::DataFusionError::Plan(format!(
+                "{} argument to {}() value {} overflows i64 ({})",
+                ordinal, func_name, v, param_name
+            ))
+        }),
+        Expr::Literal(ScalarValue::UInt32(Some(v)), _) => Ok(i64::from(*v)),
+        Expr::Literal(ScalarValue::UInt16(Some(v)), _) => Ok(i64::from(*v)),
+        Expr::Literal(ScalarValue::UInt8(Some(v)), _) => Ok(i64::from(*v)),
+        _ => {
+            plan_err!(
+                "{} argument to {}() must be an integer ({})",
+                ordinal,
+                func_name,
+                param_name
+            )
+        },
     }
 }
 
@@ -374,27 +435,8 @@ fn parse_change_function_args(
         },
     };
 
-    let start_snapshot = match &exprs[1] {
-        Expr::Literal(ScalarValue::Int64(Some(v)), _) => *v,
-        Expr::Literal(ScalarValue::Int32(Some(v)), _) => i64::from(*v),
-        _ => {
-            return plan_err!(
-                "Second argument to {}() must be an integer (start_snapshot)",
-                func_name
-            );
-        },
-    };
-
-    let end_snapshot = match &exprs[2] {
-        Expr::Literal(ScalarValue::Int64(Some(v)), _) => *v,
-        Expr::Literal(ScalarValue::Int32(Some(v)), _) => i64::from(*v),
-        _ => {
-            return plan_err!(
-                "Third argument to {}() must be an integer (end_snapshot)",
-                func_name
-            );
-        },
-    };
+    let start_snapshot = extract_snapshot_arg(&exprs[1], func_name, "Second", "start_snapshot")?;
+    let end_snapshot = extract_snapshot_arg(&exprs[2], func_name, "Third", "end_snapshot")?;
 
     if start_snapshot > end_snapshot {
         return plan_err!(
@@ -427,11 +469,7 @@ impl TableFunctionImpl for DucklakeTableInsertionsFunction {
         let (table_name, start_snapshot, end_snapshot) =
             parse_change_function_args(exprs, "ducklake_table_insertions")?;
 
-        let resolved = resolve_table_for_function(
-            &*self.provider,
-            &table_name,
-            self.snapshot_id,
-        )?;
+        let resolved = resolve_table_for_function(&*self.provider, &table_name, self.snapshot_id)?;
 
         Ok(Arc::new(TableInsertionsTable::new(
             self.provider.clone(),
@@ -597,4 +635,140 @@ pub fn register_ducklake_functions(
         "ducklake_last_committed_snapshot",
         Arc::new(DucklakeLastCommittedSnapshotFunction::new(snapshot_id)),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ==================== R5-S-009: strip_path_prefix tests ====================
+
+    #[test]
+    fn test_strip_path_prefix_exact_match() {
+        assert_eq!(
+            strip_path_prefix("/data/table/file.parquet", "/data"),
+            "table/file.parquet"
+        );
+    }
+
+    #[test]
+    fn test_strip_path_prefix_with_trailing_slash() {
+        assert_eq!(
+            strip_path_prefix("/data/table/file.parquet", "/data/"),
+            "table/file.parquet"
+        );
+    }
+
+    #[test]
+    fn test_strip_path_prefix_no_match() {
+        // "/data" should NOT strip from "/database/file.parquet" — this was the original bug
+        assert_eq!(
+            strip_path_prefix("/database/file.parquet", "/data"),
+            "/database/file.parquet"
+        );
+    }
+
+    #[test]
+    fn test_strip_path_prefix_exact_path_equals() {
+        assert_eq!(strip_path_prefix("/data", "/data"), "");
+    }
+
+    #[test]
+    fn test_strip_path_prefix_no_prefix_overlap() {
+        assert_eq!(
+            strip_path_prefix("/other/file.parquet", "/data"),
+            "/other/file.parquet"
+        );
+    }
+
+    #[test]
+    fn test_strip_path_prefix_nested() {
+        assert_eq!(
+            strip_path_prefix("/data/schemas/main/table/f.parquet", "/data/schemas"),
+            "main/table/f.parquet"
+        );
+    }
+
+    // ==================== R5-S-030: parse_table_name tests ====================
+
+    #[test]
+    fn test_parse_table_name_simple() {
+        assert_eq!(parse_table_name("users"), ("main", "users"));
+    }
+
+    #[test]
+    fn test_parse_table_name_qualified() {
+        assert_eq!(parse_table_name("myschema.users"), ("myschema", "users"));
+    }
+
+    #[test]
+    fn test_parse_table_name_quoted_with_dot() {
+        // Dots inside double-quotes should not split
+        let (schema, table) = parse_table_name("\"my.schema\".users");
+        assert_eq!(schema, "\"my.schema\"");
+        assert_eq!(table, "users");
+    }
+
+    #[test]
+    fn test_parse_table_name_quoted_table() {
+        let (schema, table) = parse_table_name("main.\"my.table\"");
+        assert_eq!(schema, "main");
+        assert_eq!(table, "\"my.table\"");
+    }
+
+    #[test]
+    fn test_parse_table_name_empty_schema() {
+        // ".foo" should default to "main"
+        assert_eq!(parse_table_name(".foo"), ("main", ".foo"));
+    }
+
+    #[test]
+    fn test_parse_table_name_empty_table() {
+        // "foo." should default to "main"
+        assert_eq!(parse_table_name("foo."), ("main", "foo."));
+    }
+
+    // ==================== R5-S-038: extract_snapshot_arg tests ====================
+
+    #[test]
+    fn test_extract_snapshot_uint32() {
+        let expr = Expr::Literal(ScalarValue::UInt32(Some(42)), None);
+        let result = extract_snapshot_arg(&expr, "test", "First", "start").unwrap();
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn test_extract_snapshot_uint64() {
+        let expr = Expr::Literal(ScalarValue::UInt64(Some(100)), None);
+        let result = extract_snapshot_arg(&expr, "test", "First", "start").unwrap();
+        assert_eq!(result, 100);
+    }
+
+    #[test]
+    fn test_extract_snapshot_uint64_overflow() {
+        let expr = Expr::Literal(ScalarValue::UInt64(Some(u64::MAX)), None);
+        let result = extract_snapshot_arg(&expr, "test", "First", "start");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_snapshot_uint8() {
+        let expr = Expr::Literal(ScalarValue::UInt8(Some(5)), None);
+        let result = extract_snapshot_arg(&expr, "test", "First", "start").unwrap();
+        assert_eq!(result, 5);
+    }
+
+    #[test]
+    fn test_extract_snapshot_int16() {
+        let expr = Expr::Literal(ScalarValue::Int16(Some(-10)), None);
+        let result = extract_snapshot_arg(&expr, "test", "First", "start").unwrap();
+        assert_eq!(result, -10);
+    }
+
+    #[test]
+    fn test_extract_snapshot_string_rejected() {
+        let expr = Expr::Literal(ScalarValue::Utf8(Some("5".to_string())), None);
+        let result = extract_snapshot_arg(&expr, "test", "First", "start");
+        assert!(result.is_err());
+    }
 }

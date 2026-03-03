@@ -340,7 +340,9 @@ impl CatalogProvider for DuckLakeCatalog {
 
         let snapshot_id = self.snapshot_id.load(Ordering::Acquire);
 
-        // Add data schemas from catalog using the current snapshot_id
+        // Add data schemas from catalog using the current snapshot_id.
+        // Note: DataFusion's CatalogProvider trait returns Vec<String> (not Result),
+        // so metadata errors must be logged and swallowed here (R5-S-059).
         let data_schemas = self
             .provider
             .list_schemas(snapshot_id)

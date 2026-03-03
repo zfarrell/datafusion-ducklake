@@ -20,7 +20,7 @@ const DEFAULT_MAX_CONNECTIONS: u32 = 5;
 const SQL_CREATE_METADATA: &str = r#"
 CREATE TABLE IF NOT EXISTS ducklake_metadata (
     `key` VARCHAR(255) NOT NULL,
-    value VARCHAR(1024) NOT NULL,
+    value TEXT NOT NULL,
     scope VARCHAR(255),
     scope_id BIGINT
 )"#;
@@ -28,8 +28,8 @@ CREATE TABLE IF NOT EXISTS ducklake_metadata (
 const SQL_CREATE_SNAPSHOT: &str = r#"
 CREATE TABLE IF NOT EXISTS ducklake_snapshot (
     snapshot_id BIGINT AUTO_INCREMENT PRIMARY KEY,
-    snapshot_time TIMESTAMP(6) DEFAULT NOW(6),
-    schema_version INTEGER DEFAULT 1,
+    snapshot_time DATETIME(6) DEFAULT NOW(6),
+    schema_version BIGINT DEFAULT 1,
     next_catalog_id BIGINT DEFAULT 0,
     next_file_id BIGINT DEFAULT 0
 )"#;
@@ -39,7 +39,7 @@ CREATE TABLE IF NOT EXISTS ducklake_schema (
     schema_id BIGINT AUTO_INCREMENT PRIMARY KEY,
     schema_uuid VARCHAR(255),
     schema_name VARCHAR(255) NOT NULL,
-    path VARCHAR(1024) NOT NULL DEFAULT '',
+    path VARCHAR(4096) NOT NULL DEFAULT '',
     path_is_relative BOOLEAN NOT NULL DEFAULT TRUE,
     begin_snapshot BIGINT NOT NULL,
     end_snapshot BIGINT
@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS ducklake_table (
     table_uuid VARCHAR(255),
     schema_id BIGINT NOT NULL,
     table_name VARCHAR(255) NOT NULL,
-    path VARCHAR(1024) NOT NULL DEFAULT '',
+    path VARCHAR(4096) NOT NULL DEFAULT '',
     path_is_relative BOOLEAN NOT NULL DEFAULT TRUE,
     begin_snapshot BIGINT NOT NULL,
     end_snapshot BIGINT
@@ -65,8 +65,8 @@ CREATE TABLE IF NOT EXISTS ducklake_column (
     column_type VARCHAR(255) NOT NULL,
     column_order INTEGER NOT NULL,
     nulls_allowed BOOLEAN DEFAULT TRUE,
-    initial_default VARCHAR(1024),
-    default_value VARCHAR(1024),
+    initial_default TEXT,
+    default_value TEXT,
     parent_column BIGINT,
     default_value_type VARCHAR(255),
     default_value_dialect VARCHAR(255),
@@ -78,7 +78,7 @@ const SQL_CREATE_DATA_FILE: &str = r#"
 CREATE TABLE IF NOT EXISTS ducklake_data_file (
     data_file_id BIGINT AUTO_INCREMENT PRIMARY KEY,
     table_id BIGINT NOT NULL,
-    path VARCHAR(1024) NOT NULL,
+    path TEXT NOT NULL,
     path_is_relative BOOLEAN NOT NULL DEFAULT TRUE,
     file_size_bytes BIGINT NOT NULL,
     footer_size BIGINT,
@@ -90,7 +90,7 @@ CREATE TABLE IF NOT EXISTS ducklake_data_file (
     file_format VARCHAR(255) DEFAULT 'parquet',
     partition_id BIGINT,
     partial_max BIGINT,
-    partial_file_info VARCHAR(1024),
+    partial_file_info TEXT,
     begin_snapshot BIGINT NOT NULL,
     end_snapshot BIGINT
 )"#;
@@ -100,7 +100,7 @@ CREATE TABLE IF NOT EXISTS ducklake_delete_file (
     delete_file_id BIGINT AUTO_INCREMENT PRIMARY KEY,
     data_file_id BIGINT NOT NULL,
     table_id BIGINT NOT NULL,
-    path VARCHAR(1024) NOT NULL,
+    path TEXT NOT NULL,
     path_is_relative BOOLEAN NOT NULL DEFAULT TRUE,
     file_size_bytes BIGINT NOT NULL,
     footer_size BIGINT,
@@ -115,10 +115,10 @@ CREATE TABLE IF NOT EXISTS ducklake_delete_file (
 const SQL_CREATE_SNAPSHOT_CHANGES: &str = r#"
 CREATE TABLE IF NOT EXISTS ducklake_snapshot_changes (
     snapshot_id BIGINT PRIMARY KEY,
-    changes_made VARCHAR(1024),
+    changes_made TEXT,
     author VARCHAR(255),
-    commit_message VARCHAR(1024),
-    commit_extra_info VARCHAR(1024)
+    commit_message TEXT,
+    commit_extra_info TEXT
 )"#;
 
 const SQL_CREATE_CHANGE_TRACKING: &str = r#"
@@ -128,6 +128,14 @@ CREATE TABLE IF NOT EXISTS _df_change_tracking (
     change_type VARCHAR(255) NOT NULL,
     table_id BIGINT,
     schema_id BIGINT
+)"#;
+
+/// Sequence table for concurrent-safe ID generation in MySQL (R5-S-027).
+/// Replaces the race-prone `MAX(id)+1 FOR UPDATE` pattern.
+const SQL_CREATE_SEQUENCES: &str = r#"
+CREATE TABLE IF NOT EXISTS _df_sequences (
+    seq_name VARCHAR(255) PRIMARY KEY,
+    seq_value BIGINT NOT NULL DEFAULT 0
 )"#;
 
 const SQL_CREATE_FILE_COLUMN_STATS: &str = r#"
@@ -223,9 +231,9 @@ CREATE TABLE IF NOT EXISTS ducklake_file_partition_value (
 const SQL_CREATE_FILES_SCHEDULED_FOR_DELETION: &str = r#"
 CREATE TABLE IF NOT EXISTS ducklake_files_scheduled_for_deletion (
     data_file_id BIGINT,
-    path VARCHAR(1024),
+    path TEXT,
     path_is_relative BOOLEAN,
-    schedule_start TIMESTAMP(6)
+    schedule_start DATETIME(6)
 )"#;
 
 const SQL_CREATE_INLINED_DATA_TABLES: &str = r#"
@@ -322,6 +330,46 @@ CREATE TABLE IF NOT EXISTS ducklake_file_variant_stats (
     contains_nan BOOLEAN,
     extra_stats VARCHAR(1024)
 )"#;
+
+/// Atomically allocate the next ID from a named sequence (R5-S-027).
+/// Uses `UPDATE ... SET seq_value = seq_value + 1` with row-level locking
+/// for concurrent-safe ID generation without the MAX+1 race.
+async fn next_sequence_id(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    seq_name: &str,
+) -> Result<i64> {
+    next_sequence_ids(tx, seq_name, 1).await
+}
+
+/// Atomically allocate `count` sequential IDs from a named sequence (R5-S-027).
+/// Returns the first ID in the allocated range. The allocated IDs are
+/// `[first_id, first_id+1, ..., first_id+count-1]`.
+async fn next_sequence_ids(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    seq_name: &str,
+    count: i64,
+) -> Result<i64> {
+    // Ensure the sequence row exists
+    sqlx::query("INSERT IGNORE INTO _df_sequences (seq_name, seq_value) VALUES (?, 0)")
+        .bind(seq_name)
+        .execute(&mut **tx)
+        .await?;
+
+    // Atomically increment by count and return the new value
+    sqlx::query("UPDATE _df_sequences SET seq_value = seq_value + ? WHERE seq_name = ?")
+        .bind(count)
+        .bind(seq_name)
+        .execute(&mut **tx)
+        .await?;
+
+    let row = sqlx::query("SELECT seq_value FROM _df_sequences WHERE seq_name = ?")
+        .bind(seq_name)
+        .fetch_one(&mut **tx)
+        .await?;
+    let end_value: i64 = row.try_get(0)?;
+    // Return the first ID in the range (end - count + 1)
+    Ok(end_value - count + 1)
+}
 
 /// Helper to get the last inserted auto-increment ID from a MySQL transaction.
 async fn last_insert_id(tx: &mut sqlx::Transaction<'_, sqlx::MySql>) -> Result<i64> {
@@ -466,12 +514,7 @@ impl MySqlMetadataWriter {
         let table_id: i64 = if let Some(t_row) = existing_table {
             t_row.try_get(0)?
         } else {
-            let next_tid_row = sqlx::query(
-                "SELECT COALESCE(MAX(table_id), 0) + 1 FROM ducklake_table FOR UPDATE",
-            )
-            .fetch_one(&mut *tx)
-            .await?;
-            let next_table_id: i64 = next_tid_row.try_get(0)?;
+            let next_table_id = next_sequence_id(&mut tx, "table_id").await?;
 
             let table_path = format!("{}/", table_name);
             let table_uuid = uuid::Uuid::new_v4().to_string();
@@ -537,17 +580,12 @@ impl MySqlMetadataWriter {
             .execute(&mut *tx)
             .await?;
 
-            let next_cid_row = sqlx::query(
-                "SELECT COALESCE(MAX(column_id), 0) + 1 FROM ducklake_column WHERE table_id = ? FOR UPDATE",
-            )
-            .bind(table_id)
-            .fetch_one(&mut *tx)
-            .await?;
-            let next_column_id: i64 = next_cid_row.try_get(0)?;
+            let first_column_id =
+                next_sequence_ids(&mut tx, "column_id", columns.len() as i64).await?;
 
             let mut new_ids = Vec::with_capacity(columns.len());
             for (order, col) in columns.iter().enumerate() {
-                let column_id = next_column_id + order as i64;
+                let column_id = first_column_id + order as i64;
                 sqlx::query(
                     "INSERT INTO ducklake_column (column_id, table_id, column_name, column_type, column_order, nulls_allowed, initial_default, default_value, parent_column, default_value_type, default_value_dialect, begin_snapshot)
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -919,11 +957,7 @@ impl MetadataWriter for MySqlMetadataWriter {
             } else {
                 format!("{}/", base_path)
             };
-            let next_tid_row =
-                sqlx::query("SELECT COALESCE(MAX(table_id), 0) + 1 FROM ducklake_table FOR UPDATE")
-                    .fetch_one(&mut *tx)
-                    .await?;
-            let next_table_id: i64 = next_tid_row.try_get(0)?;
+            let next_table_id = next_sequence_id(&mut tx, "table_id").await?;
 
             // F-026: generate UUID
             let table_uuid = uuid::Uuid::new_v4().to_string();
@@ -964,13 +998,8 @@ impl MetadataWriter for MySqlMetadataWriter {
             .execute(&mut *tx)
             .await?;
 
-            let next_cid_row = sqlx::query(
-                "SELECT COALESCE(MAX(column_id), 0) + 1 FROM ducklake_column WHERE table_id = ? FOR UPDATE",
-            )
-            .bind(table_id)
-            .fetch_one(&mut *tx)
-            .await?;
-            let next_column_id: i64 = next_cid_row.try_get(0)?;
+            let next_column_id =
+                next_sequence_ids(&mut tx, "column_id", columns.len() as i64).await?;
 
             let mut column_ids = Vec::with_capacity(columns.len());
             for (order, col) in columns.iter().enumerate() {
@@ -1151,8 +1180,8 @@ impl MetadataWriter for MySqlMetadataWriter {
 
                 // Insert the new delete file
                 sqlx::query(
-                    "INSERT INTO ducklake_delete_file (data_file_id, table_id, path, path_is_relative, file_size_bytes, footer_size, delete_count, begin_snapshot)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO ducklake_delete_file (data_file_id, table_id, path, path_is_relative, file_size_bytes, footer_size, delete_count, format, begin_snapshot)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, 'parquet', ?)",
                 )
                 .bind(file.data_file_id)
                 .bind(table_id)
@@ -1262,10 +1291,12 @@ impl MetadataWriter for MySqlMetadataWriter {
 
     fn set_data_path(&self, path: &str) -> Result<()> {
         block_on(async {
+            let mut tx = self.pool.begin().await?;
+
             sqlx::query(
                 "DELETE FROM ducklake_metadata WHERE `key` = 'data_path' AND scope IS NULL",
             )
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
 
             sqlx::query(
@@ -1273,15 +1304,19 @@ impl MetadataWriter for MySqlMetadataWriter {
                  VALUES ('data_path', ?, NULL)",
             )
             .bind(path)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
 
+            tx.commit().await?;
             Ok(())
         })
     }
 
     fn initialize_schema(&self) -> Result<()> {
         block_on(async {
+            // Note: MySQL DDL (CREATE TABLE) causes implicit commits, so these
+            // cannot be wrapped in a single transaction. If initialization fails
+            // partway through, re-running is safe due to IF NOT EXISTS clauses (R5-S-072).
             let ddl_statements = [
                 SQL_CREATE_METADATA,
                 SQL_CREATE_SNAPSHOT,
@@ -1292,6 +1327,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                 SQL_CREATE_DELETE_FILE,
                 SQL_CREATE_SNAPSHOT_CHANGES,
                 SQL_CREATE_CHANGE_TRACKING,
+                SQL_CREATE_SEQUENCES,
                 SQL_CREATE_FILE_COLUMN_STATS,
                 SQL_CREATE_VIEW,
                 SQL_CREATE_TAG,
@@ -1380,6 +1416,27 @@ impl MetadataWriter for MySqlMetadataWriter {
             )
             .execute(&self.pool)
             .await?;
+
+            // Sync sequences with existing data (handles migration from MAX+1 pattern, R5-S-027).
+            // Uses INSERT ... ON DUPLICATE KEY UPDATE to atomically set each sequence
+            // to the max existing value if it's higher than the current sequence value.
+            for (seq_name, table_name, col_name) in [
+                ("table_id", "ducklake_table", "table_id"),
+                ("column_id", "ducklake_column", "column_id"),
+                ("view_id", "ducklake_view", "view_id"),
+                ("partition_id", "ducklake_partition_info", "partition_id"),
+            ] {
+                let sync_sql = format!(
+                    "INSERT INTO _df_sequences (seq_name, seq_value)
+                     SELECT ?, COALESCE(MAX({}), 0) FROM {}
+                     ON DUPLICATE KEY UPDATE seq_value = GREATEST(seq_value, VALUES(seq_value))",
+                    col_name, table_name
+                );
+                sqlx::query(&sync_sql)
+                    .bind(seq_name)
+                    .execute(&self.pool)
+                    .await?;
+            }
 
             Ok(())
         })
@@ -1483,6 +1540,7 @@ impl MetadataWriter for MySqlMetadataWriter {
             if let Some(schema_row) = schema_row {
                 let schema_id: i64 = schema_row.try_get(0)?;
 
+                // Check DF-originated drops via change tracking
                 let schema_drop = sqlx::query(
                     "SELECT COUNT(*) FROM _df_change_tracking
                      WHERE snapshot_id > ? AND schema_id = ? AND change_type = 'DROP_SCHEMA'",
@@ -1494,6 +1552,22 @@ impl MetadataWriter for MySqlMetadataWriter {
                 if schema_drop.try_get::<i64, _>(0)? > 0 {
                     return Err(crate::error::DuckLakeError::TransactionConflict(format!(
                         "Transaction conflict: schema '{}' was dropped by another transaction since snapshot {}",
+                        schema_name, since_snapshot
+                    )));
+                }
+
+                // Check DuckDB-originated drops via catalog metadata (R5-S-018)
+                let schema_ended = sqlx::query(
+                    "SELECT COUNT(*) FROM ducklake_schema
+                     WHERE schema_id = ? AND end_snapshot IS NOT NULL AND end_snapshot > ?",
+                )
+                .bind(schema_id)
+                .bind(since_snapshot)
+                .fetch_one(&mut *tx)
+                .await?;
+                if schema_ended.try_get::<i64, _>(0)? > 0 {
+                    return Err(crate::error::DuckLakeError::TransactionConflict(format!(
+                        "Transaction conflict: schema '{}' was dropped (possibly by DuckDB) since snapshot {}",
                         schema_name, since_snapshot
                     )));
                 }
@@ -1510,6 +1584,8 @@ impl MetadataWriter for MySqlMetadataWriter {
 
                 if let Some(table_row) = table_row {
                     let table_id: i64 = table_row.try_get(0)?;
+
+                    // Check DF-originated drops via change tracking
                     let table_drop = sqlx::query(
                         "SELECT COUNT(*) FROM _df_change_tracking
                          WHERE snapshot_id > ? AND table_id = ? AND change_type = 'DROP_TABLE'",
@@ -1521,6 +1597,22 @@ impl MetadataWriter for MySqlMetadataWriter {
                     if table_drop.try_get::<i64, _>(0)? > 0 {
                         return Err(crate::error::DuckLakeError::TransactionConflict(format!(
                             "Transaction conflict: table '{}.{}' was dropped by another transaction since snapshot {}",
+                            schema_name, table_name, since_snapshot
+                        )));
+                    }
+
+                    // Check DuckDB-originated drops via catalog metadata (R5-S-018)
+                    let table_ended = sqlx::query(
+                        "SELECT COUNT(*) FROM ducklake_table
+                         WHERE table_id = ? AND end_snapshot IS NOT NULL AND end_snapshot > ?",
+                    )
+                    .bind(table_id)
+                    .bind(since_snapshot)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    if table_ended.try_get::<i64, _>(0)? > 0 {
+                        return Err(crate::error::DuckLakeError::TransactionConflict(format!(
+                            "Transaction conflict: table '{}.{}' was dropped (possibly by DuckDB) since snapshot {}",
                             schema_name, table_name, since_snapshot
                         )));
                     }
@@ -1536,6 +1628,7 @@ impl MetadataWriter for MySqlMetadataWriter {
         block_on(async {
             let mut tx = self.pool.begin().await?;
 
+            // Check DF-originated drops
             let drop_check = sqlx::query(
                 "SELECT COUNT(*) FROM _df_change_tracking
                  WHERE snapshot_id > ? AND table_id = ? AND change_type = 'DROP_TABLE'",
@@ -1551,6 +1644,22 @@ impl MetadataWriter for MySqlMetadataWriter {
                 )));
             }
 
+            // Check DuckDB-originated drops via catalog metadata (R5-S-018)
+            let table_ended = sqlx::query(
+                "SELECT COUNT(*) FROM ducklake_table
+                 WHERE table_id = ? AND end_snapshot IS NOT NULL AND end_snapshot > ?",
+            )
+            .bind(table_id)
+            .bind(since_snapshot)
+            .fetch_one(&mut *tx)
+            .await?;
+            if table_ended.try_get::<i64, _>(0)? > 0 {
+                return Err(crate::error::DuckLakeError::TransactionConflict(format!(
+                    "Transaction conflict: table (id={}) was already dropped (possibly by DuckDB) since snapshot {}",
+                    table_id, since_snapshot
+                )));
+            }
+
             Self::drop_table_inner(tx, table_id).await
         })
     }
@@ -1559,6 +1668,7 @@ impl MetadataWriter for MySqlMetadataWriter {
         block_on(async {
             let mut tx = self.pool.begin().await?;
 
+            // Check DF-originated drops
             let drop_check = sqlx::query(
                 "SELECT COUNT(*) FROM _df_change_tracking
                  WHERE snapshot_id > ? AND schema_id = ? AND change_type = 'DROP_SCHEMA'",
@@ -1570,6 +1680,22 @@ impl MetadataWriter for MySqlMetadataWriter {
             if drop_check.try_get::<i64, _>(0)? > 0 {
                 return Err(crate::error::DuckLakeError::TransactionConflict(format!(
                     "Transaction conflict: schema (id={}) was already dropped by another transaction since snapshot {}",
+                    schema_id, since_snapshot
+                )));
+            }
+
+            // Check DuckDB-originated drops via catalog metadata (R5-S-018)
+            let schema_ended = sqlx::query(
+                "SELECT COUNT(*) FROM ducklake_schema
+                 WHERE schema_id = ? AND end_snapshot IS NOT NULL AND end_snapshot > ?",
+            )
+            .bind(schema_id)
+            .bind(since_snapshot)
+            .fetch_one(&mut *tx)
+            .await?;
+            if schema_ended.try_get::<i64, _>(0)? > 0 {
+                return Err(crate::error::DuckLakeError::TransactionConflict(format!(
+                    "Transaction conflict: schema (id={}) was already dropped (possibly by DuckDB) since snapshot {}",
                     schema_id, since_snapshot
                 )));
             }
@@ -1618,11 +1744,7 @@ impl MetadataWriter for MySqlMetadataWriter {
             .execute(&mut *tx)
             .await?;
 
-            let vid_row =
-                sqlx::query("SELECT COALESCE(MAX(view_id), 0) + 1 FROM ducklake_view FOR UPDATE")
-                    .fetch_one(&mut *tx)
-                    .await?;
-            let view_id: i64 = vid_row.try_get(0)?;
+            let view_id = next_sequence_id(&mut tx, "view_id").await?;
 
             // F-026: generate UUID for view
             let view_uuid = uuid::Uuid::new_v4().to_string();
@@ -1920,14 +2042,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                     column_order,
                     is_nullable,
                 } => {
-                    // Compute next column_id explicitly
-                    let next_cid_row = sqlx::query(
-                        "SELECT COALESCE(MAX(column_id), 0) + 1 FROM ducklake_column WHERE table_id = ? FOR UPDATE",
-                    )
-                    .bind(table_id)
-                    .fetch_one(&mut *tx)
-                    .await?;
-                    let next_column_id: i64 = next_cid_row.try_get(0)?;
+                    let next_column_id = next_sequence_id(&mut tx, "column_id").await?;
 
                     let (
                         initial_default,
@@ -1969,9 +2084,11 @@ impl MetadataWriter for MySqlMetadataWriter {
                     .await?;
 
                     // Initialize table-level column stats for the new column (upstream bug #625)
+                    // R5-S-003: contains_null must be 1 because existing rows have NULL for the new column.
+                    // NULL here causes DuckDB to crash when reading from the catalog.
                     sqlx::query(
                         "INSERT INTO ducklake_table_column_stats (table_id, column_id, contains_null, contains_nan)
-                         VALUES (?, ?, NULL, NULL)",
+                         VALUES (?, ?, 1, NULL)",
                     )
                     .bind(table_id)
                     .bind(next_column_id)
@@ -2047,12 +2164,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                     .await?;
 
                     // Create new partition_info entry
-                    let pid_row: (i64,) = sqlx::query_as(
-                        "SELECT COALESCE(MAX(partition_id), 0) + 1 FROM ducklake_partition_info FOR UPDATE",
-                    )
-                    .fetch_one(&mut *tx)
-                    .await?;
-                    let partition_id = pid_row.0;
+                    let partition_id = next_sequence_id(&mut tx, "partition_id").await?;
 
                     sqlx::query(
                         "INSERT INTO ducklake_partition_info (partition_id, table_id, begin_snapshot)
@@ -2407,7 +2519,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                  ON DUPLICATE KEY UPDATE changes_made = VALUES(changes_made)",
             )
             .bind(snapshot_id)
-            .bind(format!("Altered table (id={})", table_id))
+            .bind(format!("altered_table:{}", table_id))
             .execute(&mut *tx)
             .await?;
 

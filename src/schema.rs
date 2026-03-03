@@ -64,6 +64,14 @@ pub(crate) fn validate_schema_name(name: &str) -> DataFusionResult<()> {
 /// Represents a schema within a DuckLake catalog and provides access to tables.
 /// Uses dynamic metadata lookup - tables are queried on-demand from the catalog database.
 /// Caches snapshot_id received from catalog.schema() call for query consistency.
+///
+/// **Important**: Schema objects are ephemeral — the `snapshot_id` is pinned at creation
+/// time and is NOT updated after DDL operations (register_table, deregister_table, etc.).
+/// In normal SQL query patterns this is correct because DataFusion creates fresh schema
+/// objects via `catalog.schema()` for each query. However, holding a long-lived reference
+/// to a `DuckLakeSchema` across DDL operations may result in stale reads (R5-S-029).
+/// The parent `DuckLakeCatalog` uses `AtomicI64` for its snapshot_id and updates it
+/// after DDL, but schema objects created before the DDL will still use the old snapshot.
 #[derive(Debug)]
 pub struct DuckLakeSchema {
     schema_id: i64,
@@ -148,8 +156,9 @@ impl DuckLakeSchema {
 
         let temp_ctx = SessionContext::new_with_config(config);
 
-        let temp_catalog = DuckLakeCatalog::with_snapshot(Arc::clone(&self.provider), self.snapshot_id)
-            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        let temp_catalog =
+            DuckLakeCatalog::with_snapshot(Arc::clone(&self.provider), self.snapshot_id)
+                .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
 
         temp_ctx.register_catalog("ducklake", Arc::new(temp_catalog));
 

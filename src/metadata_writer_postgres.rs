@@ -27,7 +27,7 @@ const SQL_CREATE_TABLES: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS ducklake_snapshot (
         snapshot_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
         snapshot_time TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-        schema_version INTEGER DEFAULT 1,
+        schema_version BIGINT DEFAULT 1,
         next_catalog_id BIGINT DEFAULT 0,
         next_file_id BIGINT DEFAULT 0
     )",
@@ -1049,8 +1049,8 @@ impl MetadataWriter for PostgresMetadataWriter {
 
                 // Insert the new delete file
                 sqlx::query(
-                    "INSERT INTO ducklake_delete_file (data_file_id, table_id, path, path_is_relative, file_size_bytes, footer_size, delete_count, begin_snapshot)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                    "INSERT INTO ducklake_delete_file (data_file_id, table_id, path, path_is_relative, file_size_bytes, footer_size, delete_count, format, begin_snapshot)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, 'parquet', $8)",
                 )
                 .bind(file.data_file_id)
                 .bind(table_id)
@@ -1159,8 +1159,10 @@ impl MetadataWriter for PostgresMetadataWriter {
 
     fn set_data_path(&self, path: &str) -> Result<()> {
         block_on(async {
+            let mut tx = self.pool.begin().await?;
+
             sqlx::query("DELETE FROM ducklake_metadata WHERE key = 'data_path' AND scope IS NULL")
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await?;
 
             sqlx::query(
@@ -1168,17 +1170,22 @@ impl MetadataWriter for PostgresMetadataWriter {
                  VALUES ('data_path', $1, NULL)",
             )
             .bind(path)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
 
+            tx.commit().await?;
             Ok(())
         })
     }
 
     fn initialize_schema(&self) -> Result<()> {
         block_on(async {
+            // Wrap in a transaction for atomicity — partial catalog state on failure
+            // would leave an unusable catalog (R5-S-072).
+            let mut tx = self.pool.begin().await?;
+
             for ddl in SQL_CREATE_TABLES {
-                sqlx::query(ddl).execute(&self.pool).await?;
+                sqlx::query(ddl).execute(&mut *tx).await?;
             }
 
             // Insert DuckLake version metadata if not already present.
@@ -1188,14 +1195,14 @@ impl MetadataWriter for PostgresMetadataWriter {
                  SELECT 'version', '0.3'
                  WHERE NOT EXISTS (SELECT 1 FROM ducklake_metadata WHERE key = 'version' AND scope IS NULL)",
             )
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
             sqlx::query(
                 "INSERT INTO ducklake_metadata (key, value)
                  SELECT 'created_by', 'DataFusion-DuckLake'
                  WHERE NOT EXISTS (SELECT 1 FROM ducklake_metadata WHERE key = 'created_by' AND scope IS NULL)",
             )
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
 
             // DuckDB sets `encrypted=false` in metadata; match for interop (F-047)
@@ -1204,7 +1211,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                  SELECT 'encrypted', 'false'
                  WHERE NOT EXISTS (SELECT 1 FROM ducklake_metadata WHERE key = 'encrypted' AND scope IS NULL)",
             )
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
 
             // Insert initial snapshot 0 (DuckDB expects this as the "empty catalog" snapshot)
@@ -1213,21 +1220,21 @@ impl MetadataWriter for PostgresMetadataWriter {
                  OVERRIDING SYSTEM VALUE VALUES (0, NOW(), 0, 0, 0)
                  ON CONFLICT (snapshot_id) DO NOTHING",
             )
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
 
             // Create sequences for concurrent-safe ID generation.
             sqlx::query("CREATE SEQUENCE IF NOT EXISTS ducklake_table_id_seq")
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await?;
             sqlx::query("CREATE SEQUENCE IF NOT EXISTS ducklake_column_id_seq")
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await?;
             sqlx::query("CREATE SEQUENCE IF NOT EXISTS ducklake_view_id_seq")
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await?;
             sqlx::query("CREATE SEQUENCE IF NOT EXISTS ducklake_partition_id_seq")
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await?;
 
             // Insert initial schema_version entry (F-012)
@@ -1236,7 +1243,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                  SELECT 0, 0
                  WHERE NOT EXISTS (SELECT 1 FROM ducklake_schema_versions WHERE begin_snapshot = 0)",
             )
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
 
             // Sync sequences with existing data (handles migration from MAX+1 pattern).
@@ -1244,24 +1251,25 @@ impl MetadataWriter for PostgresMetadataWriter {
             sqlx::query(
                 "SELECT setval('ducklake_table_id_seq', MAX(table_id)) FROM ducklake_table HAVING MAX(table_id) IS NOT NULL",
             )
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?;
             sqlx::query(
                 "SELECT setval('ducklake_column_id_seq', MAX(column_id)) FROM ducklake_column HAVING MAX(column_id) IS NOT NULL",
             )
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?;
             sqlx::query(
                 "SELECT setval('ducklake_view_id_seq', MAX(view_id)) FROM ducklake_view HAVING MAX(view_id) IS NOT NULL",
             )
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?;
             sqlx::query(
                 "SELECT setval('ducklake_partition_id_seq', MAX(partition_id)) FROM ducklake_partition_info HAVING MAX(partition_id) IS NOT NULL",
             )
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?;
 
+            tx.commit().await?;
             Ok(())
         })
     }
@@ -1363,6 +1371,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             if let Some(schema_row) = schema_row {
                 let schema_id: i64 = schema_row.try_get(0)?;
 
+                // Check DF-originated drops via change tracking
                 let schema_drop = sqlx::query(
                     "SELECT COUNT(*) FROM _df_change_tracking
                      WHERE snapshot_id > $1 AND schema_id = $2 AND change_type = 'DROP_SCHEMA'",
@@ -1374,6 +1383,22 @@ impl MetadataWriter for PostgresMetadataWriter {
                 if schema_drop.try_get::<i64, _>(0)? > 0 {
                     return Err(crate::error::DuckLakeError::TransactionConflict(format!(
                         "Transaction conflict: schema '{}' was dropped by another transaction since snapshot {}",
+                        schema_name, since_snapshot
+                    )));
+                }
+
+                // Check DuckDB-originated drops via catalog metadata (R5-S-018)
+                let schema_ended = sqlx::query(
+                    "SELECT COUNT(*) FROM ducklake_schema
+                     WHERE schema_id = $1 AND end_snapshot IS NOT NULL AND end_snapshot > $2",
+                )
+                .bind(schema_id)
+                .bind(since_snapshot)
+                .fetch_one(&mut *tx)
+                .await?;
+                if schema_ended.try_get::<i64, _>(0)? > 0 {
+                    return Err(crate::error::DuckLakeError::TransactionConflict(format!(
+                        "Transaction conflict: schema '{}' was dropped (possibly by DuckDB) since snapshot {}",
                         schema_name, since_snapshot
                     )));
                 }
@@ -1390,6 +1415,8 @@ impl MetadataWriter for PostgresMetadataWriter {
 
                 if let Some(table_row) = table_row {
                     let table_id: i64 = table_row.try_get(0)?;
+
+                    // Check DF-originated drops via change tracking
                     let table_drop = sqlx::query(
                         "SELECT COUNT(*) FROM _df_change_tracking
                          WHERE snapshot_id > $1 AND table_id = $2 AND change_type = 'DROP_TABLE'",
@@ -1401,6 +1428,22 @@ impl MetadataWriter for PostgresMetadataWriter {
                     if table_drop.try_get::<i64, _>(0)? > 0 {
                         return Err(crate::error::DuckLakeError::TransactionConflict(format!(
                             "Transaction conflict: table '{}.{}' was dropped by another transaction since snapshot {}",
+                            schema_name, table_name, since_snapshot
+                        )));
+                    }
+
+                    // Check DuckDB-originated drops via catalog metadata (R5-S-018)
+                    let table_ended = sqlx::query(
+                        "SELECT COUNT(*) FROM ducklake_table
+                         WHERE table_id = $1 AND end_snapshot IS NOT NULL AND end_snapshot > $2",
+                    )
+                    .bind(table_id)
+                    .bind(since_snapshot)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    if table_ended.try_get::<i64, _>(0)? > 0 {
+                        return Err(crate::error::DuckLakeError::TransactionConflict(format!(
+                            "Transaction conflict: table '{}.{}' was dropped (possibly by DuckDB) since snapshot {}",
                             schema_name, table_name, since_snapshot
                         )));
                     }
@@ -1416,6 +1459,7 @@ impl MetadataWriter for PostgresMetadataWriter {
         block_on(async {
             let mut tx = self.pool.begin().await?;
 
+            // Check DF-originated drops
             let drop_check = sqlx::query(
                 "SELECT COUNT(*) FROM _df_change_tracking
                  WHERE snapshot_id > $1 AND table_id = $2 AND change_type = 'DROP_TABLE'",
@@ -1431,6 +1475,22 @@ impl MetadataWriter for PostgresMetadataWriter {
                 )));
             }
 
+            // Check DuckDB-originated drops via catalog metadata (R5-S-018)
+            let table_ended = sqlx::query(
+                "SELECT COUNT(*) FROM ducklake_table
+                 WHERE table_id = $1 AND end_snapshot IS NOT NULL AND end_snapshot > $2",
+            )
+            .bind(table_id)
+            .bind(since_snapshot)
+            .fetch_one(&mut *tx)
+            .await?;
+            if table_ended.try_get::<i64, _>(0)? > 0 {
+                return Err(crate::error::DuckLakeError::TransactionConflict(format!(
+                    "Transaction conflict: table (id={}) was already dropped (possibly by DuckDB) since snapshot {}",
+                    table_id, since_snapshot
+                )));
+            }
+
             Self::drop_table_inner(tx, table_id).await
         })
     }
@@ -1439,6 +1499,7 @@ impl MetadataWriter for PostgresMetadataWriter {
         block_on(async {
             let mut tx = self.pool.begin().await?;
 
+            // Check DF-originated drops
             let drop_check = sqlx::query(
                 "SELECT COUNT(*) FROM _df_change_tracking
                  WHERE snapshot_id > $1 AND schema_id = $2 AND change_type = 'DROP_SCHEMA'",
@@ -1450,6 +1511,22 @@ impl MetadataWriter for PostgresMetadataWriter {
             if drop_check.try_get::<i64, _>(0)? > 0 {
                 return Err(crate::error::DuckLakeError::TransactionConflict(format!(
                     "Transaction conflict: schema (id={}) was already dropped by another transaction since snapshot {}",
+                    schema_id, since_snapshot
+                )));
+            }
+
+            // Check DuckDB-originated drops via catalog metadata (R5-S-018)
+            let schema_ended = sqlx::query(
+                "SELECT COUNT(*) FROM ducklake_schema
+                 WHERE schema_id = $1 AND end_snapshot IS NOT NULL AND end_snapshot > $2",
+            )
+            .bind(schema_id)
+            .bind(since_snapshot)
+            .fetch_one(&mut *tx)
+            .await?;
+            if schema_ended.try_get::<i64, _>(0)? > 0 {
+                return Err(crate::error::DuckLakeError::TransactionConflict(format!(
+                    "Transaction conflict: schema (id={}) was already dropped (possibly by DuckDB) since snapshot {}",
                     schema_id, since_snapshot
                 )));
             }
@@ -1842,9 +1919,11 @@ impl MetadataWriter for PostgresMetadataWriter {
                     .await?;
 
                     // Initialize table-level column stats for the new column (upstream bug #625)
+                    // R5-S-003: contains_null must be TRUE because existing rows have NULL for the new column.
+                    // NULL here causes DuckDB to crash when reading from the catalog.
                     sqlx::query(
                         "INSERT INTO ducklake_table_column_stats (table_id, column_id, contains_null, contains_nan)
-                         VALUES ($1, $2, NULL, NULL)",
+                         VALUES ($1, $2, TRUE, NULL)",
                     )
                     .bind(table_id)
                     .bind(next_column_id)

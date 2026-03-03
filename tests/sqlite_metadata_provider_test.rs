@@ -175,14 +175,14 @@ async fn create_sqlite_provider() -> anyhow::Result<SqliteMetadataProvider> {
     let provider = SqliteMetadataProvider::new("sqlite::memory:")
         .await
         .expect("Failed to create provider");
-    init_schema(&provider.pool).await?;
+    init_schema(provider.pool()).await?;
 
     Ok(provider)
 }
 
 /// Helper to populate test data in SQLite
 async fn populate_test_data(provider: &SqliteMetadataProvider) -> anyhow::Result<()> {
-    let pool = &provider.pool;
+    let pool = provider.pool();
 
     // Insert snapshots
     sqlx::query(
@@ -381,7 +381,7 @@ async fn populate_from_duckdb_catalog(
     let schemas = duckdb_provider.list_schemas(current_snapshot.snapshot_id)?;
 
     // Step 3: Populate SQLite with metadata from DuckDB
-    let pool = &provider.pool;
+    let pool = provider.pool();
 
     // Insert snapshots
     for snapshot in &snapshots {
@@ -503,7 +503,7 @@ async fn test_schema_initialization_idempotent() {
     let provider = create_sqlite_provider().await.unwrap();
 
     // Initialize schema again - should be idempotent
-    init_schema(&provider.pool)
+    init_schema(provider.pool())
         .await
         .expect("Schema initialization should be idempotent");
 

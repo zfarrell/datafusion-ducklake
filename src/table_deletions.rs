@@ -94,7 +94,10 @@ impl TableDeletionsTable {
     }
 
     /// Analyze projection and split into table columns and CDC columns
-    fn analyze_projection(&self, projection: Option<&Vec<usize>>) -> DataFusionResult<CdcProjectionAnalysis> {
+    fn analyze_projection(
+        &self,
+        projection: Option<&Vec<usize>>,
+    ) -> DataFusionResult<CdcProjectionAnalysis> {
         analyze_cdc_projection(projection, &self.table_schema, &self.output_schema)
     }
 
@@ -114,10 +117,19 @@ impl TableDeletionsTable {
 
         // Create scan for current delete file (if exists - None means full file delete)
         let current_delete_exec = if let Some(ref current_path) = delete_file.current_delete_path {
+            let size_bytes = delete_file
+                .current_delete_file_size_bytes
+                .unwrap_or_else(|| {
+                    tracing::warn!(
+                        path = current_path,
+                        "Delete file metadata missing size_bytes, defaulting to 0"
+                    );
+                    0
+                });
             Some(self.build_delete_file_scan(
                 current_path,
                 delete_file.current_delete_path_is_relative.unwrap_or(true),
-                delete_file.current_delete_file_size_bytes.unwrap_or(0),
+                size_bytes,
                 delete_file.current_delete_footer_size.unwrap_or(0),
             )?)
         } else {
@@ -126,10 +138,19 @@ impl TableDeletionsTable {
 
         // Create scan for previous delete file (if exists)
         let previous_delete_exec = if let Some(ref prev_path) = delete_file.previous_delete_path {
+            let size_bytes = delete_file
+                .previous_delete_file_size_bytes
+                .unwrap_or_else(|| {
+                    tracing::warn!(
+                        path = prev_path,
+                        "Previous delete file metadata missing size_bytes, defaulting to 0"
+                    );
+                    0
+                });
             Some(self.build_delete_file_scan(
                 prev_path,
                 delete_file.previous_delete_path_is_relative.unwrap_or(true),
-                delete_file.previous_delete_file_size_bytes.unwrap_or(0),
+                size_bytes,
                 delete_file.previous_delete_footer_size.unwrap_or(0),
             )?)
         } else {
@@ -142,13 +163,13 @@ impl TableDeletionsTable {
             delete_file.data_file_size_bytes,
             delete_file.data_file_footer_size,
             {
-                let is_natural_order =
-                    proj_info.table_indices.len() == self.table_schema.fields().len()
-                        && proj_info
-                            .table_indices
-                            .iter()
-                            .enumerate()
-                            .all(|(i, &idx)| i == idx);
+                let is_natural_order = proj_info.table_indices.len()
+                    == self.table_schema.fields().len()
+                    && proj_info
+                        .table_indices
+                        .iter()
+                        .enumerate()
+                        .all(|(i, &idx)| i == idx);
                 if is_natural_order {
                     None
                 } else {
@@ -668,10 +689,7 @@ impl DeletedRowsStream {
         })?;
 
         let num_rows_u32 = u32::try_from(num_rows).map_err(|_| {
-            DataFusionError::Internal(format!(
-                "batch row count {} exceeds u32::MAX",
-                num_rows
-            ))
+            DataFusionError::Internal(format!("batch row count {} exceeds u32::MAX", num_rows))
         })?;
         let keep_indices: Vec<u32> = match self.deleted_positions.as_ref().unwrap() {
             DeltaPositions::All => {
@@ -699,7 +717,8 @@ impl DeletedRowsStream {
         }
 
         // Use Arrow's take kernel to select rows
-        let indices = UInt32Array::from(keep_indices.clone());
+        let num_output_rows = keep_indices.len();
+        let indices = UInt32Array::from(keep_indices);
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns() + 2);
 
         for col in batch.columns() {
@@ -707,9 +726,6 @@ impl DeletedRowsStream {
                 .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
             columns.push(filtered);
         }
-
-        // Append only requested CDC columns
-        let num_output_rows = keep_indices.len();
         if self.include_snapshot_id {
             columns.push(Arc::new(Int64Array::from(vec![
                 self.snapshot_id;

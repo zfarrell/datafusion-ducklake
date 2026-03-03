@@ -29,9 +29,10 @@ use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::Stream;
 
-use crate::metadata_provider::{DataFileChange, MetadataProvider};
+use crate::metadata_provider::{DataFileChange, DeleteFileChange, MetadataProvider};
 use crate::path_resolver::resolve_path;
-use crate::table::validated_file_size;
+use crate::table::{delete_file_schema, validated_file_size};
+use crate::table_deletions::DeletedRowsExec;
 
 #[cfg(feature = "encryption")]
 use crate::encryption::EncryptionFactoryBuilder;
@@ -370,7 +371,10 @@ impl TableChangesTable {
     }
 
     /// Analyze projection and split into table columns and CDC columns
-    fn analyze_projection(&self, projection: Option<&Vec<usize>>) -> DataFusionResult<CdcProjectionAnalysis> {
+    fn analyze_projection(
+        &self,
+        projection: Option<&Vec<usize>>,
+    ) -> DataFusionResult<CdcProjectionAnalysis> {
         analyze_cdc_projection(projection, &self.table_schema, &self.output_schema)
     }
 
@@ -520,6 +524,130 @@ impl TableChangesTable {
             proj_info.reorder_indices.clone(),
         )))
     }
+
+    /// Build a ParquetExec for a delete file (positions)
+    fn build_delete_file_scan(
+        &self,
+        path: &str,
+        is_relative: bool,
+        size_bytes: i64,
+        footer_size: i64,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let resolved_path = resolve_path(&self.table_path, path, is_relative)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let mut pf = PartitionedFile::new(
+            &resolved_path,
+            validated_file_size(size_bytes, &resolved_path)?,
+        );
+        if footer_size > 0
+            && let Ok(hint) = usize::try_from(footer_size)
+        {
+            pf = pf.with_metadata_size_hint(hint);
+        }
+        let builder = FileScanConfigBuilder::new(
+            self.object_store_url.as_ref().clone(),
+            delete_file_schema(),
+            Arc::new(ParquetSource::default()),
+        )
+        .with_file_group(FileGroup::new(vec![pf]));
+        Ok(DataSourceExec::from_data_source(builder.build()))
+    }
+
+    /// Build a ParquetExec for a data file (with optional projection)
+    fn build_data_file_scan(
+        &self,
+        path: &str,
+        size_bytes: i64,
+        footer_size: Option<i64>,
+        projection: Option<&[usize]>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let mut pf = PartitionedFile::new(path, validated_file_size(size_bytes, path)?);
+        if let Some(fs) = footer_size
+            && fs > 0
+            && let Ok(hint) = usize::try_from(fs)
+        {
+            pf = pf.with_metadata_size_hint(hint);
+        }
+        let mut builder = FileScanConfigBuilder::new(
+            self.object_store_url.as_ref().clone(),
+            self.table_schema.clone(),
+            Arc::new(ParquetSource::default()),
+        )
+        .with_file_group(FileGroup::new(vec![pf]));
+        if let Some(proj) = projection {
+            builder = builder.with_projection_indices(Some(proj.to_vec()));
+        }
+        Ok(DataSourceExec::from_data_source(builder.build()))
+    }
+
+    /// Build execution plan for a single delete file change entry (R5-S-039)
+    fn build_exec_for_delete_entry(
+        &self,
+        delete_file: &DeleteFileChange,
+        proj_info: &CdcProjectionAnalysis,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        // Resolve data file path
+        let data_file_path = resolve_path(
+            &self.table_path,
+            &delete_file.data_file_path,
+            delete_file.data_file_path_is_relative,
+        )
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        // Create scan for current delete file (None means full file delete)
+        let current_delete_exec = if let Some(ref current_path) = delete_file.current_delete_path {
+            Some(self.build_delete_file_scan(
+                current_path,
+                delete_file.current_delete_path_is_relative.unwrap_or(true),
+                delete_file.current_delete_file_size_bytes.unwrap_or(0),
+                delete_file.current_delete_footer_size.unwrap_or(0),
+            )?)
+        } else {
+            None
+        };
+
+        // Create scan for previous delete file (if exists)
+        let previous_delete_exec = if let Some(ref prev_path) = delete_file.previous_delete_path {
+            Some(self.build_delete_file_scan(
+                prev_path,
+                delete_file.previous_delete_path_is_relative.unwrap_or(true),
+                delete_file.previous_delete_file_size_bytes.unwrap_or(0),
+                delete_file.previous_delete_footer_size.unwrap_or(0),
+            )?)
+        } else {
+            None
+        };
+
+        // Push table column projection to data file scan
+        let is_natural_order = proj_info.table_indices.len() == self.table_schema.fields().len()
+            && proj_info
+                .table_indices
+                .iter()
+                .enumerate()
+                .all(|(i, &idx)| i == idx);
+        let data_file_exec = self.build_data_file_scan(
+            &data_file_path,
+            delete_file.data_file_size_bytes,
+            delete_file.data_file_footer_size,
+            if is_natural_order {
+                None
+            } else {
+                Some(&proj_info.table_indices)
+            },
+        )?;
+
+        Ok(Arc::new(DeletedRowsExec::new(
+            current_delete_exec,
+            previous_delete_exec,
+            data_file_exec,
+            delete_file.data_record_count,
+            delete_file.snapshot_id,
+            proj_info.output_schema.clone(),
+            proj_info.need_snapshot_id,
+            proj_info.need_change_type,
+            proj_info.reorder_indices.clone(),
+        )))
+    }
 }
 
 #[async_trait]
@@ -556,8 +684,18 @@ impl TableProvider for TableChangesTable {
             )
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-        // Handle empty case
-        if data_files.is_empty() {
+        // Get delete files added between snapshots (DELETE changes) — R5-S-039
+        let delete_files = self
+            .provider
+            .get_delete_files_added_between_snapshots(
+                self.table_id,
+                self.start_snapshot,
+                self.end_snapshot,
+            )
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        // Handle empty case — both inserts and deletes empty
+        if data_files.is_empty() && delete_files.is_empty() {
             use datafusion::physical_plan::empty::EmptyExec;
             return Ok(Arc::new(EmptyExec::new(proj_info.output_schema)));
         }
@@ -583,8 +721,10 @@ impl TableProvider for TableChangesTable {
             }
         };
 
-        // Build execution plan for each file with projection pushdown
-        let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(data_files.len());
+        let mut execs: Vec<Arc<dyn ExecutionPlan>> =
+            Vec::with_capacity(data_files.len() + delete_files.len());
+
+        // Build execution plan for each INSERT file with projection pushdown
         for data_file in &data_files {
             #[cfg(feature = "encryption")]
             let exec = self
@@ -597,7 +737,13 @@ impl TableProvider for TableChangesTable {
             execs.push(exec);
         }
 
-        // Combine with UnionExec if multiple files
+        // Build execution plan for each DELETE change (R5-S-039)
+        for delete_file in &delete_files {
+            let exec = self.build_exec_for_delete_entry(delete_file, &proj_info)?;
+            execs.push(exec);
+        }
+
+        // Combine with UnionExec if multiple plans
         if execs.len() == 1 {
             Ok(execs.into_iter().next().expect("checked len == 1 above"))
         } else {

@@ -39,6 +39,39 @@ use datafusion::physical_plan::ExecutionPlan;
 
 use crate::metadata_provider::MetadataProvider;
 
+/// Macro to implement the repetitive TableProvider boilerplate for information_schema
+/// tables that query metadata on every scan and delegate to MemTable (R5-S-047).
+macro_rules! impl_info_schema_table_provider {
+    ($table_type:ty, $query_method:ident) => {
+        #[async_trait::async_trait]
+        impl TableProvider for $table_type {
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+
+            fn schema(&self) -> SchemaRef {
+                Arc::clone(&self.schema)
+            }
+
+            fn table_type(&self) -> TableType {
+                TableType::View
+            }
+
+            async fn scan(
+                &self,
+                state: &dyn Session,
+                projection: Option<&Vec<usize>>,
+                filters: &[datafusion::prelude::Expr],
+                limit: Option<usize>,
+            ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+                let batch = self.$query_method()?;
+                let mem_table = MemTable::try_new(Arc::clone(&self.schema), vec![vec![batch]])?;
+                mem_table.scan(state, projection, filters, limit).await
+            }
+        }
+    };
+}
+
 /// Live table provider for snapshots - queries metadata on every scan
 #[derive(Debug)]
 pub struct SnapshotsTable {
@@ -125,35 +158,7 @@ impl SnapshotsTable {
     }
 }
 
-#[async_trait::async_trait]
-impl TableProvider for SnapshotsTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
-    }
-
-    fn table_type(&self) -> TableType {
-        TableType::View
-    }
-
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[datafusion::prelude::Expr],
-        limit: Option<usize>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        // Query catalog database live
-        let batch = self.query_snapshots()?;
-
-        // Use MemTable for execution (MemTable handles projection/filters/limit)
-        let mem_table = MemTable::try_new(Arc::clone(&self.schema), vec![vec![batch]])?;
-        mem_table.scan(state, projection, filters, limit).await
-    }
-}
+impl_info_schema_table_provider!(SnapshotsTable, query_snapshots);
 
 /// Live table provider for schemata - queries metadata on every scan
 #[derive(Debug)]
@@ -219,35 +224,7 @@ impl SchemataTable {
     }
 }
 
-#[async_trait::async_trait]
-impl TableProvider for SchemataTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
-    }
-
-    fn table_type(&self) -> TableType {
-        TableType::View
-    }
-
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[datafusion::prelude::Expr],
-        limit: Option<usize>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        // Query catalog database live
-        let batch = self.query_schemata()?;
-
-        // Use MemTable for execution
-        let mem_table = MemTable::try_new(Arc::clone(&self.schema), vec![vec![batch]])?;
-        mem_table.scan(state, projection, filters, limit).await
-    }
-}
+impl_info_schema_table_provider!(SchemataTable, query_schemata);
 
 /// Live table provider for tables - queries metadata on every scan
 #[derive(Debug)]
@@ -329,35 +306,7 @@ impl TablesTable {
     }
 }
 
-#[async_trait::async_trait]
-impl TableProvider for TablesTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
-    }
-
-    fn table_type(&self) -> TableType {
-        TableType::View
-    }
-
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[datafusion::prelude::Expr],
-        limit: Option<usize>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        // Query catalog database live
-        let batch = self.query_tables()?;
-
-        // Use MemTable for execution
-        let mem_table = MemTable::try_new(Arc::clone(&self.schema), vec![vec![batch]])?;
-        mem_table.scan(state, projection, filters, limit).await
-    }
-}
+impl_info_schema_table_provider!(TablesTable, query_tables);
 
 /// Live table provider for columns - queries metadata on every scan
 #[derive(Debug)]
@@ -435,35 +384,7 @@ impl ColumnsTable {
     }
 }
 
-#[async_trait::async_trait]
-impl TableProvider for ColumnsTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
-    }
-
-    fn table_type(&self) -> TableType {
-        TableType::View
-    }
-
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[datafusion::prelude::Expr],
-        limit: Option<usize>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        // Query catalog database live
-        let batch = self.query_columns()?;
-
-        // Use MemTable for execution
-        let mem_table = MemTable::try_new(Arc::clone(&self.schema), vec![vec![batch]])?;
-        mem_table.scan(state, projection, filters, limit).await
-    }
-}
+impl_info_schema_table_provider!(ColumnsTable, query_columns);
 
 /// Live table provider for table_info - aggregates file information per table
 #[derive(Debug)]
@@ -609,32 +530,7 @@ impl TableInfoTable {
     }
 }
 
-#[async_trait::async_trait]
-impl TableProvider for TableInfoTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
-    }
-
-    fn table_type(&self) -> TableType {
-        TableType::View
-    }
-
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[datafusion::prelude::Expr],
-        limit: Option<usize>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let batch = self.query_table_info()?;
-        let mem_table = MemTable::try_new(Arc::clone(&self.schema), vec![vec![batch]])?;
-        mem_table.scan(state, projection, filters, limit).await
-    }
-}
+impl_info_schema_table_provider!(TableInfoTable, query_table_info);
 
 /// Live table provider for files - queries metadata on every scan
 #[derive(Debug)]
@@ -721,35 +617,7 @@ impl FilesTable {
     }
 }
 
-#[async_trait::async_trait]
-impl TableProvider for FilesTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
-    }
-
-    fn table_type(&self) -> TableType {
-        TableType::View
-    }
-
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[datafusion::prelude::Expr],
-        limit: Option<usize>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        // Query catalog database live
-        let batch = self.query_files()?;
-
-        // Use MemTable for execution
-        let mem_table = MemTable::try_new(Arc::clone(&self.schema), vec![vec![batch]])?;
-        mem_table.scan(state, projection, filters, limit).await
-    }
-}
+impl_info_schema_table_provider!(FilesTable, query_files);
 
 /// Schema provider for information_schema
 ///

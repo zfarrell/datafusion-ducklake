@@ -59,14 +59,8 @@ pub(crate) enum AlterTableAction {
     },
 }
 
-/// Escape a SQL identifier for safe use in double-quoted contexts.
-///
-/// Doubles any internal double-quotes per SQL standard identifier quoting,
-/// then wraps the result in double quotes. This prevents SQL injection via
-/// identifiers containing quotes, semicolons, or other special characters.
-pub(crate) fn quote_identifier(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
-}
+// Re-export from metadata_provider to avoid duplication (R5-S-044)
+pub(crate) use crate::metadata_provider::quote_identifier;
 
 /// Validate that column names are unique within the provided column list.
 ///

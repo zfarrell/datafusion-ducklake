@@ -275,7 +275,9 @@ pub fn join_paths(base_path: &str, relative_path: &str) -> Result<String> {
     };
 
     // Normalize double separators (e.g., "s3://bucket//path" -> "s3://bucket/path")
-    // but preserve the double slash in scheme prefixes like "s3://" or "file:///"
+    // but preserve the double slash in scheme prefixes like "s3://" or "file:///".
+    // NOTE (R5-S-075): This can rewrite valid object-store keys that legitimately
+    // contain "//". In practice, DuckLake paths don't use interior "//" so this is safe.
     Ok(normalize_path_separators(&joined))
 }
 

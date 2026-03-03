@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray, UInt64Array};
 use arrow::compute;
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::SchemaRef;
 use datafusion::common::DFSchema;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::object_store::ObjectStoreUrl;
@@ -46,14 +46,7 @@ use crate::table_writer::{
     extract_column_stats,
 };
 
-/// Schema for the output of update operations (count of rows updated)
-fn make_update_count_schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![Field::new(
-        "count",
-        DataType::UInt64,
-        false,
-    )]))
-}
+use crate::delete_exec::make_dml_count_schema;
 
 /// Represents a column assignment in an UPDATE SET clause.
 #[derive(Debug, Clone)]
@@ -126,7 +119,7 @@ impl DuckLakeUpdateExec {
 
     fn compute_properties() -> PlanProperties {
         PlanProperties::new(
-            EquivalenceProperties::new(make_update_count_schema()),
+            EquivalenceProperties::new(make_dml_count_schema()),
             Partitioning::UnknownPartitioning(1),
             datafusion::physical_plan::execution_plan::EmissionType::Final,
             datafusion::physical_plan::execution_plan::Boundedness::Bounded,
@@ -216,7 +209,7 @@ impl ExecutionPlan for DuckLakeUpdateExec {
         let object_store_url = self.object_store_url.clone();
         let table_path = self.table_path.clone();
         let existing_deletes = self.existing_deletes.clone();
-        let output_schema = make_update_count_schema();
+        let output_schema = make_dml_count_schema();
 
         let stream = stream::once(async move {
             let object_store = context
@@ -240,8 +233,11 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                 .collect::<DataFusionResult<Vec<_>>>()?;
 
             let mut total_updated: u64 = 0;
-            // Collect all updated rows across all files for writing as new data
+            // Collect all updated rows across all files for writing as new data.
+            // Track buffered row count to guard against OOM on large updates.
             let mut updated_batches: Vec<RecordBatch> = Vec::new();
+            let mut buffered_rows: usize = 0;
+            const MAX_BUFFERED_ROWS: usize = 10_000_000; // 10M row safety limit
             // Track uploaded files for cleanup if metadata commit fails
             let mut uploaded_files: Vec<ObjectPath> = Vec::new();
             // Collect file metadata for atomic registration
@@ -284,8 +280,7 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                 let mut matching_rows: Vec<RecordBatch> = Vec::new();
                 let mut global_row_offset: i64 = 0;
 
-                while let Some(batch_result) = parquet_stream.try_next().await? {
-                    let batch = batch_result;
+                while let Some(batch) = parquet_stream.try_next().await? {
                     let num_rows = batch.num_rows();
 
                     // Determine which rows match the filter
@@ -314,8 +309,9 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                     // Build a mask that includes filter match AND excludes already-deleted rows
                     let mut mask_values = vec![false; num_rows];
                     for (i, mask_val) in mask_values.iter_mut().enumerate().take(num_rows) {
-                        let i_i64 = i64::try_from(i)
-                            .map_err(|e| DataFusionError::Execution(format!("Row index overflow: {}", e)))?;
+                        let i_i64 = i64::try_from(i).map_err(|e| {
+                            DataFusionError::Execution(format!("Row index overflow: {}", e))
+                        })?;
                         let global_pos = global_row_offset + i_i64;
 
                         // Skip if already deleted
@@ -345,8 +341,9 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                         matching_rows.push(filtered);
                     }
 
-                    global_row_offset += i64::try_from(num_rows)
-                        .map_err(|e| DataFusionError::Execution(format!("Row count overflow: {}", e)))?;
+                    global_row_offset += i64::try_from(num_rows).map_err(|e| {
+                        DataFusionError::Execution(format!("Row count overflow: {}", e))
+                    })?;
                 }
 
                 // Skip this file if no rows to update
@@ -354,8 +351,9 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                     continue;
                 }
 
-                let new_update_count = u64::try_from(positions_to_delete.len())
-                    .map_err(|e| DataFusionError::Execution(format!("Update count overflow: {}", e)))?;
+                let new_update_count = u64::try_from(positions_to_delete.len()).map_err(|e| {
+                    DataFusionError::Execution(format!("Update count overflow: {}", e))
+                })?;
                 total_updated += new_update_count;
 
                 // Apply SET transformations to matching rows
@@ -369,13 +367,30 @@ impl ExecutionPlan for DuckLakeUpdateExec {
 
                     // Apply each SET assignment
                     for (col_idx, phys_expr) in &physical_assignments {
+                        if *col_idx >= columns.len() {
+                            return Err(DataFusionError::Plan(format!(
+                                "UPDATE assignment column index {} is out of bounds \
+                                 (table has {} columns)",
+                                col_idx,
+                                columns.len()
+                            )));
+                        }
                         let result = phys_expr.evaluate(matched_batch)?;
                         let new_values = result.into_array(matched_batch.num_rows())?;
                         columns[*col_idx] = new_values;
                     }
 
                     let updated_batch = RecordBatch::try_new(table_schema.clone(), columns)?;
+                    buffered_rows += updated_batch.num_rows();
                     updated_batches.push(updated_batch);
+
+                    if buffered_rows > MAX_BUFFERED_ROWS {
+                        return Err(DataFusionError::ResourcesExhausted(format!(
+                            "UPDATE affects too many rows ({} rows buffered, limit is {}). \
+                             Consider updating in smaller batches using a more selective WHERE clause.",
+                            buffered_rows, MAX_BUFFERED_ROWS
+                        )));
+                    }
                 }
 
                 // Merge with existing deletes for the delete file
@@ -397,8 +412,9 @@ impl ExecutionPlan for DuckLakeUpdateExec {
 
                 let del_schema = delete_file_schema();
                 // R3F-034: delete_count tracks total positions in delete file, not just new deletions
-                let total_delete_count = i64::try_from(all_positions.len())
-                    .map_err(|e| DataFusionError::Execution(format!("Delete count overflow: {}", e)))?;
+                let total_delete_count = i64::try_from(all_positions.len()).map_err(|e| {
+                    DataFusionError::Execution(format!("Delete count overflow: {}", e))
+                })?;
                 // R4-S-009: Use resolved path (from data_path root) instead of raw catalog filename
                 let file_path_values: Vec<&str> = vec![resolved_path.as_str(); all_positions.len()];
                 let file_path_array: ArrayRef = Arc::new(StringArray::from(file_path_values));
@@ -419,8 +435,9 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                     .into_inner()
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-                let file_size = i64::try_from(buffer.len())
-                    .map_err(|e| DataFusionError::Execution(format!("File size overflow: {}", e)))?;
+                let file_size = i64::try_from(buffer.len()).map_err(|e| {
+                    DataFusionError::Execution(format!("File size overflow: {}", e))
+                })?;
                 let footer_size = calculate_footer_size_from_bytes(&buffer)
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
@@ -430,18 +447,19 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
                 uploaded_files.push(delete_object_path);
 
-                let delete_file_info =
-                    DeleteFileInfo::new(data_file_id, &delete_file_name, file_size, total_delete_count)
-                        .with_footer_size(footer_size);
+                let delete_file_info = DeleteFileInfo::new(
+                    data_file_id,
+                    &delete_file_name,
+                    file_size,
+                    total_delete_count,
+                )
+                .with_footer_size(footer_size);
 
                 pending_delete_files.push(delete_file_info);
             }
 
             // Enforce NOT NULL constraints on updated rows before writing
-            crate::table_writer::validate_not_null_constraints(
-                &table_schema,
-                &updated_batches,
-            )?;
+            crate::table_writer::validate_not_null_constraints(&table_schema, &updated_batches)?;
 
             // Write updated rows as new data file(s)
             let mut pending_data_files: Vec<DataFileInfo> = Vec::new();
@@ -471,8 +489,9 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                 for batch in &updated_batches {
                     let batch_with_ids =
                         RecordBatch::try_new(write_schema.clone(), batch.columns().to_vec())?;
-                    total_records += i64::try_from(batch_with_ids.num_rows())
-                        .map_err(|e| DataFusionError::Execution(format!("Row count overflow: {}", e)))?;
+                    total_records += i64::try_from(batch_with_ids.num_rows()).map_err(|e| {
+                        DataFusionError::Execution(format!("Row count overflow: {}", e))
+                    })?;
                     arrow_writer
                         .write(&batch_with_ids)
                         .map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -489,8 +508,9 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                     .into_inner()
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-                let file_size = i64::try_from(buffer.len())
-                    .map_err(|e| DataFusionError::Execution(format!("File size overflow: {}", e)))?;
+                let file_size = i64::try_from(buffer.len()).map_err(|e| {
+                    DataFusionError::Execution(format!("File size overflow: {}", e))
+                })?;
                 let footer_size = calculate_footer_size_from_bytes(&buffer)
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
@@ -552,7 +572,7 @@ impl ExecutionPlan for DuckLakeUpdateExec {
         });
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
-            make_update_count_schema(),
+            make_dml_count_schema(),
             stream,
         )))
     }

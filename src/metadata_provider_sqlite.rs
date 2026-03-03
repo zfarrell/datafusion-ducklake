@@ -20,7 +20,7 @@ use sqlx::types::chrono::NaiveDateTime;
 /// `tokio::task::block_in_place()` to bridge async sqlx operations.
 #[derive(Debug, Clone)]
 pub struct SqliteMetadataProvider {
-    pub pool: SqlitePool,
+    pub(crate) pool: SqlitePool,
 }
 
 impl SqliteMetadataProvider {
@@ -36,6 +36,11 @@ impl SqliteMetadataProvider {
         Ok(Self {
             pool,
         })
+    }
+
+    /// Returns a reference to the underlying connection pool.
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
     }
 }
 
@@ -152,7 +157,11 @@ impl MetadataProvider for SqliteMetadataProvider {
         })
     }
 
-    fn get_table_structure(&self, table_id: i64, snapshot_id: i64) -> Result<Vec<DuckLakeTableColumn>> {
+    fn get_table_structure(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+    ) -> Result<Vec<DuckLakeTableColumn>> {
         block_on(async {
             let rows = sqlx::query(
                 "SELECT column_id, column_name, column_type, nulls_allowed
@@ -171,9 +180,16 @@ impl MetadataProvider for SqliteMetadataProvider {
             rows.into_iter()
                 .map(|row| {
                     let nulls_allowed: Option<bool> = row.try_get(3)?;
+                    let col_name: String = row.try_get(1)?;
+                    if nulls_allowed.is_none() {
+                        tracing::warn!(
+                            column_name = %col_name,
+                            "nulls_allowed is NULL in catalog — defaulting to true; this may indicate catalog corruption"
+                        );
+                    }
                     Ok(DuckLakeTableColumn {
                         column_id: row.try_get(0)?,
-                        column_name: row.try_get(1)?,
+                        column_name: col_name,
                         column_type: row.try_get(2)?,
                         is_nullable: nulls_allowed.unwrap_or(true),
                     })
@@ -416,9 +432,16 @@ impl MetadataProvider for SqliteMetadataProvider {
                     let schema_name: String = row.try_get(0)?;
                     let table_name: String = row.try_get(1)?;
                     let nulls_allowed: Option<bool> = row.try_get(5)?;
+                    let col_name: String = row.try_get(3)?;
+                    if nulls_allowed.is_none() {
+                        tracing::warn!(
+                            column_name = %col_name,
+                            "nulls_allowed is NULL in catalog — defaulting to true; this may indicate catalog corruption"
+                        );
+                    }
                     let column = DuckLakeTableColumn {
                         column_id: row.try_get(2)?,
-                        column_name: row.try_get(3)?,
+                        column_name: col_name,
                         column_type: row.try_get(4)?,
                         is_nullable: nulls_allowed.unwrap_or(true),
                     };
@@ -849,11 +872,16 @@ WHERE data.table_id = ?
 
     fn get_inlined_data(&self, table_id: i64, snapshot_id: i64) -> Result<Vec<InlinedDataRow>> {
         block_on(async {
-            // First, look up the inlined data table name from ducklake_inlined_data_tables
+            // Look up the inlined data table name, filtered by snapshot's schema_version (R5-S-028).
+            // Pick the latest schema_version that doesn't exceed the snapshot's version.
             let table_info = sqlx::query(
-                "SELECT table_name, schema_version FROM ducklake_inlined_data_tables WHERE table_id = ?",
+                "SELECT table_name, schema_version FROM ducklake_inlined_data_tables \
+                 WHERE table_id = ? \
+                   AND schema_version <= (SELECT schema_version FROM ducklake_snapshot WHERE snapshot_id = ?) \
+                 ORDER BY schema_version DESC LIMIT 1",
             )
             .bind(table_id)
+            .bind(snapshot_id)
             .fetch_optional(&self.pool)
             .await?;
 

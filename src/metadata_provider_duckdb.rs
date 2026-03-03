@@ -97,11 +97,13 @@ impl DuckdbMetadataProvider {
         };
 
         // Verify the table actually exists
-        let table_exists: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM information_schema.tables WHERE table_name = ?",
-            [&inlined_table_name],
-            |row| row.get(0),
-        ).unwrap_or(false);
+        let table_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM information_schema.tables WHERE table_name = ?",
+                [&inlined_table_name],
+                |row| row.get(0),
+            )
+            .map_err(DuckLakeError::DuckDb)?;
         if !table_exists {
             return Ok(0);
         }
@@ -131,13 +133,11 @@ impl MetadataProvider for DuckdbMetadataProvider {
         let result = conn.query_row(SQL_GET_DATA_PATH, [], |row| row.get(0));
         match result {
             Ok(data_path) => Ok(data_path),
-            Err(duckdb::Error::QueryReturnedNoRows) => {
-                Err(DuckLakeError::InvalidConfig(
-                    "No data_path found in ducklake_metadata table. \
+            Err(duckdb::Error::QueryReturnedNoRows) => Err(DuckLakeError::InvalidConfig(
+                "No data_path found in ducklake_metadata table. \
                      Is this a valid DuckLake catalog?"
-                        .to_string(),
-                ))
-            }
+                    .to_string(),
+            )),
             Err(e) => Err(DuckLakeError::DuckDb(e)),
         }
     }
@@ -207,7 +207,11 @@ impl MetadataProvider for DuckdbMetadataProvider {
         Ok(tables)
     }
 
-    fn get_table_structure(&self, table_id: i64, snapshot_id: i64) -> crate::Result<Vec<DuckLakeTableColumn>> {
+    fn get_table_structure(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+    ) -> crate::Result<Vec<DuckLakeTableColumn>> {
         let conn = self.connection()?;
         let mut stmt = conn.prepare(SQL_GET_TABLE_COLUMNS)?;
 
@@ -217,6 +221,12 @@ impl MetadataProvider for DuckdbMetadataProvider {
                 let column_name: String = row.get(1)?;
                 let column_type: String = row.get(2)?;
                 let nulls_allowed: Option<bool> = row.get(3)?;
+                if nulls_allowed.is_none() {
+                    tracing::warn!(
+                        column_name = %column_name,
+                        "nulls_allowed is NULL in catalog — defaulting to true; this may indicate catalog corruption"
+                    );
+                }
                 Ok(DuckLakeTableColumn::new(
                     column_id,
                     column_name,
@@ -388,9 +398,16 @@ impl MetadataProvider for DuckdbMetadataProvider {
                     let schema_name: String = row.get(0)?;
                     let table_name: String = row.get(1)?;
                     let nulls_allowed: Option<bool> = row.get(5)?;
+                    let col_name: String = row.get(3)?;
+                    if nulls_allowed.is_none() {
+                        tracing::warn!(
+                            column_name = %col_name,
+                            "nulls_allowed is NULL in catalog — defaulting to true; this may indicate catalog corruption"
+                        );
+                    }
                     let column = DuckLakeTableColumn {
                         column_id: row.get(2)?,
-                        column_name: row.get(3)?,
+                        column_name: col_name,
                         column_type: row.get(4)?,
                         is_nullable: nulls_allowed.unwrap_or(true),
                     };
@@ -585,10 +602,14 @@ impl MetadataProvider for DuckdbMetadataProvider {
     ) -> crate::Result<Vec<InlinedDataRow>> {
         let conn = self.connection()?;
 
-        // Look up the inlined data table name
+        // Look up the inlined data table name, filtered by snapshot's schema_version (R5-S-028).
+        // Pick the latest schema_version that doesn't exceed the snapshot's version.
         let result = conn.query_row(
-            "SELECT table_name, schema_version FROM ducklake_inlined_data_tables WHERE table_id = ?",
-            [table_id],
+            "SELECT table_name FROM ducklake_inlined_data_tables \
+             WHERE table_id = ? \
+               AND schema_version <= (SELECT schema_version FROM ducklake_snapshot WHERE snapshot_id = ?) \
+             ORDER BY schema_version DESC LIMIT 1",
+            [table_id, snapshot_id],
             |row| row.get::<_, String>(0),
         );
 
@@ -599,11 +620,13 @@ impl MetadataProvider for DuckdbMetadataProvider {
         };
 
         // Verify the inlined data table actually exists before querying it
-        let table_exists: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM information_schema.tables WHERE table_name = ?",
-            [&inlined_table_name],
-            |row| row.get(0),
-        ).unwrap_or(false);
+        let table_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM information_schema.tables WHERE table_name = ?",
+                [&inlined_table_name],
+                |row| row.get(0),
+            )
+            .map_err(DuckLakeError::DuckDb)?;
         if !table_exists {
             return Ok(Vec::new());
         }
