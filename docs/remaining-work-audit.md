@@ -63,34 +63,37 @@ Full details in `docs/2026-03-02-r3-review-synthesis.md`.
 - F-044: Provider/writer code deduplication
 - F-045: Async trait redesign (sync→async)
 
-### Cycle 4 (2026-03-03 R4) — 46 FINDINGS IDENTIFIED
+### Cycle 4 (2026-03-03 R4) — 44 of 46 FINDINGS FIXED
 
-A five-part review (idiomatic, correctness, interop, test-harness, codex) of the post-R3 codebase identified 74 raw findings → 46 after deduplication. The codex review reported 3 P0s; synthesis validation downgraded 2 to P1 (narrower scope than claimed).
+A five-part review (idiomatic, correctness, interop, test-harness, codex) of the post-R3 codebase identified 74 raw findings → 46 after deduplication. The codex review reported 3 P0s; synthesis validation downgraded 2 to P1 (narrower scope than claimed). Eight fix agents resolved **44 of 46** findings.
 
-| Priority | Count | Key Themes |
-|----------|-------|------------|
-| P0 | 1 | Inline data loss on flush failure |
-| P1 | 12 | DML metadata gaps (stats, IDs, counts), interop format divergence, NULL filter, LIMIT+delete, NOT NULL constraint |
-| P2 | 20 | Atomicity gaps, validation gaps, snapshot isolation, error swallowing, type/naming convention, test infrastructure |
-| P3 | 13 | Code quality (boilerplate, casts, style), SLT fragilities, edge cases |
-| **Total** | **46** | |
+| Priority | Count | Fixed | Deferred |
+|----------|-------|-------|----------|
+| P0 | 1 | 1 | 0 |
+| P1 | 12 | 12 | 0 |
+| P2 | 20 | 20 | 0 |
+| P3 | 13 | 11 | 2 (R4-S-036, R4-S-040) |
+| **Total** | **46** | **44** | **2** |
 
-**Key new findings not in R3:**
-- P0: `clear_inlined_data()` called before Parquet commit — data loss on flush failure
-- P1: `write_parquet_with_setup` uses `t{table_id}/` path but table stores `table_name/` — inline flush unreachable
-- P1: LIMIT pushed into Parquet scan before DeleteFilterExec — fewer rows than requested
-- P1: NULL filter predicate treated as match in DELETE/UPDATE — incorrect row matching
-- P1: DML still missing column stats, next_file_id, record_count decrements
-- P1: UPDATE/MERGE snapshot_changes use non-standard tokens — CDC broken in DuckDB
-- P1: PG/MySQL register_dml_files still missing row_id_start (R3F-002 not ported)
+**Fix agents (8):**
+- fix-dml-metadata (`54d3739`): R4-S-001, 002, 004, 005, 007, 013 — inline data safety, stats, next_file_id
+- fix-dml-correctness (`39fea14`): R4-S-010, 011, 012 — NULL filter, NOT NULL validation, LIMIT+delete
+- fix-interop-format (`d567931`): R4-S-008, 009 — snapshot_changes tokens, delete file paths
+- fix-pg-mysql (`2a51319`): R4-S-006 — port R3F-002 to PG/MySQL
+- fix-atomicity (worktree): R4-S-003, 014, 015, 016, 017, 018 — transaction safety, validation, TOCTOU
+- fix-quality (`d294651`): R4-S-019, 020, 021, 022, 025, 026, 034, 035, 037, 039, 041, 042, 046 — snapshot isolation, error handling, casts, validation
+- fix-interop-conventions (`fbeef2e`): R4-S-023, 024, 027, 043 — inlined data types, file naming, CDC dedup
+- fix-tests (`11e4084`): R4-S-028, 029, 030, 031, 032, 033, 038, 044, 045 — formatting, assertions, dedup, coverage
 
-**Recommended fix agents**: 8 agents (1 DML metadata integrity, 1 DML correctness, 1 interop format, 1 PG/MySQL parity, 1 atomicity/validation, 1 code quality, 1 interop conventions, 1 test infrastructure).
+**2 Deferred** (both relate to R2 F-044 architectural theme):
+- R4-S-036: map_err boilerplate (50+ sites)
+- R4-S-040: Monolithic execute() blocks
 
 Full details in `docs/2026-03-03-review-synthesis.md`.
 
 **R2 Deferred items still deferred:**
 - F-036: INSERT streaming for OOM prevention
-- F-044: Provider/writer code deduplication (R4-I-014 re-raised this theme)
+- F-044: Provider/writer code deduplication (R4-I-014 and R4-S-036/040 re-raised this theme)
 - F-045: Async trait redesign (sync→async)
 
 ---

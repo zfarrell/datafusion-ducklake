@@ -338,11 +338,21 @@ Note: Postgres/MySQL tests require running database containers (testcontainers).
 - fix-interop-critical (`3203d33`): R3F-001, 002, 003, 007, 011, 013, 014, 017 — table_column_stats, row_id_start, MERGE cleanup, schema_version, next_ids, snapshot_changes, set_data_path atomicity
 - fix-test-harness (`3930b56`): R3F-015, 016, 020, 021, 023, 024 — test helper dedup, assertion fixes, SLT improvements
 
-**25 remaining open**: 3 P2 + 22 P3 (code quality nits, informational items).
+**Cycle 4 (2026-03-03 R4)**: 46 findings (1 P0, 12 P1, 20 P2, 13 P3). **44 of 46 fixed** across 8 fix agents:
+- fix-dml-metadata (`54d3739`): R4-S-001, 002, 004, 005, 007, 013 — P0 inline data safety, DML stats/next_file_id/record_count
+- fix-dml-correctness (`39fea14`): R4-S-010, 011, 012 — NULL filter, NOT NULL validation, LIMIT+delete
+- fix-interop-format (`d567931`): R4-S-008, 009 — snapshot_changes tokens, delete file paths
+- fix-pg-mysql (`2a51319`): R4-S-006 — port R3F-002 row_id_start to PG/MySQL
+- fix-atomicity (worktree): R4-S-003, 014, 015, 016, 017, 018 — transaction safety, drop/rename validation, TOCTOU
+- fix-quality (`d294651`): R4-S-019–022, 025, 026, 034, 035, 037, 039, 041, 042, 046 — snapshot isolation, error handling, casts, validation
+- fix-interop-conventions (`fbeef2e`): R4-S-023, 024, 027, 043 — inlined data types, file naming, CDC dedup
+- fix-tests (`11e4084`): R4-S-028–033, 038, 044, 045 — formatting, assertions, dedup, coverage
 
-**3 Deferred** (architectural, L effort): F-036 (INSERT streaming/OOM), F-044 (provider/writer code dedup), F-045 (async trait redesign).
+**Cumulative across 4 cycles**: 190 total findings, **169 fixed**, 5 deferred (R2 F-036/F-044/F-045, R4-S-036/R4-S-040), ~16 P3 nits remaining open from R3.
 
-See `docs/2026-03-02-r3-review-synthesis.md` for full details with **[FIXED]**/**[OPEN]** markers on each finding.
+**Deferred (architectural, L effort)**: F-036 (INSERT streaming/OOM), F-044 (provider/writer code dedup, also R4-S-036/040), F-045 (async trait redesign).
+
+See `docs/2026-03-03-review-synthesis.md` for R4 full details with **[FIXED]**/**[DEFERRED]** markers on each finding.
 
 ### Tier 1: Implementable Now (no external blockers)
 

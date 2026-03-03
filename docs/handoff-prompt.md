@@ -48,7 +48,8 @@ Also in `/home/zac/`:
 - Table functions: 14 implemented (incl. `ducklake_flush_inlined_data()`)
 - Multi-backend (SQLite/Postgres/MySQL): ALL methods implemented, Docker tests passing
 - SLT pass rate: 157/254 (61.8%)
-- ~703 total tests, 62 cross-engine tests, 254 SLT files
+- ~724 total tests, 62 cross-engine tests, 254 SLT files
+- Code review cycles: 4 complete (R1: 36 findings, R2: 58, R3: 50, R4: 46 — **169 of 190 total findings fixed**)
 
 ### What's Been Done (Phases 0-6)
 Everything through Phase 6 is complete. See `docs/project-status.md` for the full verified feature matrix.
@@ -145,27 +146,28 @@ A five-part review of the post-R2 codebase identified **67 raw -> 50 after dedup
 - `docs/2026-03-02-r3-review-synthesis.md` (deduplicated + prioritized, with **[FIXED]**/**[OPEN]** markers)
 - `docs/2026-03-02-r3-review-idiomatic.md`, `docs/2026-03-02-r3-review-correctness.md`, `docs/2026-03-02-r3-review-interop.md`, `docs/2026-03-02-r3-review-test-harness.md`, `docs/2026-03-02-r3-codex-review.md`
 
-### Code Review Cycle 4 (2026-03-03 R4) — 46 FINDINGS
+### Code Review Cycle 4 (2026-03-03 R4) — 44 of 46 FINDINGS FIXED
 
-A five-part review of the post-R3 codebase identified **74 raw → 46 after dedup** (1 P0, 12 P1, 20 P2, 13 P3). The codex review claimed 3 P0s; synthesis validation downgraded 2 to P1 (inline flush path mismatch is narrower than "all writes"; partitioned commit requires unlikely mid-transaction failure).
+A five-part review of the post-R3 codebase identified **74 raw → 46 after dedup** (1 P0, 12 P1, 20 P2, 13 P3). Eight fix agents resolved **44 of 46** findings — all P0, all P1, all P2, and 11 of 13 P3.
 
-**P0 validated**: `clear_inlined_data()` called before Parquet commit — data loss on flush failure.
+**Fix agents and commits:**
+- fix-dml-metadata (`54d3739`): R4-S-001, 002, 004, 005, 007, 013 — P0 inline data safety, DML stats/next_file_id/record_count
+- fix-dml-correctness (`39fea14`): R4-S-010, 011, 012 — NULL filter, NOT NULL validation, LIMIT+delete
+- fix-interop-format (`d567931`): R4-S-008, 009 — snapshot_changes tokens, delete file paths
+- fix-pg-mysql (`2a51319`): R4-S-006 — port R3F-002 row_id_start to PG/MySQL
+- fix-atomicity (worktree): R4-S-003, 014, 015, 016, 017, 018 — transaction safety, drop/rename validation, TOCTOU
+- fix-quality (`d294651`): R4-S-019–022, 025, 026, 034, 035, 037, 039, 041, 042, 046 — snapshot isolation, error handling, casts, validation
+- fix-interop-conventions (`fbeef2e`): R4-S-023, 024, 027, 043 — inlined data types, file naming, CDC dedup
+- fix-tests (`11e4084`): R4-S-028–033, 038, 044, 045 — formatting, assertions, dedup, coverage
 
-**Key P1 findings (12)**:
-- Inline flush write path uses `t{table_id}/` mismatching stored `table_name/`
-- Partitioned commit not transactional (end_table_files + register loop)
-- DML missing: next_file_id, column stats, record_count decrements, Replace-mode stats reset
-- PG/MySQL register_dml_files missing row_id_start (R3F-002 not ported)
-- UPDATE/MERGE snapshot_changes use non-standard tokens (CDC broken)
-- Delete file file_path uses relative path (interop contract violation)
-- NULL filter predicate treated as match in DELETE/UPDATE
-- UPDATE/MERGE skip NOT NULL constraint validation
-- LIMIT pushed into Parquet scan before DeleteFilterExec
+**2 deferred** (both relate to R2 F-044 architectural theme):
+- R4-S-036: map_err boilerplate (50+ sites)
+- R4-S-040: Monolithic execute() blocks
 
-**Recommended fix agents**: 8 (DML metadata integrity, DML correctness, interop format, PG/MySQL parity, atomicity/validation, code quality, interop conventions, test infrastructure).
+**R2 deferred items remain deferred**: F-036, F-044, F-045.
 
 **Source documents:**
-- `docs/2026-03-03-review-synthesis.md` (consolidated, deduplicated, prioritized)
+- `docs/2026-03-03-review-synthesis.md` (consolidated, deduplicated, prioritized, with **[FIXED]**/**[DEFERRED]** markers)
 - `docs/2026-03-03-review-idiomatic.md`, `docs/2026-03-03-review-correctness.md`, `docs/2026-03-03-review-interop.md`, `docs/2026-03-03-review-test-harness.md`, `docs/2026-03-03-codex-review.md`
 
 ### After Implementation: PR Creation
