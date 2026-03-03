@@ -77,7 +77,6 @@ use parquet::encryption::encrypt::FileEncryptionProperties;
 ///
 /// This factory maintains a mapping of file paths to their encryption keys,
 /// populated from the DuckLake catalog metadata.
-#[derive(Clone)]
 pub struct DuckLakeEncryptionFactory {
     /// Map of file paths to their encryption keys (base64 or hex encoded)
     file_keys: Arc<HashMap<String, String>>,
@@ -248,18 +247,15 @@ impl EncryptionFactory for DuckLakeEncryptionFactory {
         // Normalize path by stripping leading slashes, then look up by both
         // exact match and normalized comparison to handle storage format differences.
         let path_normalized = path_str.trim_start_matches('/');
-        let key = self
-            .file_keys
-            .get(&path_str)
-            .or_else(|| {
-                self.file_keys.iter().find_map(|(stored_path, key)| {
-                    if stored_path.trim_start_matches('/') == path_normalized {
-                        Some(key)
-                    } else {
-                        None
-                    }
-                })
-            });
+        let key = self.file_keys.get(&path_str).or_else(|| {
+            self.file_keys.iter().find_map(|(stored_path, key)| {
+                if stored_path.trim_start_matches('/') == path_normalized {
+                    Some(key)
+                } else {
+                    None
+                }
+            })
+        });
 
         match key {
             Some(encoded_key) => {
