@@ -474,7 +474,8 @@ impl ExecutionPlan for DuckLakeMergeExec {
                 // R3F-034: delete_count tracks total positions in delete file, not just new matches
                 let total_delete_count = i64::try_from(all_positions.len())
                     .map_err(|e| DataFusionError::Execution(format!("Delete count overflow: {}", e)))?;
-                let file_path_values: Vec<&str> = vec![&table_file.file.path; all_positions.len()];
+                // R4-S-009: Use resolved path (from data_path root) instead of raw catalog filename
+                let file_path_values: Vec<&str> = vec![resolved_path.as_str(); all_positions.len()];
                 let file_path_array: ArrayRef = Arc::new(StringArray::from(file_path_values));
                 let pos_array: ArrayRef = Arc::new(Int64Array::from(all_positions));
 
@@ -540,10 +541,16 @@ impl ExecutionPlan for DuckLakeMergeExec {
                 }
             }
 
+            // Enforce NOT NULL constraints on data to be written
+            crate::table_writer::validate_not_null_constraints(
+                &table_schema,
+                &new_data_batches,
+            )?;
+
             // Write new data file(s) for updated + inserted rows
             let mut pending_data_files: Vec<DataFileInfo> = Vec::new();
             if !new_data_batches.is_empty() {
-                let data_file_name = format!("{}.parquet", Uuid::new_v4());
+                let data_file_name = format!("ducklake-{}.parquet", Uuid::new_v4());
 
                 // Use the catalog's stored table_path instead of deriving from names,
                 // so writes go to the correct location even after table rename.
@@ -617,8 +624,15 @@ impl ExecutionPlan for DuckLakeMergeExec {
             }
 
             // R3F-013: Record snapshot changes for MERGE
+            // R4-S-008: Use standard DuckDB tokens (inserted + deleted) instead of non-standard "merged_into_table"
             writer
-                .record_snapshot_changes(snapshot_id, &format!("merged_into_table:{}", table_id))
+                .record_snapshot_changes(
+                    snapshot_id,
+                    &format!(
+                        "inserted_into_table:{},deleted_from_table:{}",
+                        table_id, table_id
+                    ),
+                )
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
             let count_array: ArrayRef = Arc::new(UInt64Array::from(vec![total_affected]));

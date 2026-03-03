@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug};
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray, UInt64Array};
+use arrow::array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray, UInt64Array};
 use arrow::compute;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::DFSchema;
@@ -324,9 +324,10 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                             continue;
                         }
 
+                        // NULL predicate = no match
                         let matches = match &matching_mask {
                             None => true,
-                            Some(mask) => mask.value(i),
+                            Some(mask) => mask.is_valid(i) && mask.value(i),
                         };
 
                         if matches {
@@ -397,7 +398,8 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                 // R3F-034: delete_count tracks total positions in delete file, not just new deletions
                 let total_delete_count = i64::try_from(all_positions.len())
                     .map_err(|e| DataFusionError::Execution(format!("Delete count overflow: {}", e)))?;
-                let file_path_values: Vec<&str> = vec![&table_file.file.path; all_positions.len()];
+                // R4-S-009: Use resolved path (from data_path root) instead of raw catalog filename
+                let file_path_values: Vec<&str> = vec![resolved_path.as_str(); all_positions.len()];
                 let file_path_array: ArrayRef = Arc::new(StringArray::from(file_path_values));
                 let pos_array: ArrayRef = Arc::new(Int64Array::from(all_positions));
 
@@ -434,10 +436,16 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                 pending_delete_files.push(delete_file_info);
             }
 
+            // Enforce NOT NULL constraints on updated rows before writing
+            crate::table_writer::validate_not_null_constraints(
+                &table_schema,
+                &updated_batches,
+            )?;
+
             // Write updated rows as new data file(s)
             let mut pending_data_files: Vec<DataFileInfo> = Vec::new();
             if !updated_batches.is_empty() {
-                let data_file_name = format!("{}.parquet", Uuid::new_v4());
+                let data_file_name = format!("ducklake-{}.parquet", Uuid::new_v4());
 
                 // Use the catalog's stored table_path instead of deriving from names,
                 // so writes go to the correct location even after table rename.
@@ -513,8 +521,15 @@ impl ExecutionPlan for DuckLakeUpdateExec {
             }
 
             // R3F-013: Record snapshot changes for UPDATE
+            // R4-S-008: Use standard DuckDB tokens (inserted + deleted) instead of non-standard "updated_table"
             writer
-                .record_snapshot_changes(snapshot_id, &format!("updated_table:{}", table_id))
+                .record_snapshot_changes(
+                    snapshot_id,
+                    &format!(
+                        "inserted_into_table:{},deleted_from_table:{}",
+                        table_id, table_id
+                    ),
+                )
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
             // Return the count of updated rows

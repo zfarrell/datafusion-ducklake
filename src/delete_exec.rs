@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug};
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray, UInt64Array};
+use arrow::array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray, UInt64Array};
 use arrow::compute;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::DFSchema;
@@ -185,7 +185,7 @@ impl ExecutionPlan for DuckLakeDeleteExec {
         let table_files = self.table_files.clone();
         let filters = self.filters.clone();
         let writer = Arc::clone(&self.writer);
-        let object_store_url = self.object_store_url.clone();
+        let object_store_url = Arc::clone(&self.object_store_url);
         let table_path = self.table_path.clone();
         let existing_deletes = self.existing_deletes.clone();
         let output_schema = make_delete_count_schema();
@@ -286,10 +286,10 @@ impl ExecutionPlan for DuckLakeDeleteExec {
                             continue;
                         }
 
-                        // Check if row matches filter
+                        // Check if row matches filter (NULL predicate = no match)
                         let matches = match &matching_mask {
                             None => true, // no filter = all match
-                            Some(mask) => mask.value(i),
+                            Some(mask) => mask.is_valid(i) && mask.value(i),
                         };
 
                         if matches {
@@ -333,8 +333,9 @@ impl ExecutionPlan for DuckLakeDeleteExec {
 
                 // Build the delete file content
                 let del_schema = delete_file_schema();
+                // R4-S-009: Use resolved path (from data_path root) instead of raw catalog filename
                 let file_path_values: Vec<&str> =
-                    vec![&table_file.file.path; positions_to_delete.len()];
+                    vec![resolved_path.as_str(); positions_to_delete.len()];
                 let file_path_array: ArrayRef = Arc::new(StringArray::from(file_path_values));
                 let pos_array: ArrayRef = Arc::new(Int64Array::from(positions_to_delete.clone()));
 
