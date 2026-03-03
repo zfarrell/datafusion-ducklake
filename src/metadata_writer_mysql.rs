@@ -1762,6 +1762,22 @@ impl MetadataWriter for MySqlMetadataWriter {
             let dialect: Option<String> = view_row.try_get(3)?;
             let column_aliases: Option<String> = view_row.try_get(4)?;
 
+            // R4-S-015: Check for duplicate active view name in same schema
+            let dup = sqlx::query(
+                "SELECT COUNT(*) FROM ducklake_view
+                 WHERE schema_id = ? AND view_name = ? AND end_snapshot IS NULL",
+            )
+            .bind(schema_id)
+            .bind(new_name)
+            .fetch_one(&mut *tx)
+            .await?;
+            if dup.try_get::<i64, _>(0)? > 0 {
+                return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                    "A view named '{}' already exists in schema {}",
+                    new_name, schema_id
+                )));
+            }
+
             // Increment schema_version for DDL (F-012)
             let prev_sv_row =
                 sqlx::query("SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot")
@@ -2141,6 +2157,22 @@ impl MetadataWriter for MySqlMetadataWriter {
             let table_uuid: Option<String> = table_row.try_get(1)?;
             let path: String = table_row.try_get(2)?;
             let path_is_relative: bool = table_row.try_get(3)?;
+
+            // R4-S-015: Check for duplicate active table name in same schema
+            let dup = sqlx::query(
+                "SELECT COUNT(*) FROM ducklake_table
+                 WHERE schema_id = ? AND table_name = ? AND end_snapshot IS NULL",
+            )
+            .bind(schema_id)
+            .bind(new_name)
+            .fetch_one(&mut *tx)
+            .await?;
+            if dup.try_get::<i64, _>(0)? > 0 {
+                return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                    "A table named '{}' already exists in schema {}",
+                    new_name, schema_id
+                )));
+            }
 
             // Increment schema_version for DDL (F-012)
             let prev_sv_row =

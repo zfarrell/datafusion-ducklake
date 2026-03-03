@@ -8,7 +8,7 @@ use crate::Result;
 use crate::metadata_provider::{InlinedDataRow, block_on};
 use crate::metadata_writer::{
     AlterTableOp, ColumnDef, ColumnStatInfo, DataFileInfo, DeleteFileInfo, MetadataWriter,
-    WriteMode, WriteSetupResult,
+    ReplaceFileEntry, WriteMode, WriteSetupResult,
 };
 use crate::metadata_writer_validation::{
     ActiveColumnInfo, AlterTableAction, quote_identifier, validate_alter_table,
@@ -210,7 +210,7 @@ CREATE TABLE IF NOT EXISTS ducklake_files_scheduled_for_deletion (
     data_file_id INTEGER,
     path VARCHAR,
     path_is_relative BOOLEAN,
-    schedule_start TEXT
+    schedule_start TEXT  -- R4-S-043: Must use ISO 8601 format (e.g. '2024-01-15T10:30:00Z')
 );
 
 CREATE TABLE IF NOT EXISTS ducklake_inlined_data_tables (
@@ -612,6 +612,20 @@ impl SqliteMetadataWriter {
         mut tx: sqlx::Transaction<'_, sqlx::Sqlite>,
         table_id: i64,
     ) -> Result<i64> {
+        // R4-S-014: Validate table exists and is active before creating snapshot
+        let exists = sqlx::query(
+            "SELECT COUNT(*) FROM ducklake_table WHERE table_id = ? AND end_snapshot IS NULL",
+        )
+        .bind(table_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if exists.try_get::<i64, _>(0)? == 0 {
+            return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                "Table with id {} not found or already dropped",
+                table_id
+            )));
+        }
+
         // Increment schema_version for DDL (F-012)
         let prev_sv_row =
             sqlx::query("SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot")
@@ -704,6 +718,20 @@ impl SqliteMetadataWriter {
         mut tx: sqlx::Transaction<'_, sqlx::Sqlite>,
         schema_id: i64,
     ) -> Result<i64> {
+        // R4-S-014: Validate schema exists and is active before creating snapshot
+        let exists = sqlx::query(
+            "SELECT COUNT(*) FROM ducklake_schema WHERE schema_id = ? AND end_snapshot IS NULL",
+        )
+        .bind(schema_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if exists.try_get::<i64, _>(0)? == 0 {
+            return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                "Schema with id {} not found or already dropped",
+                schema_id
+            )));
+        }
+
         // Increment schema_version for DDL (F-012)
         let prev_sv_row =
             sqlx::query("SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot")
@@ -1143,8 +1171,103 @@ impl MetadataWriter for SqliteMetadataWriter {
             .execute(&mut *tx)
             .await?;
 
+            // R4-S-007: End active delete files in Replace mode
+            sqlx::query(
+                "UPDATE ducklake_delete_file SET end_snapshot = ?
+                 WHERE table_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(snapshot_id)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // R4-S-007: Reset table_stats so subsequent INSERTs start from 0
+            sqlx::query(
+                "UPDATE ducklake_table_stats
+                 SET record_count = 0, next_row_id = 0, file_size_bytes = 0
+                 WHERE table_id = ?",
+            )
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
             tx.commit().await?;
             Ok(result.rows_affected())
+        })
+    }
+
+    fn replace_table_files(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        files: &[ReplaceFileEntry],
+    ) -> Result<Vec<i64>> {
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+
+            // End all existing data files
+            sqlx::query(
+                "UPDATE ducklake_data_file SET end_snapshot = ?
+                 WHERE table_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(snapshot_id)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            let mut ids = Vec::with_capacity(files.len());
+            for entry in files {
+                // Register data file
+                let path_is_relative = entry.file_info.path_is_relative;
+                let row = sqlx::query(
+                    "INSERT INTO ducklake_data_file (table_id, path, path_is_relative, file_size_bytes, footer_size, record_count, begin_snapshot)
+                     VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING data_file_id",
+                )
+                .bind(table_id)
+                .bind(&entry.file_info.path)
+                .bind(path_is_relative)
+                .bind(entry.file_info.file_size_bytes)
+                .bind(entry.file_info.footer_size)
+                .bind(entry.file_info.record_count)
+                .bind(snapshot_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                let data_file_id: i64 = row.try_get(0)?;
+
+                // Register column stats
+                for stat in &entry.file_info.column_stats {
+                    sqlx::query(
+                        "INSERT INTO ducklake_file_column_stats (data_file_id, column_id, null_count, min_value, max_value)
+                         VALUES (?, ?, ?, ?, ?)",
+                    )
+                    .bind(data_file_id)
+                    .bind(stat.column_id)
+                    .bind(stat.null_count)
+                    .bind(&stat.min_value)
+                    .bind(&stat.max_value)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+
+                // Register partition values
+                for (key_index, val) in &entry.partition_values {
+                    sqlx::query(
+                        "INSERT INTO ducklake_file_partition_value (data_file_id, table_id, partition_key_index, partition_value)
+                         VALUES (?, ?, ?, ?)",
+                    )
+                    .bind(data_file_id)
+                    .bind(table_id)
+                    .bind(key_index)
+                    .bind(val.as_deref())
+                    .execute(&mut *tx)
+                    .await?;
+                }
+
+                ids.push(data_file_id);
+            }
+
+            tx.commit().await?;
+            Ok(ids)
         })
     }
 
@@ -1161,7 +1284,24 @@ impl MetadataWriter for SqliteMetadataWriter {
         block_on(async {
             let mut tx = self.pool.begin().await?;
 
+            // R4-S-013: Track net new deletions to decrement record_count
+            let mut total_net_new_deletions: i64 = 0;
+
             for file in delete_files {
+                // Get the old delete_count before ending the existing delete file
+                let old_row = sqlx::query(
+                    "SELECT COALESCE(delete_count, 0) FROM ducklake_delete_file
+                     WHERE data_file_id = ? AND table_id = ? AND end_snapshot IS NULL",
+                )
+                .bind(file.data_file_id)
+                .bind(table_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+                let old_delete_count: i64 = match old_row {
+                    Some(r) => r.try_get(0)?,
+                    None => 0,
+                };
+
                 // End any existing active delete file for this data file
                 sqlx::query(
                     "UPDATE ducklake_delete_file SET end_snapshot = ?
@@ -1188,9 +1328,25 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .bind(snapshot_id)
                 .execute(&mut *tx)
                 .await?;
+
+                total_net_new_deletions += file.delete_count - old_delete_count;
+            }
+
+            // R4-S-013: Decrement record_count by net new deletions
+            if total_net_new_deletions > 0 {
+                sqlx::query(
+                    "UPDATE ducklake_table_stats
+                     SET record_count = COALESCE(record_count, 0) - ?
+                     WHERE table_id = ?",
+                )
+                .bind(total_net_new_deletions)
+                .bind(table_id)
+                .execute(&mut *tx)
+                .await?;
             }
 
             // R3F-002: For each new data file, set row_id_start and update table_stats
+            let mut has_column_stats = false;
             for file in data_files {
                 // Get current next_row_id from table_stats
                 let stats_row =
@@ -1203,9 +1359,10 @@ impl MetadataWriter for SqliteMetadataWriter {
                     None => 0,
                 };
 
-                sqlx::query(
+                // R4-S-005: Use RETURNING to get data_file_id for column stats
+                let row = sqlx::query(
                     "INSERT INTO ducklake_data_file (table_id, path, path_is_relative, file_size_bytes, footer_size, record_count, row_id_start, begin_snapshot)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING data_file_id",
                 )
                 .bind(table_id)
                 .bind(&file.path)
@@ -1215,8 +1372,9 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .bind(file.record_count)
                 .bind(row_id_start)
                 .bind(snapshot_id)
-                .execute(&mut *tx)
+                .fetch_one(&mut *tx)
                 .await?;
+                let data_file_id: i64 = row.try_get(0)?;
 
                 // Update ducklake_table_stats
                 let new_next_row_id = row_id_start + file.record_count;
@@ -1246,7 +1404,67 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .execute(&mut *tx)
                     .await?;
                 }
+
+                // R4-S-005: Register per-file column stats
+                if !file.column_stats.is_empty() {
+                    has_column_stats = true;
+                    for stat in &file.column_stats {
+                        sqlx::query(
+                            "INSERT INTO ducklake_file_column_stats
+                             (data_file_id, table_id, column_id, null_count, min_value, max_value)
+                             VALUES (?, ?, ?, ?, ?, ?)",
+                        )
+                        .bind(data_file_id)
+                        .bind(table_id)
+                        .bind(stat.column_id)
+                        .bind(stat.null_count)
+                        .bind(&stat.min_value)
+                        .bind(&stat.max_value)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                }
             }
+
+            // R4-S-005: Recompute table-level column stats if any file stats were added
+            if has_column_stats {
+                sqlx::query("DELETE FROM ducklake_table_column_stats WHERE table_id = ?")
+                    .bind(table_id)
+                    .execute(&mut *tx)
+                    .await?;
+
+                sqlx::query(
+                    "INSERT INTO ducklake_table_column_stats
+                     (table_id, column_id, contains_null, min_value, max_value)
+                     SELECT fcs.table_id, fcs.column_id,
+                         CASE WHEN COALESCE(SUM(fcs.null_count), 0) > 0 THEN 1 ELSE 0 END,
+                         MIN(fcs.min_value),
+                         MAX(fcs.max_value)
+                     FROM ducklake_file_column_stats fcs
+                     INNER JOIN ducklake_data_file df
+                         ON fcs.data_file_id = df.data_file_id
+                         AND df.table_id = fcs.table_id
+                         AND df.end_snapshot IS NULL
+                     WHERE fcs.table_id = ?
+                     GROUP BY fcs.table_id, fcs.column_id",
+                )
+                .bind(table_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            // R4-S-004: Update snapshot's next_file_id
+            sqlx::query(
+                "UPDATE ducklake_snapshot
+                 SET next_file_id = COALESCE((SELECT MAX(v) + 1 FROM (
+                     SELECT COALESCE(MAX(data_file_id), 0) AS v FROM ducklake_data_file
+                     UNION ALL SELECT COALESCE(MAX(delete_file_id), 0) FROM ducklake_delete_file
+                 )), 0)
+                 WHERE snapshot_id = ?",
+            )
+            .bind(snapshot_id)
+            .execute(&mut *tx)
+            .await?;
 
             tx.commit().await?;
             Ok(())
@@ -1646,6 +1864,20 @@ impl MetadataWriter for SqliteMetadataWriter {
         block_on(async {
             let mut tx = self.pool.begin().await?;
 
+            // R4-S-014: Validate view exists and is active before creating snapshot
+            let exists = sqlx::query(
+                "SELECT COUNT(*) FROM ducklake_view WHERE view_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(view_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if exists.try_get::<i64, _>(0)? == 0 {
+                return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                    "View with id {} not found or already dropped",
+                    view_id
+                )));
+            }
+
             // Increment schema_version for DDL (F-012)
             let prev_sv_row =
                 sqlx::query("SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot")
@@ -1719,6 +1951,22 @@ impl MetadataWriter for SqliteMetadataWriter {
             let sql: String = view_row.try_get(2)?;
             let dialect: Option<String> = view_row.try_get(3)?;
             let column_aliases: Option<String> = view_row.try_get(4)?;
+
+            // R4-S-015: Check for duplicate active view name in same schema
+            let dup = sqlx::query(
+                "SELECT COUNT(*) FROM ducklake_view
+                 WHERE schema_id = ? AND view_name = ? AND end_snapshot IS NULL",
+            )
+            .bind(schema_id)
+            .bind(new_name)
+            .fetch_one(&mut *tx)
+            .await?;
+            if dup.try_get::<i64, _>(0)? > 0 {
+                return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                    "A view named '{}' already exists in schema {}",
+                    new_name, schema_id
+                )));
+            }
 
             // Increment schema_version for DDL (F-012)
             let prev_sv_row =
@@ -2121,6 +2369,22 @@ impl MetadataWriter for SqliteMetadataWriter {
             let path: String = table_row.try_get(2)?;
             let path_is_relative: bool = table_row.try_get(3)?;
 
+            // R4-S-015: Check for duplicate active table name in same schema
+            let dup = sqlx::query(
+                "SELECT COUNT(*) FROM ducklake_table
+                 WHERE schema_id = ? AND table_name = ? AND end_snapshot IS NULL",
+            )
+            .bind(schema_id)
+            .bind(new_name)
+            .fetch_one(&mut *tx)
+            .await?;
+            if dup.try_get::<i64, _>(0)? > 0 {
+                return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                    "A table named '{}' already exists in schema {}",
+                    new_name, schema_id
+                )));
+            }
+
             // Increment schema_version for DDL (F-012)
             let prev_sv_row =
                 sqlx::query("SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot")
@@ -2429,7 +2693,9 @@ impl MetadataWriter for SqliteMetadataWriter {
         block_on(async {
             let mut tx = self.pool.begin().await?;
 
-            let inlined_table_name = format!("ducklake_inlined_data_{}", table_id);
+            // R4-S-023: Use DuckDB-compatible naming: ducklake_inlined_data_{table_id}_{schema_version}
+            let schema_version: i64 = 1;
+            let inlined_table_name = format!("ducklake_inlined_data_{}_{}", table_id, schema_version);
 
             // Check if inline data table exists; create if not
             let exists =
@@ -2447,19 +2713,24 @@ impl MetadataWriter for SqliteMetadataWriter {
                     quote_identifier(&inlined_table_name)
                 );
                 for col in columns {
-                    // Use TEXT for all columns in SQLite (dynamic typing)
-                    // quote_identifier() escapes embedded quotes to prevent SQL injection
-                    create_sql.push_str(&format!(", {} TEXT", quote_identifier(col.name())));
+                    // R4-S-023: Use the DuckLake type from column definition (matching DuckDB convention)
+                    // instead of TEXT for all columns. quote_identifier() escapes embedded quotes.
+                    create_sql.push_str(&format!(
+                        ", {} {}",
+                        quote_identifier(col.name()),
+                        col.ducklake_type()
+                    ));
                 }
                 create_sql.push(')');
                 sqlx::query(&create_sql).execute(&mut *tx).await?;
 
                 // Register in ducklake_inlined_data_tables
                 sqlx::query(
-                    "INSERT INTO ducklake_inlined_data_tables (table_id, table_name, schema_version) VALUES (?, ?, 1)",
+                    "INSERT INTO ducklake_inlined_data_tables (table_id, table_name, schema_version) VALUES (?, ?, ?)",
                 )
                 .bind(table_id)
                 .bind(&inlined_table_name)
+                .bind(schema_version)
                 .execute(&mut *tx)
                 .await?;
             }
