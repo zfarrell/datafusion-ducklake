@@ -85,20 +85,24 @@ pub(crate) fn analyze_cdc_projection(
 
             // Compute reorder mapping from natural order to projection order.
             // Natural order: [table_cols in table_indices order, snapshot_id?, change_type?]
-            let table_idx_pos: std::collections::HashMap<usize, usize> = table_indices
-                .iter()
-                .enumerate()
-                .map(|(pos, &idx)| (idx, pos))
-                .collect();
+            // Build position-by-position to handle duplicate column projections correctly
+            // (e.g., SELECT col, col — a HashMap would collapse duplicates).
             let snapshot_natural_pos = table_indices.len();
-            let change_type_natural_pos =
-                table_indices.len() + if need_snapshot_id { 1 } else { 0 };
+            let change_type_natural_pos = table_indices.len()
+                + if need_snapshot_id {
+                    1
+                } else {
+                    0
+                };
 
             let natural_pos_map: Vec<usize> = indices
                 .iter()
                 .map(|&idx| {
                     if idx < num_table_cols {
-                        table_idx_pos[&idx]
+                        // Find position of this table column index in table_indices.
+                        // Use position-by-position scan to handle duplicate projections:
+                        // each occurrence maps to the corresponding table_indices position.
+                        table_indices.iter().position(|&ti| ti == idx).unwrap_or(0)
                     } else if idx == snapshot_id_idx {
                         snapshot_natural_pos
                     } else {
@@ -121,5 +125,73 @@ pub(crate) fn analyze_cdc_projection(
                 },
             })
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_test_schemas() -> (SchemaRef, SchemaRef) {
+        let table_schema = Arc::new(Schema::new(vec![
+            Field::new("id", arrow::datatypes::DataType::Int32, false),
+            Field::new("name", arrow::datatypes::DataType::Utf8, true),
+        ]));
+        let mut output_fields: Vec<Field> = table_schema
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
+        output_fields.push(Field::new(
+            "snapshot_id",
+            arrow::datatypes::DataType::Int64,
+            false,
+        ));
+        output_fields.push(Field::new(
+            "change_type",
+            arrow::datatypes::DataType::Utf8,
+            false,
+        ));
+        let output_schema = Arc::new(Schema::new(output_fields));
+        (table_schema, output_schema)
+    }
+
+    #[test]
+    fn test_cdc_projection_no_projection() {
+        let (table_schema, output_schema) = make_test_schemas();
+        let result = analyze_cdc_projection(None, &table_schema, &output_schema).unwrap();
+        assert_eq!(result.table_indices, vec![0, 1]);
+        assert!(result.need_snapshot_id);
+        assert!(result.need_change_type);
+        assert!(result.reorder_indices.is_none());
+    }
+
+    #[test]
+    fn test_cdc_projection_duplicate_columns() {
+        // R5-S-037: Duplicate column projections (SELECT col, col) should not collapse
+        let (table_schema, output_schema) = make_test_schemas();
+        let projection = vec![0, 0]; // id, id
+        let result =
+            analyze_cdc_projection(Some(&projection), &table_schema, &output_schema).unwrap();
+
+        // Both projected columns should map to valid positions
+        assert_eq!(result.table_indices.len(), 2);
+        assert_eq!(result.output_schema.fields().len(), 2);
+
+        // Reorder indices should be valid (both mapping to the same natural position is OK)
+        if let Some(reorder) = &result.reorder_indices {
+            assert_eq!(reorder.len(), 2);
+            // Both should map to position 0 (the column index in table_indices)
+            assert_eq!(reorder[0], 0);
+            assert_eq!(reorder[1], 0);
+        }
+    }
+
+    #[test]
+    fn test_cdc_projection_out_of_bounds() {
+        let (table_schema, output_schema) = make_test_schemas();
+        let projection = vec![10]; // out of bounds
+        let result = analyze_cdc_projection(Some(&projection), &table_schema, &output_schema);
+        assert!(result.is_err());
     }
 }

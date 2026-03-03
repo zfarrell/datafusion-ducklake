@@ -39,8 +39,9 @@ use crate::path_resolver::join_paths;
 use crate::table::delete_file_schema;
 use crate::table_writer::{calculate_footer_size_from_bytes, cleanup_orphaned_files};
 
-/// Schema for the output of delete operations (count of rows deleted)
-fn make_delete_count_schema() -> SchemaRef {
+/// Schema for the output of DML operations (count of rows affected).
+/// Shared by DELETE, UPDATE, INSERT, and MERGE exec plans.
+pub(crate) fn make_dml_count_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![Field::new(
         "count",
         DataType::UInt64,
@@ -102,7 +103,7 @@ impl DuckLakeDeleteExec {
 
     fn compute_properties() -> PlanProperties {
         PlanProperties::new(
-            EquivalenceProperties::new(make_delete_count_schema()),
+            EquivalenceProperties::new(make_dml_count_schema()),
             Partitioning::UnknownPartitioning(1),
             datafusion::physical_plan::execution_plan::EmissionType::Final,
             datafusion::physical_plan::execution_plan::Boundedness::Bounded,
@@ -188,7 +189,7 @@ impl ExecutionPlan for DuckLakeDeleteExec {
         let object_store_url = Arc::clone(&self.object_store_url);
         let table_path = self.table_path.clone();
         let existing_deletes = self.existing_deletes.clone();
-        let output_schema = make_delete_count_schema();
+        let output_schema = make_dml_count_schema();
 
         let stream = stream::once(async move {
             let object_store = context
@@ -244,8 +245,7 @@ impl ExecutionPlan for DuckLakeDeleteExec {
                 let mut positions_to_delete: Vec<i64> = Vec::new();
                 let mut global_row_offset: i64 = 0;
 
-                while let Some(batch_result) = parquet_stream.try_next().await? {
-                    let batch = batch_result;
+                while let Some(batch) = parquet_stream.try_next().await? {
                     let num_rows = batch.num_rows();
 
                     // Determine which rows match the filter
@@ -275,8 +275,9 @@ impl ExecutionPlan for DuckLakeDeleteExec {
 
                     // Collect matching row positions (excluding already-deleted rows)
                     for i in 0..num_rows {
-                        let i_i64 = i64::try_from(i)
-                            .map_err(|e| DataFusionError::Execution(format!("Row index overflow: {}", e)))?;
+                        let i_i64 = i64::try_from(i).map_err(|e| {
+                            DataFusionError::Execution(format!("Row index overflow: {}", e))
+                        })?;
                         let global_pos = global_row_offset + i_i64;
 
                         // Skip if already deleted
@@ -297,8 +298,9 @@ impl ExecutionPlan for DuckLakeDeleteExec {
                         }
                     }
 
-                    global_row_offset += i64::try_from(num_rows)
-                        .map_err(|e| DataFusionError::Execution(format!("Row count overflow: {}", e)))?;
+                    global_row_offset += i64::try_from(num_rows).map_err(|e| {
+                        DataFusionError::Execution(format!("Row count overflow: {}", e))
+                    })?;
                 }
 
                 // Skip this file if no rows to delete
@@ -306,8 +308,9 @@ impl ExecutionPlan for DuckLakeDeleteExec {
                     continue;
                 }
 
-                let new_delete_count = u64::try_from(positions_to_delete.len())
-                    .map_err(|e| DataFusionError::Execution(format!("Delete count overflow: {}", e)))?;
+                let new_delete_count = u64::try_from(positions_to_delete.len()).map_err(|e| {
+                    DataFusionError::Execution(format!("Delete count overflow: {}", e))
+                })?;
                 total_deleted += new_delete_count;
 
                 // Merge with existing deletes if any
@@ -320,8 +323,9 @@ impl ExecutionPlan for DuckLakeDeleteExec {
                 }
 
                 // R3F-034: delete_count tracks total positions in delete file, not just new deletions
-                let delete_count = i64::try_from(positions_to_delete.len())
-                    .map_err(|e| DataFusionError::Execution(format!("Delete count overflow: {}", e)))?;
+                let delete_count = i64::try_from(positions_to_delete.len()).map_err(|e| {
+                    DataFusionError::Execution(format!("Delete count overflow: {}", e))
+                })?;
 
                 // Write the delete file
                 let delete_file_name = format!("ducklake-{}-delete.parquet", Uuid::new_v4());
@@ -337,7 +341,7 @@ impl ExecutionPlan for DuckLakeDeleteExec {
                 let file_path_values: Vec<&str> =
                     vec![resolved_path.as_str(); positions_to_delete.len()];
                 let file_path_array: ArrayRef = Arc::new(StringArray::from(file_path_values));
-                let pos_array: ArrayRef = Arc::new(Int64Array::from(positions_to_delete.clone()));
+                let pos_array: ArrayRef = Arc::new(Int64Array::from(positions_to_delete));
 
                 let delete_batch =
                     RecordBatch::try_new(del_schema.clone(), vec![file_path_array, pos_array])?;
@@ -354,8 +358,9 @@ impl ExecutionPlan for DuckLakeDeleteExec {
                     .into_inner()
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-                let file_size = i64::try_from(buffer.len())
-                    .map_err(|e| DataFusionError::Execution(format!("File size overflow: {}", e)))?;
+                let file_size = i64::try_from(buffer.len()).map_err(|e| {
+                    DataFusionError::Execution(format!("File size overflow: {}", e))
+                })?;
                 let footer_size = calculate_footer_size_from_bytes(&buffer)
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
@@ -395,10 +400,9 @@ impl ExecutionPlan for DuckLakeDeleteExec {
 
             // R3F-013: Record snapshot changes for DELETE
             // R4-S-016: Non-fatal — DML data is already committed
-            if let Err(e) = writer.record_snapshot_changes(
-                snapshot_id,
-                &format!("deleted_from_table:{}", table_id),
-            ) {
+            if let Err(e) = writer
+                .record_snapshot_changes(snapshot_id, &format!("deleted_from_table:{}", table_id))
+            {
                 tracing::warn!(
                     snapshot_id,
                     error = %e,
@@ -412,7 +416,7 @@ impl ExecutionPlan for DuckLakeDeleteExec {
         });
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
-            make_delete_count_schema(),
+            make_dml_count_schema(),
             stream,
         )))
     }

@@ -199,6 +199,15 @@ fn extract_update_info(
     let schema = table.schema();
     let mut assignments = Vec::new();
 
+    if projection_exprs.len() > schema.fields().len() {
+        tracing::warn!(
+            "UPDATE projection has {} expressions but table schema has {} fields; \
+             extra expressions will be ignored",
+            projection_exprs.len(),
+            schema.fields().len()
+        );
+    }
+
     for (i, expr) in projection_exprs.iter().enumerate() {
         if i >= schema.fields().len() {
             break;

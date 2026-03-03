@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, RecordBatch, UInt64Array};
 use arrow::compute;
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Schema, SchemaRef};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -35,14 +35,7 @@ use crate::table_writer::DuckLakeTableWriter;
 ))]
 use sqlx::types::chrono;
 
-/// Schema for the output of insert operations (count of rows inserted)
-fn make_insert_count_schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![Field::new(
-        "count",
-        DataType::UInt64,
-        false,
-    )]))
-}
+use crate::delete_exec::make_dml_count_schema;
 
 /// Partition column info for write-side partitioning.
 #[derive(Debug, Clone)]
@@ -102,7 +95,7 @@ impl DuckLakeInsertExec {
 
     fn compute_properties() -> PlanProperties {
         PlanProperties::new(
-            EquivalenceProperties::new(make_insert_count_schema()),
+            EquivalenceProperties::new(make_dml_count_schema()),
             Partitioning::UnknownPartitioning(1),
             datafusion::physical_plan::execution_plan::EmissionType::Final,
             datafusion::physical_plan::execution_plan::Boundedness::Bounded,
@@ -205,7 +198,7 @@ impl ExecutionPlan for DuckLakeInsertExec {
         let write_mode = self.write_mode;
         let object_store_url = self.object_store_url.clone();
         let partition_columns = self.partition_columns.clone();
-        let output_schema = make_insert_count_schema();
+        let output_schema = make_dml_count_schema();
 
         let stream = stream::once(async move {
             // Collect batches from ALL input partitions to avoid dropping data
@@ -272,7 +265,7 @@ impl ExecutionPlan for DuckLakeInsertExec {
         });
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
-            make_insert_count_schema(),
+            make_dml_count_schema(),
             stream,
         )))
     }
@@ -614,13 +607,12 @@ fn precompute_identity_values(
         DataType::LargeUtf8 => extract_all!(LargeStringArray),
         DataType::Boolean => extract_all!(BooleanArray),
         DataType::Date32 => {
-            let a =
-                array
-                    .as_any()
-                    .downcast_ref::<Date32Array>()
-                    .ok_or_else(|| {
-                        DuckLakeError::Internal("Failed to downcast Date32 array".to_string())
-                    })?;
+            let a = array
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .ok_or_else(|| {
+                    DuckLakeError::Internal("Failed to downcast Date32 array".to_string())
+                })?;
             for i in 0..len {
                 values.push(if a.is_null(i) {
                     None
@@ -631,13 +623,12 @@ fn precompute_identity_values(
             }
         },
         DataType::Date64 => {
-            let a =
-                array
-                    .as_any()
-                    .downcast_ref::<Date64Array>()
-                    .ok_or_else(|| {
-                        DuckLakeError::Internal("Failed to downcast Date64 array".to_string())
-                    })?;
+            let a = array
+                .as_any()
+                .downcast_ref::<Date64Array>()
+                .ok_or_else(|| {
+                    DuckLakeError::Internal("Failed to downcast Date64 array".to_string())
+                })?;
             for i in 0..len {
                 values.push(if a.is_null(i) {
                     None
@@ -718,9 +709,10 @@ fn extract_rows(
                 }
                 current_batch_idx = Some(batch_idx);
             }
-            take_indices.push(u32::try_from(row_idx).map_err(|e| {
-                DuckLakeError::Internal(format!("Row index overflow: {}", e))
-            })?);
+            take_indices.push(
+                u32::try_from(row_idx)
+                    .map_err(|e| DuckLakeError::Internal(format!("Row index overflow: {}", e)))?,
+            );
         }
         if let Some(prev) = current_batch_idx {
             if !take_indices.is_empty() {
@@ -812,18 +804,18 @@ async fn write_partitioned(
         .commit_uploaded_files(&setup, uploaded_files, write_mode)
         .await?;
 
-    Ok(u64::try_from(result.records_written).map_err(|e| {
-        DataFusionError::Execution(format!("Record count overflow: {}", e))
-    })?)
+    Ok(u64::try_from(result.records_written)
+        .map_err(|e| DataFusionError::Execution(format!("Record count overflow: {}", e)))?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::datatypes::Field;
 
     #[test]
     fn test_insert_count_schema() {
-        let schema = make_insert_count_schema();
+        let schema = make_dml_count_schema();
         assert_eq!(schema.fields().len(), 1);
         assert_eq!(schema.field(0).name(), "count");
         assert_eq!(schema.field(0).data_type(), &DataType::UInt64);
