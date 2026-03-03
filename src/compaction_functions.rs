@@ -76,6 +76,51 @@ fn open_compaction_connection(catalog_path: &str) -> DataFusionResult<duckdb::Co
     Ok(conn)
 }
 
+/// Helper to map a DuckDB error to a DataFusionError.
+fn duckdb_err(e: duckdb::Error) -> datafusion::error::DataFusionError {
+    datafusion::error::DataFusionError::External(Box::new(e))
+}
+
+/// Collect a DuckDB result set into a RecordBatch.
+///
+/// `row_mapper` extracts typed values from each DuckDB row and returns them as
+/// a Vec of Option values (one per column). The `array_builder` converts the
+/// collected column Vecs into Arrow ArrayRefs.
+fn collect_duckdb_rows<F, G>(
+    conn: &duckdb::Connection,
+    sql: &str,
+    schema: SchemaRef,
+    num_cols: usize,
+    row_mapper: F,
+    array_builder: G,
+) -> DataFusionResult<Arc<dyn TableProvider>>
+where
+    F: Fn(&duckdb::Row<'_>) -> DataFusionResult<Vec<ScalarValue>>,
+    G: Fn(Vec<Vec<ScalarValue>>) -> DataFusionResult<Vec<ArrayRef>>,
+{
+    let mut stmt = conn.prepare(sql).map_err(duckdb_err)?;
+    let mut rows = stmt.query([]).map_err(duckdb_err)?;
+
+    let mut columns: Vec<Vec<ScalarValue>> = (0..num_cols).map(|_| Vec::new()).collect();
+    while let Some(row) = rows.next().map_err(duckdb_err)? {
+        let values = row_mapper(row)?;
+        for (i, val) in values.into_iter().enumerate() {
+            columns[i].push(val);
+        }
+    }
+
+    let batch = if columns[0].is_empty() {
+        RecordBatch::new_empty(schema.clone())
+    } else {
+        let arrays = array_builder(columns)?;
+        RecordBatch::try_new(schema.clone(), arrays)
+            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?
+    };
+
+    let mem = datafusion::datasource::memory::MemTable::try_new(schema, vec![vec![batch]])?;
+    Ok(Arc::new(mem))
+}
+
 /// Execute a DuckDB query that returns `(Success: Boolean)` and collect results.
 fn execute_success_query(
     conn: &duckdb::Connection,
@@ -293,73 +338,46 @@ impl TableFunctionImpl for DucklakeExpireSnapshotsFunction {
         );
 
         let schema = expire_snapshots_schema();
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
-        let mut rows = stmt
-            .query([])
-            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
-
-        let mut snapshot_ids: Vec<Option<i64>> = Vec::new();
-        let mut snapshot_times: Vec<Option<String>> = Vec::new();
-        let mut schema_versions: Vec<Option<i64>> = Vec::new();
-        let mut changes_col: Vec<Option<String>> = Vec::new();
-        let mut authors: Vec<Option<String>> = Vec::new();
-        let mut commit_messages: Vec<Option<String>> = Vec::new();
-        let mut commit_extra_infos: Vec<Option<String>> = Vec::new();
-
-        while let Some(row) = rows
-            .next()
-            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?
-        {
-            snapshot_ids.push(
-                row.get(0)
-                    .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?,
-            );
-            snapshot_times.push(
-                row.get(1)
-                    .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?,
-            );
-            schema_versions.push(
-                row.get(2)
-                    .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?,
-            );
-            changes_col.push(
-                row.get(3)
-                    .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?,
-            );
-            authors.push(
-                row.get(4)
-                    .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?,
-            );
-            commit_messages.push(
-                row.get(5)
-                    .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?,
-            );
-            commit_extra_infos.push(
-                row.get(6)
-                    .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?,
-            );
-        }
-
-        let batch = if snapshot_ids.is_empty() {
-            RecordBatch::new_empty(schema.clone())
-        } else {
-            let arrays: Vec<ArrayRef> = vec![
-                Arc::new(Int64Array::from(snapshot_ids)),
-                Arc::new(StringArray::from(snapshot_times)),
-                Arc::new(Int64Array::from(schema_versions)),
-                Arc::new(StringArray::from(changes_col)),
-                Arc::new(StringArray::from(authors)),
-                Arc::new(StringArray::from(commit_messages)),
-                Arc::new(StringArray::from(commit_extra_infos)),
-            ];
-            RecordBatch::try_new(schema.clone(), arrays)
-                .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?
-        };
-
-        let mem = datafusion::datasource::memory::MemTable::try_new(schema, vec![vec![batch]])?;
-        Ok(Arc::new(mem))
+        collect_duckdb_rows(
+            &conn,
+            &sql,
+            schema,
+            7,
+            |row| {
+                Ok(vec![
+                    ScalarValue::Int64(row.get::<_, Option<i64>>(0).map_err(duckdb_err)?),
+                    ScalarValue::Utf8(row.get::<_, Option<String>>(1).map_err(duckdb_err)?),
+                    ScalarValue::Int64(row.get::<_, Option<i64>>(2).map_err(duckdb_err)?),
+                    ScalarValue::Utf8(row.get::<_, Option<String>>(3).map_err(duckdb_err)?),
+                    ScalarValue::Utf8(row.get::<_, Option<String>>(4).map_err(duckdb_err)?),
+                    ScalarValue::Utf8(row.get::<_, Option<String>>(5).map_err(duckdb_err)?),
+                    ScalarValue::Utf8(row.get::<_, Option<String>>(6).map_err(duckdb_err)?),
+                ])
+            },
+            |cols| {
+                fn to_i64_array(col: &[ScalarValue]) -> ArrayRef {
+                    Arc::new(Int64Array::from(col.iter().map(|v| match v {
+                        ScalarValue::Int64(v) => *v,
+                        _ => None,
+                    }).collect::<Vec<_>>()))
+                }
+                fn to_string_array(col: &[ScalarValue]) -> ArrayRef {
+                    Arc::new(StringArray::from(col.iter().map(|v| match v {
+                        ScalarValue::Utf8(v) => v.clone(),
+                        _ => None,
+                    }).collect::<Vec<_>>()))
+                }
+                Ok(vec![
+                    to_i64_array(&cols[0]),
+                    to_string_array(&cols[1]),
+                    to_i64_array(&cols[2]),
+                    to_string_array(&cols[3]),
+                    to_string_array(&cols[4]),
+                    to_string_array(&cols[5]),
+                    to_string_array(&cols[6]),
+                ])
+            },
+        )
     }
 }
 
@@ -478,9 +496,20 @@ fn extract_string_arg(expr: &Expr, func_name: &str, pos: usize) -> DataFusionRes
 fn extract_float_arg(expr: &Expr, func_name: &str, pos: usize) -> DataFusionResult<f64> {
     match expr {
         Expr::Literal(ScalarValue::Float64(Some(v)), _) => Ok(*v),
-        Expr::Literal(ScalarValue::Float32(Some(v)), _) => Ok(*v as f64),
-        Expr::Literal(ScalarValue::Int64(Some(v)), _) => Ok(*v as f64),
-        Expr::Literal(ScalarValue::Int32(Some(v)), _) => Ok(*v as f64),
+        Expr::Literal(ScalarValue::Float32(Some(v)), _) => Ok(f64::from(*v)),
+        Expr::Literal(ScalarValue::Int64(Some(v)), _) => {
+            // Values above 2^53 lose precision in f64 representation
+            const MAX_SAFE: i64 = 1_i64 << 53;
+            if *v > MAX_SAFE || *v < -MAX_SAFE {
+                plan_err!(
+                    "Argument {} to {}() integer value {} exceeds safe f64 range (2^53)",
+                    pos, func_name, v
+                )
+            } else {
+                Ok(*v as f64)
+            }
+        },
+        Expr::Literal(ScalarValue::Int32(Some(v)), _) => Ok(f64::from(*v)),
         _ => plan_err!(
             "Argument {} to {}() must be a numeric literal",
             pos,
@@ -539,61 +568,36 @@ impl TableFunctionImpl for DucklakeOptionsFunction {
 
         let sql = "SELECT option_name, description, value, scope, scope_entry FROM ducklake_options('__compaction')";
 
-        let mut stmt = conn
-            .prepare(sql)
-            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
-        let mut rows = stmt
-            .query([])
-            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
-
-        let mut option_names: Vec<Option<String>> = Vec::new();
-        let mut descriptions: Vec<Option<String>> = Vec::new();
-        let mut values: Vec<Option<String>> = Vec::new();
-        let mut scopes: Vec<Option<String>> = Vec::new();
-        let mut scope_entries: Vec<Option<String>> = Vec::new();
-
-        while let Some(row) = rows
-            .next()
-            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?
-        {
-            option_names.push(
-                row.get(0)
-                    .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?,
-            );
-            descriptions.push(
-                row.get(1)
-                    .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?,
-            );
-            values.push(
-                row.get(2)
-                    .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?,
-            );
-            scopes.push(
-                row.get(3)
-                    .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?,
-            );
-            scope_entries.push(
-                row.get(4)
-                    .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?,
-            );
-        }
-
-        let batch = if option_names.is_empty() {
-            RecordBatch::new_empty(schema.clone())
-        } else {
-            let arrays: Vec<ArrayRef> = vec![
-                Arc::new(StringArray::from(option_names)),
-                Arc::new(StringArray::from(descriptions)),
-                Arc::new(StringArray::from(values)),
-                Arc::new(StringArray::from(scopes)),
-                Arc::new(StringArray::from(scope_entries)),
-            ];
-            RecordBatch::try_new(schema.clone(), arrays)
-                .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?
-        };
-
-        let mem = datafusion::datasource::memory::MemTable::try_new(schema, vec![vec![batch]])?;
-        Ok(Arc::new(mem))
+        collect_duckdb_rows(
+            &conn,
+            sql,
+            schema,
+            5,
+            |row| {
+                Ok(vec![
+                    ScalarValue::Utf8(row.get::<_, Option<String>>(0).map_err(duckdb_err)?),
+                    ScalarValue::Utf8(row.get::<_, Option<String>>(1).map_err(duckdb_err)?),
+                    ScalarValue::Utf8(row.get::<_, Option<String>>(2).map_err(duckdb_err)?),
+                    ScalarValue::Utf8(row.get::<_, Option<String>>(3).map_err(duckdb_err)?),
+                    ScalarValue::Utf8(row.get::<_, Option<String>>(4).map_err(duckdb_err)?),
+                ])
+            },
+            |cols| {
+                fn to_string_array(col: &[ScalarValue]) -> ArrayRef {
+                    Arc::new(StringArray::from(col.iter().map(|v| match v {
+                        ScalarValue::Utf8(v) => v.clone(),
+                        _ => None,
+                    }).collect::<Vec<_>>()))
+                }
+                Ok(vec![
+                    to_string_array(&cols[0]),
+                    to_string_array(&cols[1]),
+                    to_string_array(&cols[2]),
+                    to_string_array(&cols[3]),
+                    to_string_array(&cols[4]),
+                ])
+            },
+        )
     }
 }
 

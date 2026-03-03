@@ -13,41 +13,6 @@ use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::types::chrono::NaiveDateTime;
 
-macro_rules! bind_repeat {
-    ($query:expr, $value:expr, 1) => {
-        $query.bind($value)
-    };
-    ($query:expr, $value:expr, 2) => {
-        $query.bind($value).bind($value)
-    };
-    ($query:expr, $value:expr, 3) => {
-        $query.bind($value).bind($value).bind($value)
-    };
-    ($query:expr, $value:expr, 4) => {
-        $query.bind($value).bind($value).bind($value).bind($value)
-    };
-    ($query:expr, $value:expr, 6) => {
-        $query
-            .bind($value)
-            .bind($value)
-            .bind($value)
-            .bind($value)
-            .bind($value)
-            .bind($value)
-    };
-    ($query:expr, $value:expr, 8) => {
-        $query
-            .bind($value)
-            .bind($value)
-            .bind($value)
-            .bind($value)
-            .bind($value)
-            .bind($value)
-            .bind($value)
-            .bind($value)
-    };
-}
-
 /// Note: This provider requires a multi-threaded Tokio runtime
 /// (`tokio::runtime::Builder::new_multi_thread()`) because it uses
 /// `tokio::task::block_in_place()` to bridge async sqlx operations.
@@ -377,8 +342,7 @@ impl MetadataProvider for PostgresMetadataProvider {
 
     fn list_all_tables(&self, snapshot_id: i64) -> Result<Vec<TableWithSchema>> {
         block_on(async {
-            let rows = bind_repeat!(
-                sqlx::query(
+            let rows = sqlx::query(
                     "SELECT s.schema_name, s.schema_id, t.table_id, t.table_name,
                             CAST(t.table_uuid AS VARCHAR) AS table_uuid, t.path, t.path_is_relative
                      FROM ducklake_schema s
@@ -388,10 +352,11 @@ impl MetadataProvider for PostgresMetadataProvider {
                        AND $3 >= t.begin_snapshot
                        AND ($4 < t.end_snapshot OR t.end_snapshot IS NULL)
                      ORDER BY s.schema_name, t.table_name"
-                ),
-                snapshot_id,
-                4
-            )
+                )
+                .bind(snapshot_id)
+                .bind(snapshot_id)
+                .bind(snapshot_id)
+                .bind(snapshot_id)
             .fetch_all(&self.pool)
             .await?;
 
@@ -428,9 +393,12 @@ impl MetadataProvider for PostgresMetadataProvider {
                    AND ($2 < s.end_snapshot OR s.end_snapshot IS NULL)
                    AND $3 >= t.begin_snapshot
                    AND ($4 < t.end_snapshot OR t.end_snapshot IS NULL)
-                   AND c.end_snapshot IS NULL
+                   AND $5 >= c.begin_snapshot
+                   AND ($6 < c.end_snapshot OR c.end_snapshot IS NULL)
                  ORDER BY s.schema_name, t.table_name, c.column_order",
             )
+            .bind(snapshot_id)
+            .bind(snapshot_id)
             .bind(snapshot_id)
             .bind(snapshot_id)
             .bind(snapshot_id)

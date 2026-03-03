@@ -96,6 +96,16 @@ impl DuckdbMetadataProvider {
             Err(e) => return Err(DuckLakeError::DuckDb(e)),
         };
 
+        // Verify the table actually exists
+        let table_exists: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM information_schema.tables WHERE table_name = ?",
+            [&inlined_table_name],
+            |row| row.get(0),
+        ).unwrap_or(false);
+        if !table_exists {
+            return Ok(0);
+        }
+
         // Count active inlined rows at this snapshot
         let count_sql = format!(
             "SELECT COUNT(*) FROM {} WHERE ? >= begin_snapshot AND (? < end_snapshot OR end_snapshot IS NULL)",
@@ -373,7 +383,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
 
         let columns = stmt
             .query_map(
-                params![snapshot_id, snapshot_id, snapshot_id, snapshot_id],
+                params![snapshot_id, snapshot_id, snapshot_id, snapshot_id, snapshot_id, snapshot_id],
                 |row| {
                     let schema_name: String = row.get(0)?;
                     let table_name: String = row.get(1)?;
@@ -588,6 +598,16 @@ impl MetadataProvider for DuckdbMetadataProvider {
             Err(e) => return Err(DuckLakeError::DuckDb(e)),
         };
 
+        // Verify the inlined data table actually exists before querying it
+        let table_exists: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM information_schema.tables WHERE table_name = ?",
+            [&inlined_table_name],
+            |row| row.get(0),
+        ).unwrap_or(false);
+        if !table_exists {
+            return Ok(Vec::new());
+        }
+
         // Get column names from the inlined data table (skip row_id, begin_snapshot, end_snapshot)
         let pragma_sql = format!(
             "PRAGMA table_info({})",
@@ -596,7 +616,8 @@ impl MetadataProvider for DuckdbMetadataProvider {
         let mut pragma_stmt = conn.prepare(&pragma_sql)?;
         let user_columns: Vec<String> = pragma_stmt
             .query_map([], |row| row.get::<_, String>(1))?
-            .filter_map(|r| r.ok())
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
             .filter(|name| name != "row_id" && name != "begin_snapshot" && name != "end_snapshot")
             .collect();
 

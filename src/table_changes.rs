@@ -318,20 +318,8 @@ impl RecordBatchStream for AppendCDCColumnsStream {
     }
 }
 
-/// Projection analysis result: maps logical projection to physical components
-struct ProjectionInfo {
-    /// Table column indices to read from Parquet (in original order)
-    table_indices: Vec<usize>,
-    /// Whether snapshot_id is requested
-    need_snapshot_id: bool,
-    /// Whether change_type is requested
-    need_change_type: bool,
-    /// The projected output schema
-    output_schema: SchemaRef,
-    /// Maps from natural column order (table_cols + CDC cols) to projection order.
-    /// None when no reordering is needed (columns already in natural order).
-    reorder_indices: Option<Vec<usize>>,
-}
+// R4-S-027: Use shared CDC projection analysis from cdc_common module
+use crate::cdc_common::{CdcProjectionAnalysis, analyze_cdc_projection};
 
 #[derive(Debug)]
 pub struct TableChangesTable {
@@ -382,89 +370,8 @@ impl TableChangesTable {
     }
 
     /// Analyze projection and split into table columns and CDC columns
-    fn analyze_projection(&self, projection: Option<&Vec<usize>>) -> ProjectionInfo {
-        let num_table_cols = self.table_schema.fields().len();
-        let snapshot_id_idx = num_table_cols;
-        let change_type_idx = num_table_cols + 1;
-
-        match projection {
-            None => {
-                // No projection - read all columns
-                ProjectionInfo {
-                    table_indices: (0..num_table_cols).collect(),
-                    need_snapshot_id: true,
-                    need_change_type: true,
-                    output_schema: self.output_schema.clone(),
-                    reorder_indices: None,
-                }
-            },
-            Some(indices) => {
-                // Split indices into table columns and CDC columns
-                let mut table_indices: Vec<usize> = Vec::new();
-                let mut need_snapshot_id = false;
-                let mut need_change_type = false;
-
-                for &idx in indices {
-                    if idx < num_table_cols {
-                        table_indices.push(idx);
-                    } else if idx == snapshot_id_idx {
-                        need_snapshot_id = true;
-                    } else if idx == change_type_idx {
-                        need_change_type = true;
-                    }
-                }
-
-                // Build projected output schema in the order requested
-                let mut fields: Vec<Field> = Vec::with_capacity(indices.len());
-                for &idx in indices {
-                    fields.push(self.output_schema.field(idx).clone());
-                }
-                let output_schema = Arc::new(Schema::new(fields));
-
-                // Compute reorder mapping from natural order to projection order.
-                // Natural order: [table_cols in table_indices order, snapshot_id?, change_type?]
-                // We need to map each projection entry to its position in natural order.
-                let mut natural_pos_map: Vec<usize> = Vec::with_capacity(indices.len());
-                // Build lookup: table column index -> position in table_indices
-                let table_idx_pos: std::collections::HashMap<usize, usize> = table_indices
-                    .iter()
-                    .enumerate()
-                    .map(|(pos, &idx)| (idx, pos))
-                    .collect();
-                let snapshot_natural_pos = table_indices.len();
-                let change_type_natural_pos = table_indices.len()
-                    + if need_snapshot_id {
-                        1
-                    } else {
-                        0
-                    };
-
-                for &idx in indices {
-                    if idx < num_table_cols {
-                        natural_pos_map.push(table_idx_pos[&idx]);
-                    } else if idx == snapshot_id_idx {
-                        natural_pos_map.push(snapshot_natural_pos);
-                    } else if idx == change_type_idx {
-                        natural_pos_map.push(change_type_natural_pos);
-                    }
-                }
-
-                // Check if reordering is actually needed (identity mapping)
-                let needs_reorder = natural_pos_map.iter().enumerate().any(|(i, &pos)| i != pos);
-
-                ProjectionInfo {
-                    table_indices,
-                    need_snapshot_id,
-                    need_change_type,
-                    output_schema,
-                    reorder_indices: if needs_reorder {
-                        Some(natural_pos_map)
-                    } else {
-                        None
-                    },
-                }
-            },
-        }
+    fn analyze_projection(&self, projection: Option<&Vec<usize>>) -> DataFusionResult<CdcProjectionAnalysis> {
+        analyze_cdc_projection(projection, &self.table_schema, &self.output_schema)
     }
 
     /// Build the schema that AppendCDCColumnsExec will output
@@ -495,7 +402,7 @@ impl TableChangesTable {
         &self,
         state: &dyn Session,
         data_file: &DataFileChange,
-        proj_info: &ProjectionInfo,
+        proj_info: &CdcProjectionAnalysis,
         encryption_factory: &Option<Arc<dyn EncryptionFactory>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let parquet_source = if let Some(factory) = encryption_factory {
@@ -513,7 +420,7 @@ impl TableChangesTable {
         &self,
         state: &dyn Session,
         data_file: &DataFileChange,
-        proj_info: &ProjectionInfo,
+        proj_info: &CdcProjectionAnalysis,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         self.build_exec_for_file_impl(state, data_file, proj_info, ParquetSource::default())
             .await
@@ -524,7 +431,7 @@ impl TableChangesTable {
         &self,
         _state: &dyn Session,
         data_file: &DataFileChange,
-        proj_info: &ProjectionInfo,
+        proj_info: &CdcProjectionAnalysis,
         parquet_source: ParquetSource,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         // Resolve file path
@@ -637,7 +544,7 @@ impl TableProvider for TableChangesTable {
         _limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         // Analyze projection to determine what to read
-        let proj_info = self.analyze_projection(projection);
+        let proj_info = self.analyze_projection(projection)?;
 
         // Get data files added between snapshots (INSERT changes)
         let data_files = self

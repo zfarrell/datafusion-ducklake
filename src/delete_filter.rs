@@ -169,19 +169,18 @@ impl DeleteFilterStream {
 
         // Build list of row indices to keep
         let num_rows = batch.num_rows();
-        if num_rows > u32::MAX as usize {
-            return Err(DataFusionError::Internal(format!(
+        let num_rows_u32 = u32::try_from(num_rows).map_err(|_| {
+            DataFusionError::Internal(format!(
                 "batch row count {} exceeds u32::MAX",
                 num_rows
-            )));
-        }
+            ))
+        })?;
         let mut keep_indices: Vec<u32> = Vec::with_capacity(num_rows);
 
-        for i in 0..num_rows {
-            // Safe: i < num_rows which fits in i64 (checked via u32::MAX above)
-            let global_pos = self.row_offset + i as i64;
+        for i in 0..num_rows_u32 {
+            let global_pos = self.row_offset + i64::from(i);
             if !self.deleted_positions.contains(&global_pos) {
-                keep_indices.push(i as u32);
+                keep_indices.push(i);
             }
         }
 

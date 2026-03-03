@@ -376,7 +376,7 @@ fn parse_change_function_args(
 
     let start_snapshot = match &exprs[1] {
         Expr::Literal(ScalarValue::Int64(Some(v)), _) => *v,
-        Expr::Literal(ScalarValue::Int32(Some(v)), _) => *v as i64,
+        Expr::Literal(ScalarValue::Int32(Some(v)), _) => i64::from(*v),
         _ => {
             return plan_err!(
                 "Second argument to {}() must be an integer (start_snapshot)",
@@ -387,7 +387,7 @@ fn parse_change_function_args(
 
     let end_snapshot = match &exprs[2] {
         Expr::Literal(ScalarValue::Int64(Some(v)), _) => *v,
-        Expr::Literal(ScalarValue::Int32(Some(v)), _) => *v as i64,
+        Expr::Literal(ScalarValue::Int32(Some(v)), _) => i64::from(*v),
         _ => {
             return plan_err!(
                 "Third argument to {}() must be an integer (end_snapshot)",

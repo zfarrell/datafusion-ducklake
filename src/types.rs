@@ -184,7 +184,17 @@ pub fn arrow_to_ducklake_type(arrow_type: &DataType) -> Result<String> {
                 .iter()
                 .map(|f| {
                     let dt = arrow_to_ducklake_type(f.data_type())?;
-                    Ok(format!("{} {}", f.name(), dt))
+                    let name = f.name();
+                    // Quote field names that contain special characters
+                    let needs_quoting = name.contains(|c: char| {
+                        c == ' ' || c == ',' || c == ':' || c == '(' || c == ')' || c == '"'
+                    });
+                    if needs_quoting {
+                        let escaped = name.replace('"', "\"\"");
+                        Ok(format!("\"{}\" {}", escaped, dt))
+                    } else {
+                        Ok(format!("{} {}", name, dt))
+                    }
                 })
                 .collect();
             Ok(format!("struct({})", field_strs?.join(", ")))
@@ -263,7 +273,12 @@ fn parse_decimal(type_str: &str) -> Result<Option<DataType>> {
     };
     let end = match type_str.find(')') {
         Some(e) => e,
-        None => return Ok(Some(DataType::Decimal128(18, 0))),
+        None => {
+            return Err(DuckLakeError::UnsupportedType(format!(
+                "Missing closing parenthesis in decimal type '{}'",
+                type_str
+            )));
+        },
     };
 
     // R3F-029: Reject trailing garbage after closing parenthesis

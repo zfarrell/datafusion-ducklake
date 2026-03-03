@@ -212,6 +212,8 @@ pub struct DataFileInfo {
     pub footer_size: Option<i64>,
     /// Number of records in the file
     pub record_count: i64,
+    /// Per-column statistics for query optimization (R4-S-005)
+    pub column_stats: Vec<ColumnStatInfo>,
 }
 
 impl DataFileInfo {
@@ -223,18 +225,28 @@ impl DataFileInfo {
             file_size_bytes,
             footer_size: None,
             record_count,
+            column_stats: Vec::new(),
         }
     }
 
     /// Set the footer size for read optimization.
+    #[must_use]
     pub fn with_footer_size(mut self, footer_size: i64) -> Self {
         self.footer_size = Some(footer_size);
         self
     }
 
     /// Mark this file as having an absolute path.
+    #[must_use]
     pub fn with_absolute_path(mut self) -> Self {
         self.path_is_relative = false;
+        self
+    }
+
+    /// Attach per-column statistics for this data file.
+    #[must_use]
+    pub fn with_column_stats(mut self, stats: Vec<ColumnStatInfo>) -> Self {
+        self.column_stats = stats;
         self
     }
 }
@@ -294,10 +306,24 @@ impl DeleteFileInfo {
     }
 
     /// Set the footer size for read optimization.
+    #[must_use]
     pub fn with_footer_size(mut self, footer_size: i64) -> Self {
         self.footer_size = Some(footer_size);
         self
     }
+}
+
+/// Entry for atomically replacing table files (end old + register new in one transaction).
+///
+/// Used by `MetadataWriter::replace_table_files` to batch all file registrations
+/// (data file, column stats, partition values) into a single atomic operation.
+/// Column stats are carried in `file_info.column_stats`.
+#[derive(Debug)]
+pub struct ReplaceFileEntry {
+    /// Data file metadata (includes column_stats)
+    pub file_info: DataFileInfo,
+    /// Partition values as (key_index, value) pairs
+    pub partition_values: Vec<(i32, Option<String>)>,
 }
 
 /// Result of a write operation.
@@ -453,6 +479,46 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
             self.register_data_file(table_id, snapshot_id, file)?;
         }
         Ok(())
+    }
+
+    /// Atomically replace table files: end existing files and register new ones.
+    ///
+    /// Ends all existing data files for the table, then registers each new file
+    /// with its column stats and partition values, all within a single transaction.
+    ///
+    /// Returns the data_file_id for each registered file.
+    ///
+    /// Default implementation calls individual methods (non-atomic, for backward
+    /// compatibility). Backends should override for true atomicity.
+    fn replace_table_files(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        files: &[ReplaceFileEntry],
+    ) -> Result<Vec<i64>> {
+        self.end_table_files(table_id, snapshot_id)?;
+        let mut ids = Vec::with_capacity(files.len());
+        for entry in files {
+            let data_file_id =
+                self.register_data_file(table_id, snapshot_id, &entry.file_info)?;
+            if !entry.file_info.column_stats.is_empty() {
+                self.register_column_stats(
+                    data_file_id,
+                    table_id,
+                    &entry.file_info.column_stats,
+                )?;
+            }
+            for (key_index, val) in &entry.partition_values {
+                self.register_file_partition_value(
+                    data_file_id,
+                    table_id,
+                    *key_index,
+                    val.as_deref(),
+                )?;
+            }
+            ids.push(data_file_id);
+        }
+        Ok(ids)
     }
 
     /// Drop a table by setting its end_snapshot.

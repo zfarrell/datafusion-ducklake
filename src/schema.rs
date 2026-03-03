@@ -148,7 +148,7 @@ impl DuckLakeSchema {
 
         let temp_ctx = SessionContext::new_with_config(config);
 
-        let temp_catalog = DuckLakeCatalog::with_snapshot(self.provider.clone(), self.snapshot_id)
+        let temp_catalog = DuckLakeCatalog::with_snapshot(Arc::clone(&self.provider), self.snapshot_id)
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
 
         temp_ctx.register_catalog("ducklake", Arc::new(temp_catalog));
@@ -240,9 +240,9 @@ impl SchemaProvider for DuckLakeSchema {
                 let table = DuckLakeTable::new(
                     meta.table_id,
                     meta.table_name.clone(),
-                    self.provider.clone(),
+                    Arc::clone(&self.provider),
                     self.snapshot_id, // Propagate snapshot_id
-                    self.object_store_url.clone(),
+                    Arc::clone(&self.object_store_url),
                     table_path,
                 )
                 .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
@@ -337,9 +337,9 @@ impl SchemaProvider for DuckLakeSchema {
         let table = DuckLakeTable::new(
             meta.table_id,
             meta.table_name.clone(),
-            self.provider.clone(),
+            Arc::clone(&self.provider),
             self.snapshot_id,
-            self.object_store_url.clone(),
+            Arc::clone(&self.object_store_url),
             table_path,
         )
         .map_err(|e| DataFusionError::External(Box::new(e)))?;

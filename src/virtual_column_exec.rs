@@ -216,8 +216,10 @@ impl Stream for VirtualColumnStream {
                 if self.included.file_row_number {
                     let num_rows_i64 = i64::try_from(num_rows)
                         .map_err(|e| DataFusionError::Execution(format!("Row count overflow: {}", e)))?;
-                    let row_numbers: Vec<i64> =
-                        (row_offset..row_offset + num_rows_i64).collect();
+                    let end = row_offset.checked_add(num_rows_i64).ok_or_else(|| {
+                        DataFusionError::Execution("Row offset overflow computing file_row_number".to_string())
+                    })?;
+                    let row_numbers: Vec<i64> = (row_offset..end).collect();
                     let row_number_array = Int64Array::from(row_numbers);
                     columns.push(Arc::new(row_number_array));
                 }
@@ -227,8 +229,11 @@ impl Stream for VirtualColumnStream {
                         Some(row_id_start) => {
                             let num_rows_i64 = i64::try_from(num_rows)
                                 .map_err(|e| DataFusionError::Execution(format!("Row count overflow: {}", e)))?;
-                            let rowids: Vec<i64> = (row_offset..row_offset + num_rows_i64)
-                                .map(|offset| row_id_start + offset)
+                            let end = row_offset.checked_add(num_rows_i64).ok_or_else(|| {
+                                DataFusionError::Execution("Row offset overflow computing rowid".to_string())
+                            })?;
+                            let rowids: Vec<i64> = (row_offset..end)
+                                .map(|offset| row_id_start.checked_add(offset).unwrap_or(i64::MAX))
                                 .collect();
                             columns.push(Arc::new(Int64Array::from(rowids)));
                         },
@@ -257,8 +262,11 @@ impl Stream for VirtualColumnStream {
                 }
 
                 // Update row offset
-                self.row_offset += i64::try_from(num_rows)
+                let num_rows_incr = i64::try_from(num_rows)
                     .map_err(|e| DataFusionError::Execution(format!("Row count overflow: {}", e)))?;
+                self.row_offset = self.row_offset.checked_add(num_rows_incr).ok_or_else(|| {
+                    DataFusionError::Execution("Row offset overflow updating position".to_string())
+                })?;
 
                 let result = RecordBatch::try_new(Arc::clone(&self.output_schema), columns)
                     .map_err(|e| DataFusionError::ArrowError(Box::new(e), None));

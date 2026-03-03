@@ -245,23 +245,15 @@ impl EncryptionFactory for DuckLakeEncryptionFactory {
         let path_str = file_path.to_string();
 
         // Try to find the key for this file path
-        // The path might be stored with or without leading slash, so try multiple formats:
-        // 1. Exact match
-        // 2. With leading slash added
-        // 3. With leading slash removed
-        // 4. Normalized comparison (both without leading slash)
+        // Normalize path by stripping leading slashes, then look up by both
+        // exact match and normalized comparison to handle storage format differences.
+        let path_normalized = path_str.trim_start_matches('/');
         let key = self
             .file_keys
             .get(&path_str)
-            .or_else(|| self.file_keys.get(&format!("/{}", path_str)))
-            .or_else(|| self.file_keys.get(path_str.trim_start_matches('/')))
             .or_else(|| {
-                // Try matching by normalized paths - useful when absolute paths differ
-                // e.g., stored as "/Users/x/data/file.parquet" but received as "Users/x/data/file.parquet"
                 self.file_keys.iter().find_map(|(stored_path, key)| {
-                    let stored_normalized = stored_path.trim_start_matches('/');
-                    let path_normalized = path_str.trim_start_matches('/');
-                    if stored_normalized == path_normalized {
+                    if stored_path.trim_start_matches('/') == path_normalized {
                         Some(key)
                     } else {
                         None
