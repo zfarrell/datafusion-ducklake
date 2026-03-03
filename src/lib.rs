@@ -36,6 +36,7 @@
 //! ```
 
 pub mod catalog;
+pub mod cdc_common;
 pub mod column_rename;
 pub mod delete_filter;
 pub mod encryption;
