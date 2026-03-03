@@ -49,7 +49,7 @@ Also in `/home/zac/`:
 - Multi-backend (SQLite/Postgres/MySQL): ALL methods implemented, Docker tests passing
 - SLT pass rate: 157/254 (61.8%)
 - ~724 total tests, 62 cross-engine tests, 254 SLT files
-- Code review cycles: 4 complete (R1: 36 findings, R2: 58, R3: 50, R4: 46 — **168 of 190 total findings fixed, 1 open**)
+- Code review cycles: 5 complete (R1: 36, R2: 58, R3: 50, R4: 46, R5: 77 — **168 of 190 fixed in R1-R4; R5 77 findings pending**)
 
 ### What's Been Done (Phases 0-6)
 Everything through Phase 6 is complete. See `docs/project-status.md` for the full verified feature matrix.
@@ -172,6 +172,31 @@ A five-part review of the post-R3 codebase identified **74 raw → 46 after dedu
 **Source documents:**
 - `docs/2026-03-03-review-synthesis.md` (consolidated, deduplicated, prioritized, with **[FIXED]**/**[OPEN]**/**[DEFERRED]** markers)
 - `docs/2026-03-03-review-idiomatic.md`, `docs/2026-03-03-review-correctness.md`, `docs/2026-03-03-review-interop.md`, `docs/2026-03-03-review-test-harness.md`, `docs/2026-03-03-codex-review.md`
+
+### Code Review Cycle 5 (2026-03-03 R5) — 77 FINDINGS IDENTIFIED, FIXES PENDING
+
+A five-part review of the post-R4 codebase identified **95 raw → 77 after dedup** (0 P0, 11 P1, 28 P2, 38 P3). All 4 codex P0 claims were validated against source code and downgraded (2→P1, 2→P2). One codex P1 (CX-007, NOT NULL enforcement) was a false positive — already fixed in R4.
+
+**P1 findings (11):**
+- R5-S-001: Lexicographic MIN/MAX on VARCHAR column stats → wrong pruning bounds
+- R5-S-002: replace_table_files doesn't update table_stats after compaction
+- R5-S-003: contains_null inconsistency in PG/MySQL ALTER TABLE ADD COLUMN
+- R5-S-004: Inlining flush silently loses existing inline rows on conversion error
+- R5-S-005: Date32/Date64 partition pruning uses epoch-days vs DuckDB ISO strings
+- R5-S-006: UPDATE can panic on invalid assignment column index
+- R5-S-007: Delete-delta boundary BETWEEN (inclusive) vs strict lower bound
+- R5-S-008: statistics() sized to base columns, schema() returns full_schema with virtuals
+- R5-S-009: strip_prefix mis-trim paths in ducklake_list_files
+- R5-S-010: Decimal128 negative sign loss in test formatter (whole=0)
+- R5-S-011: Missing cross-engine tests for DML, ALTER TABLE, partitions, complex types
+
+**Recommended 8 fix agents:** fix-write-safety, fix-metadata-correctness, fix-interop-types, fix-dml-robustness, fix-test-infrastructure, fix-table-functions, fix-backend-parity, cross-engine-test-coverage.
+
+**Deferred items remain deferred**: F-036, F-044, F-045, R4-S-018, R4-S-036, R4-S-040.
+
+**Source documents:**
+- `docs/2026-03-03-r5-review-synthesis.md` (consolidated, deduplicated, prioritized)
+- `docs/2026-03-03-r5-review-idiomatic.md`, `docs/2026-03-03-r5-review-correctness.md`, `docs/2026-03-03-r5-review-interop.md`, `docs/2026-03-03-r5-review-test-harness.md`, `docs/2026-03-03-r5-codex-review.md`
 
 ### After Implementation: PR Creation
 Follow `/home/zac/ducklake-pr-strategy.md`:

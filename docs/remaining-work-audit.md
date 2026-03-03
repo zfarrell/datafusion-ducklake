@@ -96,6 +96,43 @@ Full details in `docs/2026-03-03-review-synthesis.md`.
 - F-044: Provider/writer code deduplication (R4-I-014 and R4-S-036/040 re-raised this theme)
 - F-045: Async trait redesign (sync→async)
 
+### Cycle 5 (2026-03-03 R5) — FINDINGS IDENTIFIED, FIXES PENDING
+
+A five-part review (idiomatic, correctness, interop, test-harness, codex) of the post-R4 codebase identified 95 raw findings → 77 after deduplication. The codex review reported 4 P0s; synthesis validation downgraded all 4 (2 to P1, 2 to P2). One codex P1 (CX-007) was a false positive — NOT NULL enforcement already exists.
+
+| Priority | Count | Status |
+|----------|-------|--------|
+| P0 | 0 | All codex P0s downgraded |
+| P1 | 11 | Pending fix |
+| P2 | 28 | Pending fix |
+| P3 | 38 | Pending fix |
+| **Total** | **77** | **Pending** |
+
+**Key P1 findings:**
+- R5-S-001: Lexicographic MIN/MAX on VARCHAR column stats (wrong pruning)
+- R5-S-002: replace_table_files stale stats after compaction
+- R5-S-003: contains_null inconsistency in PG/MySQL ALTER TABLE
+- R5-S-004: Inlining flush silently loses rows on conversion error
+- R5-S-005: Date32 partition pruning wrong for cross-engine
+- R5-S-006: UPDATE panic on invalid column index
+- R5-S-007: Delete-delta boundary BETWEEN vs strict lower bound
+- R5-S-008: statistics/schema alignment mismatch
+- R5-S-009: strip_prefix path mis-trim
+- R5-S-010: Decimal128 negative sign loss in test formatter
+- R5-S-011: Missing cross-engine DML/ALTER/type tests
+
+**Recommended 8 fix agents** (see `docs/2026-03-03-r5-review-synthesis.md` for groupings).
+
+**R2 Deferred items still deferred:**
+- F-036: INSERT streaming for OOM prevention
+- F-044: Provider/writer code deduplication
+- F-045: Async trait redesign (sync→async)
+- R4-S-018: PG/MySQL checked write TOCTOU
+- R4-S-036: map_err boilerplate (50+ sites)
+- R4-S-040: Monolithic execute() blocks
+
+Full details in `docs/2026-03-03-r5-review-synthesis.md`.
+
 ---
 
 ## 1. Executive Summary
