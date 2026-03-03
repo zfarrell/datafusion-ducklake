@@ -607,6 +607,20 @@ impl MySqlMetadataWriter {
         mut tx: sqlx::Transaction<'_, sqlx::MySql>,
         table_id: i64,
     ) -> Result<i64> {
+        // R4-S-014: Validate table exists and is active before creating snapshot
+        let exists = sqlx::query(
+            "SELECT COUNT(*) FROM ducklake_table WHERE table_id = ? AND end_snapshot IS NULL",
+        )
+        .bind(table_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if exists.try_get::<i64, _>(0)? == 0 {
+            return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                "Table with id {} not found or already dropped",
+                table_id
+            )));
+        }
+
         // Increment schema_version for DDL (F-012)
         let prev_sv_row =
             sqlx::query("SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot")
@@ -700,6 +714,20 @@ impl MySqlMetadataWriter {
         mut tx: sqlx::Transaction<'_, sqlx::MySql>,
         schema_id: i64,
     ) -> Result<i64> {
+        // R4-S-014: Validate schema exists and is active before creating snapshot
+        let exists = sqlx::query(
+            "SELECT COUNT(*) FROM ducklake_schema WHERE schema_id = ? AND end_snapshot IS NULL",
+        )
+        .bind(schema_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if exists.try_get::<i64, _>(0)? == 0 {
+            return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                "Schema with id {} not found or already dropped",
+                schema_id
+            )));
+        }
+
         // Increment schema_version for DDL (F-012)
         let prev_sv_row =
             sqlx::query("SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot")
@@ -1138,10 +1166,22 @@ impl MetadataWriter for MySqlMetadataWriter {
                 .await?;
             }
 
+            // R3F-002: For each new data file, set row_id_start and update table_stats
             for file in data_files {
+                // Get current next_row_id from table_stats
+                let stats_row =
+                    sqlx::query("SELECT next_row_id FROM ducklake_table_stats WHERE table_id = ?")
+                        .bind(table_id)
+                        .fetch_optional(&mut *tx)
+                        .await?;
+                let row_id_start: i64 = match stats_row {
+                    Some(r) => r.try_get::<Option<i64>, _>(0)?.unwrap_or(0),
+                    None => 0,
+                };
+
                 sqlx::query(
-                    "INSERT INTO ducklake_data_file (table_id, path, path_is_relative, file_size_bytes, footer_size, record_count, begin_snapshot)
-                     VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO ducklake_data_file (table_id, path, path_is_relative, file_size_bytes, footer_size, record_count, row_id_start, begin_snapshot)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .bind(table_id)
                 .bind(&file.path)
@@ -1149,10 +1189,53 @@ impl MetadataWriter for MySqlMetadataWriter {
                 .bind(file.file_size_bytes)
                 .bind(file.footer_size)
                 .bind(file.record_count)
+                .bind(row_id_start)
                 .bind(snapshot_id)
                 .execute(&mut *tx)
                 .await?;
+
+                // Update ducklake_table_stats
+                let new_next_row_id = row_id_start + file.record_count;
+                let updated = sqlx::query(
+                    "UPDATE ducklake_table_stats
+                     SET record_count = COALESCE(record_count, 0) + ?,
+                         next_row_id = ?,
+                         file_size_bytes = COALESCE(file_size_bytes, 0) + ?
+                     WHERE table_id = ?",
+                )
+                .bind(file.record_count)
+                .bind(new_next_row_id)
+                .bind(file.file_size_bytes)
+                .bind(table_id)
+                .execute(&mut *tx)
+                .await?;
+
+                if updated.rows_affected() == 0 {
+                    sqlx::query(
+                        "INSERT INTO ducklake_table_stats (table_id, record_count, next_row_id, file_size_bytes)
+                         VALUES (?, ?, ?, ?)",
+                    )
+                    .bind(table_id)
+                    .bind(file.record_count)
+                    .bind(new_next_row_id)
+                    .bind(file.file_size_bytes)
+                    .execute(&mut *tx)
+                    .await?;
+                }
             }
+
+            // R4-S-004: Update snapshot's next_file_id
+            sqlx::query(
+                "UPDATE ducklake_snapshot
+                 SET next_file_id = COALESCE(GREATEST(
+                     (SELECT COALESCE(MAX(data_file_id), 0) + 1 FROM ducklake_data_file),
+                     (SELECT COALESCE(MAX(delete_file_id), 0) + 1 FROM ducklake_delete_file)
+                 ), 0)
+                 WHERE snapshot_id = ?",
+            )
+            .bind(snapshot_id)
+            .execute(&mut *tx)
+            .await?;
 
             tx.commit().await?;
             Ok(())
@@ -1589,6 +1672,20 @@ impl MetadataWriter for MySqlMetadataWriter {
     fn drop_view(&self, view_id: i64) -> Result<i64> {
         block_on(async {
             let mut tx = self.pool.begin().await?;
+
+            // R4-S-014: Validate view exists and is active before creating snapshot
+            let exists = sqlx::query(
+                "SELECT COUNT(*) FROM ducklake_view WHERE view_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(view_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if exists.try_get::<i64, _>(0)? == 0 {
+                return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                    "View with id {} not found or already dropped",
+                    view_id
+                )));
+            }
 
             // Increment schema_version for DDL (F-012)
             let prev_sv_row =
