@@ -7,8 +7,9 @@
 - Already tracked from R3: 2 (R3F-046, R3F-035)
 - Related to R2 deferred (F-044): 2 (not counted as new)
 - By priority: **1 P0, 12 P1, 20 P2, 13 P3**
-- **Resolution: 44 of 46 FIXED, 2 DEFERRED**
+- **Resolution: 43 of 46 FIXED, 1 OPEN, 2 DEFERRED**
   - Fixed by 8 agents across 8 commits
+  - Open: R4-S-018 (PG/MySQL checked write TOCTOU — fix-atomicity worktree cleaned up before change landed)
   - Deferred: R4-S-036 (map_err boilerplate, relates to R2 F-044), R4-S-040 (monolithic execute blocks, relates to R2 F-044)
 
 ## Deduplication Notes
@@ -187,7 +188,7 @@
 - **Fix**: Track commit stage; skip file deletion if metadata already references the file.
 - **Effort**: S
 
-#### R4-S-018: Checked write transactions TOCTOU in PG/MySQL **[FIXED]** (fix-atomicity)
+#### R4-S-018: Checked write transactions TOCTOU in PG/MySQL **[OPEN]** (fix-atomicity worktree cleaned up before change landed)
 - **Source**: codex (CX-023)
 - **Files**: `metadata_writer_postgres.rs:1259-1375`, `metadata_writer_mysql.rs:1379-1495`
 - **Description**: Conflict detection uses `SELECT COUNT(*)` without `FOR UPDATE` or serializable isolation.
@@ -392,9 +393,10 @@ All 8 recommended agents were executed. **44 of 46 findings fixed.**
 - **Commit**: `2a51319`
 - **Findings fixed**: R4-S-006
 
-### Agent 5: fix-atomicity — Atomicity + Validation (P1 + P2) ✓
-- **Commit**: committed to worktree
-- **Findings fixed**: R4-S-003, R4-S-014, R4-S-015, R4-S-016, R4-S-017, R4-S-018
+### Agent 5: fix-atomicity — Atomicity + Validation (P1 + P2) ⚠️
+- **Commit**: committed to worktree (worktree cleaned up)
+- **Findings landed** (incorporated by overlapping agents): R4-S-003, R4-S-014, R4-S-015, R4-S-016, R4-S-017
+- **Finding NOT landed**: R4-S-018 (TOCTOU — no `FOR UPDATE` in PG/MySQL checked writes)
 
 ### Agent 6: fix-quality — Code Quality + Safety (P2 + P3) ✓
 - **Commit**: `d294651`
@@ -416,13 +418,13 @@ All 8 recommended agents were executed. **44 of 46 findings fixed.**
 
 ## Priority Summary
 
-| Priority | Count | Fixed | Deferred | Key Themes |
-|----------|-------|-------|----------|------------|
-| P0 | 1 | 1 | 0 | Inline data loss on flush failure |
-| P1 | 12 | 12 | 0 | DML metadata gaps (stats, IDs, counts), interop format divergence, NULL filter, LIMIT+delete, NOT NULL constraint |
-| P2 | 20 | 20 | 0 | Atomicity gaps, validation gaps, snapshot isolation, error swallowing, type/naming convention, test infrastructure |
-| P3 | 13 | 11 | 2 | Code quality (boilerplate, casts, style), SLT fragilities, edge cases |
-| **Total** | **46** | **44** | **2** | |
+| Priority | Count | Fixed | Open | Deferred | Key Themes |
+|----------|-------|-------|------|----------|------------|
+| P0 | 1 | 1 | 0 | 0 | Inline data loss on flush failure |
+| P1 | 12 | 12 | 0 | 0 | DML metadata gaps (stats, IDs, counts), interop format divergence, NULL filter, LIMIT+delete, NOT NULL constraint |
+| P2 | 20 | 19 | 1 | 0 | Atomicity gaps, validation gaps, snapshot isolation, error swallowing, type/naming convention, test infrastructure |
+| P3 | 13 | 11 | 0 | 2 | Code quality (boilerplate, casts, style), SLT fragilities, edge cases |
+| **Total** | **46** | **43** | **1** | **2** | |
 
 ## Cross-Cutting Observations
 
