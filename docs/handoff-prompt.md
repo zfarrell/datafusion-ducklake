@@ -49,7 +49,7 @@ Also in `/home/zac/`:
 - Multi-backend (SQLite/Postgres/MySQL): ALL methods implemented, Docker tests passing
 - SLT pass rate: 157/254 (61.8%)
 - ~724 total tests, 62 cross-engine tests, 254 SLT files
-- Code review cycles: 5 complete (R1: 36, R2: 58, R3: 50, R4: 46, R5: 77 — **240 of 267 fixed across R1-R5; 72 of 77 R5 findings fixed**)
+- Code review cycles: 6 complete (R1: 36, R2: 58, R3: 50, R4: 46, R5: 77, R6: 88 — **231 fixed in R1-R5; R6 pending fix agents**)
 
 ### What's Been Done (Phases 0-6)
 Everything through Phase 6 is complete. See `docs/project-status.md` for the full verified feature matrix.
@@ -197,6 +197,31 @@ Eight fix agents resolved **72 of 77** findings. 6 findings verified as already 
 - `docs/2026-03-03-r5-review-synthesis.md` (consolidated, deduplicated, prioritized, with **[FIXED]**/**[VERIFIED]**/**[SKIPPED]**/**[FALSE POSITIVE]** markers)
 - `docs/2026-03-03-r5-review-idiomatic.md`, `docs/2026-03-03-r5-review-correctness.md`, `docs/2026-03-03-r5-review-interop.md`, `docs/2026-03-03-r5-review-test-harness.md`, `docs/2026-03-03-r5-codex-review.md`
 
+### Code Review Cycle 6 (2026-03-04 R6) — 88 FINDINGS IDENTIFIED, PENDING FIXES
+
+A five-part review (idiomatic, correctness, interop, test-harness, codex) of the post-R5 codebase identified **107 raw → 88 after dedup** (0 P0, 14 P1, 38 P2, 36 P3). All 3 codex P0 claims were validated against source code and downgraded (100% P0 FP rate this cycle).
+
+**Key P1 findings:**
+- R6-S-001: `replace_table_files()` missing `table_id` in column stats INSERT (SQLite) — corrupts stats after compaction
+- R6-S-002: Compaction UDTFs execute side effects at planning time — EXPLAIN triggers compaction
+- R6-S-003: PG/MySQL missing `record_count` decrement on DELETE — stats diverge across backends
+- R6-S-004: `end_table_files` backend drift PG/MySQL — stale delete files after replace
+- R6-S-005/006: unwrap()/silent downcasts in merge_exec and insert_exec — panic paths or silent misrouting
+- R6-S-007: Inconsistent inlined value parse policy — write succeeds but data reads back as NULL
+- R6-S-008: `arrow_array_value_to_string` returns empty string on failure — corrupted statistics
+- R6-S-009: Hardcoded `schema_version=1` in inlined data table naming — breaks DuckDB interop
+- R6-S-011: `parse_table_name` doesn't unescape quoted identifiers — table function lookup failures
+- R6-S-012: CDC paths missing encryption factory — encrypted catalogs can't use CDC functions
+- R6-S-013/014: Test infrastructure issues (false positive transaction test, duplicated type conversion)
+
+**10 recommended fix agents** spanning: SQLite metadata, backend parity, error handling, table functions, interop, metadata correctness, test infrastructure, DML robustness, code quality, cross-engine tests.
+
+**Deferred items remain deferred**: F-036, F-044, F-045, R4-S-018, R4-S-036, R4-S-040. R6-S-017 (concurrent DML race) added to deferred.
+
+**Source documents:**
+- `docs/2026-03-04-r6-review-synthesis.md` (consolidated, deduplicated, prioritized)
+- `docs/2026-03-04-review-idiomatic.md`, `docs/2026-03-04-review-correctness.md`, `docs/2026-03-04-review-interop.md`, `docs/2026-03-04-review-test-harness.md`, `docs/2026-03-04-codex-review.md`
+
 ### After Implementation: PR Creation
 Follow `/home/zac/ducklake-pr-strategy.md`:
 - Each PR is a coherent unit re-implemented on branches off main
@@ -224,7 +249,15 @@ Task tool with:
 # 4. When agents finish, shut them down
 SendMessage: type="shutdown_request", recipient="agent-name"
 
-# 5. When all done, clean up
+# 5. Spawn merge agent (NOT in a worktree) to merge all branches into integration
+Agent tool with:
+  name: "merge-agent"
+  subagent_type: "general-purpose"
+  team_name: "next-phase"
+  # NO isolation: "worktree" — works directly on integration branch
+  prompt: 'Merge these worktree branches into integration: ...'
+
+# 6. Only after merge agent confirms success, clean up
 TeamDelete
 ```
 
@@ -234,5 +267,22 @@ Always tell agents:
 - Use cargo: `/home/zac/.cargo/bin/cargo`
 - No AI attribution in commits
 - Do NOT push or create PRs
+- **Reproduce first**: Before fixing a bug, write a test that reproduces it (when applicable). For bugs relevant to multiple metadata backends, write tests for all engines (SQLite, Postgres, MySQL). Verify the test fails, fix the bug, verify the test passes.
+- **Cross-backend verification**: For any change to `metadata_writer_sqlite.rs`, verify the corresponding change exists in `metadata_writer_postgres.rs` and `metadata_writer_mysql.rs`
+- **Regression tests required**: Add or extend tests covering new code, particularly for interop-sensitive changes (snapshot_changes format, stats aggregation, metadata field population)
+- **Report worktree branch name and commit hashes** when done. Do NOT merge into integration yourself.
 - **ALWAYS run `/home/zac/.cargo/bin/cargo clean` before finishing**
 - **Check disk space periodically: `df -h /` — clean if >70%**
+
+### Merge Workflow (CRITICAL — prevents lost commits)
+
+After fix agents complete, spawn a **merge agent** (NOT in a worktree) to:
+1. Merge each fix agent's worktree branch into `ducklake-features/integration` one at a time
+2. Resolve conflicts or report back if non-trivial
+3. Run full build + test suite after all merges
+4. Verify every claimed fix commit is reachable from integration HEAD
+5. Report: branches merged, final commit hash, any issues
+
+**Do NOT clean up worktrees or teams until the merge agent confirms success.**
+
+This prevents the lost-commit problem that caused R1 P0-3 and R1 P1-4 to persist undetected for 3 review cycles.
