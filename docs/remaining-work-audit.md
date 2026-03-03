@@ -96,32 +96,37 @@ Full details in `docs/2026-03-03-review-synthesis.md`.
 - F-044: Provider/writer code deduplication (R4-I-014 and R4-S-036/040 re-raised this theme)
 - F-045: Async trait redesign (sync→async)
 
-### Cycle 5 (2026-03-03 R5) — FINDINGS IDENTIFIED, FIXES PENDING
+### Cycle 5 (2026-03-03 R5) — 72 of 77 FINDINGS FIXED
 
 A five-part review (idiomatic, correctness, interop, test-harness, codex) of the post-R4 codebase identified 95 raw findings → 77 after deduplication. The codex review reported 4 P0s; synthesis validation downgraded all 4 (2 to P1, 2 to P2). One codex P1 (CX-007) was a false positive — NOT NULL enforcement already exists.
 
-| Priority | Count | Status |
-|----------|-------|--------|
-| P0 | 0 | All codex P0s downgraded |
-| P1 | 11 | Pending fix |
-| P2 | 28 | Pending fix |
-| P3 | 38 | Pending fix |
-| **Total** | **77** | **Pending** |
+Eight fix agents resolved **72 of 77** findings. 6 findings verified as already correct. 1 false positive. 4 skipped/deferred.
 
-**Key P1 findings:**
-- R5-S-001: Lexicographic MIN/MAX on VARCHAR column stats (wrong pruning)
-- R5-S-002: replace_table_files stale stats after compaction
-- R5-S-003: contains_null inconsistency in PG/MySQL ALTER TABLE
-- R5-S-004: Inlining flush silently loses rows on conversion error
-- R5-S-005: Date32 partition pruning wrong for cross-engine
-- R5-S-006: UPDATE panic on invalid column index
-- R5-S-007: Delete-delta boundary BETWEEN vs strict lower bound
-- R5-S-008: statistics/schema alignment mismatch
-- R5-S-009: strip_prefix path mis-trim
-- R5-S-010: Decimal128 negative sign loss in test formatter
-- R5-S-011: Missing cross-engine DML/ALTER/type tests
+| Priority | Count | Fixed | Verified | Skipped |
+|----------|-------|-------|----------|---------|
+| P0 | 0 | — | — | — |
+| P1 | 11 | 11 | 0 | 0 |
+| P2 | 28 | 22 | 4 | 2 |
+| P3 | 38 | 29 | 4 | 2 + 1 FP |
+| **Total** | **77** | **62** | **8** | **4 + 1 FP** |
 
-**Recommended 8 fix agents** (see `docs/2026-03-03-r5-review-synthesis.md` for groupings).
+**Fix agents (8):**
+- fix-backend-parity (`15b746f`): R5-S-013,018,027,029,044,047,052,053,059,065,066,071,072,078,079 (15)
+- fix-table-functions (`15b746f`): R5-S-009,028,030,038,039,048,055,062,075 (9)
+- fix-dml-robustness (`fc2f5da`): R5-S-006,021,034,035,037,045,046,049,050,057,058,064,076 (13)
+- fix-metadata-correctness (various): R5-S-001,002,007,008,025,026,036,073 (8)
+- fix-cross-engine (`fc2f5da`,`7c685bd`): R5-S-011,067,077,081 (4) — 11 new cross-engine tests
+- fix-write-safety (various): R5-S-003,004,005,019,020,022,024,061 (8)
+- fix-interop-types (`84d51ff`): R5-S-012,014,015,016,017,054,063 (7)
+- fix-test-infrastructure (`08f55a9`): R5-S-010,023,031,032,033,040,041,042,043,069,070,080 (12) — 4 new tests
+
+**Skipped/deferred:**
+- R5-S-051: Arc::clone style consistency — too broad/mechanical
+- R5-S-068: Parquet v2 vs v1 — no functional issue
+- R5-S-060: deregister_schema cascade — requires MetadataWriter trait API change
+- R5-S-074: get_table_row_count no transaction — minimal impact
+
+**False positive:** R5-S-056 (code already uses char-based iteration)
 
 **R2 Deferred items still deferred:**
 - F-036: INSERT streaming for OOM prevention

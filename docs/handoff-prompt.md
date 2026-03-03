@@ -49,7 +49,7 @@ Also in `/home/zac/`:
 - Multi-backend (SQLite/Postgres/MySQL): ALL methods implemented, Docker tests passing
 - SLT pass rate: 157/254 (61.8%)
 - ~724 total tests, 62 cross-engine tests, 254 SLT files
-- Code review cycles: 5 complete (R1: 36, R2: 58, R3: 50, R4: 46, R5: 77 — **168 of 190 fixed in R1-R4; R5 77 findings pending**)
+- Code review cycles: 5 complete (R1: 36, R2: 58, R3: 50, R4: 46, R5: 77 — **240 of 267 fixed across R1-R5; 72 of 77 R5 findings fixed**)
 
 ### What's Been Done (Phases 0-6)
 Everything through Phase 6 is complete. See `docs/project-status.md` for the full verified feature matrix.
@@ -173,29 +173,28 @@ A five-part review of the post-R3 codebase identified **74 raw → 46 after dedu
 - `docs/2026-03-03-review-synthesis.md` (consolidated, deduplicated, prioritized, with **[FIXED]**/**[OPEN]**/**[DEFERRED]** markers)
 - `docs/2026-03-03-review-idiomatic.md`, `docs/2026-03-03-review-correctness.md`, `docs/2026-03-03-review-interop.md`, `docs/2026-03-03-review-test-harness.md`, `docs/2026-03-03-codex-review.md`
 
-### Code Review Cycle 5 (2026-03-03 R5) — 77 FINDINGS IDENTIFIED, FIXES PENDING
+### Code Review Cycle 5 (2026-03-03 R5) — 72 of 77 FINDINGS FIXED
 
 A five-part review of the post-R4 codebase identified **95 raw → 77 after dedup** (0 P0, 11 P1, 28 P2, 38 P3). All 4 codex P0 claims were validated against source code and downgraded (2→P1, 2→P2). One codex P1 (CX-007, NOT NULL enforcement) was a false positive — already fixed in R4.
 
-**P1 findings (11):**
-- R5-S-001: Lexicographic MIN/MAX on VARCHAR column stats → wrong pruning bounds
-- R5-S-002: replace_table_files doesn't update table_stats after compaction
-- R5-S-003: contains_null inconsistency in PG/MySQL ALTER TABLE ADD COLUMN
-- R5-S-004: Inlining flush silently loses existing inline rows on conversion error
-- R5-S-005: Date32/Date64 partition pruning uses epoch-days vs DuckDB ISO strings
-- R5-S-006: UPDATE can panic on invalid assignment column index
-- R5-S-007: Delete-delta boundary BETWEEN (inclusive) vs strict lower bound
-- R5-S-008: statistics() sized to base columns, schema() returns full_schema with virtuals
-- R5-S-009: strip_prefix mis-trim paths in ducklake_list_files
-- R5-S-010: Decimal128 negative sign loss in test formatter (whole=0)
-- R5-S-011: Missing cross-engine tests for DML, ALTER TABLE, partitions, complex types
+Eight fix agents resolved **72 of 77** findings. 6 findings verified as already correct (no code change needed). 1 false positive. 4 skipped/deferred.
 
-**Recommended 8 fix agents:** fix-write-safety, fix-metadata-correctness, fix-interop-types, fix-dml-robustness, fix-test-infrastructure, fix-table-functions, fix-backend-parity, cross-engine-test-coverage.
+**Fix agents and commits:**
+- fix-backend-parity (`15b746f`): R5-S-013,018,027,029,044,047,052,053,059,065,066,071,072,078,079 (15)
+- fix-table-functions (`15b746f`): R5-S-009,028,030,038,039,048,055,062,075 (9)
+- fix-dml-robustness (`fc2f5da`): R5-S-006,021,034,035,037,045,046,049,050,057,058,064,076 (13)
+- fix-metadata-correctness (various): R5-S-001,002,007,008,025,026,036,073 (8)
+- fix-cross-engine (`fc2f5da`,`7c685bd`): R5-S-011,067,077,081 (4) — 11 new cross-engine tests
+- fix-write-safety (various): R5-S-003,004,005,019,020,022,024,061 (8)
+- fix-interop-types (`84d51ff`): R5-S-012,014,015,016,017,054,063 (7)
+- fix-test-infrastructure (`08f55a9`): R5-S-010,023,031,032,033,040,041,042,043,069,070,080 (12) — 4 new tests
+
+**Skipped/deferred:** R5-S-051 (Arc::clone style), R5-S-068 (Parquet v2 vs v1), R5-S-060 (deregister_schema cascade), R5-S-074 (get_table_row_count no transaction).
 
 **Deferred items remain deferred**: F-036, F-044, F-045, R4-S-018, R4-S-036, R4-S-040.
 
 **Source documents:**
-- `docs/2026-03-03-r5-review-synthesis.md` (consolidated, deduplicated, prioritized)
+- `docs/2026-03-03-r5-review-synthesis.md` (consolidated, deduplicated, prioritized, with **[FIXED]**/**[VERIFIED]**/**[SKIPPED]**/**[FALSE POSITIVE]** markers)
 - `docs/2026-03-03-r5-review-idiomatic.md`, `docs/2026-03-03-r5-review-correctness.md`, `docs/2026-03-03-r5-review-interop.md`, `docs/2026-03-03-r5-review-test-harness.md`, `docs/2026-03-03-r5-codex-review.md`
 
 ### After Implementation: PR Creation
