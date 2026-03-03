@@ -780,9 +780,19 @@ async fn run_hybrid_test(test_file: &str) -> Result<(), Box<dyn std::error::Erro
     let test_dir_str = temp_dir.path().to_string_lossy().to_string();
     let processed_content = preprocess_test_file(&original_content, &test_dir_str);
 
+    // Verify that preprocessing didn't eliminate all statements
+    let has_statements = processed_content.lines().any(|line| {
+        let t = line.trim();
+        t.starts_with("statement") || t.starts_with("query") || t == "halt"
+    });
+    assert!(
+        has_statements,
+        "Preprocessed test file has zero statements/queries — test would pass vacuously: {test_file}"
+    );
+
     // Write preprocessed test to temp file
     let temp_test_file = temp_dir.path().join("test.slt");
-    std::fs::write(&temp_test_file, processed_content)?;
+    std::fs::write(&temp_test_file, &processed_content)?;
 
     // Run preprocessed test file with sqllogictest
     let temp_test_path = temp_test_file.to_string_lossy().to_string();

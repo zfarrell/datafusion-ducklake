@@ -21,7 +21,7 @@ use std::sync::Arc;
 use arrow::array::*;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use common::test_utils::{assert_results_eq, df_query, duckdb_value_to_string};
+use common::test_utils::{assert_results_eq, df_query};
 use datafusion::prelude::*;
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
@@ -94,72 +94,7 @@ async fn open_in_datafusion_writable(catalog_path: &Path) -> SessionContext {
     ctx
 }
 
-struct DuckDbConn {
-    conn: duckdb::Connection,
-}
-
-impl DuckDbConn {
-    fn open(catalog_db_path: &Path) -> Self {
-        let conn = duckdb::Connection::open_in_memory().expect("open in-memory duckdb");
-        conn.execute("INSTALL ducklake;", [])
-            .expect("install ducklake");
-        conn.execute("LOAD ducklake;", []).expect("load ducklake");
-        let attach_path = format!("ducklake:sqlite:{}", catalog_db_path.display());
-        conn.execute(&format!("ATTACH '{}' AS ducklake;", attach_path), [])
-            .expect("attach ducklake catalog");
-        DuckDbConn {
-            conn,
-        }
-    }
-
-    fn open_with_data_path(catalog_path: &Path, data_path: &Path) -> Self {
-        let conn = duckdb::Connection::open_in_memory().expect("open in-memory duckdb");
-        conn.execute("INSTALL ducklake;", [])
-            .expect("install ducklake");
-        conn.execute("LOAD ducklake;", []).expect("load ducklake");
-        let attach_path = format!("ducklake:{}", catalog_path.display());
-        conn.execute(
-            &format!(
-                "ATTACH '{}' AS ducklake (DATA_PATH '{}');",
-                attach_path,
-                data_path.display()
-            ),
-            [],
-        )
-        .expect("attach ducklake catalog with data path");
-        DuckDbConn {
-            conn,
-        }
-    }
-
-    fn execute(&self, sql: &str) {
-        self.conn
-            .execute(sql, [])
-            .unwrap_or_else(|e| panic!("DuckDB execute failed: {e}\nSQL: {sql}"));
-    }
-
-    fn query(&self, sql: &str) -> Vec<Vec<String>> {
-        let mut stmt = self
-            .conn
-            .prepare(sql)
-            .unwrap_or_else(|e| panic!("DuckDB prepare failed: {e}\nSQL: {sql}"));
-        let mut rows = stmt.query([]).expect("DuckDB query failed");
-
-        let mut results = Vec::new();
-        while let Some(row) = rows.next().expect("DuckDB row iteration") {
-            let mut vals = Vec::new();
-            for i in 0.. {
-                match row.get::<_, duckdb::types::Value>(i) {
-                    Ok(v) => vals.push(duckdb_value_to_string(&v)),
-                    Err(_) => break,
-                }
-            }
-            results.push(vals);
-        }
-        results
-    }
-}
-
+use common::test_utils::DuckDbConn;
 
 // ==================== Test 1: DF INSERT + DuckDB SELECT ====================
 // DataFusion writes via DuckLakeTableWriter → DuckDB reads and verifies columns/types

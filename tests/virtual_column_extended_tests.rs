@@ -5,43 +5,17 @@
 
 #![cfg(all(feature = "write-sqlite", feature = "metadata-sqlite", feature = "metadata-duckdb"))]
 
+mod common;
+
 use std::sync::Arc;
 
 use arrow::array::{Array, Int32Array, Int64Array, UInt64Array};
 use arrow::datatypes::DataType;
+use common::test_utils::DuckDbConn;
 use datafusion::prelude::*;
 use tempfile::TempDir;
 
 use datafusion_ducklake::{DuckLakeCatalog, DuckdbMetadataProvider};
-
-/// Helper struct for DuckDB connections
-struct DuckDbConn {
-    conn: duckdb::Connection,
-}
-
-impl DuckDbConn {
-    fn open_with_data_path(catalog_path: &std::path::Path, data_path: &std::path::Path) -> Self {
-        let conn = duckdb::Connection::open_in_memory().unwrap();
-        conn.execute_batch("INSTALL ducklake; LOAD ducklake;")
-            .unwrap();
-        conn.execute(
-            &format!(
-                "ATTACH 'ducklake:{}' AS ducklake (DATA_PATH '{}')",
-                catalog_path.display(),
-                data_path.display()
-            ),
-            [],
-        )
-        .unwrap();
-        Self {
-            conn,
-        }
-    }
-
-    fn execute(&self, sql: &str) {
-        self.conn.execute(sql, []).unwrap();
-    }
-}
 
 /// Create a multi-file test catalog via DuckDB and return a DataFusion context
 async fn setup_multi_file_catalog() -> (SessionContext, TempDir) {

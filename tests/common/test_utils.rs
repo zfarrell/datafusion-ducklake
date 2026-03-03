@@ -272,10 +272,15 @@ pub fn get_int_column(batch: &RecordBatch, col_idx: usize) -> Vec<i32> {
 }
 
 /// Normalize a string value for comparison (handle float precision differences).
+///
+/// Only normalizes values that look like floats (contain '.') to avoid
+/// collapsing distinct integer/float representations (e.g. "100" vs "100.0000001").
 pub fn normalize_value(s: &str) -> String {
     if s == "NULL" {
         return s.to_string();
     }
+    // Normalize any numeric value to a canonical float form so that
+    // cross-engine representation differences (e.g. "0" vs "0.0") match.
     if let Ok(f) = s.parse::<f64>() {
         return format!("{:.6}", f);
     }
@@ -287,13 +292,18 @@ pub fn normalize_value(s: &str) -> String {
 /// Checks both row count and column count before comparing values,
 /// preventing false passes from zip truncation.
 pub fn assert_results_eq(scenario: &str, expected: &[Vec<String>], actual: &[Vec<String>]) {
-    assert_eq!(
-        expected.len(),
-        actual.len(),
-        "[{scenario}] Row count mismatch: expected {} rows, got {}.\n  Expected: {expected:?}\n  Actual:   {actual:?}",
-        expected.len(),
-        actual.len()
-    );
+    if expected.len() != actual.len() {
+        let max_show = 5;
+        let exp_preview: Vec<_> = expected.iter().take(max_show).collect();
+        let act_preview: Vec<_> = actual.iter().take(max_show).collect();
+        panic!(
+            "[{scenario}] Row count mismatch: expected {} rows, got {}.\n  \
+             Expected (first {max_show}):\n{exp_preview:#?}\n  \
+             Actual (first {max_show}):\n{act_preview:#?}",
+            expected.len(),
+            actual.len(),
+        );
+    }
     for (i, (exp_row, act_row)) in expected.iter().zip(actual.iter()).enumerate() {
         assert_eq!(
             exp_row.len(),
@@ -318,4 +328,133 @@ pub async fn df_query(ctx: &datafusion::prelude::SessionContext, sql: &str) -> V
     let df = ctx.sql(sql).await.expect("DataFusion SQL failed");
     let batches = df.collect().await.expect("DataFusion collect failed");
     batches_to_strings_filtered(&batches)
+}
+
+/// Wrapper for DuckDB operations on a DuckLake catalog.
+///
+/// Provides connection management and query helpers for cross-engine tests
+/// where DuckDB writes data and DataFusion reads it.
+pub struct DuckDbConn {
+    pub conn: duckdb::Connection,
+}
+
+impl DuckDbConn {
+    /// Open a DuckLake catalog in DuckDB using the SQLite backend.
+    /// Attaches as `ducklake:sqlite:<path>`.
+    pub fn open(catalog_db_path: &std::path::Path) -> Self {
+        let conn = duckdb::Connection::open_in_memory().expect("open in-memory duckdb");
+        conn.execute("INSTALL ducklake;", [])
+            .expect("install ducklake");
+        conn.execute("LOAD ducklake;", []).expect("load ducklake");
+        let attach_path = format!("ducklake:sqlite:{}", catalog_db_path.display());
+        conn.execute(
+            &format!("ATTACH '{}' AS ducklake;", attach_path),
+            [],
+        )
+        .expect("attach ducklake catalog");
+        DuckDbConn { conn }
+    }
+
+    /// Open a DuckLake catalog in DuckDB using the native DuckDB backend.
+    /// Attaches as `ducklake:<path>` (no sqlite: prefix).
+    pub fn open_native(catalog_path: &std::path::Path) -> Self {
+        let conn = duckdb::Connection::open_in_memory().expect("open in-memory duckdb");
+        conn.execute("INSTALL ducklake;", [])
+            .expect("install ducklake");
+        conn.execute("LOAD ducklake;", []).expect("load ducklake");
+        let attach_path = format!("ducklake:{}", catalog_path.display());
+        conn.execute(
+            &format!("ATTACH '{}' AS ducklake;", attach_path),
+            [],
+        )
+        .expect("attach ducklake catalog");
+        DuckDbConn { conn }
+    }
+
+    /// Open/create a DuckLake catalog in DuckDB with a specified DATA_PATH.
+    pub fn open_with_data_path(
+        catalog_path: &std::path::Path,
+        data_path: &std::path::Path,
+    ) -> Self {
+        let conn = duckdb::Connection::open_in_memory().expect("open in-memory duckdb");
+        conn.execute("INSTALL ducklake;", [])
+            .expect("install ducklake");
+        conn.execute("LOAD ducklake;", []).expect("load ducklake");
+        let attach_path = format!("ducklake:{}", catalog_path.display());
+        conn.execute(
+            &format!(
+                "ATTACH '{}' AS ducklake (DATA_PATH '{}');",
+                attach_path,
+                data_path.display()
+            ),
+            [],
+        )
+        .expect("attach ducklake catalog with data path");
+        DuckDbConn { conn }
+    }
+
+    /// Execute a SQL statement (no results expected).
+    pub fn execute(&self, sql: &str) {
+        self.conn
+            .execute(sql, [])
+            .unwrap_or_else(|e| panic!("DuckDB execute failed: {e}\nSQL: {sql}"));
+    }
+
+    /// Query and return results as Vec<Vec<String>>.
+    pub fn query(&self, sql: &str) -> Vec<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare(sql)
+            .unwrap_or_else(|e| panic!("DuckDB prepare failed: {e}\nSQL: {sql}"));
+        let mut rows = stmt.query([]).expect("DuckDB query failed");
+
+        let mut results = Vec::new();
+        while let Some(row) = rows.next().expect("DuckDB row iteration") {
+            let mut vals = Vec::new();
+            for i in 0.. {
+                match row.get::<_, duckdb::types::Value>(i) {
+                    Ok(v) => vals.push(duckdb_value_to_string(&v)),
+                    Err(_) => break,
+                }
+            }
+            results.push(vals);
+        }
+        results
+    }
+
+    /// Query and return single-column results as Vec<String>.
+    pub fn query_single_string(&self, sql: &str) -> Vec<String> {
+        self.query(sql)
+            .into_iter()
+            .map(|row| row[0].clone())
+            .collect()
+    }
+
+    /// Query a single scalar count value (e.g. SELECT COUNT(*) ...).
+    pub fn query_count(&self, sql: &str) -> i64 {
+        let rows = self.query(sql);
+        assert_eq!(rows.len(), 1, "query_count expects exactly 1 row");
+        rows[0][0].parse().unwrap()
+    }
+
+    /// Fallible query — returns Result instead of panicking.
+    pub fn try_query(
+        &self,
+        sql: &str,
+    ) -> std::result::Result<Vec<Vec<String>>, duckdb::Error> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let mut rows = stmt.query([])?;
+        let mut results = Vec::new();
+        while let Some(row) = rows.next()? {
+            let mut vals = Vec::new();
+            for i in 0.. {
+                match row.get::<_, duckdb::types::Value>(i) {
+                    Ok(v) => vals.push(duckdb_value_to_string(&v)),
+                    Err(_) => break,
+                }
+            }
+            results.push(vals);
+        }
+        Ok(results)
+    }
 }

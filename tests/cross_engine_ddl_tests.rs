@@ -22,7 +22,7 @@ use std::sync::Arc;
 use arrow::array::*;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use common::test_utils::{batches_to_strings_filtered, df_query, duckdb_value_to_string};
+use common::test_utils::{batches_to_strings_filtered, df_query, DuckDbConn};
 use datafusion::prelude::*;
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
@@ -149,96 +149,7 @@ fn open_readonly_df_duckdb(catalog_path: &Path) -> SessionContext {
     ctx
 }
 
-// ==================== DuckDB wrapper ====================
-
-struct DuckDbConn {
-    conn: duckdb::Connection,
-}
-
-impl DuckDbConn {
-    fn open_native(catalog_path: &Path) -> Self {
-        let conn = duckdb::Connection::open_in_memory().unwrap();
-        conn.execute("INSTALL ducklake;", []).unwrap();
-        conn.execute("LOAD ducklake;", []).unwrap();
-        let attach_path = format!("ducklake:{}", catalog_path.display());
-        conn.execute(&format!("ATTACH '{}' AS ducklake;", attach_path), [])
-            .unwrap();
-        DuckDbConn {
-            conn,
-        }
-    }
-
-    fn open_with_data_path(catalog_path: &Path, data_path: &Path) -> Self {
-        let conn = duckdb::Connection::open_in_memory().unwrap();
-        conn.execute("INSTALL ducklake;", []).unwrap();
-        conn.execute("LOAD ducklake;", []).unwrap();
-        let attach_path = format!("ducklake:{}", catalog_path.display());
-        conn.execute(
-            &format!(
-                "ATTACH '{}' AS ducklake (DATA_PATH '{}');",
-                attach_path,
-                data_path.display()
-            ),
-            [],
-        )
-        .unwrap();
-        DuckDbConn {
-            conn,
-        }
-    }
-
-    fn execute(&self, sql: &str) {
-        self.conn
-            .execute(sql, [])
-            .unwrap_or_else(|e| panic!("DuckDB execute failed: {e}\nSQL: {sql}"));
-    }
-
-    fn query(&self, sql: &str) -> Vec<Vec<String>> {
-        let mut stmt = self
-            .conn
-            .prepare(sql)
-            .unwrap_or_else(|e| panic!("DuckDB prepare failed: {e}\nSQL: {sql}"));
-        let mut rows = stmt.query([]).expect("DuckDB query failed");
-
-        let mut results = Vec::new();
-        while let Some(row) = rows.next().expect("DuckDB row iteration") {
-            let mut vals = Vec::new();
-            for i in 0.. {
-                match row.get::<_, duckdb::types::Value>(i) {
-                    Ok(v) => vals.push(duckdb_value_to_string(&v)),
-                    Err(_) => break,
-                }
-            }
-            results.push(vals);
-        }
-        results
-    }
-
-    #[allow(dead_code)]
-    fn query_single_string(&self, sql: &str) -> Vec<String> {
-        self.query(sql)
-            .into_iter()
-            .map(|row| row[0].clone())
-            .collect()
-    }
-
-    fn try_query(&self, sql: &str) -> std::result::Result<Vec<Vec<String>>, duckdb::Error> {
-        let mut stmt = self.conn.prepare(sql)?;
-        let mut rows = stmt.query([])?;
-        let mut results = Vec::new();
-        while let Some(row) = rows.next()? {
-            let mut vals = Vec::new();
-            for i in 0.. {
-                match row.get::<_, duckdb::types::Value>(i) {
-                    Ok(v) => vals.push(duckdb_value_to_string(&v)),
-                    Err(_) => break,
-                }
-            }
-            results.push(vals);
-        }
-        Ok(results)
-    }
-}
+// DuckDbConn imported from common::test_utils
 
 // ==================== Query helpers ====================
 

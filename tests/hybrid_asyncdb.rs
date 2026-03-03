@@ -417,7 +417,10 @@ impl AsyncDB for HybridDuckLakeDB {
                         Ok(duckdb::types::Value::Double(v)) => v.to_string(),
                         Ok(duckdb::types::Value::Text(v)) => v,
                         Ok(other) => format!("{:?}", other),
-                        Err(_) => "NULL".to_string(),
+                        Err(e) => {
+                            eprintln!("Warning: DuckDB column {i} decode error: {e}");
+                            "NULL".to_string()
+                        },
                     };
                     vals.push(val);
                 }
@@ -560,8 +563,8 @@ fn convert_batch_to_strings(batch: &RecordBatch) -> Result<Vec<Vec<String>>, Hyb
                         arr.value(row_idx).to_string()
                     },
                     DataType::Date32 => {
-                        let arr = column.as_any().downcast_ref::<Date32Array>().unwrap();
-                        arr.value_as_date(row_idx).unwrap().to_string()
+                        let arr = column.as_any().downcast_ref::<Date32Array>().expect("Date32 downcast");
+                        arr.value_as_date(row_idx).expect("Date32 value_as_date").to_string()
                     },
                     DataType::Timestamp(unit, _) => {
                         use datafusion::arrow::datatypes::TimeUnit;
@@ -597,14 +600,13 @@ fn convert_batch_to_strings(batch: &RecordBatch) -> Result<Vec<Vec<String>>, Hyb
                         }
                     },
                     DataType::Decimal128(_, scale) => {
-                        let arr = column.as_any().downcast_ref::<Decimal128Array>().unwrap();
-                        let value = arr.value(row_idx);
-                        let scale_factor = 10_f64.powi(*scale as i32);
-                        format!(
-                            "{:.scale$}",
-                            value as f64 / scale_factor,
-                            scale = *scale as usize
-                        )
+                        let arr = column.as_any().downcast_ref::<Decimal128Array>().expect("Decimal128 downcast");
+                        let raw = arr.value(row_idx);
+                        let scale = *scale as u32;
+                        let divisor = 10i128.pow(scale);
+                        let whole = raw / divisor;
+                        let frac = (raw % divisor).unsigned_abs();
+                        format!("{whole}.{frac:0>width$}", width = scale as usize)
                     },
                     DataType::Binary => {
                         let arr = column.as_any().downcast_ref::<BinaryArray>().unwrap();
@@ -615,10 +617,11 @@ fn convert_batch_to_strings(batch: &RecordBatch) -> Result<Vec<Vec<String>>, Hyb
                             .map(|b| format!("{:02X}", b))
                             .collect::<String>()
                     },
-                    _ => {
-                        // Use Arrow's built-in display formatting as fallback
-                        datafusion::arrow::util::display::array_value_to_string(column, row_idx)
-                            .unwrap_or_else(|_| format!("{:?}", column.data_type()))
+                    other => {
+                        panic!(
+                            "convert_batch_to_strings: unsupported Arrow type {:?} at col {} row {}",
+                            other, col_idx, row_idx
+                        );
                     },
                 }
             };
@@ -776,5 +779,64 @@ mod tests {
             result, "SELECT * FROM ducklake.s1.v1",
             "3-part name should not be rewritten"
         );
+    }
+
+    #[test]
+    fn test_is_write_statement_basic() {
+        assert!(HybridDuckLakeDB::is_write_statement("CREATE TABLE t (x INT)"));
+        assert!(HybridDuckLakeDB::is_write_statement("INSERT INTO t VALUES (1)"));
+        assert!(HybridDuckLakeDB::is_write_statement("UPDATE t SET x = 1"));
+        assert!(HybridDuckLakeDB::is_write_statement("DELETE FROM t"));
+        assert!(HybridDuckLakeDB::is_write_statement("DROP TABLE t"));
+        assert!(HybridDuckLakeDB::is_write_statement("ALTER TABLE t ADD COLUMN y INT"));
+        assert!(HybridDuckLakeDB::is_write_statement("MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET x = 1"));
+        assert!(HybridDuckLakeDB::is_write_statement("BEGIN"));
+        assert!(HybridDuckLakeDB::is_write_statement("COMMIT"));
+        assert!(HybridDuckLakeDB::is_write_statement("ROLLBACK"));
+    }
+
+    #[test]
+    fn test_is_write_statement_read_only() {
+        assert!(!HybridDuckLakeDB::is_write_statement("SELECT * FROM t"));
+        assert!(!HybridDuckLakeDB::is_write_statement("SELECT 1"));
+        assert!(!HybridDuckLakeDB::is_write_statement("WITH cte AS (SELECT 1) SELECT * FROM cte"));
+    }
+
+    #[test]
+    fn test_is_write_statement_mixed_case() {
+        assert!(HybridDuckLakeDB::is_write_statement("create table t (x int)"));
+        assert!(HybridDuckLakeDB::is_write_statement("Insert Into t VALUES (1)"));
+        assert!(HybridDuckLakeDB::is_write_statement("uPdAtE t SET x = 1"));
+        assert!(HybridDuckLakeDB::is_write_statement("Delete FROM t"));
+    }
+
+    #[test]
+    fn test_is_write_statement_leading_whitespace() {
+        assert!(HybridDuckLakeDB::is_write_statement("  CREATE TABLE t (x INT)"));
+        assert!(HybridDuckLakeDB::is_write_statement("\tINSERT INTO t VALUES (1)"));
+        assert!(HybridDuckLakeDB::is_write_statement("\n  UPDATE t SET x = 1"));
+    }
+
+    #[test]
+    fn test_is_write_statement_trailing_semicolons() {
+        assert!(HybridDuckLakeDB::is_write_statement("CREATE TABLE t (x INT);"));
+        assert!(HybridDuckLakeDB::is_write_statement("INSERT INTO t VALUES (1) ;"));
+        assert!(HybridDuckLakeDB::is_write_statement("BEGIN;"));
+        assert!(HybridDuckLakeDB::is_write_statement("COMMIT ;"));
+    }
+
+    #[test]
+    fn test_is_write_statement_ctes_not_writes() {
+        // WITH...SELECT should NOT be detected as write
+        assert!(!HybridDuckLakeDB::is_write_statement("WITH x AS (SELECT 1) SELECT * FROM x"));
+    }
+
+    #[test]
+    fn test_is_write_statement_additional_keywords() {
+        assert!(HybridDuckLakeDB::is_write_statement("USE ducklake"));
+        assert!(HybridDuckLakeDB::is_write_statement("SET search_path = main"));
+        assert!(HybridDuckLakeDB::is_write_statement("COPY t TO 'file.csv'"));
+        assert!(HybridDuckLakeDB::is_write_statement("PREPARE stmt AS SELECT 1"));
+        assert!(HybridDuckLakeDB::is_write_statement("EXECUTE stmt"));
     }
 }

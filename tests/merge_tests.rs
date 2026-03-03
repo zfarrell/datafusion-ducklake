@@ -96,14 +96,7 @@ async fn open_readonly_ctx(catalog_path: &Path) -> SessionContext {
     ctx
 }
 
-/// Query helper: run SQL and return results as Vec<Vec<String>>.
-async fn query_results(ctx: &SessionContext, sql: &str) -> Vec<Vec<String>> {
-    let df = ctx.sql(sql).await.expect("SQL failed");
-    let batches = df.collect().await.expect("collect failed");
-    batches_to_strings(&batches)
-}
-
-use common::test_utils::batches_to_strings;
+use common::test_utils::df_query as query_results;
 
 /// Build the standard test schema: (id INT32, name VARCHAR, value INT32)
 fn test_schema() -> Arc<Schema> {
@@ -396,61 +389,7 @@ async fn merge_insert_only() {
 
 // ==================== Cross-engine tests ====================
 
-/// Wrapper for DuckDB operations on a DuckLake catalog.
-struct DuckDbConn {
-    conn: duckdb::Connection,
-}
-
-impl DuckDbConn {
-    fn open_with_data_path(catalog_path: &Path, data_path: &Path) -> Self {
-        let conn = duckdb::Connection::open_in_memory().expect("open in-memory duckdb");
-        conn.execute("INSTALL ducklake;", [])
-            .expect("install ducklake");
-        conn.execute("LOAD ducklake;", []).expect("load ducklake");
-        let attach_path = format!("ducklake:{}", catalog_path.display());
-        conn.execute(
-            &format!(
-                "ATTACH '{}' AS ducklake (DATA_PATH '{}');",
-                attach_path,
-                data_path.display()
-            ),
-            [],
-        )
-        .expect("attach ducklake catalog with data path");
-        DuckDbConn {
-            conn,
-        }
-    }
-
-    fn execute(&self, sql: &str) {
-        self.conn
-            .execute(sql, [])
-            .unwrap_or_else(|e| panic!("DuckDB execute failed: {e}\nSQL: {sql}"));
-    }
-
-    fn query(&self, sql: &str) -> Vec<Vec<String>> {
-        let mut stmt = self
-            .conn
-            .prepare(sql)
-            .unwrap_or_else(|e| panic!("DuckDB prepare failed: {e}\nSQL: {sql}"));
-        let mut rows = stmt.query([]).expect("DuckDB query failed");
-
-        let mut results = Vec::new();
-        while let Some(row) = rows.next().expect("DuckDB row iteration") {
-            let mut vals = Vec::new();
-            for i in 0.. {
-                match row.get::<_, duckdb::types::Value>(i) {
-                    Ok(v) => vals.push(duckdb_value_to_string(&v)),
-                    Err(_) => break,
-                }
-            }
-            results.push(vals);
-        }
-        results
-    }
-}
-
-use common::test_utils::duckdb_value_to_string;
+use common::test_utils::DuckDbConn;
 
 /// Cross-engine test: DuckDB MERGE → DataFusion reads.
 ///

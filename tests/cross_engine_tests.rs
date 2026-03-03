@@ -19,7 +19,7 @@ use std::sync::Arc;
 use arrow::array::*;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use common::test_utils::{assert_results_eq, df_query, duckdb_value_to_string};
+use common::test_utils::{assert_results_eq, df_query};
 use datafusion::prelude::*;
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
@@ -106,92 +106,7 @@ async fn open_in_datafusion_writable(catalog_path: &Path) -> SessionContext {
     ctx
 }
 
-/// Wrapper for DuckDB operations on a DuckLake catalog.
-struct DuckDbConn {
-    conn: duckdb::Connection,
-}
-
-impl DuckDbConn {
-    /// Open a DuckLake catalog in DuckDB using the SQLite backend.
-    fn open(catalog_db_path: &Path) -> Self {
-        let conn = duckdb::Connection::open_in_memory().expect("open in-memory duckdb");
-        conn.execute("INSTALL ducklake;", [])
-            .expect("install ducklake");
-        conn.execute("LOAD ducklake;", []).expect("load ducklake");
-        let attach_path = format!("ducklake:sqlite:{}", catalog_db_path.display());
-        conn.execute(&format!("ATTACH '{}' AS ducklake;", attach_path), [])
-            .expect("attach ducklake catalog");
-        DuckDbConn {
-            conn,
-        }
-    }
-
-    /// Open a DuckLake catalog in DuckDB using the native DuckDB backend (read-only re-attach).
-    #[allow(dead_code)]
-    fn open_native(catalog_path: &Path) -> Self {
-        let conn = duckdb::Connection::open_in_memory().expect("open in-memory duckdb");
-        conn.execute("INSTALL ducklake;", [])
-            .expect("install ducklake");
-        conn.execute("LOAD ducklake;", []).expect("load ducklake");
-        let attach_path = format!("ducklake:{}", catalog_path.display());
-        conn.execute(&format!("ATTACH '{}' AS ducklake;", attach_path), [])
-            .expect("attach ducklake catalog");
-        DuckDbConn {
-            conn,
-        }
-    }
-
-    /// Open/create a DuckLake catalog in DuckDB with a specified DATA_PATH.
-    /// Used when DuckDB is the writer and needs to create the catalog from scratch.
-    fn open_with_data_path(catalog_path: &Path, data_path: &Path) -> Self {
-        let conn = duckdb::Connection::open_in_memory().expect("open in-memory duckdb");
-        conn.execute("INSTALL ducklake;", [])
-            .expect("install ducklake");
-        conn.execute("LOAD ducklake;", []).expect("load ducklake");
-        let attach_path = format!("ducklake:{}", catalog_path.display());
-        conn.execute(
-            &format!(
-                "ATTACH '{}' AS ducklake (DATA_PATH '{}');",
-                attach_path,
-                data_path.display()
-            ),
-            [],
-        )
-        .expect("attach ducklake catalog with data path");
-        DuckDbConn {
-            conn,
-        }
-    }
-
-    /// Execute a SQL statement (no results expected).
-    fn execute(&self, sql: &str) {
-        self.conn
-            .execute(sql, [])
-            .unwrap_or_else(|e| panic!("DuckDB execute failed: {e}\nSQL: {sql}"));
-    }
-
-    /// Query and return results as Vec<Vec<String>>.
-    fn query(&self, sql: &str) -> Vec<Vec<String>> {
-        let mut stmt = self
-            .conn
-            .prepare(sql)
-            .unwrap_or_else(|e| panic!("DuckDB prepare failed: {e}\nSQL: {sql}"));
-        let mut rows = stmt.query([]).expect("DuckDB query failed");
-
-        let mut results = Vec::new();
-        while let Some(row) = rows.next().expect("DuckDB row iteration") {
-            let mut vals = Vec::new();
-            for i in 0.. {
-                match row.get::<_, duckdb::types::Value>(i) {
-                    Ok(v) => vals.push(duckdb_value_to_string(&v)),
-                    Err(_) => break,
-                }
-            }
-            results.push(vals);
-        }
-        results
-    }
-}
+use common::test_utils::DuckDbConn;
 
 // ==================== Query + comparison helpers ====================
 

@@ -24,6 +24,7 @@ use datafusion::prelude::*;
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 
+use common::test_utils::DuckDbConn;
 use datafusion_ducklake::metadata_writer::AlterTableOp;
 use datafusion_ducklake::{
     DuckLakeCatalog, DuckLakeTableWriter, DuckdbMetadataProvider, MetadataWriter,
@@ -133,109 +134,9 @@ async fn open_df_sqlite(catalog_path: &Path) -> SessionContext {
 
 // ==================== DuckDB wrapper ====================
 
-struct DuckDbConn {
-    conn: duckdb::Connection,
-}
+// DuckDbConn imported from common::test_utils
 
-impl DuckDbConn {
-    fn open(catalog_db_path: &Path) -> Self {
-        let conn = duckdb::Connection::open_in_memory().unwrap();
-        conn.execute("INSTALL ducklake;", []).unwrap();
-        conn.execute("LOAD ducklake;", []).unwrap();
-        let attach_path = format!("ducklake:sqlite:{}", catalog_db_path.display());
-        conn.execute(&format!("ATTACH '{}' AS ducklake;", attach_path), [])
-            .unwrap();
-        DuckDbConn {
-            conn,
-        }
-    }
-
-    fn open_native(catalog_path: &Path) -> Self {
-        let conn = duckdb::Connection::open_in_memory().unwrap();
-        conn.execute("INSTALL ducklake;", []).unwrap();
-        conn.execute("LOAD ducklake;", []).unwrap();
-        let attach_path = format!("ducklake:{}", catalog_path.display());
-        conn.execute(&format!("ATTACH '{}' AS ducklake;", attach_path), [])
-            .unwrap();
-        DuckDbConn {
-            conn,
-        }
-    }
-
-    fn open_with_data_path(catalog_path: &Path, data_path: &Path) -> Self {
-        let conn = duckdb::Connection::open_in_memory().unwrap();
-        conn.execute("INSTALL ducklake;", []).unwrap();
-        conn.execute("LOAD ducklake;", []).unwrap();
-        let attach_path = format!("ducklake:{}", catalog_path.display());
-        conn.execute(
-            &format!(
-                "ATTACH '{}' AS ducklake (DATA_PATH '{}');",
-                attach_path,
-                data_path.display()
-            ),
-            [],
-        )
-        .unwrap();
-        DuckDbConn {
-            conn,
-        }
-    }
-
-    fn execute(&self, sql: &str) {
-        self.conn
-            .execute(sql, [])
-            .unwrap_or_else(|e| panic!("DuckDB execute failed: {e}\nSQL: {sql}"));
-    }
-
-    fn query(&self, sql: &str) -> Vec<Vec<String>> {
-        let mut stmt = self
-            .conn
-            .prepare(sql)
-            .unwrap_or_else(|e| panic!("DuckDB prepare failed: {e}\nSQL: {sql}"));
-        let mut rows = stmt.query([]).expect("DuckDB query failed");
-
-        let mut results = Vec::new();
-        while let Some(row) = rows.next().expect("DuckDB row iteration") {
-            let mut vals = Vec::new();
-            for i in 0.. {
-                match row.get::<_, duckdb::types::Value>(i) {
-                    Ok(v) => vals.push(duckdb_value_to_string(&v)),
-                    Err(_) => break,
-                }
-            }
-            results.push(vals);
-        }
-        results
-    }
-}
-
-use common::test_utils::duckdb_value_to_string;
-
-async fn df_query(ctx: &SessionContext, sql: &str) -> Vec<Vec<String>> {
-    let df = ctx.sql(sql).await.expect("DataFusion SQL failed");
-    let batches = df.collect().await.expect("DataFusion collect failed");
-    let mut rows = Vec::new();
-    for batch in &batches {
-        for row_idx in 0..batch.num_rows() {
-            let mut row = Vec::new();
-            for col_idx in 0..batch.num_columns() {
-                let col = batch.column(col_idx);
-                if col.is_null(row_idx) {
-                    row.push("NULL".to_string());
-                } else {
-                    row.push(
-                        arrow::util::display::ArrayFormatter::try_new(col, &Default::default())
-                            .unwrap()
-                            .value(row_idx)
-                            .to_string(),
-                    );
-                }
-            }
-            rows.push(row);
-        }
-    }
-    rows
-}
+use common::test_utils::df_query;
 
 /// Get the table_id for a table from the SQLite catalog.
 async fn get_table_id(catalog_path: &Path, table_name: &str) -> i64 {
