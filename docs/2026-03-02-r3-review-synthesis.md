@@ -6,8 +6,8 @@
 - Not a finding: 1 (R3-009 — correct Arc::clone usage)
 - After deduplication: 50
 - By priority: 3 P0, 9 P1, 16 P2, 22 P3
-- **Fixed: 25 of 50** (all P0 + all P1 + 13 of 16 P2)
-- **Open: 25** (3 P2 + 22 P3)
+- **Fixed: 38 of 50** (all P0 + all P1 + all P2 except R3F-022,028 + 8 P3)
+- **Open: 12** (2 P2 deferred + 10 P3 deferred)
 
 ### Fix Agents (2026-03-03)
 
@@ -19,6 +19,8 @@
 | Agent 4 — fix-numeric-safety | `888705e` | R3F-009, 010, 025 |
 | Agent 5 — fix-interop-critical | `3203d33` | R3F-001, 002, 003, 007, 011, 013, 014, 017 |
 | Agent 6 — fix-test-harness | `3930b56` | R3F-015, 016, 020, 021, 023, 024 |
+| Agent 7 — fix-correctness | `69388dd` | R3F-019, 032, 033, 034, 048 |
+| Agent 8 — fix-quality | `0aa590c` | R3F-029, 030, 036, 037, 038, 039, 040, 041 |
 
 ## Deduplication Notes
 
@@ -227,7 +229,7 @@ No R3 findings filtered — all are either genuinely new or narrower than R2 def
 - **Effort**: M
 - **Fix group**: Agent 2 — Inlined Data + Type Roundtrip (or standalone)
 
-#### R3F-019: `get_table_structure` is not snapshot-aware in table functions **[OPEN]**
+#### R3F-019: `get_table_structure` is not snapshot-aware in table functions **[FIXED]** (commit 69388dd)
 - **Source reviews**: codex (CX3-013)
 - **File(s)**: `table_functions.rs:331-333`
 - **Description**: `resolve_table_for_function()` pins schema/table lookup with `snapshot_id`, but `get_table_structure(table_id)` has no snapshot parameter — returns current-version columns. Historical queries see wrong schema after evolution.
@@ -319,13 +321,13 @@ No R3 findings filtered — all are either genuinely new or narrower than R2 def
 
 ### P3 — Low
 
-#### R3F-029: `parse_decimal` silently ignores trailing garbage after closing parenthesis **[OPEN]**
+#### R3F-029: `parse_decimal` silently ignores trailing garbage after closing parenthesis **[FIXED]** (commit 0aa590c)
 - **Source reviews**: codex (CX3-017)
 - **File(s)**: `types.rs:255-259`
 - **Description**: `"decimal(10,2)extra_garbage"` parses successfully as `Decimal128(10,2)`.
 - **Effort**: S
 
-#### R3F-030: `parse_string_to_array` fallback silently downcasts unsupported types to string **[OPEN]**
+#### R3F-030: `parse_string_to_array` fallback silently downcasts unsupported types to string **[FIXED]** (commit 0aa590c)
 - **Source reviews**: correctness (C3-009)
 - **File(s)**: `table_writer.rs:1129-1139`
 - **Description**: Unrecognized types (Decimal128, Binary, etc.) stored as `StringBuilder` — schema mismatch on `RecordBatch::try_new`.
@@ -337,19 +339,19 @@ No R3 findings filtered — all are either genuinely new or narrower than R2 def
 - **Description**: ~40-50 lines identical boilerplate per exec. Related to R2 deferred F-044 (provider/writer dedup).
 - **Effort**: M
 
-#### R3F-032: Empty snapshots created when DML affects zero rows **[OPEN]**
+#### R3F-032: Empty snapshots created when DML affects zero rows **[FIXED]** (commit 69388dd)
 - **Source reviews**: codex (CX3-020)
 - **File(s)**: `delete_exec.rs:199-201`, `update_exec.rs:232-234`, `merge_exec.rs:317-319`
 - **Description**: `create_snapshot()` called unconditionally, even for zero-match WHERE clauses.
 - **Effort**: S
 
-#### R3F-033: MERGE source rows can match multiple target rows without error **[OPEN]**
+#### R3F-033: MERGE source rows can match multiple target rows without error **[FIXED]** (commit 69388dd)
 - **Source reviews**: codex (CX3-021)
 - **File(s)**: `merge_exec.rs:388-421`
 - **Description**: SQL standard MERGE should error when a source row matches multiple targets. Ours silently performs multiple deletes/updates.
 - **Effort**: M
 
-#### R3F-034: `delete_count` metadata tracks delta, not total positions in delete file **[OPEN]**
+#### R3F-034: `delete_count` metadata tracks delta, not total positions in delete file **[FIXED]** (commit 69388dd)
 - **Source reviews**: codex (CX3-022)
 - **File(s)**: `delete_exec.rs:311`, `update_exec.rs:434`, `merge_exec.rs:493-498`
 - **Description**: `delete_count` set to new deletion count, but file includes merged existing positions. Metadata understates total.
@@ -361,37 +363,37 @@ No R3 findings filtered — all are either genuinely new or narrower than R2 def
 - **Description**: `with_new_children()` calls `new()` on already-coalesced child. Works now but fragile if optimizer inserts repartitioning.
 - **Effort**: S
 
-#### R3F-036: `changes_made` format doesn't escape quotes in schema/table names **[OPEN]**
+#### R3F-036: `changes_made` format doesn't escape quotes in schema/table names **[FIXED]** (commit 0aa590c)
 - **Source reviews**: codex (CX3-024)
 - **File(s)**: `metadata_writer_sqlite.rs:550`
 - **Description**: `format!("created_table:\"{}\".\"{}\"")` doesn't escape internal double-quotes.
 - **Effort**: S
 
-#### R3F-037: `rewrite_unqualified_tables` is a no-op wasting allocations **[OPEN]**
+#### R3F-037: `rewrite_unqualified_tables` is a no-op wasting allocations **[FIXED]** (commit 0aa590c)
 - **Source reviews**: codex (CX3-025)
 - **File(s)**: `sqllogictest_runner.rs:604-612`
 - **Description**: Returns `line.to_string()` without transformation, called for every non-directive line.
 - **Effort**: S
 
-#### R3F-038: DuckDB error handling inconsistency for missing `data_path` **[OPEN]**
+#### R3F-038: DuckDB error handling inconsistency for missing `data_path` **[FIXED]** (commit 0aa590c)
 - **Source reviews**: codex (CX3-027)
 - **File(s)**: `metadata_provider_duckdb.rs:119`
 - **Description**: SQLx providers return `InvalidConfig`; DuckDB provider bubbles raw `QueryReturnedNoRows`.
 - **Effort**: S
 
-#### R3F-039: Bare `decimal`/`numeric` without parameters produces misleading error **[OPEN]**
+#### R3F-039: Bare `decimal`/`numeric` without parameters produces misleading error **[FIXED]** (commit 0aa590c)
 - **Source reviews**: codex (CX3-028)
 - **File(s)**: `types.rs:242-253,93-99`
 - **Description**: `"decimal"` falls to unsupported-type error. Should default to `Decimal128(18,0)` or give descriptive error.
 - **Effort**: S
 
-#### R3F-040: `information_schema.rs` `table_exist()` allocates on every call **[OPEN]**
+#### R3F-040: `information_schema.rs` `table_exist()` allocates on every call **[FIXED]** (commit 0aa590c)
 - **Source reviews**: idiomatic (R3-010)
 - **File(s)**: `information_schema.rs:820-822`
 - **Description**: `table_names()` builds `Vec<String>` just for membership check. Use `matches!()` instead.
 - **Effort**: S
 
-#### R3F-041: `Arc::clone` vs `.clone()` inconsistency on Arc types **[OPEN]**
+#### R3F-041: `Arc::clone` vs `.clone()` inconsistency on Arc types **[FIXED]** (commit 0aa590c)
 - **Source reviews**: idiomatic (R3-008)
 - **Description**: Codebase mostly uses `Arc::clone(&x)` but scattered `.clone()` on Arc types in `information_schema.rs`.
 - **Effort**: S
@@ -432,7 +434,7 @@ No R3 findings filtered — all are either genuinely new or narrower than R2 def
 - **Description**: In-transaction reads routed to DuckDB with independent formatting; potential subtle SLT mismatches.
 - **Effort**: S
 
-#### R3F-048: Decimal type string spacing difference **[OPEN]**
+#### R3F-048: Decimal type string spacing difference **[FIXED]** (commit 69388dd)
 - **Source reviews**: interop (I-R3-08)
 - **File(s)**: `types.rs:159`
 - **Description**: Ours: `"decimal(10, 2)"` (with space). DuckDB: `"decimal(10,2)"` (no space).
@@ -497,9 +499,9 @@ No R3 findings filtered — all are either genuinely new or narrower than R2 def
 |----------|-------|-------|------|-----------|
 | P0 | 3 | 3 | 0 | Table column stats crash, DML row_id_start, MERGE orphan cleanup |
 | P1 | 9 | 9 | 0 | Inlined data roundtrip, PG/MySQL fix parity, schema_version, quoting, casts, panics |
-| P2 | 16 | 13 | 3 | Snapshot changes, test harness, type lossy roundtrips, atomicity gaps |
-| P3 | 22 | 0 | 22 | Code quality, minor consistency, informational items |
-| **Total** | **50** | **25** | **25** | |
+| P2 | 16 | 14 | 2 | Snapshot changes, test harness, type lossy roundtrips, atomicity gaps |
+| P3 | 22 | 12 | 10 | Code quality, minor consistency, informational items |
+| **Total** | **50** | **38** | **12** | |
 
 ## Cross-Cutting Observations
 

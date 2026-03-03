@@ -10,7 +10,7 @@ mod common;
 use std::path::Path;
 use std::sync::Arc;
 
-use common::test_utils::{batches_to_strings_filtered, DuckDbConn};
+use common::test_utils::{DuckDbConn, batches_to_strings_filtered};
 use datafusion::prelude::*;
 use tempfile::TempDir;
 

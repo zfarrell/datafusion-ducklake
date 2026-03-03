@@ -170,10 +170,7 @@ impl DeleteFilterStream {
         // Build list of row indices to keep
         let num_rows = batch.num_rows();
         let num_rows_u32 = u32::try_from(num_rows).map_err(|_| {
-            DataFusionError::Internal(format!(
-                "batch row count {} exceeds u32::MAX",
-                num_rows
-            ))
+            DataFusionError::Internal(format!("batch row count {} exceeds u32::MAX", num_rows))
         })?;
         let mut keep_indices: Vec<u32> = Vec::with_capacity(num_rows);
 

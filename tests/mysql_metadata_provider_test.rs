@@ -429,7 +429,8 @@ async fn populate_from_duckdb_catalog(
             .execute(pool)
             .await?;
 
-            let columns = duckdb_provider.get_table_structure(table.table_id, current_snapshot.snapshot_id)?;
+            let columns = duckdb_provider
+                .get_table_structure(table.table_id, current_snapshot.snapshot_id)?;
 
             for (order, column) in columns.iter().enumerate() {
                 sqlx::query(

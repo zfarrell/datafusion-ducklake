@@ -171,7 +171,7 @@ current_delete AS (
     FROM ducklake_delete_file df
     CROSS JOIN params p
     WHERE df.table_id = p.table_identifier
-      AND df.begin_snapshot BETWEEN p.start_snapshot AND p.finish_snapshot
+      AND df.begin_snapshot > p.start_snapshot AND df.begin_snapshot <= p.finish_snapshot
 ),
 
 all_deletes AS (
@@ -255,7 +255,7 @@ LEFT JOIN LATERAL (
 ) pd ON true
 CROSS JOIN params p
 WHERE data.table_id = p.table_identifier
-  AND data.end_snapshot BETWEEN p.start_snapshot AND p.finish_snapshot;
+  AND data.end_snapshot > p.start_snapshot AND data.end_snapshot <= p.finish_snapshot;
 ";
 
 // Bulk queries for information_schema (avoids N+1 query problem)
@@ -621,7 +621,11 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
     fn list_tables(&self, schema_id: i64, snapshot_id: i64) -> Result<Vec<TableMetadata>>;
 
     /// Get table structure (columns) for a specific snapshot
-    fn get_table_structure(&self, table_id: i64, snapshot_id: i64) -> Result<Vec<DuckLakeTableColumn>>;
+    fn get_table_structure(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+    ) -> Result<Vec<DuckLakeTableColumn>>;
 
     /// Get table files for a specific snapshot
     fn get_table_files_for_select(

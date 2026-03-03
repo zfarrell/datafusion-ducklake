@@ -317,3 +317,131 @@ async fn test_no_stats_returns_none() {
     // No files = no stats = None
     assert!(table.statistics().is_none());
 }
+
+/// R5-S-001: Verify numeric column stats use type-aware comparison, not lexicographic.
+/// With lexicographic VARCHAR MIN/MAX, MIN('9','10') = '10' (wrong) and MAX('9','20') = '9' (wrong).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_numeric_stats_type_aware_aggregation() {
+    let (writer, temp_dir) = create_test_env().await;
+
+    let schema = Arc::new(Schema::new(vec![Field::new("val", DataType::Int32, false)]));
+
+    // First write: value 9
+    let batch1 =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![9]))]).unwrap();
+
+    let object_store = create_object_store();
+    let table_writer = DuckLakeTableWriter::new(writer.clone(), object_store.clone()).unwrap();
+    table_writer
+        .write_table("main", "numeric_stats_test", &[batch1])
+        .await
+        .unwrap();
+
+    // Second write (append): value 10
+    let batch2 =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![10]))]).unwrap();
+
+    let table_writer2 = DuckLakeTableWriter::new(writer.clone(), object_store).unwrap();
+    table_writer2
+        .append_table("main", "numeric_stats_test", &[batch2])
+        .await
+        .unwrap();
+
+    // Read table-level stats: min should be 9 (not 10), max should be 10 (not 9)
+    let ctx = create_read_context(&temp_dir).await;
+    let table = ctx
+        .catalog("ducklake")
+        .unwrap()
+        .schema("main")
+        .unwrap()
+        .table("numeric_stats_test")
+        .await
+        .unwrap()
+        .unwrap();
+
+    let stats = table.statistics().expect("statistics should be present");
+    let col_stats = &stats.column_statistics[0];
+
+    match &col_stats.min_value {
+        Precision::Inexact(ScalarValue::Int32(Some(v))) => {
+            assert_eq!(*v, 9, "min should be 9, not 10 (lexicographic)")
+        },
+        other => panic!("Expected Inexact(Int32(9)), got {:?}", other),
+    }
+    match &col_stats.max_value {
+        Precision::Inexact(ScalarValue::Int32(Some(v))) => {
+            assert_eq!(*v, 10, "max should be 10, not 9 (lexicographic)")
+        },
+        other => panic!("Expected Inexact(Int32(10)), got {:?}", other),
+    }
+
+    // Also verify by reading table-level stats directly from metadata
+    let db_path = temp_dir.path().join("test.db");
+    let conn_str = format!("sqlite:{}", db_path.display());
+    let provider = SqliteMetadataProvider::new(&conn_str).await.unwrap();
+    let snapshot_id = provider.get_current_snapshot().unwrap();
+    let schema_meta = provider
+        .get_schema_by_name("main", snapshot_id)
+        .unwrap()
+        .unwrap();
+    let table_meta = provider
+        .get_table_by_name(schema_meta.schema_id, "numeric_stats_test", snapshot_id)
+        .unwrap()
+        .unwrap();
+
+    // Verify ducklake_table_column_stats via get_file_column_stats
+    // (This reads file-level stats; the table-level stats are what DuckDB reads directly)
+    let file_stats = provider
+        .get_file_column_stats(table_meta.table_id, snapshot_id)
+        .unwrap();
+    // Should have 2 file-level stat entries (one per file)
+    assert_eq!(file_stats.len(), 2, "Should have stats from both files");
+}
+
+/// R5-S-008: Verify statistics column count matches schema (including virtual columns).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_statistics_column_count_matches_schema() {
+    let (writer, temp_dir) = create_test_env().await;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec![Some("a"), None, Some("c")])),
+        ],
+    )
+    .unwrap();
+
+    let object_store = create_object_store();
+    let table_writer = DuckLakeTableWriter::new(writer.clone(), object_store).unwrap();
+    table_writer
+        .write_table("main", "schema_align_test", &[batch])
+        .await
+        .unwrap();
+
+    let ctx = create_read_context(&temp_dir).await;
+    let table = ctx
+        .catalog("ducklake")
+        .unwrap()
+        .schema("main")
+        .unwrap()
+        .table("schema_align_test")
+        .await
+        .unwrap()
+        .unwrap();
+
+    let schema_col_count = table.schema().fields().len();
+    let stats = table.statistics().expect("statistics should be present");
+    assert_eq!(
+        stats.column_statistics.len(),
+        schema_col_count,
+        "statistics column count ({}) must match schema column count ({})",
+        stats.column_statistics.len(),
+        schema_col_count
+    );
+}

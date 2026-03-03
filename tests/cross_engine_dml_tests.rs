@@ -21,7 +21,7 @@ use std::sync::Arc;
 use arrow::array::*;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use common::test_utils::{assert_results_eq, df_query, DuckDbConn};
+use common::test_utils::{DuckDbConn, assert_results_eq, df_query};
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::*;
 use object_store::local::LocalFileSystem;

@@ -22,7 +22,7 @@ use std::sync::Arc;
 use arrow::array::*;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use common::test_utils::{batches_to_strings_filtered, df_query, DuckDbConn};
+use common::test_utils::{DuckDbConn, batches_to_strings_filtered, df_query};
 use datafusion::prelude::*;
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
@@ -161,7 +161,6 @@ async fn df_query_result(
     let batches = df.collect().await?;
     Ok(batches_to_strings_filtered(&batches))
 }
-
 
 fn make_test_batch() -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![

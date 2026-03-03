@@ -614,10 +614,13 @@ async fn test_corrupt_catalog_negative_file_size() {
         Ok(df) => {
             // If query plan succeeds, collecting may still fail, but should not panic
             match df.collect().await {
-                Ok(batches) => assert!(batches.iter().all(|b| b.num_rows() >= 0), "batches should be valid"),
+                Ok(batches) => assert!(
+                    batches.iter().all(|b| b.num_rows() >= 0),
+                    "batches should be valid"
+                ),
                 Err(e) => eprintln!("Expected error with negative file size: {e}"),
             }
-        }
+        },
         Err(e) => eprintln!("Expected error with negative file size: {e}"),
     }
 }
@@ -655,12 +658,13 @@ async fn test_corrupt_catalog_oversized_footer() {
     let ctx = create_read_ctx(&temp).await;
     let result = ctx.sql("SELECT * FROM ducklake.main.test").await;
     match result {
-        Ok(df) => {
-            match df.collect().await {
-                Ok(batches) => assert!(batches.iter().all(|b| b.num_rows() >= 0), "batches should be valid"),
-                Err(e) => eprintln!("Expected error with oversized footer: {e}"),
-            }
-        }
+        Ok(df) => match df.collect().await {
+            Ok(batches) => assert!(
+                batches.iter().all(|b| b.num_rows() >= 0),
+                "batches should be valid"
+            ),
+            Err(e) => eprintln!("Expected error with oversized footer: {e}"),
+        },
         Err(e) => eprintln!("Expected error with oversized footer: {e}"),
     }
 }
@@ -703,10 +707,10 @@ async fn test_corrupt_catalog_no_columns() {
             match df.collect().await {
                 Ok(_batches) => {
                     // Graceful handling: may return virtual columns only or empty batches
-                }
+                },
                 Err(e) => eprintln!("Expected error with no columns: {e}"),
             }
-        }
+        },
         Err(e) => eprintln!("Expected error with no columns: {e}"),
     }
 }
@@ -787,12 +791,12 @@ async fn test_corrupt_catalog_orphaned_snapshot() {
     let result = SqliteMetadataProvider::new(&conn_str).await;
     // Should fail gracefully when no snapshots exist
     match result {
-        Ok(provider) => {
-            match DuckLakeCatalog::new(provider) {
-                Ok(_catalog) => eprintln!("Catalog created despite missing snapshots (snapshot_id=0 fallback)"),
-                Err(e) => eprintln!("Expected error creating catalog with no snapshots: {e}"),
-            }
-        }
+        Ok(provider) => match DuckLakeCatalog::new(provider) {
+            Ok(_catalog) => {
+                eprintln!("Catalog created despite missing snapshots (snapshot_id=0 fallback)")
+            },
+            Err(e) => eprintln!("Expected error creating catalog with no snapshots: {e}"),
+        },
         Err(e) => eprintln!("Expected error connecting to corrupted catalog: {e}"),
     }
 }
@@ -829,32 +833,61 @@ fn test_type_parser_null_bytes() {
 fn test_type_parser_extreme_decimal() {
     // Very large precision — should error or produce a valid type, never panic
     let result = ducklake_to_arrow_type("decimal(999999999, 999999999)");
-    assert!(result.is_ok() || result.is_err(), "should not panic on extreme precision");
+    assert!(
+        result.is_ok() || result.is_err(),
+        "should not panic on extreme precision"
+    );
 
     // Negative values
     let result = ducklake_to_arrow_type("decimal(-1, -1)");
-    assert!(result.is_ok() || result.is_err(), "should not panic on negative precision");
+    assert!(
+        result.is_ok() || result.is_err(),
+        "should not panic on negative precision"
+    );
 
     // Zero values
     let result = ducklake_to_arrow_type("decimal(0, 0)");
-    assert!(result.is_ok() || result.is_err(), "should not panic on zero precision");
+    assert!(
+        result.is_ok() || result.is_err(),
+        "should not panic on zero precision"
+    );
 }
 
 /// VULN-004: Malformed parameterized types.
 #[test]
 fn test_type_parser_malformed_params() {
     // Unclosed parenthesis — should not panic
-    assert!(ducklake_to_arrow_type("varchar(").is_ok() || ducklake_to_arrow_type("varchar(").is_err());
-    assert!(ducklake_to_arrow_type("decimal(10,").is_ok() || ducklake_to_arrow_type("decimal(10,").is_err());
-    assert!(ducklake_to_arrow_type("decimal(10, 2").is_ok() || ducklake_to_arrow_type("decimal(10, 2").is_err());
+    assert!(
+        ducklake_to_arrow_type("varchar(").is_ok() || ducklake_to_arrow_type("varchar(").is_err()
+    );
+    assert!(
+        ducklake_to_arrow_type("decimal(10,").is_ok()
+            || ducklake_to_arrow_type("decimal(10,").is_err()
+    );
+    assert!(
+        ducklake_to_arrow_type("decimal(10, 2").is_ok()
+            || ducklake_to_arrow_type("decimal(10, 2").is_err()
+    );
 
     // Extra parentheses — should not panic
-    assert!(ducklake_to_arrow_type("varchar(())").is_ok() || ducklake_to_arrow_type("varchar(())").is_err());
-    assert!(ducklake_to_arrow_type("decimal((10), (2))").is_ok() || ducklake_to_arrow_type("decimal((10), (2))").is_err());
+    assert!(
+        ducklake_to_arrow_type("varchar(())").is_ok()
+            || ducklake_to_arrow_type("varchar(())").is_err()
+    );
+    assert!(
+        ducklake_to_arrow_type("decimal((10), (2))").is_ok()
+            || ducklake_to_arrow_type("decimal((10), (2))").is_err()
+    );
 
     // Non-numeric precision — should not panic
-    assert!(ducklake_to_arrow_type("decimal(abc, def)").is_ok() || ducklake_to_arrow_type("decimal(abc, def)").is_err());
-    assert!(ducklake_to_arrow_type("varchar(abc)").is_ok() || ducklake_to_arrow_type("varchar(abc)").is_err());
+    assert!(
+        ducklake_to_arrow_type("decimal(abc, def)").is_ok()
+            || ducklake_to_arrow_type("decimal(abc, def)").is_err()
+    );
+    assert!(
+        ducklake_to_arrow_type("varchar(abc)").is_ok()
+            || ducklake_to_arrow_type("varchar(abc)").is_err()
+    );
 }
 
 /// VULN-004: Empty and whitespace type strings.
@@ -879,7 +912,10 @@ fn test_type_parser_deeply_nested() {
         nested = format!("list({})", nested);
     }
     let result = ducklake_to_arrow_type(&nested);
-    assert!(result.is_ok() || result.is_err(), "deeply nested list should not panic");
+    assert!(
+        result.is_ok() || result.is_err(),
+        "deeply nested list should not panic"
+    );
 
     // Deeply nested struct — should not panic
     let mut nested_struct = "struct(a int32)".to_string();
@@ -887,7 +923,10 @@ fn test_type_parser_deeply_nested() {
         nested_struct = format!("struct(f{} {})", i, nested_struct);
     }
     let result = ducklake_to_arrow_type(&nested_struct);
-    assert!(result.is_ok() || result.is_err(), "deeply nested struct should not panic");
+    assert!(
+        result.is_ok() || result.is_err(),
+        "deeply nested struct should not panic"
+    );
 }
 
 // ============================================================================

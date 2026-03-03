@@ -341,14 +341,20 @@ fn attack_type_decimal_overflow_precision() {
 fn attack_type_decimal_no_params() {
     // "decimal" without parentheses defaults to Decimal128(18,0) matching DuckDB behavior.
     let result = ducklake_to_arrow_type("decimal");
-    assert!(result.is_ok(), "'decimal' without params should default to Decimal128(18,0)");
+    assert!(
+        result.is_ok(),
+        "'decimal' without params should default to Decimal128(18,0)"
+    );
     assert_eq!(
         result.unwrap(),
         arrow::datatypes::DataType::Decimal128(18, 0)
     );
     // Also check "numeric" bare
     let result = ducklake_to_arrow_type("numeric");
-    assert!(result.is_ok(), "'numeric' without params should default to Decimal128(18,0)");
+    assert!(
+        result.is_ok(),
+        "'numeric' without params should default to Decimal128(18,0)"
+    );
     assert_eq!(
         result.unwrap(),
         arrow::datatypes::DataType::Decimal128(18, 0)
@@ -369,7 +375,11 @@ fn attack_type_decimal_trailing_garbage() {
     let result = ducklake_to_arrow_type("decimal(10,2)extra_garbage");
     assert!(result.is_err(), "trailing garbage after ')' should fail");
     let err_msg = result.unwrap_err().to_string();
-    assert!(err_msg.contains("trailing"), "error should mention trailing characters: {}", err_msg);
+    assert!(
+        err_msg.contains("trailing"),
+        "error should mention trailing characters: {}",
+        err_msg
+    );
 }
 
 // ---------- VARCHAR/CHAR edge cases ----------

@@ -499,14 +499,9 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         self.end_table_files(table_id, snapshot_id)?;
         let mut ids = Vec::with_capacity(files.len());
         for entry in files {
-            let data_file_id =
-                self.register_data_file(table_id, snapshot_id, &entry.file_info)?;
+            let data_file_id = self.register_data_file(table_id, snapshot_id, &entry.file_info)?;
             if !entry.file_info.column_stats.is_empty() {
-                self.register_column_stats(
-                    data_file_id,
-                    table_id,
-                    &entry.file_info.column_stats,
-                )?;
+                self.register_column_stats(data_file_id, table_id, &entry.file_info.column_stats)?;
             }
             for (key_index, val) in &entry.partition_values {
                 self.register_file_partition_value(
