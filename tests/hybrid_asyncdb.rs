@@ -149,28 +149,44 @@ impl HybridDuckLakeDB {
     }
 
     /// Check if a CTE-prefixed statement wraps a DML keyword.
+    ///
+    /// Handles single-quoted and double-quoted strings so that parentheses or
+    /// DML keywords inside string literals do not cause false positives.
     fn cte_wraps_dml(upper_sql: &str) -> bool {
         let dml_keywords = ["INSERT ", "UPDATE ", "DELETE ", "MERGE "];
         let mut depth: i32 = 0;
-        let mut in_quote = false;
+        let mut in_single_quote = false;
+        let mut in_double_quote = false;
         let bytes = upper_sql.as_bytes();
         let len = bytes.len();
         let mut i = 0;
         while i < len {
             let b = bytes[i];
-            if in_quote {
+            if in_single_quote {
                 if b == b'\'' {
                     if i + 1 < len && bytes[i + 1] == b'\'' {
                         i += 2;
                         continue;
                     }
-                    in_quote = false;
+                    in_single_quote = false;
+                }
+                i += 1;
+                continue;
+            }
+            if in_double_quote {
+                if b == b'"' {
+                    if i + 1 < len && bytes[i + 1] == b'"' {
+                        i += 2;
+                        continue;
+                    }
+                    in_double_quote = false;
                 }
                 i += 1;
                 continue;
             }
             match b {
-                b'\'' => in_quote = true,
+                b'\'' => in_single_quote = true,
+                b'"' => in_double_quote = true,
                 b'(' => depth += 1,
                 b')' => {
                     depth -= 1;
@@ -358,16 +374,28 @@ impl HybridDuckLakeDB {
     /// but not in DuckDB's SELECT *
     const DUCKLAKE_VIRTUAL_COLS: &'static [&'static str] = &["rowid", "snapshot_id"];
 
-    /// Rewrite ORDER BY ALL since DataFusion's parser dialect doesn't support it
+    /// Rewrite ORDER BY ALL since DataFusion's parser dialect doesn't support it.
+    ///
+    /// String-literal aware: skips matches inside single-quoted strings so that
+    /// e.g. `WHERE col = 'ORDER BY ALL'` is left untouched.
     fn rewrite_order_by_all(sql: &str) -> String {
         let upper = sql.to_uppercase();
-        if let Some(pos) = upper.find("ORDER BY ALL") {
+        let needle = "ORDER BY ALL";
+        let mut search_start = 0;
+        while let Some(rel) = upper[search_start..].find(needle) {
+            let pos = search_start + rel;
+            // Check whether `pos` falls inside a single-quoted string literal
+            // by counting unescaped quotes before it.
+            let in_string = sql[..pos].chars().filter(|&c| c == '\'').count() % 2 != 0;
+            if in_string {
+                search_start = pos + needle.len();
+                continue;
+            }
             let before = &sql[..pos];
-            let after = &sql[pos + 12..];
-            format!("{}{}", before.trim_end(), after)
-        } else {
-            sql.to_string()
+            let after = &sql[pos + needle.len()..];
+            return format!("{}{}", before.trim_end(), after);
         }
+        sql.to_string()
     }
 
     /// Execute READ via DataFusion
@@ -1245,10 +1273,34 @@ mod tests {
 
     #[test]
     fn test_rewrite_order_by_all_inside_string() {
+        // String-literal occurrences must be left untouched
         let input = "SELECT * FROM t WHERE col = 'ORDER BY ALL'";
         let result = HybridDuckLakeDB::rewrite_order_by_all(input);
-        // The function uses simple string matching so it will rewrite even inside literals
-        assert!(result.len() <= input.len());
+        assert_eq!(
+            result, input,
+            "ORDER BY ALL inside a string literal must not be rewritten"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_order_by_all_after_string_literal() {
+        // A real ORDER BY ALL after a string containing it should still be rewritten
+        let input = "SELECT * FROM t WHERE col = 'ORDER BY ALL' ORDER BY ALL";
+        let result = HybridDuckLakeDB::rewrite_order_by_all(input);
+        assert_eq!(result, "SELECT * FROM t WHERE col = 'ORDER BY ALL'");
+    }
+
+    // R7-S-036: CTE DML detection handles double-quoted identifiers
+    #[test]
+    fn test_cte_wraps_dml_double_quoted_identifier() {
+        // Parentheses inside double-quoted identifiers must not affect depth tracking
+        assert!(!HybridDuckLakeDB::is_write_statement(
+            "WITH src AS (SELECT \"col(x)\" FROM t) SELECT * FROM src"
+        ));
+        // DML keyword inside double-quoted identifier must not cause false positive
+        assert!(!HybridDuckLakeDB::is_write_statement(
+            "WITH src AS (SELECT \"INSERT \" FROM t) SELECT * FROM src"
+        ));
     }
 
     // R6-S-044: CTE-wrapped DML detection

@@ -488,8 +488,14 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     ///
     /// Returns the data_file_id for each registered file.
     ///
-    /// Default implementation calls individual methods (non-atomic, for backward
-    /// compatibility). Backends should override for true atomicity.
+    /// # Warning: Default implementation is NOT atomic
+    ///
+    /// The default implementation calls `end_table_files` followed by individual
+    /// `register_data_file` / `register_column_stats` / `register_file_partition_value`
+    /// calls **without** a wrapping transaction.  If a failure occurs mid-way, the
+    /// table metadata will be left in an inconsistent state (some files ended, some
+    /// new files registered).  Backends **should** override this method to wrap the
+    /// entire operation in a single transaction for true atomicity.
     fn replace_table_files(
         &self,
         table_id: i64,

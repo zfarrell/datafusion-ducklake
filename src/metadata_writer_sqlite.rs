@@ -1462,7 +1462,13 @@ impl MetadataWriter for SqliteMetadataWriter {
             }
 
             // R5-S-002: Recalculate ducklake_table_stats from new files after compaction
-            let total_record_count: i64 = files.iter().map(|f| f.file_info.record_count).sum();
+            let total_record_count: i64 = files.iter().try_fold(0i64, |acc, f| {
+                acc.checked_add(f.file_info.record_count).ok_or_else(|| {
+                    DuckLakeError::Internal(
+                        "record_count sum overflow in replace_table_files".into(),
+                    )
+                })
+            })?;
             let total_file_size: i64 = files.iter().map(|f| f.file_info.file_size_bytes).sum();
             let updated = sqlx::query(
                 "UPDATE ducklake_table_stats
@@ -1733,8 +1739,16 @@ impl MetadataWriter for SqliteMetadataWriter {
     }
 
     fn initialize_schema(&self) -> Result<()> {
+        let pool = &self.pool;
         block_on(async {
-            sqlx::query(SQL_CREATE_SCHEMA).execute(&self.pool).await?;
+            // The DDL (CREATE TABLE IF NOT EXISTS) must run outside the
+            // transaction because SQLite does not support transactional DDL
+            // via sqlx's raw `execute` on a multi-statement string.
+            sqlx::query(SQL_CREATE_SCHEMA).execute(pool).await?;
+
+            // Wrap the seed DML in an explicit transaction so that either all
+            // metadata rows are inserted or none are (R7-S-047).
+            let mut tx = pool.begin().await?;
 
             // Insert DuckLake version metadata if not already present.
             // DuckLake uses this for migration checks; v0.3 is compatible with DuckDB v1.4.x.
@@ -1743,14 +1757,14 @@ impl MetadataWriter for SqliteMetadataWriter {
                  SELECT 'version', '0.3'
                  WHERE NOT EXISTS (SELECT 1 FROM ducklake_metadata WHERE key = 'version' AND scope IS NULL)",
             )
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
             sqlx::query(
                 "INSERT INTO ducklake_metadata (key, value)
                  SELECT 'created_by', 'DataFusion-DuckLake'
                  WHERE NOT EXISTS (SELECT 1 FROM ducklake_metadata WHERE key = 'created_by' AND scope IS NULL)",
             )
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
 
             // DuckDB sets `encrypted=false` in metadata; match for interop (F-047)
@@ -1759,7 +1773,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                  SELECT 'encrypted', 'false'
                  WHERE NOT EXISTS (SELECT 1 FROM ducklake_metadata WHERE key = 'encrypted' AND scope IS NULL)",
             )
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
 
             // Insert initial snapshot 0 (DuckDB expects this as the "empty catalog" snapshot)
@@ -1767,7 +1781,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 "INSERT OR IGNORE INTO ducklake_snapshot (snapshot_id, snapshot_time, schema_version, next_catalog_id, next_file_id)
                  VALUES (0, strftime('%Y-%m-%d %H:%M:%f+00:00', 'now'), 0, 0, 0)",
             )
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
 
             // Insert initial schema_version entry (F-012)
@@ -1775,8 +1789,10 @@ impl MetadataWriter for SqliteMetadataWriter {
                 "INSERT OR IGNORE INTO ducklake_schema_versions (begin_snapshot, schema_version)
                  VALUES (0, 0)",
             )
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+
+            tx.commit().await?;
 
             Ok(())
         })
