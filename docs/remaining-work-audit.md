@@ -138,37 +138,46 @@ Eight fix agents resolved **72 of 77** findings. 6 findings verified as already 
 
 Full details in `docs/2026-03-03-r5-review-synthesis.md`.
 
-### Cycle 6 (2026-03-04 R6) — 88 FINDINGS IDENTIFIED, PENDING FIXES
+### Cycle 6 (2026-03-04 R6) — ~49 of 52 ASSIGNED FINDINGS FIXED
 
 A five-part review (idiomatic, correctness, interop, test-harness, codex) of the post-R5 codebase identified 107 raw findings → 88 after deduplication. Zero P0 findings. All 3 codex P0 claims were downgraded (100% P0 FP rate this cycle).
 
-| Priority | Count | Status |
-|----------|-------|--------|
-| P0 | 0 | — |
-| P1 | 14 | Pending fix agents |
-| P2 | 38 | Pending fix agents |
-| P3 | 36 | Optional |
-| **Total** | **88** | **Pending** |
+Ten fix agents resolved **~49 of 52** assigned findings. 36 P3 findings were not assigned.
 
-**Key new issues identified:**
-- SQLite `replace_table_files` missing `table_id` in column stats (P1, breaks compaction stats)
-- PG/MySQL `register_dml_files` missing record_count decrement on DELETE (P1, stats diverge)
-- PG/MySQL `end_table_files` doesn't end delete files (P1, stale data after replace)
-- Compaction UDTFs execute side effects during planning (P1, EXPLAIN triggers compaction)
-- Hardcoded `schema_version=1` in inlined data table naming (P1, breaks DuckDB interop)
-- 6 unwrap/expect panic paths and silent error swallowing bugs in production code (P1)
-- Missing DF-write→DuckDB-read cross-engine test coverage gap (P2)
-- Multiple write tests only verify COUNT, not actual values (P2)
+| Priority | Count | Fixed | Unfixable | Deferred | Not Assigned |
+|----------|-------|-------|-----------|----------|--------------|
+| P0 | 0 | — | — | — | — |
+| P1 | 14 | 13 | 1 (R6-S-014) | 0 | 0 |
+| P2 | 38 | 35 | 0 | 1 (R6-S-017) | 2 |
+| P3 | 36 | 0 | 0 | 0 | 36 |
+| **Total** | **88** | **~49** | **1** | **1** | **36** |
 
-**10 recommended fix agents.** R6-S-017 (concurrent DML race) deferred alongside R4-S-018.
+**Fix agents (10):**
+- fix-sqlite-metadata (`d3aa034`): R6-S-001,015,016,019,029 (5/5)
+- fix-backend-parity (`75ad2e1`): R6-S-003,004,018,033,034 (5/5)
+- fix-error-handling (`aaf5a4f`,`07cd101`): R6-S-005,006,008,020,021 (5/6; R6-S-007 resolved by code-quality)
+- fix-table-functions (`f93444c`): R6-S-002,011,024-028,052 (8/8)
+- fix-interop (`b8a4476`): R6-S-009,012,030,031 (4/4)
+- fix-metadata-correctness (`f4c0f58`): R6-S-010,035,036,040 (4/4)
+- fix-test-infra (`03f9cb3`): R6-S-013,042-047,050,051 (9/10; R6-S-014 unfixable)
+- fix-dml-robustness (`5666cf5`,`08ff2f7`): R6-S-037,038,039 (3/3)
+- fix-code-quality (`c9c761b`): R6-S-022,023,041 (3/3)
+- fix-cross-engine-tests (`d6a5104`): R6-S-032,048,049 (3/3)
 
-**R2 Deferred items still deferred:**
+**Merge**: 3 branches merged, 21 conflicts resolved. Final commit: `4f9cc49`.
+**Tests**: 725 pass, 72+ cross-engine tests. 10 new cross-engine, 7 partition validation, 9 table function tests.
+
+**1 unfixable**: R6-S-014 (duplicated type conversion) — module structure prevents dedup.
+**1 deferred**: R6-S-017 (concurrent DML race) — architectural, related to R4-S-018.
+
+**All deferred items:**
 - F-036: INSERT streaming for OOM prevention
 - F-044: Provider/writer code deduplication
 - F-045: Async trait redesign (sync→async)
 - R4-S-018: PG/MySQL checked write TOCTOU
 - R4-S-036: map_err boilerplate (50+ sites)
 - R4-S-040: Monolithic execute() blocks
+- R6-S-017: Concurrent DML lost-delete race
 
 Full details in `docs/2026-03-04-r6-review-synthesis.md`.
 

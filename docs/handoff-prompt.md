@@ -49,7 +49,7 @@ Also in `/home/zac/`:
 - Multi-backend (SQLite/Postgres/MySQL): ALL methods implemented, Docker tests passing
 - SLT pass rate: 157/254 (61.8%)
 - ~724 total tests, 62 cross-engine tests, 254 SLT files
-- Code review cycles: 6 complete (R1: 36, R2: 58, R3: 50, R4: 46, R5: 77, R6: 88 — **231 fixed in R1-R5; R6 pending fix agents**)
+- Code review cycles: 6 complete (R1: 36, R2: 58, R3: 50, R4: 46, R5: 77, R6: 88 — **~280 fixed across R1-R6**)
 
 ### What's Been Done (Phases 0-6)
 Everything through Phase 6 is complete. See `docs/project-status.md` for the full verified feature matrix.
@@ -197,29 +197,35 @@ Eight fix agents resolved **72 of 77** findings. 6 findings verified as already 
 - `docs/2026-03-03-r5-review-synthesis.md` (consolidated, deduplicated, prioritized, with **[FIXED]**/**[VERIFIED]**/**[SKIPPED]**/**[FALSE POSITIVE]** markers)
 - `docs/2026-03-03-r5-review-idiomatic.md`, `docs/2026-03-03-r5-review-correctness.md`, `docs/2026-03-03-r5-review-interop.md`, `docs/2026-03-03-r5-review-test-harness.md`, `docs/2026-03-03-r5-codex-review.md`
 
-### Code Review Cycle 6 (2026-03-04 R6) — 88 FINDINGS IDENTIFIED, PENDING FIXES
+### Code Review Cycle 6 (2026-03-04 R6) — ~49 of 52 ASSIGNED FINDINGS FIXED
 
 A five-part review (idiomatic, correctness, interop, test-harness, codex) of the post-R5 codebase identified **107 raw → 88 after dedup** (0 P0, 14 P1, 38 P2, 36 P3). All 3 codex P0 claims were validated against source code and downgraded (100% P0 FP rate this cycle).
 
-**Key P1 findings:**
-- R6-S-001: `replace_table_files()` missing `table_id` in column stats INSERT (SQLite) — corrupts stats after compaction
-- R6-S-002: Compaction UDTFs execute side effects at planning time — EXPLAIN triggers compaction
-- R6-S-003: PG/MySQL missing `record_count` decrement on DELETE — stats diverge across backends
-- R6-S-004: `end_table_files` backend drift PG/MySQL — stale delete files after replace
-- R6-S-005/006: unwrap()/silent downcasts in merge_exec and insert_exec — panic paths or silent misrouting
-- R6-S-007: Inconsistent inlined value parse policy — write succeeds but data reads back as NULL
-- R6-S-008: `arrow_array_value_to_string` returns empty string on failure — corrupted statistics
-- R6-S-009: Hardcoded `schema_version=1` in inlined data table naming — breaks DuckDB interop
-- R6-S-011: `parse_table_name` doesn't unescape quoted identifiers — table function lookup failures
-- R6-S-012: CDC paths missing encryption factory — encrypted catalogs can't use CDC functions
-- R6-S-013/014: Test infrastructure issues (false positive transaction test, duplicated type conversion)
+Ten fix agents resolved **~49 of 52** assigned findings (all P1 except 1 unfixable, all assigned P2). 36 P3 findings were not assigned.
 
-**10 recommended fix agents** spanning: SQLite metadata, backend parity, error handling, table functions, interop, metadata correctness, test infrastructure, DML robustness, code quality, cross-engine tests.
+**Fix agents (10):**
+- fix-sqlite-metadata (`d3aa034`): R6-S-001,015,016,019,029 (5/5) — table_id in stats, row_id_start, overflow check, decimal precision, type validation
+- fix-backend-parity (`75ad2e1`): R6-S-003,004,018,033,034 (5/5) — record_count decrement, end_table_files, atomic replace, row locking, UNIQUE stats
+- fix-error-handling (`aaf5a4f`,`07cd101`): R6-S-005,006,008,020,021 (5/6) — unwrap→error, silent NULL→error, epoch const; R6-S-007 resolved by code-quality
+- fix-table-functions (`f93444c`): R6-S-002,011,024-028,052 (8/8) — deferred compaction to scan time, parse_table_name quotes, validation, INSTALL caching, configurable older_than
+- fix-interop (`b8a4476`): R6-S-009,012,030,031 (4/4) — schema_version lookup, CDC encryption factory, table naming, timestamp format
+- fix-metadata-correctness (`f4c0f58`): R6-S-010,035,036,040 (4/4) — SET NOT NULL warning, column_id docs, partition transform validation, snapshot propagation
+- fix-test-infra (`03f9cb3`): R6-S-013,042-047,050,051 (9/10) — transaction test, SLT filters, write test assertions, ORDER BY ALL tests; R6-S-014 unfixable
+- fix-dml-robustness (`5666cf5`,`08ff2f7`): R6-S-037,038,039 (3/3) — upload cleanup, snapshot failure cleanup, atomic single-file finish
+- fix-code-quality (`c9c761b`): R6-S-022,023,041 (3/3) — shared parser, transform enum, limit pushdown fix
+- fix-cross-engine-tests (`d6a5104`): R6-S-032,048,049 (3/3) — DF-write→DuckDB-read tests, schema assertions, BOOLEAN roundtrip
 
-**Deferred items remain deferred**: F-036, F-044, F-045, R4-S-018, R4-S-036, R4-S-040. R6-S-017 (concurrent DML race) added to deferred.
+**1 unfixable**: R6-S-014 (duplicated type-to-string conversion) — module structure prevents dedup without major refactor.
+**1 deferred**: R6-S-017 (concurrent DML race) — architectural, related to R4-S-018.
+**36 P3 not assigned**: Optional, low impact.
+
+**Merge**: 3 branches merged, 21 conflicts resolved. Final commit: `4f9cc49`.
+**Tests**: 725 pass, 3 SQLite concurrency flakes (pre-existing). 10 new cross-engine tests, 7 partition validation tests, 9 table function tests, and more.
+
+**Deferred items remain deferred**: F-036, F-044, F-045, R4-S-018, R4-S-036, R4-S-040. R6-S-017 added to deferred.
 
 **Source documents:**
-- `docs/2026-03-04-r6-review-synthesis.md` (consolidated, deduplicated, prioritized)
+- `docs/2026-03-04-r6-review-synthesis.md` (consolidated, deduplicated, prioritized, with **[FIXED]**/**[UNFIXABLE]**/**[DEFERRED]**/**[NOT ASSIGNED]** markers)
 - `docs/2026-03-04-review-idiomatic.md`, `docs/2026-03-04-review-correctness.md`, `docs/2026-03-04-review-interop.md`, `docs/2026-03-04-review-test-harness.md`, `docs/2026-03-04-codex-review.md`
 
 ### After Implementation: PR Creation

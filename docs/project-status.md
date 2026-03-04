@@ -227,13 +227,15 @@
 
 | Category | Count |
 |----------|-------|
-| **Total `#[test]` + `#[tokio::test]`** | **~740+** |
+| **Total `#[test]` + `#[tokio::test]`** | **~725+** |
 | SLT test files | 254 |
 | SLT pass rate | 157/254 (61.8%) |
 
 **Note (2026-03-02)**: +21 tests added during the R2 review fix cycle: 18 new unit tests (input validation, timestamp precisions, partition safety, SQL identifier quoting, date formatting) + 3 new interop tests (`test_df_write_partitioned_duckdb_read`, `test_df_write_inlined_duckdb_read`, `test_duckdb_partitioned_inlined_data`).
 
 **Note (2026-03-03)**: +15 tests added during R5 review fix cycle: 11 new cross-engine tests (DML, DDL, inline data, partition operations) from fix-cross-engine agent + 4 new unit/integration tests from fix-test-infrastructure agent.
+
+**Note (2026-03-04)**: Tests added during R6 review fix cycle: 10 new cross-engine tests, 7 partition validation tests, 9 table function tests, and additional unit tests. Total: 725+ tests passing.
 
 ### 2.2 Test Breakdown by File
 
@@ -309,7 +311,7 @@
 | Partition operations | 7 | Same |
 | Postgres cross-engine | 8 | `write-postgres` + `metadata-duckdb` + `metadata-postgres` (Docker) |
 | MySQL cross-engine | 8 | `write-mysql` + `metadata-duckdb` + `metadata-mysql` (Docker) |
-| **Total cross-engine** | **62+** | (11 new tests added in R5 fix cycle) |
+| **Total cross-engine** | **72+** | (11 new in R5, 10 new in R6 fix cycles) |
 
 ### 2.4 Per-Backend Test Coverage
 
@@ -360,11 +362,23 @@ Note: Postgres/MySQL tests require running database containers (testcontainers).
 - fix-interop-types (`84d51ff`): 7 findings — inlined serialization, Decimal flush/stats, delete format
 - fix-test-infrastructure (`08f55a9`): 12 findings — Decimal sign, normalize, timestamp, virtual columns, 4 new tests
 
-**Cumulative across 5 cycles**: 267 total findings, **240 fixed**, 6 verified already correct, 1 false positive, 9 deferred/skipped (R2 F-036/F-044/F-045, R4-S-036/R4-S-040, R5-S-051/060/068/074), ~16 P3 nits remaining open from R3.
+**Cycle 6 (2026-03-04 R6)**: 88 findings (0 P0, 14 P1, 38 P2, 36 P3). **~49 of 52 assigned fixed** across 10 fix agents:
+- fix-sqlite-metadata (`d3aa034`): 5 findings — table_id in stats, row_id_start, overflow, decimal precision, type validation
+- fix-backend-parity (`75ad2e1`): 5 findings — record_count decrement, end_table_files, atomic replace, row locking, UNIQUE stats
+- fix-error-handling (`aaf5a4f`,`07cd101`): 5 findings — unwrap→error, silent NULL→error, epoch const
+- fix-table-functions (`f93444c`): 8 findings — deferred compaction to scan time, parse_table_name, validation, INSTALL cache
+- fix-interop (`b8a4476`): 4 findings — schema_version, CDC encryption, table naming, timestamp format
+- fix-metadata-correctness (`f4c0f58`): 4 findings — SET NOT NULL warning, column_id docs, partition validation, snapshot propagation
+- fix-test-infra (`03f9cb3`): 9 findings — transaction test, SLT filters, write test assertions, ORDER BY ALL tests
+- fix-dml-robustness (`5666cf5`,`08ff2f7`): 3 findings — upload cleanup, snapshot cleanup, atomic single-file finish
+- fix-code-quality (`c9c761b`): 3 findings — shared parser, transform enum, limit pushdown
+- fix-cross-engine-tests (`d6a5104`): 3 findings — DF-write→DuckDB-read tests, schema assertions, BOOLEAN roundtrip
 
-**Deferred (architectural, L effort)**: F-036 (INSERT streaming/OOM), F-044 (provider/writer code dedup, also R4-S-036/040), F-045 (async trait redesign).
+**Cumulative across 6 cycles**: 355 total findings, **~280 fixed**, 6 verified already correct, 1 false positive, 1 unfixable (R6-S-014), ~10 deferred/skipped, 36 P3 not assigned from R6, ~16 P3 nits remaining from R3.
 
-See `docs/2026-03-03-r5-review-synthesis.md` for R5 full details with **[FIXED]**/**[VERIFIED]**/**[SKIPPED]**/**[FALSE POSITIVE]** markers on each finding.
+**Deferred (architectural, L effort)**: F-036 (INSERT streaming/OOM), F-044 (provider/writer code dedup, also R4-S-036/040), F-045 (async trait redesign), R6-S-017 (concurrent DML race).
+
+See `docs/2026-03-04-r6-review-synthesis.md` for R6 full details with **[FIXED]**/**[UNFIXABLE]**/**[DEFERRED]**/**[NOT ASSIGNED]** markers on each finding.
 
 ### Tier 1: Implementable Now (no external blockers)
 
