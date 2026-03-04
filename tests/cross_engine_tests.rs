@@ -22,14 +22,16 @@ use std::sync::Arc;
 use arrow::array::*;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use common::test_utils::{assert_results_eq, df_query};
+use common::test_utils::{DuckDbConn, assert_results_eq, df_query};
+use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::*;
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 
 use datafusion_ducklake::{
-    DuckLakeCatalog, DuckLakeTableWriter, DuckdbMetadataProvider, MetadataWriter,
-    SqliteMetadataProvider, SqliteMetadataWriter,
+    AlterTableOp, ColumnDef, DuckLakeCatalog, DuckLakeQueryPlanner, DuckLakeTableWriter,
+    DuckdbMetadataProvider, MetadataProvider, MetadataWriter, SqliteMetadataProvider,
+    SqliteMetadataWriter,
 };
 
 // ==================== Setup helpers ====================
@@ -108,8 +110,6 @@ async fn open_in_datafusion_writable(catalog_path: &Path) -> SessionContext {
     ctx.register_catalog("ducklake", Arc::new(catalog));
     ctx
 }
-
-use common::test_utils::DuckDbConn;
 
 // ==================== Query + comparison helpers ====================
 
@@ -1027,4 +1027,448 @@ async fn cross_engine_interleaved_dml_reads() {
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0], vec!["2", "process", "2"]);
     assert_eq!(rows[1], vec!["3", "warning", "2"]);
+}
+
+// ==================== Test Pattern 4: DF write (DML/DDL) → DuckDB read ====================
+// R6-S-032: Cross-engine tests for DELETE, UPDATE, ALTER TABLE, DROP TABLE, CREATE VIEW,
+// and multi-batch INSERT.
+
+/// Standard id/name test records for DML tests.
+fn test_records() -> Vec<RecordBatch> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec!["apple", "banana", "cherry"])),
+        ],
+    )
+    .unwrap();
+    vec![batch]
+}
+
+/// Write test data via DuckLakeTableWriter.
+async fn write_test_data_via_df(catalog_path: &Path, table_name: &str, batches: &[RecordBatch]) {
+    let conn_str = format!("sqlite:{}?mode=rwc", catalog_path.display());
+    let writer = SqliteMetadataWriter::new(&conn_str)
+        .await
+        .expect("create writer");
+    let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(LocalFileSystem::new());
+    let table_writer =
+        DuckLakeTableWriter::new(Arc::new(writer), object_store).expect("create table writer");
+    let result = table_writer
+        .write_table("main", table_name, batches)
+        .await
+        .expect("write table");
+    assert!(result.records_written > 0);
+}
+
+/// Open a writable DF context with DuckLakeQueryPlanner for DML operations.
+async fn open_in_datafusion_writable_dml(catalog_path: &Path) -> SessionContext {
+    let conn_str = format!("sqlite:{}?mode=rwc", catalog_path.display());
+    let provider = Arc::new(SqliteMetadataProvider::new(&conn_str).await.unwrap());
+    let writer = Arc::new(SqliteMetadataWriter::new(&conn_str).await.unwrap());
+    let catalog = DuckLakeCatalog::with_writer(provider, writer).unwrap();
+
+    let state = SessionStateBuilder::new()
+        .with_default_features()
+        .with_query_planner(Arc::new(DuckLakeQueryPlanner))
+        .build();
+    let ctx = SessionContext::new_with_state(state);
+    ctx.register_catalog("ducklake", Arc::new(catalog));
+    ctx
+}
+
+/// Helper to collect DML count from a DataFrame result.
+async fn collect_dml_count(df: DataFrame) -> u64 {
+    let batches = df.collect().await.unwrap();
+    assert!(!batches.is_empty());
+    batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap()
+        .value(0)
+}
+
+/// R6-S-032: DF deletes rows → DuckDB reads and verifies.
+#[tokio::test(flavor = "multi_thread")]
+async fn cross_engine_df_delete_duckdb_read() {
+    let env = setup_ducklake_catalog().await;
+    let catalog_path = &env.catalog_db_path;
+
+    // DF writes initial data
+    write_test_data_via_df(catalog_path, "del_test", &test_records()).await;
+
+    // DF deletes rows where id > 2
+    let ctx = open_in_datafusion_writable_dml(catalog_path).await;
+    let df = ctx
+        .sql("DELETE FROM ducklake.main.del_test WHERE id > 2")
+        .await
+        .unwrap();
+    let count = collect_dml_count(df).await;
+    assert!(count > 0, "should have deleted at least one row");
+
+    // DuckDB reads the result
+    let duckdb = DuckDbConn::open(catalog_path);
+    let rows = duckdb.query("SELECT id, name FROM ducklake.main.del_test ORDER BY id");
+    assert_eq!(rows.len(), 2, "should have 2 rows after delete");
+    assert_eq!(rows[0][0], "1");
+    assert_eq!(rows[1][0], "2");
+}
+
+/// R6-S-032: DF updates rows → DuckDB reads and verifies.
+#[tokio::test(flavor = "multi_thread")]
+async fn cross_engine_df_update_duckdb_read() {
+    let env = setup_ducklake_catalog().await;
+    let catalog_path = &env.catalog_db_path;
+
+    write_test_data_via_df(catalog_path, "upd_test", &test_records()).await;
+
+    // DF updates name for id = 1
+    let ctx = open_in_datafusion_writable_dml(catalog_path).await;
+    let df = ctx
+        .sql("UPDATE ducklake.main.upd_test SET name = 'updated' WHERE id = 1")
+        .await
+        .unwrap();
+    let count = collect_dml_count(df).await;
+    assert_eq!(count, 1);
+
+    // DuckDB reads the result
+    let duckdb = DuckDbConn::open(catalog_path);
+    let rows = duckdb.query("SELECT id, name FROM ducklake.main.upd_test ORDER BY id");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0], vec!["1", "updated"]);
+    assert_eq!(rows[1], vec!["2", "banana"]);
+    assert_eq!(rows[2], vec!["3", "cherry"]);
+}
+
+/// R6-S-032: DF adds column via MetadataWriter → DuckDB verifies schema.
+#[tokio::test(flavor = "multi_thread")]
+async fn cross_engine_df_alter_add_column_duckdb_read() {
+    let env = setup_ducklake_catalog().await;
+    let catalog_path = &env.catalog_db_path;
+
+    write_test_data_via_df(catalog_path, "alter_test", &test_records()).await;
+
+    // Use MetadataWriter to add a column
+    let conn_str = format!("sqlite:{}?mode=rwc", catalog_path.display());
+    let provider = SqliteMetadataProvider::new(&conn_str).await.unwrap();
+    let writer = SqliteMetadataWriter::new(&conn_str).await.unwrap();
+
+    let snapshot = provider.get_current_snapshot().unwrap();
+    let schema_meta = provider
+        .get_schema_by_name("main", snapshot)
+        .unwrap()
+        .unwrap();
+    let table_meta = provider
+        .get_table_by_name(schema_meta.schema_id, "alter_test", snapshot)
+        .unwrap()
+        .unwrap();
+
+    let new_col = ColumnDef::new("score", "DOUBLE", true).unwrap();
+    let op = AlterTableOp::AddColumn {
+        column: new_col,
+    };
+    writer.alter_table(table_meta.table_id, &op).unwrap();
+
+    // DuckDB verifies the new column exists
+    let duckdb = DuckDbConn::open(catalog_path);
+    let rows = duckdb.query(
+        "SELECT column_name FROM information_schema.columns \
+         WHERE table_name = 'alter_test' AND column_name = 'score'",
+    );
+    assert_eq!(rows.len(), 1, "new column 'score' should exist in DuckDB");
+    assert_eq!(rows[0][0], "score");
+}
+
+/// R6-S-032: DF drops table → DuckDB verifies it's gone.
+#[tokio::test(flavor = "multi_thread")]
+async fn cross_engine_df_drop_table_duckdb_behavior() {
+    let env = setup_ducklake_catalog().await;
+    let catalog_path = &env.catalog_db_path;
+
+    write_test_data_via_df(catalog_path, "drop_test", &test_records()).await;
+
+    // Use writer to drop the table (via MetadataWriter API)
+    let conn_str = format!("sqlite:{}?mode=rwc", catalog_path.display());
+    let provider = SqliteMetadataProvider::new(&conn_str).await.unwrap();
+    let writer = SqliteMetadataWriter::new(&conn_str).await.unwrap();
+
+    let snapshot = provider.get_current_snapshot().unwrap();
+    let schema_meta = provider
+        .get_schema_by_name("main", snapshot)
+        .unwrap()
+        .unwrap();
+    let table_meta = provider
+        .get_table_by_name(schema_meta.schema_id, "drop_test", snapshot)
+        .unwrap()
+        .unwrap();
+    writer.drop_table(table_meta.table_id).unwrap();
+
+    // DuckDB verifies the table is gone
+    let duckdb = DuckDbConn::open(catalog_path);
+    let result = duckdb.try_query("SELECT * FROM ducklake.main.drop_test");
+    assert!(result.is_err(), "dropped table should not be queryable");
+}
+
+/// R6-S-032: DF creates view via MetadataWriter → DF reads it back.
+#[tokio::test(flavor = "multi_thread")]
+async fn cross_engine_df_create_view_read_back() {
+    let env = setup_ducklake_catalog().await;
+    let catalog_path = &env.catalog_db_path;
+
+    write_test_data_via_df(catalog_path, "view_base", &test_records()).await;
+
+    // Create view via MetadataWriter
+    let conn_str = format!("sqlite:{}?mode=rwc", catalog_path.display());
+    let provider = SqliteMetadataProvider::new(&conn_str).await.unwrap();
+    let writer = SqliteMetadataWriter::new(&conn_str).await.unwrap();
+
+    let snapshot = provider.get_current_snapshot().unwrap();
+    let schema_meta = provider
+        .get_schema_by_name("main", snapshot)
+        .unwrap()
+        .unwrap();
+    writer
+        .create_view(
+            schema_meta.schema_id,
+            "name_view",
+            "SELECT name FROM view_base WHERE id <= 2",
+        )
+        .unwrap();
+
+    // DF reads the view back
+    let ctx = open_in_datafusion_duckdb(catalog_path);
+    let rows = df_query(
+        &ctx,
+        "SELECT name FROM ducklake.main.name_view ORDER BY name",
+    )
+    .await;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0], "apple");
+    assert_eq!(rows[1][0], "banana");
+}
+
+/// R6-S-032: DF writes multiple batches → DuckDB reads all rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn cross_engine_df_multi_batch_insert_duckdb_read() {
+    let env = setup_ducklake_catalog().await;
+    let catalog_path = &env.catalog_db_path;
+
+    // Write two separate batches
+    let batch1 = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("val", DataType::Utf8, true),
+        ])),
+        vec![Arc::new(Int32Array::from(vec![1, 2])), Arc::new(StringArray::from(vec!["a", "b"]))],
+    )
+    .unwrap();
+    let batch2 = RecordBatch::try_new(
+        batch1.schema(),
+        vec![Arc::new(Int32Array::from(vec![3, 4])), Arc::new(StringArray::from(vec!["c", "d"]))],
+    )
+    .unwrap();
+
+    // Write using DuckLakeTableWriter with multiple batches
+    let conn_str = format!("sqlite:{}?mode=rwc", catalog_path.display());
+    let writer = SqliteMetadataWriter::new(&conn_str).await.unwrap();
+    let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(LocalFileSystem::new());
+    let table_writer =
+        DuckLakeTableWriter::new(Arc::new(writer), object_store).expect("create table writer");
+    let result = table_writer
+        .write_table("main", "multi_batch", &[batch1, batch2])
+        .await
+        .expect("write multi batch");
+    assert_eq!(result.records_written, 4);
+
+    // DuckDB reads all 4 rows
+    let duckdb = DuckDbConn::open(catalog_path);
+    let rows = duckdb.query("SELECT id, val FROM ducklake.main.multi_batch ORDER BY id");
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[0], vec!["1", "a"]);
+    assert_eq!(rows[1], vec!["2", "b"]);
+    assert_eq!(rows[2], vec!["3", "c"]);
+    assert_eq!(rows[3], vec!["4", "d"]);
+}
+
+// ==================== R6-S-048: Schema assertions ====================
+// Verify column names and types match between DataFusion and DuckDB.
+
+/// Query DuckDB information_schema for column names and types.
+fn duckdb_table_schema(duckdb: &DuckDbConn, table_name: &str) -> Vec<(String, String)> {
+    let rows = duckdb.query(&format!(
+        "SELECT column_name, data_type FROM information_schema.columns \
+         WHERE table_name = '{}' ORDER BY ordinal_position",
+        table_name
+    ));
+    rows.into_iter()
+        .map(|r| (r[0].clone(), r[1].clone()))
+        .collect()
+}
+
+/// Query DataFusion schema for column names and types.
+async fn df_table_schema(ctx: &SessionContext, table_name: &str) -> Vec<(String, String)> {
+    let df = ctx
+        .sql(&format!(
+            "SELECT * FROM ducklake.main.{} LIMIT 0",
+            table_name
+        ))
+        .await
+        .unwrap();
+    df.schema()
+        .fields()
+        .iter()
+        .map(|f| (f.name().clone(), format!("{}", f.data_type())))
+        .collect()
+}
+
+/// Normalize DuckDB type strings to comparable form.
+fn normalize_duckdb_type(ty: &str) -> &str {
+    match ty {
+        "INTEGER" => "Int32",
+        "BIGINT" => "Int64",
+        "SMALLINT" => "Int16",
+        "TINYINT" => "Int8",
+        "DOUBLE" | "FLOAT" => "Float64",
+        "VARCHAR" => "Utf8",
+        "BOOLEAN" => "Boolean",
+        "DATE" => "Date32",
+        "TIMESTAMP" => "Timestamp(Microsecond, None)",
+        _ => ty,
+    }
+}
+
+/// R6-S-048: Column names match between DF and DuckDB.
+#[tokio::test(flavor = "multi_thread")]
+async fn cross_engine_schema_column_names_match() {
+    let env = setup_ducklake_catalog().await;
+    let catalog_path = &env.catalog_db_path;
+
+    write_test_data_via_df(catalog_path, "schema_test", &test_records()).await;
+
+    // Get schema from DuckDB
+    let duckdb = DuckDbConn::open(catalog_path);
+    let duckdb_schema = duckdb_table_schema(&duckdb, "schema_test");
+    let duckdb_names: Vec<&str> = duckdb_schema.iter().map(|(n, _)| n.as_str()).collect();
+
+    // Get schema from DataFusion
+    let ctx = open_in_datafusion_duckdb(catalog_path);
+    let df_schema = df_table_schema(&ctx, "schema_test").await;
+    let df_names: Vec<&str> = df_schema.iter().map(|(n, _)| n.as_str()).collect();
+
+    assert_eq!(
+        duckdb_names, df_names,
+        "Column names should match: DuckDB={:?}, DF={:?}",
+        duckdb_names, df_names
+    );
+}
+
+/// R6-S-048: DF writes data, DuckDB verifies column names and types match.
+#[tokio::test(flavor = "multi_thread")]
+async fn cross_engine_df_write_schema_duckdb_verifies() {
+    let env = setup_ducklake_catalog().await;
+    let catalog_path = &env.catalog_db_path;
+
+    // Write a table with varied types
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("big_num", DataType::Int64, true),
+        Field::new("label", DataType::Utf8, true),
+        Field::new("score", DataType::Float64, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(Int64Array::from(vec![100i64])),
+            Arc::new(StringArray::from(vec!["test"])),
+            Arc::new(Float64Array::from(vec![3.14])),
+        ],
+    )
+    .unwrap();
+    write_test_data_via_df(catalog_path, "typed_table", &[batch]).await;
+
+    // DuckDB verifies types
+    let duckdb = DuckDbConn::open(catalog_path);
+    let schema = duckdb_table_schema(&duckdb, "typed_table");
+
+    assert_eq!(schema.len(), 4, "should have 4 columns");
+    assert_eq!(schema[0].0, "id");
+    assert_eq!(schema[1].0, "big_num");
+    assert_eq!(schema[2].0, "label");
+    assert_eq!(schema[3].0, "score");
+
+    // Verify types are compatible
+    assert_eq!(normalize_duckdb_type(&schema[0].1), "Int32");
+    assert_eq!(normalize_duckdb_type(&schema[1].1), "Int64");
+    assert_eq!(normalize_duckdb_type(&schema[2].1), "Utf8");
+    assert_eq!(normalize_duckdb_type(&schema[3].1), "Float64");
+}
+
+// ==================== R6-S-049: BOOLEAN type roundtrip ====================
+
+/// R6-S-049: DF writes BOOLEAN values → DuckDB reads, and vice versa.
+#[tokio::test(flavor = "multi_thread")]
+async fn cross_engine_boolean_type_roundtrip() {
+    let env = setup_ducklake_catalog().await;
+    let catalog_path = &env.catalog_db_path;
+
+    // DF writes boolean data
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("flag", DataType::Boolean, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(BooleanArray::from(vec![Some(true), Some(false), None])),
+        ],
+    )
+    .unwrap();
+    write_test_data_via_df(catalog_path, "bool_test", &[batch]).await;
+
+    // DuckDB reads boolean values
+    let duckdb = DuckDbConn::open(catalog_path);
+    let rows = duckdb.query("SELECT id, flag FROM ducklake.main.bool_test ORDER BY id");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0], vec!["1", "true"]);
+    assert_eq!(rows[1], vec!["2", "false"]);
+    assert_eq!(rows[2][0], "3");
+    // NULL might be "NULL" or empty string depending on DuckDbConn implementation
+    assert!(
+        rows[2][1] == "NULL" || rows[2][1].is_empty(),
+        "null boolean should be NULL, got: '{}'",
+        rows[2][1]
+    );
+
+    // Now DuckDB writes booleans, DF reads
+    let duckdb2 = DuckDbConn::open(catalog_path);
+    duckdb2.execute("CREATE TABLE ducklake.main.bool_duckdb (id INT, active BOOLEAN)");
+    duckdb2
+        .execute("INSERT INTO ducklake.main.bool_duckdb VALUES (1, true), (2, false), (3, NULL)");
+    drop(duckdb2);
+
+    // DF reads DuckDB-written booleans
+    let ctx = open_in_datafusion_duckdb(catalog_path);
+    let rows = df_query(
+        &ctx,
+        "SELECT id, active FROM ducklake.main.bool_duckdb ORDER BY id",
+    )
+    .await;
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0], vec!["1", "true"]);
+    assert_eq!(rows[1], vec!["2", "false"]);
+    assert_eq!(rows[2][0], "3");
+    // DF might show NULL differently
+    assert!(
+        rows[2][1] == "NULL" || rows[2][1].is_empty() || rows[2][1] == "",
+        "null boolean from DF should be NULL, got: '{}'",
+        rows[2][1]
+    );
 }

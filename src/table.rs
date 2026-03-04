@@ -362,11 +362,7 @@ impl DuckLakeTable {
             }
 
             // Parse string values into the appropriate Arrow array type
-            let array = crate::parse_values::parse_string_values_to_array(
-                &string_values,
-                data_type,
-                crate::parse_values::ParseMode::Lenient,
-            )?;
+            let array = crate::table_writer::parse_string_to_array(&string_values, data_type)?;
             column_arrays.push(array);
         }
 
