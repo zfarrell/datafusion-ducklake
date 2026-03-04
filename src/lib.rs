@@ -43,6 +43,7 @@ pub mod encryption;
 pub mod error;
 pub mod information_schema;
 pub mod metadata_provider;
+pub mod parse_values;
 pub mod path_resolver;
 pub mod schema;
 pub mod table;

@@ -165,20 +165,21 @@ async fn test_write_temporal_types() {
         .unwrap();
     assert_eq!(result.records_written, 2);
 
-    // Read back
+    // Read back and verify values
     let ctx = create_read_context(&temp_dir).await;
     let df = ctx
-        .sql("SELECT COUNT(*) as cnt FROM test.main.events")
+        .sql("SELECT id, date FROM test.main.events ORDER BY id")
         .await
         .unwrap();
     let batches = df.collect().await.unwrap();
-    let count = batches[0]
-        .column(0)
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+    let dates = batches[0]
+        .column(1)
         .as_any()
-        .downcast_ref::<Int64Array>()
-        .unwrap()
-        .value(0);
-    assert_eq!(count, 2);
+        .downcast_ref::<Date32Array>()
+        .unwrap();
+    assert_eq!(dates.value(0), 19000, "First date should be day 19000");
+    assert_eq!(dates.value(1), 19001, "Second date should be day 19001");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -210,20 +211,21 @@ async fn test_write_multiple_batches() {
         .unwrap();
     assert_eq!(result.records_written, 4);
 
-    // Read back
+    // Read back and verify values
     let ctx = create_read_context(&temp_dir).await;
     let df = ctx
-        .sql("SELECT COUNT(*) as cnt FROM test.main.data")
+        .sql("SELECT id, value FROM test.main.data ORDER BY id")
         .await
         .unwrap();
     let batches = df.collect().await.unwrap();
-    let count = batches[0]
-        .column(0)
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 4);
+    let values = batches[0]
+        .column(1)
         .as_any()
-        .downcast_ref::<Int64Array>()
-        .unwrap()
-        .value(0);
-    assert_eq!(count, 4);
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(values.value(0), "a", "First value should be 'a'");
 }
 
 #[tokio::test(flavor = "multi_thread")]
