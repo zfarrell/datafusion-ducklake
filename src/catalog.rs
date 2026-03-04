@@ -255,7 +255,7 @@ impl CatalogProvider for DuckLakeCatalog {
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
         // Update snapshot so subsequent lookups see the change
-        self.snapshot_id.store(new_snapshot, Ordering::Release);
+        self.snapshot_id.fetch_max(new_snapshot, Ordering::Release);
 
         // Return the schema provider that was dropped
         let schema_path = resolve_path(&self.catalog_path, &meta.path, meta.path_is_relative)
@@ -312,7 +312,7 @@ impl CatalogProvider for DuckLakeCatalog {
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
         // Update snapshot so subsequent lookups see the new schema
-        self.snapshot_id.store(new_snapshot, Ordering::Release);
+        self.snapshot_id.fetch_max(new_snapshot, Ordering::Release);
 
         // Build the schema provider
         let schema_path = resolve_path(&self.catalog_path, name, true)
@@ -325,7 +325,8 @@ impl CatalogProvider for DuckLakeCatalog {
             self.object_store_url.clone(),
             schema_path,
         )
-        .with_writer(Arc::clone(&config.writer));
+        .with_writer(Arc::clone(&config.writer))
+        .with_catalog_snapshot_id(Arc::clone(&self.snapshot_id));
 
         if let Some(ref store) = config.object_store {
             schema = schema.with_object_store(Arc::clone(store));

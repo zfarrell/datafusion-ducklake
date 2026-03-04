@@ -251,9 +251,10 @@ pub fn parse_string_values_to_array(
             let mut builder = Decimal128Builder::with_capacity(values.len());
             for val in values {
                 match val {
-                    Some(s) => {
-                        let i128_val = parse_decimal_string(s, *scale)?;
-                        builder.append_value(i128_val);
+                    Some(s) => match parse_decimal_string(s, *scale) {
+                        Ok(i128_val) => builder.append_value(i128_val),
+                        Err(_) if mode == ParseMode::Lenient => builder.append_null(),
+                        Err(e) => return Err(e),
                     },
                     None => builder.append_null(),
                 }
@@ -274,9 +275,12 @@ pub fn parse_string_values_to_array(
             let mut builder = Decimal256Builder::with_capacity(values.len());
             for val in values {
                 match val {
-                    Some(s) => {
-                        let i128_val = parse_decimal_string(s, *scale)?;
-                        builder.append_value(arrow::datatypes::i256::from_i128(i128_val));
+                    Some(s) => match parse_decimal_string(s, *scale) {
+                        Ok(i128_val) => {
+                            builder.append_value(arrow::datatypes::i256::from_i128(i128_val));
+                        },
+                        Err(_) if mode == ParseMode::Lenient => builder.append_null(),
+                        Err(e) => return Err(e),
                     },
                     None => builder.append_null(),
                 }

@@ -376,7 +376,7 @@ impl SchemaProvider for DuckLakeSchema {
 
         // Propagate new snapshot to parent catalog so subsequent lookups see the change
         if let Some(ref catalog_sid) = self.catalog_snapshot_id {
-            catalog_sid.store(new_snapshot, Ordering::Release);
+            catalog_sid.fetch_max(new_snapshot, Ordering::Release);
         }
 
         Ok(Some(Arc::new(table) as Arc<dyn TableProvider>))
@@ -442,7 +442,7 @@ impl SchemaProvider for DuckLakeSchema {
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
             // Propagate new snapshot to parent catalog
             if let Some(ref catalog_sid) = self.catalog_snapshot_id {
-                catalog_sid.store(result.snapshot_id, Ordering::Release);
+                catalog_sid.fetch_max(result.snapshot_id, Ordering::Release);
             }
         } else {
             // CTAS with data — write to Parquet and create metadata in one operation.
@@ -461,7 +461,7 @@ impl SchemaProvider for DuckLakeSchema {
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
             // Propagate new snapshot to parent catalog
             if let Some(ref catalog_sid) = self.catalog_snapshot_id {
-                catalog_sid.store(result.snapshot_id, Ordering::Release);
+                catalog_sid.fetch_max(result.snapshot_id, Ordering::Release);
             }
         }
 

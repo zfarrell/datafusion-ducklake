@@ -1361,8 +1361,10 @@ fn parquet_stats_min_max(
             );
             if is_decimal {
                 (
-                    vs.min_opt().map(|v| decode_decimal_bytes(v.data())),
-                    vs.max_opt().map(|v| decode_decimal_bytes(v.data())),
+                    vs.min_opt()
+                        .and_then(|v| decode_decimal_bytes(v.data()).ok()),
+                    vs.max_opt()
+                        .and_then(|v| decode_decimal_bytes(v.data()).ok()),
                 )
             } else {
                 (
@@ -1378,9 +1380,16 @@ fn parquet_stats_min_max(
 }
 
 /// Decode a big-endian two's complement byte array to a decimal string.
-fn decode_decimal_bytes(bytes: &[u8]) -> String {
+///
+/// Returns an error if the input exceeds 16 bytes (R7-S-007).
+fn decode_decimal_bytes(bytes: &[u8]) -> crate::Result<String> {
     if bytes.is_empty() {
-        return "0".to_string();
+        return Ok("0".to_string());
+    }
+    if bytes.len() > 16 {
+        return Err(crate::error::DuckLakeError::Internal(
+            "Decimal value exceeds 16 bytes".into(),
+        ));
     }
     // Sign-extend to 16 bytes for i128
     let negative = bytes[0] & 0x80 != 0;
@@ -1390,10 +1399,10 @@ fn decode_decimal_bytes(bytes: &[u8]) -> String {
         0x00
     };
     let mut padded = [fill; 16];
-    let start = 16usize.saturating_sub(bytes.len());
+    let start = 16 - bytes.len();
     padded[start..].copy_from_slice(bytes);
     let value = i128::from_be_bytes(padded);
-    value.to_string()
+    Ok(value.to_string())
 }
 
 /// Decide whether a new min value should replace the current one.

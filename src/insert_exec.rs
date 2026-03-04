@@ -51,14 +51,18 @@ pub enum PartitionTransform {
 impl PartitionTransform {
     /// Parse an optional transform string into a [`PartitionTransform`].
     /// `None`, empty, or `"identity"` all map to [`PartitionTransform::Identity`].
-    pub fn from_str_opt(s: Option<&str>) -> Self {
+    /// Returns an error for unrecognized transform strings (R7-S-003).
+    pub fn from_str_opt(s: Option<&str>) -> crate::Result<Self> {
         match s.map(|t| t.to_lowercase()).as_deref() {
-            None | Some("") | Some("identity") => Self::Identity,
-            Some("year") => Self::Year,
-            Some("month") => Self::Month,
-            Some("day") => Self::Day,
-            Some("hour") => Self::Hour,
-            Some(_) => Self::Identity,
+            None | Some("") | Some("identity") => Ok(Self::Identity),
+            Some("year") => Ok(Self::Year),
+            Some("month") => Ok(Self::Month),
+            Some("day") => Ok(Self::Day),
+            Some("hour") => Ok(Self::Hour),
+            Some(other) => Err(DuckLakeError::InvalidConfig(format!(
+                "Unknown partition transform: {}",
+                other
+            ))),
         }
     }
 }
@@ -929,45 +933,48 @@ mod tests {
     #[test]
     fn test_partition_transform_from_str_opt() {
         assert_eq!(
-            PartitionTransform::from_str_opt(None),
+            PartitionTransform::from_str_opt(None).unwrap(),
             PartitionTransform::Identity
         );
         assert_eq!(
-            PartitionTransform::from_str_opt(Some("")),
+            PartitionTransform::from_str_opt(Some("")).unwrap(),
             PartitionTransform::Identity
         );
         assert_eq!(
-            PartitionTransform::from_str_opt(Some("identity")),
+            PartitionTransform::from_str_opt(Some("identity")).unwrap(),
             PartitionTransform::Identity
         );
         assert_eq!(
-            PartitionTransform::from_str_opt(Some("IDENTITY")),
+            PartitionTransform::from_str_opt(Some("IDENTITY")).unwrap(),
             PartitionTransform::Identity
         );
         assert_eq!(
-            PartitionTransform::from_str_opt(Some("year")),
+            PartitionTransform::from_str_opt(Some("year")).unwrap(),
             PartitionTransform::Year
         );
         assert_eq!(
-            PartitionTransform::from_str_opt(Some("Year")),
+            PartitionTransform::from_str_opt(Some("Year")).unwrap(),
             PartitionTransform::Year
         );
         assert_eq!(
-            PartitionTransform::from_str_opt(Some("month")),
+            PartitionTransform::from_str_opt(Some("month")).unwrap(),
             PartitionTransform::Month
         );
         assert_eq!(
-            PartitionTransform::from_str_opt(Some("day")),
+            PartitionTransform::from_str_opt(Some("day")).unwrap(),
             PartitionTransform::Day
         );
         assert_eq!(
-            PartitionTransform::from_str_opt(Some("hour")),
+            PartitionTransform::from_str_opt(Some("hour")).unwrap(),
             PartitionTransform::Hour
         );
-        // Unknown transforms default to Identity
-        assert_eq!(
-            PartitionTransform::from_str_opt(Some("yer")),
-            PartitionTransform::Identity
+        // Unknown transforms return an error (R7-S-003)
+        let err = PartitionTransform::from_str_opt(Some("yer"));
+        assert!(err.is_err());
+        assert!(
+            err.unwrap_err()
+                .to_string()
+                .contains("Unknown partition transform: yer")
         );
     }
 

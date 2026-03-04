@@ -17,7 +17,7 @@
 
 #![cfg(feature = "metadata-duckdb")]
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use arrow::array::{ArrayRef, BooleanArray, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -32,8 +32,10 @@ use datafusion::logical_expr::Expr;
 /// Used as default when no explicit `older_than` is provided (R6-S-052).
 const DEFAULT_OLDER_THAN: &str = "2099-01-01";
 
-/// Global flag to ensure `INSTALL ducklake` is only executed once per process (R6-S-026).
-static DUCKLAKE_INSTALLED: OnceLock<()> = OnceLock::new();
+/// Global flag to track whether `INSTALL ducklake` has succeeded (R6-S-026, R7-S-001).
+/// Uses `Mutex<bool>` instead of `OnceLock<()>` so that a failed INSTALL can be retried
+/// on the next call rather than permanently caching the failure.
+static DUCKLAKE_INSTALLED: Mutex<bool> = Mutex::new(false);
 
 // ==================== Schemas ====================
 
@@ -78,9 +80,15 @@ fn open_compaction_connection(catalog_path: &str) -> DataFusionResult<duckdb::Co
         .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
     // Only INSTALL once per process — the extension is cached on disk (R6-S-026).
     // INSTALL is idempotent but has overhead; LOAD is still needed per-connection.
-    DUCKLAKE_INSTALLED.get_or_init(|| {
-        let _ = conn.execute("INSTALL ducklake;", []);
-    });
+    // Uses Mutex<bool> so failures can be retried on subsequent calls (R7-S-001).
+    {
+        let mut installed = DUCKLAKE_INSTALLED.lock().unwrap_or_else(|e| e.into_inner());
+        if !*installed {
+            conn.execute("INSTALL ducklake;", [])
+                .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+            *installed = true;
+        }
+    }
     conn.execute("LOAD ducklake;", [])
         .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
     let attach_sql = format!(

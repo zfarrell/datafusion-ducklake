@@ -958,7 +958,11 @@ impl DuckLakeTable {
                     let file_value = values.iter().find(|(ki, _)| ki == key_index);
                     match file_value {
                         Some((_, actual_value)) => {
-                            if actual_value.as_deref() != Some(expected_value.as_str()) {
+                            let matches = match actual_value.as_deref() {
+                                Some(actual) => partition_values_equal(actual, expected_value),
+                                None => false,
+                            };
+                            if !matches {
                                 return false; // Partition value doesn't match
                             }
                         },
@@ -1290,6 +1294,23 @@ fn scalar_value_to_partition_string(value: &datafusion::common::ScalarValue) -> 
             .map(|dt| dt.format("%Y-%m-%d").to_string()),
         _ => None,
     }
+}
+
+/// Type-aware comparison of partition values (R7-S-005).
+///
+/// Tries numeric (f64) comparison first so that "10" and "10.0" are considered
+/// equal and ordering is numeric rather than lexicographic. Falls back to
+/// exact string comparison for non-numeric values.
+fn partition_values_equal(actual: &str, expected: &str) -> bool {
+    // Fast path: exact string match
+    if actual == expected {
+        return true;
+    }
+    // Try numeric comparison for values that parse as numbers
+    if let (Ok(a), Ok(b)) = (actual.parse::<f64>(), expected.parse::<f64>()) {
+        return a == b;
+    }
+    false
 }
 
 #[async_trait]
@@ -1750,16 +1771,19 @@ impl TableProvider for DuckLakeTable {
                     .fields()
                     .iter()
                     .position(|f| f.name() == &pc.column_name)?;
-                Some(crate::insert_exec::WritePartitionColumn {
-                    column_name: pc.column_name.clone(),
-                    column_index: col_idx,
-                    resolved_transform: crate::insert_exec::PartitionTransform::from_str_opt(
-                        pc.transform.as_deref(),
-                    ),
-                    transform: pc.transform.clone(),
-                })
+                let resolved_transform =
+                    crate::insert_exec::PartitionTransform::from_str_opt(pc.transform.as_deref())
+                        .map_err(|e| DataFusionError::External(Box::new(e)));
+                Some(
+                    resolved_transform.map(|rt| crate::insert_exec::WritePartitionColumn {
+                        column_name: pc.column_name.clone(),
+                        column_index: col_idx,
+                        resolved_transform: rt,
+                        transform: pc.transform.clone(),
+                    }),
+                )
             })
-            .collect();
+            .collect::<DataFusionResult<Vec<_>>>()?;
 
         let exec = DuckLakeInsertExec::new(
             actual_input,
