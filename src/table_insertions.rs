@@ -103,7 +103,20 @@ impl TableProvider for TableInsertionsTable {
                 Some(indices) => {
                     let fields: Vec<arrow::datatypes::Field> = indices
                         .iter()
-                        .map(|&i| self.table_schema.field(i).clone())
+                        .map(|&i| {
+                            self.table_schema.fields().get(i).cloned().ok_or_else(|| {
+                                DataFusionError::External(Box::new(
+                                    crate::error::DuckLakeError::Internal(format!(
+                                        "Projection index {} out of bounds ({})",
+                                        i,
+                                        self.table_schema.fields().len()
+                                    )),
+                                ))
+                            })
+                        })
+                        .collect::<std::result::Result<Vec<_>, _>>()?
+                        .into_iter()
+                        .map(|f| f.as_ref().clone())
                         .collect();
                     Arc::new(arrow::datatypes::Schema::new(fields))
                 },

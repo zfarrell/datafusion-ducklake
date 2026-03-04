@@ -413,6 +413,157 @@ fn validate_drop_not_null(
     })
 }
 
+/// Validate a DuckLake type string for safe use in DDL (R6-S-029, R7-S-009).
+/// Rejects types containing characters that could enable SQL injection.
+/// Only allows alphanumeric, parentheses, commas, spaces, underscores, and dots.
+/// Shared across all backends so any backend doing DDL interpolation is protected.
+pub(crate) fn validate_ducklake_type_for_ddl(type_str: &str) -> Result<()> {
+    if type_str.is_empty() {
+        return Err(DuckLakeError::InvalidConfig(
+            "empty DuckLake type in DDL".into(),
+        ));
+    }
+    for ch in type_str.chars() {
+        if !ch.is_alphanumeric() && !matches!(ch, '(' | ')' | ',' | ' ' | '_' | '.') {
+            return Err(DuckLakeError::InvalidConfig(format!(
+                "invalid character '{}' in DuckLake type '{}' for DDL",
+                ch, type_str
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Check if a DuckLake column type string represents a numeric type (R7-S-022).
+/// Shared across all backends for consistent type-aware stats comparison.
+pub(crate) fn is_numeric_type(column_type: &str) -> bool {
+    let t = column_type.to_uppercase();
+    let base = t.split('(').next().unwrap_or(&t).trim();
+    matches!(
+        base,
+        "TINYINT"
+            | "SMALLINT"
+            | "INTEGER"
+            | "INT"
+            | "BIGINT"
+            | "HUGEINT"
+            | "UTINYINT"
+            | "USMALLINT"
+            | "UINTEGER"
+            | "UBIGINT"
+            | "FLOAT"
+            | "REAL"
+            | "DOUBLE"
+            | "DECIMAL"
+            | "NUMERIC"
+            | "INT8"
+            | "INT16"
+            | "INT32"
+            | "INT64"
+            | "UINT8"
+            | "UINT16"
+            | "UINT32"
+            | "UINT64"
+            | "FLOAT4"
+            | "FLOAT8"
+    )
+}
+
+/// Compare two stat value strings: returns true if `a < b` (R7-S-022).
+/// For numeric types, attempts numeric parsing; falls back to lexicographic.
+/// Shared across all backends for consistent column stats aggregation.
+pub(crate) fn stat_value_less_than(a: &str, b: &str, is_numeric: bool) -> bool {
+    if is_numeric {
+        if let (Ok(ia), Ok(ib)) = (a.parse::<i128>(), b.parse::<i128>()) {
+            return ia < ib;
+        }
+        if let Some(ord) = cmp_decimal_strings(a, b) {
+            return ord == std::cmp::Ordering::Less;
+        }
+    }
+    a < b
+}
+
+/// Compare two decimal number strings without f64 conversion (R6-S-019, R7-S-022).
+pub(crate) fn cmp_decimal_strings(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    fn parse_parts(s: &str) -> Option<(bool, &str, &str)> {
+        let s = s.trim();
+        let (neg, s) = if let Some(rest) = s.strip_prefix('-') {
+            (true, rest)
+        } else if let Some(rest) = s.strip_prefix('+') {
+            (false, rest)
+        } else {
+            (false, s)
+        };
+        if s.is_empty() || s.chars().any(|c| !c.is_ascii_digit() && c != '.') {
+            return None;
+        }
+        if s.matches('.').count() > 1 {
+            return None;
+        }
+        let (int_part, frac_part) = match s.split_once('.') {
+            Some((i, f)) => (i, f),
+            None => (s, ""),
+        };
+        Some((neg, int_part, frac_part))
+    }
+
+    fn cmp_magnitude(a_int: &str, a_frac: &str, b_int: &str, b_frac: &str) -> std::cmp::Ordering {
+        let ai = a_int.trim_start_matches('0');
+        let bi = b_int.trim_start_matches('0');
+        match ai.len().cmp(&bi.len()) {
+            std::cmp::Ordering::Equal => {},
+            ord => return ord,
+        }
+        match ai.cmp(bi) {
+            std::cmp::Ordering::Equal => {},
+            ord => return ord,
+        }
+        let a_bytes = a_frac.as_bytes();
+        let b_bytes = b_frac.as_bytes();
+        let max_len = a_bytes.len().max(b_bytes.len());
+        for i in 0..max_len {
+            let ac = a_bytes.get(i).copied().unwrap_or(b'0');
+            let bc = b_bytes.get(i).copied().unwrap_or(b'0');
+            match ac.cmp(&bc) {
+                std::cmp::Ordering::Equal => continue,
+                ord => return ord,
+            }
+        }
+        std::cmp::Ordering::Equal
+    }
+
+    let (a_neg, a_int, a_frac) = parse_parts(a)?;
+    let (b_neg, b_int, b_frac) = parse_parts(b)?;
+
+    match (a_neg, b_neg) {
+        (true, false) => {
+            let a_zero =
+                a_int.trim_start_matches('0').is_empty() && a_frac.trim_end_matches('0').is_empty();
+            let b_zero =
+                b_int.trim_start_matches('0').is_empty() && b_frac.trim_end_matches('0').is_empty();
+            if a_zero && b_zero {
+                Some(std::cmp::Ordering::Equal)
+            } else {
+                Some(std::cmp::Ordering::Less)
+            }
+        },
+        (false, true) => {
+            let a_zero =
+                a_int.trim_start_matches('0').is_empty() && a_frac.trim_end_matches('0').is_empty();
+            let b_zero =
+                b_int.trim_start_matches('0').is_empty() && b_frac.trim_end_matches('0').is_empty();
+            if a_zero && b_zero {
+                Some(std::cmp::Ordering::Equal)
+            } else {
+                Some(std::cmp::Ordering::Greater)
+            }
+        },
+        (false, false) => Some(cmp_magnitude(a_int, a_frac, b_int, b_frac)),
+        (true, true) => Some(cmp_magnitude(b_int, b_frac, a_int, a_frac)),
+    }
+}
+
 /// Allowed partition transform values. Empty/None maps to identity.
 const ALLOWED_PARTITION_TRANSFORMS: &[&str] = &["identity", "year", "month", "day", "hour"];
 

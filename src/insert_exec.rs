@@ -534,7 +534,13 @@ fn route_batches_identity(
         let col_values: Vec<Vec<Option<String>>> = partition_columns
             .iter()
             .map(|pc| {
-                let array = batch.column(pc.column_index);
+                let array = batch.columns().get(pc.column_index).ok_or_else(|| {
+                    crate::error::DuckLakeError::Internal(format!(
+                        "Partition column index {} out of bounds ({})",
+                        pc.column_index,
+                        batch.num_columns()
+                    ))
+                })?;
                 precompute_identity_values(array.as_ref())
             })
             .collect::<crate::Result<Vec<_>>>()?;
@@ -656,7 +662,13 @@ fn route_batches_generic(
         for row_idx in 0..batch.num_rows() {
             let mut values = Vec::with_capacity(partition_columns.len());
             for pc in partition_columns {
-                let array = batch.column(pc.column_index);
+                let array = batch.columns().get(pc.column_index).ok_or_else(|| {
+                    crate::error::DuckLakeError::Internal(format!(
+                        "Partition column index {} out of bounds ({})",
+                        pc.column_index,
+                        batch.num_columns()
+                    ))
+                })?;
                 let val = compute_partition_value(array.as_ref(), row_idx, pc.resolved_transform)?;
                 values.push(val);
             }

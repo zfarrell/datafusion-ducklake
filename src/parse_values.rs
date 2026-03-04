@@ -201,11 +201,11 @@ pub fn parse_string_values_to_array(
             macro_rules! build_timestamp {
                 ($builder_ty:ty, $convert:expr) => {{
                     let mut builder = <$builder_ty>::with_capacity(values.len());
-                    let convert_fn: fn(i64) -> i64 = $convert;
+                    let convert_fn: fn(i64) -> crate::Result<i64> = $convert;
                     for val in values {
                         match val {
                             Some(s) => match parse_ts_to_us(s) {
-                                Some(us) => builder.append_value(convert_fn(us)),
+                                Some(us) => builder.append_value(convert_fn(us)?),
                                 None => match mode {
                                     ParseMode::Lenient => builder.append_null(),
                                     ParseMode::Strict => {
@@ -228,16 +228,22 @@ pub fn parse_string_values_to_array(
 
             match unit {
                 TimeUnit::Second => {
-                    build_timestamp!(TimestampSecondBuilder, |us: i64| us / 1_000_000)
+                    build_timestamp!(TimestampSecondBuilder, |us: i64| Ok(us / 1_000_000))
                 },
                 TimeUnit::Millisecond => {
-                    build_timestamp!(TimestampMillisecondBuilder, |us: i64| us / 1_000)
+                    build_timestamp!(TimestampMillisecondBuilder, |us: i64| Ok(us / 1_000))
                 },
                 TimeUnit::Microsecond => {
-                    build_timestamp!(TimestampMicrosecondBuilder, |us: i64| us)
+                    build_timestamp!(TimestampMicrosecondBuilder, |us: i64| Ok(us))
                 },
                 TimeUnit::Nanosecond => {
-                    build_timestamp!(TimestampNanosecondBuilder, |us: i64| us * 1_000)
+                    build_timestamp!(TimestampNanosecondBuilder, |us: i64| {
+                        us.checked_mul(1_000).ok_or_else(|| {
+                            crate::error::DuckLakeError::Internal(
+                                "Timestamp nanosecond overflow".into(),
+                            )
+                        })
+                    })
                 },
             }
         },
