@@ -3,10 +3,11 @@
 //! Requires multi-threaded Tokio runtime (`#[tokio::test(flavor = "multi_thread")]`).
 
 use crate::Result;
+use crate::error::DuckLakeError;
 use crate::metadata_provider::block_on;
 use crate::metadata_writer::{
     AlterTableOp, ColumnDef, ColumnStatInfo, DataFileInfo, DeleteFileInfo, MetadataWriter,
-    WriteMode, WriteSetupResult,
+    ReplaceFileEntry, WriteMode, WriteSetupResult,
 };
 use crate::metadata_writer_validation::{
     ActiveColumnInfo, AlterTableAction, validate_alter_table, validate_no_duplicate_columns,
@@ -152,7 +153,7 @@ const SQL_CREATE_TABLES: &[&str] = &[
         value VARCHAR
     )",
     "CREATE TABLE IF NOT EXISTS ducklake_table_stats (
-        table_id BIGINT,
+        table_id BIGINT PRIMARY KEY,
         record_count BIGINT,
         next_row_id BIGINT,
         file_size_bytes BIGINT
@@ -945,11 +946,13 @@ impl MetadataWriter for PostgresMetadataWriter {
             let mut tx = self.pool.begin().await?;
 
             // Get current next_row_id from table_stats (F-011: row_id_start)
-            let stats_row =
-                sqlx::query("SELECT next_row_id FROM ducklake_table_stats WHERE table_id = $1")
-                    .bind(table_id)
-                    .fetch_optional(&mut *tx)
-                    .await?;
+            // R6-S-033: Use FOR UPDATE to prevent concurrent row_id allocation races
+            let stats_row = sqlx::query(
+                "SELECT next_row_id FROM ducklake_table_stats WHERE table_id = $1 FOR UPDATE",
+            )
+            .bind(table_id)
+            .fetch_optional(&mut *tx)
+            .await?;
             let row_id_start: i64 = match stats_row {
                 Some(r) => r.try_get::<Option<i64>, _>(0)?.unwrap_or(0),
                 None => 0,
@@ -972,7 +975,9 @@ impl MetadataWriter for PostgresMetadataWriter {
             let data_file_id: i64 = row.try_get(0)?;
 
             // Update ducklake_table_stats (F-012: table_stats population)
-            let new_next_row_id = row_id_start + file.record_count;
+            let new_next_row_id = row_id_start
+                .checked_add(file.record_count)
+                .ok_or_else(|| DuckLakeError::Internal("row_id overflow".into()))?;
             let updated = sqlx::query(
                 "UPDATE ducklake_table_stats
                  SET record_count = COALESCE(record_count, 0) + $1,
@@ -1017,8 +1022,141 @@ impl MetadataWriter for PostgresMetadataWriter {
             .execute(&mut *tx)
             .await?;
 
+            // R6-S-004: End active delete files in Replace mode (parity with SQLite)
+            sqlx::query(
+                "UPDATE ducklake_delete_file SET end_snapshot = $1
+                 WHERE table_id = $2 AND end_snapshot IS NULL",
+            )
+            .bind(snapshot_id)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // R6-S-004: Reset table_stats so subsequent INSERTs start from 0
+            sqlx::query(
+                "UPDATE ducklake_table_stats
+                 SET record_count = 0, next_row_id = 0, file_size_bytes = 0
+                 WHERE table_id = $1",
+            )
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
             tx.commit().await?;
             Ok(result.rows_affected())
+        })
+    }
+
+    // R6-S-018: Atomic replace_table_files override (parity with SQLite)
+    fn replace_table_files(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        files: &[ReplaceFileEntry],
+    ) -> Result<Vec<i64>> {
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+
+            // End all existing data files
+            sqlx::query(
+                "UPDATE ducklake_data_file SET end_snapshot = $1
+                 WHERE table_id = $2 AND end_snapshot IS NULL",
+            )
+            .bind(snapshot_id)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            let mut ids = Vec::with_capacity(files.len());
+            let mut cumulative_row_id: i64 = 0;
+            for entry in files {
+                let path_is_relative = entry.file_info.path_is_relative;
+                let row = sqlx::query(
+                    "INSERT INTO ducklake_data_file (table_id, path, path_is_relative, file_size_bytes, footer_size, record_count, row_id_start, begin_snapshot)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING data_file_id",
+                )
+                .bind(table_id)
+                .bind(&entry.file_info.path)
+                .bind(path_is_relative)
+                .bind(entry.file_info.file_size_bytes)
+                .bind(entry.file_info.footer_size)
+                .bind(entry.file_info.record_count)
+                .bind(cumulative_row_id)
+                .bind(snapshot_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                let data_file_id: i64 = row.try_get(0)?;
+
+                // Register column stats
+                for stat in &entry.file_info.column_stats {
+                    sqlx::query(
+                        "INSERT INTO ducklake_file_column_stats (data_file_id, table_id, column_id, null_count, min_value, max_value)
+                         VALUES ($1, $2, $3, $4, $5, $6)",
+                    )
+                    .bind(data_file_id)
+                    .bind(table_id)
+                    .bind(stat.column_id)
+                    .bind(stat.null_count)
+                    .bind(&stat.min_value)
+                    .bind(&stat.max_value)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+
+                // Register partition values
+                for (key_index, val) in &entry.partition_values {
+                    sqlx::query(
+                        "INSERT INTO ducklake_file_partition_value (data_file_id, table_id, partition_key_index, partition_value)
+                         VALUES ($1, $2, $3, $4)",
+                    )
+                    .bind(data_file_id)
+                    .bind(table_id)
+                    .bind(key_index)
+                    .bind(val.as_deref())
+                    .execute(&mut *tx)
+                    .await?;
+                }
+
+                cumulative_row_id = cumulative_row_id
+                    .checked_add(entry.file_info.record_count)
+                    .ok_or_else(|| {
+                        DuckLakeError::Internal("row_id overflow during compaction".into())
+                    })?;
+                ids.push(data_file_id);
+            }
+
+            // Recalculate ducklake_table_stats from new files
+            let total_record_count: i64 = files.iter().map(|f| f.file_info.record_count).sum();
+            let total_file_size: i64 = files.iter().map(|f| f.file_info.file_size_bytes).sum();
+            let updated = sqlx::query(
+                "UPDATE ducklake_table_stats
+                 SET record_count = $1,
+                     next_row_id = $2,
+                     file_size_bytes = $3
+                 WHERE table_id = $4",
+            )
+            .bind(total_record_count)
+            .bind(total_record_count)
+            .bind(total_file_size)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            if updated.rows_affected() == 0 {
+                sqlx::query(
+                    "INSERT INTO ducklake_table_stats (table_id, record_count, next_row_id, file_size_bytes)
+                     VALUES ($1, $2, $3, $4)",
+                )
+                .bind(table_id)
+                .bind(total_record_count)
+                .bind(total_record_count)
+                .bind(total_file_size)
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            tx.commit().await?;
+            Ok(ids)
         })
     }
 
@@ -1035,7 +1173,24 @@ impl MetadataWriter for PostgresMetadataWriter {
         block_on(async {
             let mut tx = self.pool.begin().await?;
 
+            // R6-S-003: Track net new deletions to decrement record_count (parity with SQLite)
+            let mut total_net_new_deletions: i64 = 0;
+
             for file in delete_files {
+                // R6-S-003: Get the old delete_count before ending the existing delete file
+                let old_row = sqlx::query(
+                    "SELECT COALESCE(delete_count, 0) FROM ducklake_delete_file
+                     WHERE data_file_id = $1 AND table_id = $2 AND end_snapshot IS NULL",
+                )
+                .bind(file.data_file_id)
+                .bind(table_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+                let old_delete_count: i64 = match old_row {
+                    Some(r) => r.try_get(0)?,
+                    None => 0,
+                };
+
                 // End any existing active delete file for this data file
                 sqlx::query(
                     "UPDATE ducklake_delete_file SET end_snapshot = $1
@@ -1062,16 +1217,33 @@ impl MetadataWriter for PostgresMetadataWriter {
                 .bind(snapshot_id)
                 .execute(&mut *tx)
                 .await?;
+
+                total_net_new_deletions += file.delete_count - old_delete_count;
+            }
+
+            // R6-S-003: Decrement record_count by net new deletions
+            if total_net_new_deletions > 0 {
+                sqlx::query(
+                    "UPDATE ducklake_table_stats
+                     SET record_count = COALESCE(record_count, 0) - $1
+                     WHERE table_id = $2",
+                )
+                .bind(total_net_new_deletions)
+                .bind(table_id)
+                .execute(&mut *tx)
+                .await?;
             }
 
             // R3F-002: For each new data file, set row_id_start and update table_stats
             for file in data_files {
                 // Get current next_row_id from table_stats
-                let stats_row =
-                    sqlx::query("SELECT next_row_id FROM ducklake_table_stats WHERE table_id = $1")
-                        .bind(table_id)
-                        .fetch_optional(&mut *tx)
-                        .await?;
+                // R6-S-033: Use FOR UPDATE to prevent concurrent row_id allocation races
+                let stats_row = sqlx::query(
+                    "SELECT next_row_id FROM ducklake_table_stats WHERE table_id = $1 FOR UPDATE",
+                )
+                .bind(table_id)
+                .fetch_optional(&mut *tx)
+                .await?;
                 let row_id_start: i64 = match stats_row {
                     Some(r) => r.try_get::<Option<i64>, _>(0)?.unwrap_or(0),
                     None => 0,
@@ -1093,7 +1265,9 @@ impl MetadataWriter for PostgresMetadataWriter {
                 .await?;
 
                 // Update ducklake_table_stats
-                let new_next_row_id = row_id_start + file.record_count;
+                let new_next_row_id = row_id_start
+                    .checked_add(file.record_count)
+                    .ok_or_else(|| DuckLakeError::Internal("row_id overflow".into()))?;
                 let updated = sqlx::query(
                     "UPDATE ducklake_table_stats
                      SET record_count = COALESCE(record_count, 0) + $1,
