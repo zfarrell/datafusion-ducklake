@@ -58,7 +58,7 @@ impl PartitionTransform {
             Some("month") => Self::Month,
             Some("day") => Self::Day,
             Some("hour") => Self::Hour,
-            Some(_) => Self::Identity, // unknown transforms default to identity
+            Some(_) => Self::Identity,
         }
     }
 }

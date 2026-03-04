@@ -364,11 +364,14 @@ impl ExecutionPlan for DuckLakeDeleteExec {
                 let footer_size = calculate_footer_size_from_bytes(&buffer)
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-                // Upload to object store
-                object_store
+                // R6-S-037: Upload to object store; clean up prior uploads on failure
+                if let Err(e) = object_store
                     .put(&delete_object_path, PutPayload::from(buffer))
                     .await
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                {
+                    cleanup_orphaned_files(&*object_store, &uploaded_files).await;
+                    return Err(DataFusionError::External(Box::new(e)));
+                }
                 uploaded_files.push(delete_object_path);
 
                 // Collect delete file info for atomic batch registration
@@ -385,10 +388,14 @@ impl ExecutionPlan for DuckLakeDeleteExec {
                 return Ok(RecordBatch::try_new(output_schema, vec![count_array])?);
             }
 
-            // Create a snapshot for this delete operation (deferred until we know rows are affected)
-            let snapshot_id = writer
-                .create_snapshot()
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            // R6-S-038: Create snapshot; clean up uploads if snapshot creation fails
+            let snapshot_id = match writer.create_snapshot() {
+                Ok(id) => id,
+                Err(e) => {
+                    cleanup_orphaned_files(&*object_store, &uploaded_files).await;
+                    return Err(DataFusionError::External(Box::new(e)));
+                },
+            };
 
             // Atomically register all delete files
             if let Err(e) =
