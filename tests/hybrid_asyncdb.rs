@@ -1061,6 +1061,85 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_transaction_routing_end_to_end() {
+        use sqllogictest::AsyncDB;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let catalog_path = temp_dir.path().join("test_tx_routing.ducklake");
+        let mut db = HybridDuckLakeDB::new(catalog_path).unwrap();
+
+        // Create a table outside a transaction
+        let _ = db
+            .run("CREATE TABLE ducklake.t_route(id INTEGER, val VARCHAR)")
+            .await;
+
+        // Insert initial data outside transaction so DataFusion can see it
+        let _ = db
+            .run("INSERT INTO ducklake.t_route VALUES (1, 'committed')")
+            .await;
+
+        // Verify DataFusion can read the committed row
+        let result = db
+            .run("SELECT id, val FROM ducklake.main.t_route ORDER BY id")
+            .await
+            .unwrap();
+        match &result {
+            sqllogictest::DBOutput::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1, "Should see 1 committed row via DataFusion");
+                assert_eq!(rows[0], vec!["1", "committed"]);
+            }
+            _ => panic!("Expected Rows output"),
+        }
+
+        // BEGIN a transaction
+        let _ = db.run("BEGIN").await;
+
+        // Insert uncommitted data (routed to DuckDB)
+        let _ = db
+            .run("INSERT INTO ducklake.t_route VALUES (2, 'uncommitted')")
+            .await;
+
+        // Read inside transaction — should route to DuckDB and see uncommitted data
+        let result = db
+            .run("SELECT id, val FROM ducklake.t_route ORDER BY id")
+            .await
+            .unwrap();
+        match &result {
+            sqllogictest::DBOutput::Rows { rows, .. } => {
+                assert_eq!(
+                    rows.len(),
+                    2,
+                    "DuckDB should see both committed and uncommitted rows"
+                );
+                assert_eq!(rows[0], vec!["1", "committed"]);
+                assert_eq!(rows[1], vec!["2", "uncommitted"]);
+            }
+            _ => panic!("Expected Rows output"),
+        }
+
+        // COMMIT the transaction
+        let _ = db.run("COMMIT").await;
+
+        // Read after commit — should route to DataFusion and see all data
+        let result = db
+            .run("SELECT id, val FROM ducklake.main.t_route ORDER BY id")
+            .await
+            .unwrap();
+        match &result {
+            sqllogictest::DBOutput::Rows { rows, .. } => {
+                assert_eq!(
+                    rows.len(),
+                    2,
+                    "DataFusion should see both rows after commit"
+                );
+                assert_eq!(rows[0], vec!["1", "committed"]);
+                assert_eq!(rows[1], vec!["2", "uncommitted"]);
+            }
+            _ => panic!("Expected Rows output"),
+        }
+    }
+
     #[test]
     fn test_rewrite_preserves_string_literals() {
         // R5-S-033: rewrite_table_references should NOT rewrite inside string literals
