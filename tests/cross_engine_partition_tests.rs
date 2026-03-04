@@ -2,6 +2,9 @@
 //!
 //! Tests that DataFusion can correctly read partitioned DuckLake tables
 //! created by DuckDB, including partition pruning and hive-style directories.
+//!
+//! TODO(R7-S-042): Add partition DML tests (DELETE/UPDATE on partitioned tables)
+//! once DF write-path supports partition-aware DML operations.
 
 #![cfg(all(feature = "write-sqlite", feature = "metadata-duckdb", feature = "metadata-sqlite"))]
 

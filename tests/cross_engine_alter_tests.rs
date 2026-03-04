@@ -458,6 +458,67 @@ async fn test_duckdb_set_column_comment_verify() {
     assert_eq!(rows[1][1], "Person name");
 }
 
+// ==================== ADD COLUMN tests (R7-S-032) ====================
+
+/// DataFusion adds column → DuckDB reads data with new column (NULLs for existing rows)
+#[tokio::test(flavor = "multi_thread")]
+async fn test_df_add_column_duckdb_reads() {
+    let env = setup_sqlite_with_table().await;
+    let writer = get_sqlite_writer(&env.catalog_db_path).await;
+    let table_id = get_table_id(&env.catalog_db_path, "people").await;
+
+    // DataFusion adds a new nullable column
+    let column = datafusion_ducklake::metadata_writer::ColumnDef::new("email", "varchar", true)
+        .expect("valid column def");
+    let op = AlterTableOp::AddColumn {
+        column,
+    };
+    writer.alter_table(table_id, &op).unwrap();
+
+    // DuckDB should see the new column with NULLs for existing rows
+    let duckdb = DuckDbConn::open(&env.catalog_db_path);
+    let rows = duckdb.query("SELECT id, name, email FROM ducklake.main.people ORDER BY id");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0][0], "1");
+    assert_eq!(rows[0][1], "Alice");
+    assert_eq!(rows[0][2], "NULL");
+    assert_eq!(rows[2][0], "3");
+    assert_eq!(rows[2][2], "NULL");
+}
+
+// ==================== DROP COLUMN tests (R7-S-032) ====================
+
+/// DataFusion drops column → DataFusion reads without dropped column.
+/// DuckDB read-only cannot handle DF-dropped columns (DuckDB internal assertion),
+/// so this test verifies the DF→DF roundtrip only.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_df_drop_column_df_reads() {
+    let env = setup_sqlite_with_table().await;
+    let writer = get_sqlite_writer(&env.catalog_db_path).await;
+    let table_id = get_table_id(&env.catalog_db_path, "people").await;
+
+    // DataFusion drops the age column
+    let op = AlterTableOp::DropColumn {
+        column_name: "age".into(),
+    };
+    writer.alter_table(table_id, &op).unwrap();
+
+    // DataFusion should see only id and name (age was dropped)
+    let ctx = open_df_sqlite(&env.catalog_db_path).await;
+    let df_rows = df_query(
+        &ctx,
+        "SELECT id, name FROM ducklake.main.people ORDER BY id",
+    )
+    .await;
+    assert_eq!(df_rows.len(), 3);
+    assert_eq!(df_rows[0][0], "1");
+    assert_eq!(df_rows[0][1], "Alice");
+    assert_eq!(df_rows[1][0], "2");
+    assert_eq!(df_rows[1][1], "Bob");
+    assert_eq!(df_rows[2][0], "3");
+    assert_eq!(df_rows[2][1], "Charlie");
+}
+
 // ==================== Combined operation tests ====================
 
 /// Verify data is still readable after multiple ALTER TABLE operations

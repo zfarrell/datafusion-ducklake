@@ -327,21 +327,30 @@ async fn test_append_semantics() {
         .unwrap();
     assert_eq!(result.records_written, 2);
 
-    // Read back - should have all data
+    // Read back - should have all data with correct values
     let ctx = create_read_context(&temp_dir).await;
     let df = ctx
-        .sql("SELECT COUNT(*) as cnt FROM test.main.append_test")
+        .sql("SELECT id, value FROM test.main.append_test ORDER BY id")
         .await
         .unwrap();
     let batches = df.collect().await.unwrap();
 
-    let count = batches[0]
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 4);
+
+    let ids = batches[0]
         .column(0)
         .as_any()
-        .downcast_ref::<Int64Array>()
-        .unwrap()
-        .value(0);
-    assert_eq!(count, 4);
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(ids.values(), &[1, 2, 3, 4]);
+
+    let values = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(values.values(), &[100, 200, 300, 400]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -495,20 +504,31 @@ async fn test_streaming_write_api() {
     assert_eq!(result.records_written, 6);
     assert_eq!(result.files_written, 1);
 
-    // Read back via DuckLakeCatalog
+    // Read back via DuckLakeCatalog and verify values
     let ctx = create_read_context(&temp_dir).await;
     let df = ctx
-        .sql("SELECT COUNT(*) as cnt FROM test.main.streaming_test")
+        .sql("SELECT id, value FROM test.main.streaming_test ORDER BY id")
         .await
         .unwrap();
     let batches = df.collect().await.unwrap();
-    let count = batches[0]
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 6);
+
+    let ids = batches[0]
         .column(0)
         .as_any()
-        .downcast_ref::<Int64Array>()
-        .unwrap()
-        .value(0);
-    assert_eq!(count, 6);
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(ids.value(0), 0);
+    assert_eq!(ids.value(1), 1);
+
+    let values = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(values.value(0), "val_0");
+    assert_eq!(values.value(1), "val_1");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -651,20 +671,29 @@ async fn test_append_add_nullable_column() {
     assert!(result.is_ok(), "Adding nullable column should succeed");
     assert_eq!(result.unwrap().records_written, 2);
 
-    // Read back - should have all 4 rows
+    // Read back - should have all 4 rows with correct values
     let ctx = create_read_context(&temp_dir).await;
     let df = ctx
-        .sql("SELECT COUNT(*) as cnt FROM test.main.evolve_add")
+        .sql("SELECT id, name FROM test.main.evolve_add ORDER BY id")
         .await
         .unwrap();
     let batches = df.collect().await.unwrap();
-    let count = batches[0]
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 4);
+
+    let ids = batches[0]
         .column(0)
         .as_any()
-        .downcast_ref::<Int64Array>()
-        .unwrap()
-        .value(0);
-    assert_eq!(count, 4);
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(ids.value(0), 1);
+
+    let names = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(names.value(0), "Alice");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -897,20 +926,31 @@ async fn test_append_reorder_columns() {
     assert!(result.is_ok(), "Reordering columns should succeed");
     assert_eq!(result.unwrap().records_written, 2);
 
-    // Read back - should have all 4 rows
+    // Read back - should have all 4 rows with correct values
     let ctx = create_read_context(&temp_dir).await;
     let df = ctx
-        .sql("SELECT COUNT(*) as cnt FROM test.main.evolve_reorder")
+        .sql("SELECT id, name, value FROM test.main.evolve_reorder ORDER BY id")
         .await
         .unwrap();
     let batches = df.collect().await.unwrap();
-    let count = batches[0]
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 4);
+
+    let ids = batches[0]
         .column(0)
         .as_any()
-        .downcast_ref::<Int64Array>()
-        .unwrap()
-        .value(0);
-    assert_eq!(count, 4);
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(ids.value(0), 1);
+    assert_eq!(ids.value(1), 2);
+
+    let names = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(names.value(0), "Alice");
+    assert_eq!(names.value(1), "Bob");
 }
 
 /// Verify that `cleanup_orphaned_files` removes files from object store.

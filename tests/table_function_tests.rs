@@ -386,3 +386,72 @@ async fn test_table_info_multiple_tables() -> Result<(), Box<dyn std::error::Err
 
     Ok(())
 }
+
+// ==================== R7-S-039: parse_table_name with quoted identifiers through SQL ====================
+
+/// Test that ducklake_list_files works with a schema-qualified table name.
+#[tokio::test]
+async fn test_list_files_qualified_table_name() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = TempDir::new()?;
+    let catalog_path = temp_dir.path().join("test.ducklake");
+    common::create_catalog_no_deletes(&catalog_path)?;
+
+    let ctx = setup_context(catalog_path.to_str().unwrap())?;
+
+    // Use schema-qualified name: main.users
+    let df = ctx
+        .sql("SELECT data_file FROM ducklake_list_files('main.users')")
+        .await?;
+    let results = df.collect().await?;
+    assert!(!results.is_empty());
+    let batch = &results[0];
+    assert!(batch.num_rows() > 0, "Should find files for main.users");
+
+    let data_files = get_string_values(batch, 0);
+    assert!(
+        data_files[0].as_ref().unwrap().ends_with(".parquet"),
+        "data_file should be a parquet path"
+    );
+
+    Ok(())
+}
+
+/// Test that ducklake_list_files works with quoted identifiers containing dots.
+/// This exercises parse_table_name's quote-aware splitting through the full SQL path.
+#[tokio::test]
+async fn test_list_files_quoted_identifier_with_dot() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = TempDir::new()?;
+    let catalog_path = temp_dir.path().join("test.ducklake");
+
+    // Create a table whose name contains a dot (requires quoting)
+    let conn = duckdb::Connection::open_in_memory()?;
+    conn.execute("INSTALL ducklake;", [])?;
+    conn.execute("LOAD ducklake;", [])?;
+    let ducklake_path = format!("ducklake:{}", catalog_path.display());
+    conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;
+    conn.execute(
+        "CREATE TABLE test_catalog.\"my.table\" (id INT, val VARCHAR);",
+        [],
+    )?;
+    conn.execute(
+        "INSERT INTO test_catalog.\"my.table\" VALUES (1, 'hello');",
+        [],
+    )?;
+    drop(conn);
+
+    let ctx = setup_context(catalog_path.to_str().unwrap())?;
+
+    // Use quoted table name with dot — parse_table_name must not split on the inner dot
+    let df = ctx
+        .sql("SELECT data_file FROM ducklake_list_files('\"my.table\"')")
+        .await?;
+    let results = df.collect().await?;
+    assert!(
+        !results.is_empty(),
+        "Should return results for quoted table"
+    );
+    let batch = &results[0];
+    assert!(batch.num_rows() > 0, "Should find files for '\"my.table\"'");
+
+    Ok(())
+}
