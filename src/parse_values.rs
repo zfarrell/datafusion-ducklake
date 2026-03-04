@@ -9,6 +9,12 @@ use std::sync::Arc;
 use arrow::array::Array;
 use arrow::datatypes::DataType;
 
+/// Unix epoch date (1970-01-01) for Date32/Date64 conversions.
+const UNIX_EPOCH_DATE: chrono::NaiveDate = match chrono::NaiveDate::from_ymd_opt(1970, 1, 1) {
+    Some(d) => d,
+    None => panic!("1970-01-01 is a valid date"),
+};
+
 /// Controls how parse failures are handled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParseMode {
@@ -121,9 +127,7 @@ pub fn parse_string_values_to_array(
                         let epoch_days = if let Ok(date) =
                             chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
                         {
-                            let epoch: chrono::NaiveDate =
-                                chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-                            date.signed_duration_since(epoch).num_days() as i32
+                            date.signed_duration_since(UNIX_EPOCH_DATE).num_days() as i32
                         } else if let Ok(v) = s.parse::<i32>() {
                             v
                         } else {
@@ -155,9 +159,8 @@ pub fn parse_string_values_to_array(
                         let epoch_ms = if let Ok(date) =
                             chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
                         {
-                            let epoch: chrono::NaiveDate =
-                                chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-                            date.signed_duration_since(epoch).num_days() as i64 * 86_400_000
+                            date.signed_duration_since(UNIX_EPOCH_DATE).num_days() as i64
+                                * 86_400_000
                         } else if let Ok(v) = s.parse::<i64>() {
                             v
                         } else {

@@ -317,73 +317,48 @@ fn compute_partition_value(
     match transform {
         PartitionTransform::Identity => {
             // Extract the raw value as a string
+            macro_rules! downcast_partition {
+                ($arr_type:ty) => {
+                    array.as_any().downcast_ref::<$arr_type>().ok_or_else(|| {
+                        DuckLakeError::Internal(format!(
+                            "Failed to downcast partition column to {}",
+                            stringify!($arr_type)
+                        ))
+                    })
+                };
+            }
             let value = match array.data_type() {
-                DataType::Int8 => array
-                    .as_any()
-                    .downcast_ref::<Int8Array>()
-                    .map(|a| a.value(row).to_string()),
-                DataType::Int16 => array
-                    .as_any()
-                    .downcast_ref::<Int16Array>()
-                    .map(|a| a.value(row).to_string()),
-                DataType::Int32 => array
-                    .as_any()
-                    .downcast_ref::<Int32Array>()
-                    .map(|a| a.value(row).to_string()),
-                DataType::Int64 => array
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .map(|a| a.value(row).to_string()),
-                DataType::UInt8 => array
-                    .as_any()
-                    .downcast_ref::<UInt8Array>()
-                    .map(|a| a.value(row).to_string()),
-                DataType::UInt16 => array
-                    .as_any()
-                    .downcast_ref::<UInt16Array>()
-                    .map(|a| a.value(row).to_string()),
-                DataType::UInt32 => array
-                    .as_any()
-                    .downcast_ref::<UInt32Array>()
-                    .map(|a| a.value(row).to_string()),
-                DataType::UInt64 => array
-                    .as_any()
-                    .downcast_ref::<UInt64Array>()
-                    .map(|a| a.value(row).to_string()),
-                DataType::Float32 => array
-                    .as_any()
-                    .downcast_ref::<Float32Array>()
-                    .map(|a| a.value(row).to_string()),
-                DataType::Float64 => array
-                    .as_any()
-                    .downcast_ref::<Float64Array>()
-                    .map(|a| a.value(row).to_string()),
-                DataType::Utf8 => array
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .map(|a| a.value(row).to_string()),
-                DataType::LargeUtf8 => array
-                    .as_any()
-                    .downcast_ref::<LargeStringArray>()
-                    .map(|a| a.value(row).to_string()),
-                DataType::Boolean => array
-                    .as_any()
-                    .downcast_ref::<BooleanArray>()
-                    .map(|a| a.value(row).to_string()),
+                DataType::Int8 => Some(downcast_partition!(Int8Array)?.value(row).to_string()),
+                DataType::Int16 => Some(downcast_partition!(Int16Array)?.value(row).to_string()),
+                DataType::Int32 => Some(downcast_partition!(Int32Array)?.value(row).to_string()),
+                DataType::Int64 => Some(downcast_partition!(Int64Array)?.value(row).to_string()),
+                DataType::UInt8 => Some(downcast_partition!(UInt8Array)?.value(row).to_string()),
+                DataType::UInt16 => Some(downcast_partition!(UInt16Array)?.value(row).to_string()),
+                DataType::UInt32 => Some(downcast_partition!(UInt32Array)?.value(row).to_string()),
+                DataType::UInt64 => Some(downcast_partition!(UInt64Array)?.value(row).to_string()),
+                DataType::Float32 => {
+                    Some(downcast_partition!(Float32Array)?.value(row).to_string())
+                },
+                DataType::Float64 => {
+                    Some(downcast_partition!(Float64Array)?.value(row).to_string())
+                },
+                DataType::Utf8 => Some(downcast_partition!(StringArray)?.value(row).to_string()),
+                DataType::LargeUtf8 => Some(
+                    downcast_partition!(LargeStringArray)?
+                        .value(row)
+                        .to_string(),
+                ),
+                DataType::Boolean => {
+                    Some(downcast_partition!(BooleanArray)?.value(row).to_string())
+                },
                 DataType::Date32 => {
-                    let days = array
-                        .as_any()
-                        .downcast_ref::<Date32Array>()
-                        .map(|a| a.value(row));
-                    days.and_then(|d| chrono::NaiveDate::from_num_days_from_ce_opt(d + 719_163))
+                    let days = downcast_partition!(Date32Array)?.value(row);
+                    chrono::NaiveDate::from_num_days_from_ce_opt(days + 719_163)
                         .map(|date| date.format("%Y-%m-%d").to_string())
                 },
                 DataType::Date64 => {
-                    let ms = array
-                        .as_any()
-                        .downcast_ref::<Date64Array>()
-                        .map(|a| a.value(row));
-                    ms.and_then(chrono::DateTime::from_timestamp_millis)
+                    let ms = downcast_partition!(Date64Array)?.value(row);
+                    chrono::DateTime::from_timestamp_millis(ms)
                         .map(|dt| dt.format("%Y-%m-%d").to_string())
                 },
                 dt => {

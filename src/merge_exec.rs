@@ -237,9 +237,20 @@ fn extract_key_value(
         }};
     }
 
+    macro_rules! downcast_key {
+        ($arr_type:ty) => {
+            col.as_any().downcast_ref::<$arr_type>().ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "MERGE: failed to downcast to {}",
+                    stringify!($arr_type)
+                ))
+            })
+        };
+    }
+
     match col.data_type() {
         DataType::Boolean => {
-            let a = col.as_any().downcast_ref::<BooleanArray>().unwrap();
+            let a = downcast_key!(BooleanArray)?;
             Ok(HashableKeyValue::Bool(a.value(row)))
         },
         DataType::Int8 => extract_int!(Int8Array),
@@ -251,9 +262,8 @@ fn extract_key_value(
         DataType::UInt32 => extract_uint!(UInt32Array),
         DataType::UInt64 => extract_uint!(UInt64Array),
         DataType::Float32 => {
-            let a = col.as_any().downcast_ref::<Float32Array>().unwrap();
+            let a = downcast_key!(Float32Array)?;
             let v = a.value(row);
-            // Normalize NaN to a canonical bit pattern for consistent hashing
             let bits = if v.is_nan() {
                 f32::NAN.to_bits()
             } else {
@@ -262,7 +272,7 @@ fn extract_key_value(
             Ok(HashableKeyValue::Float32Bits(bits))
         },
         DataType::Float64 => {
-            let a = col.as_any().downcast_ref::<Float64Array>().unwrap();
+            let a = downcast_key!(Float64Array)?;
             let v = a.value(row);
             let bits = if v.is_nan() {
                 f64::NAN.to_bits()
@@ -272,11 +282,11 @@ fn extract_key_value(
             Ok(HashableKeyValue::Float64Bits(bits))
         },
         DataType::Utf8 => {
-            let a = col.as_any().downcast_ref::<StringArray>().unwrap();
+            let a = downcast_key!(StringArray)?;
             Ok(HashableKeyValue::String(a.value(row).to_string()))
         },
         DataType::LargeUtf8 => {
-            let a = col.as_any().downcast_ref::<LargeStringArray>().unwrap();
+            let a = downcast_key!(LargeStringArray)?;
             Ok(HashableKeyValue::String(a.value(row).to_string()))
         },
         DataType::Date32 => extract_int!(Date32Array),
@@ -286,7 +296,7 @@ fn extract_key_value(
         DataType::Timestamp(TimeUnit::Microsecond, _) => extract_int!(TimestampMicrosecondArray),
         DataType::Timestamp(TimeUnit::Nanosecond, _) => extract_int!(TimestampNanosecondArray),
         DataType::Decimal128(_, _) => {
-            let a = col.as_any().downcast_ref::<Decimal128Array>().unwrap();
+            let a = downcast_key!(Decimal128Array)?;
             Ok(HashableKeyValue::Decimal128(a.value(row)))
         },
         dt => Err(DataFusionError::NotImplemented(format!(

@@ -1811,7 +1811,9 @@ fn combine_execution_plans(
     execs: Vec<Arc<dyn ExecutionPlan>>,
 ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
     if execs.len() == 1 {
-        Ok(execs.into_iter().next().expect("checked len == 1 above"))
+        Ok(execs.into_iter().next().ok_or_else(|| {
+            DataFusionError::Internal("Expected at least one execution plan".into())
+        })?)
     } else {
         use datafusion::physical_plan::union::UnionExec;
         UnionExec::try_new(execs)

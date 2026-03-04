@@ -1166,7 +1166,10 @@ fn arrow_array_value_to_string(
             );
             match formatter {
                 Ok(f) => Ok(f.value(idx).to_string()),
-                Err(_) => Ok(String::new()),
+                Err(e) => Err(crate::error::DuckLakeError::Internal(format!(
+                    "Failed to format array value: {}",
+                    e
+                ))),
             }
         },
     }
