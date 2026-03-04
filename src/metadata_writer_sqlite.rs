@@ -21,6 +21,75 @@ use std::str::FromStr;
 
 const DEFAULT_MAX_CONNECTIONS: u32 = 5;
 
+/// Maximum number of retries for SQLITE_BUSY errors.
+const BUSY_RETRY_MAX_ATTEMPTS: u32 = 20;
+
+/// Initial backoff delay for SQLITE_BUSY retries (in milliseconds).
+const BUSY_RETRY_INITIAL_DELAY_MS: u64 = 10;
+
+/// Check whether a [`DuckLakeError`] wraps an SQLITE_BUSY error.
+///
+/// SQLite uses error code 5 for SQLITE_BUSY and 517 for SQLITE_BUSY_SNAPSHOT
+/// (which occurs in WAL mode when a transaction can't commit because the
+/// database was modified after the transaction started).
+fn is_sqlite_busy(err: &DuckLakeError) -> bool {
+    if let DuckLakeError::Sqlx(sqlx::Error::Database(db_err)) = err {
+        if let Some(code) = db_err.code() {
+            return code.as_ref() == "5" || code.as_ref() == "517";
+        }
+    }
+    // Also handle the error message as a fallback
+    if let DuckLakeError::Sqlx(sqlx::Error::Database(db_err)) = err {
+        return db_err.message().contains("database is locked");
+    }
+    false
+}
+
+/// Execute an async closure via [`block_on`], retrying with exponential backoff
+/// and jitter when the operation fails with SQLITE_BUSY.
+///
+/// This is necessary because SQLite only supports a single concurrent writer.
+/// Under concurrent load, transactions may fail with "database is locked"
+/// even when `busy_timeout` is set, particularly due to SQLITE_BUSY_SNAPSHOT
+/// errors in WAL mode that bypass the busy handler.
+///
+/// The jitter prevents thundering-herd collisions when many writers retry
+/// at the same backoff intervals.
+fn block_on_with_retry<F, Fut, T>(mut f: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut attempt = 0u32;
+    loop {
+        match block_on(f()) {
+            Ok(val) => return Ok(val),
+            Err(e) if is_sqlite_busy(&e) && attempt < BUSY_RETRY_MAX_ATTEMPTS => {
+                attempt += 1;
+                // Exponential backoff: 20, 40, 80, ..., capped at 640ms base
+                let base_ms = BUSY_RETRY_INITIAL_DELAY_MS * (1u64 << attempt.min(6));
+                // Add random jitter (0 to base_ms) to avoid thundering herd
+                let jitter_ms = {
+                    // Simple per-thread jitter using thread id + attempt as seed
+                    let tid = std::thread::current().id();
+                    let hash = {
+                        use std::hash::{Hash, Hasher};
+                        let mut h = std::collections::hash_map::DefaultHasher::new();
+                        tid.hash(&mut h);
+                        attempt.hash(&mut h);
+                        h.finish()
+                    };
+                    hash % base_ms.max(1)
+                };
+                let delay = std::time::Duration::from_millis(base_ms + jitter_ms);
+                // Use std::thread::sleep to avoid blocking the tokio runtime
+                std::thread::sleep(delay);
+            },
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 const SQL_CREATE_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS ducklake_metadata (
     key VARCHAR NOT NULL,
@@ -1107,7 +1176,8 @@ fn cmp_decimal_strings(a: &str, b: &str) -> Option<std::cmp::Ordering> {
 
 impl MetadataWriter for SqliteMetadataWriter {
     fn create_snapshot(&self) -> Result<i64> {
-        block_on(async {
+        let pool = &self.pool;
+        block_on_with_retry(|| async {
             // R3F-007: Inherit schema_version from previous snapshot
             // R3F-011: Compute next_catalog_id and next_file_id
             // Use a single INSERT with subqueries to minimize lock duration
@@ -1127,7 +1197,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                      )), 0)
                  ) RETURNING snapshot_id",
             )
-            .fetch_one(&self.pool)
+            .fetch_one(pool)
             .await?;
             Ok(row.try_get(0)?)
         })
@@ -1139,9 +1209,10 @@ impl MetadataWriter for SqliteMetadataWriter {
         path: Option<&str>,
         snapshot_id: i64,
     ) -> Result<(i64, bool)> {
-        block_on(async {
+        let pool = &self.pool;
+        block_on_with_retry(|| async {
             // Use a transaction to prevent TOCTOU race between SELECT and INSERT
-            let mut tx = self.pool.begin().await?;
+            let mut tx = pool.begin().await?;
 
             let existing = sqlx::query(
                 "SELECT schema_id FROM ducklake_schema
@@ -1197,8 +1268,9 @@ impl MetadataWriter for SqliteMetadataWriter {
         path: Option<&str>,
         snapshot_id: i64,
     ) -> Result<(i64, bool)> {
-        block_on(async {
-            let mut tx = self.pool.begin().await?;
+        let pool = &self.pool;
+        block_on_with_retry(|| async {
+            let mut tx = pool.begin().await?;
 
             let existing = sqlx::query(
                 "SELECT table_id FROM ducklake_table
@@ -1252,10 +1324,11 @@ impl MetadataWriter for SqliteMetadataWriter {
         snapshot_id: i64,
     ) -> Result<Vec<i64>> {
         validate_no_duplicate_columns(columns)?;
-        block_on(async {
+        let pool = &self.pool;
+        block_on_with_retry(|| async {
             // Use a transaction to ensure atomicity: if column insertion fails,
             // we don't leave existing columns marked as ended
-            let mut tx = self.pool.begin().await?;
+            let mut tx = pool.begin().await?;
 
             sqlx::query(
                 "UPDATE ducklake_column SET end_snapshot = ?
@@ -1312,8 +1385,9 @@ impl MetadataWriter for SqliteMetadataWriter {
         if stats.is_empty() {
             return Ok(());
         }
-        block_on(async {
-            let mut tx = self.pool.begin().await?;
+        let pool = &self.pool;
+        block_on_with_retry(|| async {
+            let mut tx = pool.begin().await?;
             for stat in stats {
                 sqlx::query(
                     "INSERT INTO ducklake_file_column_stats
@@ -1345,8 +1419,9 @@ impl MetadataWriter for SqliteMetadataWriter {
         snapshot_id: i64,
         file: &DataFileInfo,
     ) -> Result<i64> {
-        block_on(async {
-            let mut tx = self.pool.begin().await?;
+        let pool = &self.pool;
+        block_on_with_retry(|| async {
+            let mut tx = pool.begin().await?;
 
             // Get current next_row_id from table_stats (F-011: row_id_start)
             let stats_row =
@@ -1412,8 +1487,9 @@ impl MetadataWriter for SqliteMetadataWriter {
     }
 
     fn end_table_files(&self, table_id: i64, snapshot_id: i64) -> Result<u64> {
-        block_on(async {
-            let mut tx = self.pool.begin().await?;
+        let pool = &self.pool;
+        block_on_with_retry(|| async {
+            let mut tx = pool.begin().await?;
             let result = sqlx::query(
                 "UPDATE ducklake_data_file SET end_snapshot = ?
                  WHERE table_id = ? AND end_snapshot IS NULL",
@@ -1454,8 +1530,9 @@ impl MetadataWriter for SqliteMetadataWriter {
         snapshot_id: i64,
         files: &[ReplaceFileEntry],
     ) -> Result<Vec<i64>> {
-        block_on(async {
-            let mut tx = self.pool.begin().await?;
+        let pool = &self.pool;
+        block_on_with_retry(|| async {
+            let mut tx = pool.begin().await?;
 
             // End all existing data files
             sqlx::query(
@@ -1573,8 +1650,9 @@ impl MetadataWriter for SqliteMetadataWriter {
         if delete_files.is_empty() && data_files.is_empty() {
             return Ok(());
         }
-        block_on(async {
-            let mut tx = self.pool.begin().await?;
+        let pool = &self.pool;
+        block_on_with_retry(|| async {
+            let mut tx = pool.begin().await?;
 
             // R4-S-013: Track net new deletions to decrement record_count
             let mut total_net_new_deletions: i64 = 0;
@@ -1854,8 +1932,9 @@ impl MetadataWriter for SqliteMetadataWriter {
         snapshot_id: i64,
         file: &DeleteFileInfo,
     ) -> Result<i64> {
-        block_on(async {
-            let mut tx = self.pool.begin().await?;
+        let pool = &self.pool;
+        block_on_with_retry(|| async {
+            let mut tx = pool.begin().await?;
 
             // End any existing active delete file for this data file
             sqlx::query(
@@ -1890,15 +1969,17 @@ impl MetadataWriter for SqliteMetadataWriter {
     }
 
     fn drop_table(&self, table_id: i64) -> Result<i64> {
-        block_on(async {
-            let tx = self.pool.begin().await?;
+        let pool = &self.pool;
+        block_on_with_retry(|| async {
+            let tx = pool.begin().await?;
             Self::drop_table_inner(tx, table_id).await
         })
     }
 
     fn drop_schema(&self, schema_id: i64) -> Result<i64> {
-        block_on(async {
-            let tx = self.pool.begin().await?;
+        let pool = &self.pool;
+        block_on_with_retry(|| async {
+            let tx = pool.begin().await?;
             Self::drop_schema_inner(tx, schema_id).await
         })
     }
@@ -1929,8 +2010,9 @@ impl MetadataWriter for SqliteMetadataWriter {
         mode: WriteMode,
         since_snapshot: i64,
     ) -> Result<WriteSetupResult> {
-        block_on(async {
-            let mut tx = self.pool.begin().await?;
+        let pool = &self.pool;
+        block_on_with_retry(|| async {
+            let mut tx = pool.begin().await?;
 
             // Conflict check: look for DROP operations since our snapshot.
             // This runs in the SAME transaction as the write to prevent TOCTOU races.
@@ -2031,8 +2113,9 @@ impl MetadataWriter for SqliteMetadataWriter {
     }
 
     fn drop_table_checked(&self, table_id: i64, since_snapshot: i64) -> Result<i64> {
-        block_on(async {
-            let mut tx = self.pool.begin().await?;
+        let pool = &self.pool;
+        block_on_with_retry(|| async {
+            let mut tx = pool.begin().await?;
 
             // Check DF-originated drops
             let drop_check = sqlx::query(
@@ -2072,8 +2155,9 @@ impl MetadataWriter for SqliteMetadataWriter {
     }
 
     fn drop_schema_checked(&self, schema_id: i64, since_snapshot: i64) -> Result<i64> {
-        block_on(async {
-            let mut tx = self.pool.begin().await?;
+        let pool = &self.pool;
+        block_on_with_retry(|| async {
+            let mut tx = pool.begin().await?;
 
             // Check DF-originated drops
             let drop_check = sqlx::query(
@@ -2119,15 +2203,17 @@ impl MetadataWriter for SqliteMetadataWriter {
         columns: &[ColumnDef],
         mode: WriteMode,
     ) -> Result<WriteSetupResult> {
-        block_on(async {
-            let tx = self.pool.begin().await?;
+        let pool = &self.pool;
+        block_on_with_retry(|| async {
+            let tx = pool.begin().await?;
             Self::write_transaction_inner(tx, schema_name, table_name, columns, mode).await
         })
     }
 
     fn create_view(&self, schema_id: i64, view_name: &str, sql: &str) -> Result<(i64, i64)> {
-        block_on(async {
-            let mut tx = self.pool.begin().await?;
+        let pool = &self.pool;
+        block_on_with_retry(|| async {
+            let mut tx = pool.begin().await?;
 
             // Increment schema_version for DDL (F-012)
             let prev_sv_row =
@@ -2204,8 +2290,9 @@ impl MetadataWriter for SqliteMetadataWriter {
     }
 
     fn drop_view(&self, view_id: i64) -> Result<i64> {
-        block_on(async {
-            let mut tx = self.pool.begin().await?;
+        let pool = &self.pool;
+        block_on_with_retry(|| async {
+            let mut tx = pool.begin().await?;
 
             // R4-S-014: Validate view exists and is active before creating snapshot
             let exists = sqlx::query(
@@ -2388,8 +2475,9 @@ impl MetadataWriter for SqliteMetadataWriter {
     }
 
     fn alter_table(&self, table_id: i64, op: &AlterTableOp) -> Result<i64> {
-        block_on(async {
-            let mut tx = self.pool.begin().await?;
+        let pool = &self.pool;
+        block_on_with_retry(|| async {
+            let mut tx = pool.begin().await?;
 
             // Get active columns for validation (including default value fields)
             let col_rows = sqlx::query(
