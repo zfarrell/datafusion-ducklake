@@ -1165,7 +1165,10 @@ fn arrow_array_value_to_string(
             );
             match formatter {
                 Ok(f) => Ok(f.value(idx).to_string()),
-                Err(_) => Ok(String::new()),
+                Err(e) => Err(crate::error::DuckLakeError::Internal(format!(
+                    "Failed to format array value: {}",
+                    e
+                ))),
             }
         },
     }
@@ -1814,8 +1817,12 @@ mod tests {
 
         // Read: ISO string "2024-06-15" -> Date32 value 19889
         let values = vec![Some(serialized)];
-        let result =
-            crate::parse_values::parse_string_values_to_array(&values, &DataType::Date32).unwrap();
+        let result = crate::parse_values::parse_string_values_to_array(
+            &values,
+            &DataType::Date32,
+            crate::parse_values::ParseMode::Strict,
+        )
+        .unwrap();
         let date_array = result.as_any().downcast_ref::<Date32Array>().unwrap();
         assert_eq!(date_array.value(0), 19889);
     }
@@ -1835,6 +1842,7 @@ mod tests {
         let result = crate::parse_values::parse_string_values_to_array(
             &values,
             &DataType::Timestamp(TimeUnit::Microsecond, None),
+            crate::parse_values::ParseMode::Strict,
         )
         .unwrap();
         let ts_array = result
@@ -1849,8 +1857,12 @@ mod tests {
         use arrow::array::Date32Array;
         // Verify that old epoch-day strings ("19889") are still parseable
         let values = vec![Some("19889".to_string())];
-        let result =
-            crate::parse_values::parse_string_values_to_array(&values, &DataType::Date32).unwrap();
+        let result = crate::parse_values::parse_string_values_to_array(
+            &values,
+            &DataType::Date32,
+            crate::parse_values::ParseMode::Strict,
+        )
+        .unwrap();
         let date_array = result.as_any().downcast_ref::<Date32Array>().unwrap();
         assert_eq!(date_array.value(0), 19889);
     }
@@ -1865,6 +1877,7 @@ mod tests {
         let result = crate::parse_values::parse_string_values_to_array(
             &values,
             &DataType::Timestamp(TimeUnit::Microsecond, None),
+            crate::parse_values::ParseMode::Strict,
         )
         .unwrap();
         let ts_array = result
@@ -1883,6 +1896,7 @@ mod tests {
         let result = crate::parse_values::parse_string_values_to_array(
             &values,
             &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            crate::parse_values::ParseMode::Strict,
         )
         .unwrap();
         let ts_array = result
