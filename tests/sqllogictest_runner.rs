@@ -356,7 +356,9 @@ fn preprocess_test_file(content: &str, test_dir: &str) -> String {
 
             // Check if error text matches patterns that can't occur in hybrid mode
             let error_upper = error_text.to_uppercase();
-            let convert_to_ok = is_hybrid_incompatible_error(&error_upper);
+            let sql_combined_upper = sql_lines_collected.join(" ").to_uppercase();
+            let convert_to_ok =
+                is_hybrid_incompatible_error_with_sql(&error_upper, &sql_combined_upper);
 
             if convert_to_ok {
                 output.push_str("statement ok\n");
@@ -661,7 +663,8 @@ fn contains_unsupported_function(sql_upper: &str) -> bool {
         || sql_upper.contains("DUCKLAKE_META.")
         || sql_upper.contains("METADATA.DUCKLAKE_")
         // DuckDB functions not available
-        || sql_upper.contains("COLUMNS(")
+        || sql_upper.contains(" COLUMNS(")
+        || sql_upper.starts_with("COLUMNS(")
         // Infinity timestamp literals (DataFusion optimizer can't handle)
         || sql_upper.contains("'INFINITY'")
         || sql_upper.contains("'-INFINITY'")
@@ -679,20 +682,33 @@ fn contains_unsupported_function(sql_upper: &str) -> bool {
 ///
 /// These are logged as warnings rather than silently converted, to make test
 /// coverage gaps visible. Each pattern has a documented reason.
-const HYBRID_INCOMPATIBLE_PATTERNS: &[(&str, &str)] = &[
-    ("READ-ONLY", "hybrid adapter always has writable DuckDB"),
-    ("READ ONLY", "hybrid adapter always has writable DuckDB"),
-    ("DOES NOT EXIST!", "DETACH is skipped in hybrid mode"),
+/// Each pattern is (error_pattern, optional_sql_pattern, reason).
+/// If optional_sql_pattern is Some, the SQL must also match for conversion.
+const HYBRID_INCOMPATIBLE_PATTERNS: &[(&str, Option<&str>, &str)] = &[
+    (
+        "READ-ONLY",
+        None,
+        "hybrid adapter always has writable DuckDB",
+    ),
+    (
+        "READ ONLY",
+        None,
+        "hybrid adapter always has writable DuckDB",
+    ),
+    ("DOES NOT EXIST!", None, "DETACH is skipped in hybrid mode"),
     (
         "MISSING EXTENSION ERROR",
+        None,
         "parquet is always loaded in hybrid mode",
     ),
     (
         "COULD NOT LOAD THE COPY FUNCTION",
+        None,
         "parquet is always loaded in hybrid mode",
     ),
     (
         "TRANSACTION-LOCAL INLINED DATA",
+        None,
         "DuckDB version may not enforce this constraint",
     ),
 ];
@@ -700,9 +716,14 @@ const HYBRID_INCOMPATIBLE_PATTERNS: &[(&str, &str)] = &[
 /// Check if an expected error text matches patterns that can't occur in hybrid mode.
 /// When these patterns match, the statement error should be converted to statement ok.
 /// Logs a warning for each conversion so that coverage gaps are visible in test output.
-fn is_hybrid_incompatible_error(error_upper: &str) -> bool {
-    for (pattern, reason) in HYBRID_INCOMPATIBLE_PATTERNS {
+fn is_hybrid_incompatible_error_with_sql(error_upper: &str, sql_upper: &str) -> bool {
+    for (pattern, sql_pattern, reason) in HYBRID_INCOMPATIBLE_PATTERNS {
         if error_upper.contains(pattern) {
+            if let Some(sp) = sql_pattern {
+                if !sql_upper.contains(sp) {
+                    continue;
+                }
+            }
             tracing::warn!(
                 "Converting 'statement error' to 'statement ok': pattern '{}' ({})",
                 pattern,
@@ -781,6 +802,15 @@ async fn run_hybrid_test(test_file: &str) -> Result<(), Box<dyn std::error::Erro
     let test_dir_str = temp_dir.path().to_string_lossy().to_string();
     let processed_content = preprocess_test_file(&original_content, &test_dir_str);
 
+    // Log directive counts before/after preprocessing for visibility into filtering
+    let original_directive_count = original_content
+        .lines()
+        .filter(|line| {
+            let t = line.trim();
+            t.starts_with("statement") || t.starts_with("query")
+        })
+        .count();
+
     // Verify that preprocessing didn't eliminate all meaningful statements.
     // Count actual test directives (not just "halt" which stops the test early).
     let meaningful_count = processed_content
@@ -797,6 +827,12 @@ async fn run_hybrid_test(test_file: &str) -> Result<(), Box<dyn std::error::Erro
     if meaningful_count < 3 {
         eprintln!(
             "Warning: test file '{test_file}' has only {meaningful_count} meaningful statement(s) after preprocessing — consider reviewing for excessive filtering"
+        );
+    }
+    if meaningful_count < original_directive_count {
+        eprintln!(
+            "[SLT filter] {test_file}: {original_directive_count} original → {meaningful_count} preprocessed directives ({} filtered)",
+            original_directive_count - meaningful_count
         );
     }
 

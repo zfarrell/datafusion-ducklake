@@ -276,10 +276,10 @@ fn resolve_table_for_function(
     table_name: &str,
     snapshot_id: i64,
 ) -> DataFusionResult<ResolvedTable> {
-    let (schema_name, table_name_only) = parse_table_name(table_name);
+    let (schema_name, table_name_only) = parse_table_name(table_name)?;
 
     let schema = provider
-        .get_schema_by_name(schema_name, snapshot_id)
+        .get_schema_by_name(&schema_name, snapshot_id)
         .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?
         .ok_or_else(|| {
             datafusion::error::DataFusionError::Plan(format!(
@@ -289,7 +289,7 @@ fn resolve_table_for_function(
         })?;
 
     let table = provider
-        .get_table_by_name(schema.schema_id, table_name_only, snapshot_id)
+        .get_table_by_name(schema.schema_id, &table_name_only, snapshot_id)
         .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?
         .ok_or_else(|| {
             datafusion::error::DataFusionError::Plan(format!(
@@ -350,8 +350,9 @@ fn strip_path_prefix(path: &str, prefix: &str) -> String {
 /// Parse a potentially qualified table name into (schema, table).
 ///
 /// Handles quoted identifiers: dots inside double-quotes are not treated as
-/// separators. Empty parts (e.g., ".foo" or "foo.") are rejected.
-fn parse_table_name(table_name: &str) -> (&str, &str) {
+/// separators (R6-S-011). Quotes are stripped and escaped `""` is unescaped.
+/// Empty parts (e.g., ".foo" or "foo.") return an error (R6-S-028).
+fn parse_table_name(table_name: &str) -> DataFusionResult<(String, String)> {
     // Find the first dot that is not inside double-quotes
     let mut in_quotes = false;
     let mut dot_pos = None;
@@ -367,16 +368,29 @@ fn parse_table_name(table_name: &str) -> (&str, &str) {
     }
 
     if let Some(pos) = dot_pos {
-        let schema = &table_name[..pos];
-        let table = &table_name[pos + 1..];
-        // Fall back to default if either part is empty
-        if schema.is_empty() || table.is_empty() {
-            ("main", table_name)
-        } else {
-            (schema, table)
+        let schema_raw = &table_name[..pos];
+        let table_raw = &table_name[pos + 1..];
+        if schema_raw.is_empty() || table_raw.is_empty() {
+            return plan_err!(
+                "Malformed table name '{}': both schema and table parts must be non-empty",
+                table_name
+            );
         }
+        Ok((
+            unquote_identifier(schema_raw),
+            unquote_identifier(table_raw),
+        ))
     } else {
-        ("main", table_name)
+        Ok(("main".to_string(), unquote_identifier(table_name)))
+    }
+}
+
+/// Strip surrounding double-quotes from a SQL identifier and unescape `""` → `"`.
+fn unquote_identifier(s: &str) -> String {
+    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+        s[1..s.len() - 1].replace("\"\"", "\"")
+    } else {
+        s.to_string()
     }
 }
 
@@ -689,43 +703,64 @@ mod tests {
         );
     }
 
-    // ==================== R5-S-030: parse_table_name tests ====================
+    // ==================== parse_table_name tests (R5-S-030, R6-S-011, R6-S-028) ====================
 
     #[test]
     fn test_parse_table_name_simple() {
-        assert_eq!(parse_table_name("users"), ("main", "users"));
+        let (s, t) = parse_table_name("users").unwrap();
+        assert_eq!(s, "main");
+        assert_eq!(t, "users");
     }
 
     #[test]
     fn test_parse_table_name_qualified() {
-        assert_eq!(parse_table_name("myschema.users"), ("myschema", "users"));
+        let (s, t) = parse_table_name("myschema.users").unwrap();
+        assert_eq!(s, "myschema");
+        assert_eq!(t, "users");
     }
 
     #[test]
     fn test_parse_table_name_quoted_with_dot() {
-        // Dots inside double-quotes should not split
-        let (schema, table) = parse_table_name("\"my.schema\".users");
-        assert_eq!(schema, "\"my.schema\"");
+        // Dots inside double-quotes should not split; quotes are stripped (R6-S-011)
+        let (schema, table) = parse_table_name("\"my.schema\".users").unwrap();
+        assert_eq!(schema, "my.schema");
         assert_eq!(table, "users");
     }
 
     #[test]
     fn test_parse_table_name_quoted_table() {
-        let (schema, table) = parse_table_name("main.\"my.table\"");
+        let (schema, table) = parse_table_name("main.\"my.table\"").unwrap();
         assert_eq!(schema, "main");
-        assert_eq!(table, "\"my.table\"");
+        assert_eq!(table, "my.table");
     }
 
     #[test]
-    fn test_parse_table_name_empty_schema() {
-        // ".foo" should default to "main"
-        assert_eq!(parse_table_name(".foo"), ("main", ".foo"));
+    fn test_parse_table_name_both_quoted() {
+        let (s, t) = parse_table_name("\"my.schema\".\"my.table\"").unwrap();
+        assert_eq!(s, "my.schema");
+        assert_eq!(t, "my.table");
     }
 
     #[test]
-    fn test_parse_table_name_empty_table() {
-        // "foo." should default to "main"
-        assert_eq!(parse_table_name("foo."), ("main", "foo."));
+    fn test_parse_table_name_escaped_quotes() {
+        let (s, t) = parse_table_name("\"say\"\"hello\"").unwrap();
+        assert_eq!(s, "main");
+        assert_eq!(t, "say\"hello");
+    }
+
+    #[test]
+    fn test_parse_table_name_empty_schema_error() {
+        assert!(parse_table_name(".foo").is_err());
+    }
+
+    #[test]
+    fn test_parse_table_name_empty_table_error() {
+        assert!(parse_table_name("foo.").is_err());
+    }
+
+    #[test]
+    fn test_parse_table_name_double_dot_error() {
+        assert!(parse_table_name("..").is_err());
     }
 
     // ==================== R5-S-038: extract_snapshot_arg tests ====================

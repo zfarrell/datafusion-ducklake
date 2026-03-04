@@ -310,6 +310,40 @@ pub fn normalize_value(s: &str) -> String {
     s.to_string()
 }
 
+/// Assert two result sets are equal WITHOUT normalization.
+///
+/// Same structure checks as assert_results_eq but compares values directly.
+/// Use this when you need strict type confusion detection (e.g., "1" vs "1.0").
+pub fn assert_results_eq_strict(scenario: &str, expected: &[Vec<String>], actual: &[Vec<String>]) {
+    if expected.len() != actual.len() {
+        let max_show = 5;
+        let exp_preview: Vec<_> = expected.iter().take(max_show).collect();
+        let act_preview: Vec<_> = actual.iter().take(max_show).collect();
+        panic!(
+            "[{scenario}] Row count mismatch: expected {} rows, got {}.\n  \
+             Expected (first {max_show}):\n{exp_preview:#?}\n  \
+             Actual (first {max_show}):\n{act_preview:#?}",
+            expected.len(),
+            actual.len(),
+        );
+    }
+    for (i, (exp_row, act_row)) in expected.iter().zip(actual.iter()).enumerate() {
+        assert_eq!(
+            exp_row.len(),
+            act_row.len(),
+            "[{scenario}] Column count mismatch at row {i}: expected {} cols, got {}.\n  Expected row: {exp_row:?}\n  Actual row:   {act_row:?}",
+            exp_row.len(),
+            act_row.len()
+        );
+        for (j, (exp_val, act_val)) in exp_row.iter().zip(act_row.iter()).enumerate() {
+            assert_eq!(
+                exp_val, act_val,
+                "[{scenario}] Strict mismatch at row {i}, col {j}: expected '{exp_val}', got '{act_val}'"
+            );
+        }
+    }
+}
+
 /// Assert two result sets are equal (after normalizing floats).
 ///
 /// Checks both row count and column count before comparing values,

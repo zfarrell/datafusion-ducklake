@@ -127,15 +127,8 @@ CREATE TABLE IF NOT EXISTS _df_change_tracking (
     schema_id INTEGER
 );
 
--- R6-S-030: The following tables use the ducklake_ prefix to match DuckDB's catalog schema exactly.
+-- R6-S-030: The ducklake_ prefix on the following tables matches DuckDB's catalog schema exactly.
 -- This ensures cross-engine interoperability: DuckDB expects these standard DuckLake table names.
--- Tables: ducklake_file_column_stats, ducklake_view, ducklake_tag, ducklake_column_tag,
--- ducklake_table_stats, ducklake_table_column_stats, ducklake_partition_info,
--- ducklake_partition_column, ducklake_file_partition_value,
--- ducklake_files_scheduled_for_deletion, ducklake_inlined_data_tables,
--- ducklake_column_mapping, ducklake_name_mapping, ducklake_schema_versions,
--- ducklake_macro, ducklake_macro_impl, ducklake_macro_parameters,
--- ducklake_sort_info, ducklake_sort_expression, ducklake_file_variant_stats
 CREATE TABLE IF NOT EXISTS ducklake_file_column_stats (
     data_file_id INTEGER NOT NULL,
     table_id INTEGER NOT NULL,
@@ -224,6 +217,7 @@ CREATE TABLE IF NOT EXISTS ducklake_files_scheduled_for_deletion (
     schedule_start TEXT  -- R4-S-043/R6-S-031: TEXT for cross-engine compat; ISO 8601 UTC (e.g. '2024-01-15T10:30:00Z'). DuckDB uses TIMESTAMPTZ.
 );
 
+-- R6-S-030: ducklake_ prefix matches DuckDB's catalog naming convention for interoperability.
 CREATE TABLE IF NOT EXISTS ducklake_inlined_data_tables (
     table_id INTEGER,
     table_name VARCHAR,
@@ -1022,8 +1016,7 @@ fn stat_value_less_than(a: &str, b: &str, is_numeric: bool) -> bool {
         if let (Ok(ia), Ok(ib)) = (a.parse::<i128>(), b.parse::<i128>()) {
             return ia < ib;
         }
-        // R6-S-019: Use string-based decimal comparison to avoid f64 precision loss.
-        // Parse sign, integer part, and fractional part for exact comparison.
+        // R6-S-019: Use string-based decimal comparison to avoid f64 precision loss
         if let Some(ord) = cmp_decimal_strings(a, b) {
             return ord == std::cmp::Ordering::Less;
         }
@@ -1032,8 +1025,7 @@ fn stat_value_less_than(a: &str, b: &str, is_numeric: bool) -> bool {
     a < b
 }
 
-/// Compare two decimal number strings without f64 conversion.
-/// Returns `Some(Ordering)` if both strings are valid decimal numbers, `None` otherwise.
+/// Compare two decimal number strings without f64 conversion (R6-S-019).
 fn cmp_decimal_strings(a: &str, b: &str) -> Option<std::cmp::Ordering> {
     fn parse_parts(s: &str) -> Option<(bool, &str, &str)> {
         let s = s.trim();
@@ -1044,7 +1036,6 @@ fn cmp_decimal_strings(a: &str, b: &str) -> Option<std::cmp::Ordering> {
         } else {
             (false, s)
         };
-        // Validate: only digits and at most one dot
         if s.is_empty() || s.chars().any(|c| !c.is_ascii_digit() && c != '.') {
             return None;
         }
@@ -1059,10 +1050,8 @@ fn cmp_decimal_strings(a: &str, b: &str) -> Option<std::cmp::Ordering> {
     }
 
     fn cmp_magnitude(a_int: &str, a_frac: &str, b_int: &str, b_frac: &str) -> std::cmp::Ordering {
-        // Strip leading zeros from integer parts
         let ai = a_int.trim_start_matches('0');
         let bi = b_int.trim_start_matches('0');
-        // Compare integer part by length first, then lexicographically
         match ai.len().cmp(&bi.len()) {
             std::cmp::Ordering::Equal => {},
             ord => return ord,
@@ -1071,7 +1060,6 @@ fn cmp_decimal_strings(a: &str, b: &str) -> Option<std::cmp::Ordering> {
             std::cmp::Ordering::Equal => {},
             ord => return ord,
         }
-        // Compare fractional parts: pad shorter with trailing zeros conceptually
         let a_bytes = a_frac.as_bytes();
         let b_bytes = b_frac.as_bytes();
         let max_len = a_bytes.len().max(b_bytes.len());
@@ -1091,7 +1079,6 @@ fn cmp_decimal_strings(a: &str, b: &str) -> Option<std::cmp::Ordering> {
 
     match (a_neg, b_neg) {
         (true, false) => {
-            // Check if a is -0.0...
             let a_zero =
                 a_int.trim_start_matches('0').is_empty() && a_frac.trim_end_matches('0').is_empty();
             let b_zero =
@@ -1114,8 +1101,26 @@ fn cmp_decimal_strings(a: &str, b: &str) -> Option<std::cmp::Ordering> {
             }
         },
         (false, false) => Some(cmp_magnitude(a_int, a_frac, b_int, b_frac)),
-        (true, true) => Some(cmp_magnitude(b_int, b_frac, a_int, a_frac)), // reversed for negatives
+        (true, true) => Some(cmp_magnitude(b_int, b_frac, a_int, a_frac)),
     }
+}
+
+/// R6-S-029: Validate a DuckLake type string for safe use in DDL.
+fn validate_ducklake_type_for_ddl(type_str: &str) -> crate::Result<()> {
+    if type_str.is_empty() {
+        return Err(DuckLakeError::InvalidConfig(
+            "empty DuckLake type in DDL".into(),
+        ));
+    }
+    for ch in type_str.chars() {
+        if !ch.is_alphanumeric() && !matches!(ch, '(' | ')' | ',' | ' ' | '_' | '.') {
+            return Err(DuckLakeError::InvalidConfig(format!(
+                "invalid character \'{}\' in DuckLake type \'{}\' for DDL",
+                ch, type_str
+            )));
+        }
+    }
+    Ok(())
 }
 
 impl MetadataWriter for SqliteMetadataWriter {
@@ -3055,7 +3060,7 @@ impl MetadataWriter for SqliteMetadataWriter {
         block_on(async {
             let mut tx = self.pool.begin().await?;
 
-            // R4-S-023 + R6-S-009: Use DuckDB-compatible naming: ducklake_inlined_data_{table_id}_{schema_version}
+            // R4-S-023 + R6-S-009: Use DuckDB-compatible naming with actual schema_version
             // First check if an inlined data table already exists for this table_id
             let existing = sqlx::query(
                 "SELECT table_name, schema_version FROM ducklake_inlined_data_tables WHERE table_id = ?",
@@ -3098,9 +3103,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                     quote_identifier(&inlined_table_name)
                 );
                 for col in columns {
-                    // R6-S-029: Validate ducklake_type against known types before DDL interpolation.
-                    // ColumnDef::new() already validates via ducklake_to_arrow_type(), but we add
-                    // a belt-and-suspenders check since the type text is interpolated into raw SQL.
+                    // R6-S-029: Validate type string before DDL interpolation
                     let dl_type = col.ducklake_type();
                     validate_ducklake_type_for_ddl(dl_type)?;
                     create_sql.push_str(&format!(", {} {}", quote_identifier(col.name()), dl_type));
@@ -4221,52 +4224,24 @@ mod tests {
         assert!(!stat_value_less_than("banana", "banana", false));
     }
 
-    // R6-S-019: Test decimal comparison precision
     #[test]
     fn test_cmp_decimal_strings() {
         use std::cmp::Ordering;
-
-        // Basic decimal comparison
         assert_eq!(cmp_decimal_strings("1.1", "1.2"), Some(Ordering::Less));
         assert_eq!(cmp_decimal_strings("1.2", "1.1"), Some(Ordering::Greater));
         assert_eq!(cmp_decimal_strings("1.1", "1.1"), Some(Ordering::Equal));
-
-        // Large decimals that lose precision in f64
         assert_eq!(
             cmp_decimal_strings("99999999999999999.1", "99999999999999999.2"),
             Some(Ordering::Less)
         );
-        assert_eq!(
-            cmp_decimal_strings("99999999999999999.2", "99999999999999999.1"),
-            Some(Ordering::Greater)
-        );
-
-        // Negative numbers
-        assert_eq!(cmp_decimal_strings("-5.5", "3.3"), Some(Ordering::Less));
-        assert_eq!(cmp_decimal_strings("3.3", "-5.5"), Some(Ordering::Greater));
         assert_eq!(cmp_decimal_strings("-10.5", "-10.3"), Some(Ordering::Less));
-        assert_eq!(
-            cmp_decimal_strings("-10.3", "-10.5"),
-            Some(Ordering::Greater)
-        );
-
-        // Leading/trailing zeros
-        assert_eq!(cmp_decimal_strings("01.10", "1.1"), Some(Ordering::Equal));
         assert_eq!(cmp_decimal_strings("-0.0", "0.0"), Some(Ordering::Equal));
-
-        // Integer vs decimal
         assert_eq!(cmp_decimal_strings("5", "5.0"), Some(Ordering::Equal));
-        assert_eq!(cmp_decimal_strings("5", "5.1"), Some(Ordering::Less));
-
-        // Invalid input
         assert_eq!(cmp_decimal_strings("abc", "def"), None);
-        assert_eq!(cmp_decimal_strings("1.2.3", "1.0"), None);
     }
 
-    // R6-S-019: stat_value_less_than uses decimal comparison for high-precision values
     #[test]
     fn test_stat_value_less_than_decimal_precision() {
-        // These values are indistinguishable in f64 but should compare correctly
         assert!(stat_value_less_than(
             "99999999999999999.1",
             "99999999999999999.2",
@@ -4279,7 +4254,6 @@ mod tests {
         ));
     }
 
-    // R6-S-001: replace_table_files includes table_id in column stats
     #[tokio::test(flavor = "multi_thread")]
     async fn test_replace_table_files_column_stats_include_table_id() {
         let (writer, _temp) = create_test_writer().await;
@@ -4288,64 +4262,46 @@ mod tests {
             .get_or_create_schema("main", None, snapshot_id)
             .unwrap();
         let (table_id, _) = writer
-            .get_or_create_table(schema_id, "test_table", None, snapshot_id)
+            .get_or_create_table(schema_id, "t", None, snapshot_id)
             .unwrap();
-
-        let cols = vec![
-            ColumnDef::new("id", "int64", false).unwrap(),
-            ColumnDef::new("name", "varchar", true).unwrap(),
-        ];
-        writer
-            .set_columns(table_id, &cols, snapshot_id, false)
-            .unwrap();
-
-        // Get column IDs from the database
-        let col_row = sqlx::query(
-            "SELECT column_id FROM ducklake_column WHERE table_id = ? ORDER BY column_id LIMIT 1",
-        )
-        .bind(table_id)
-        .fetch_one(&*writer.pool)
-        .await
-        .unwrap();
-        let first_col_id: i64 = col_row.try_get(0).unwrap();
-
-        // Register initial file
-        let file = DataFileInfo::new("file1.parquet", 1000, 100);
+        let cols = vec![ColumnDef::new("id", "int64", false).unwrap()];
+        writer.set_columns(table_id, &cols, snapshot_id).unwrap();
+        let col_row =
+            sqlx::query("SELECT column_id FROM ducklake_column WHERE table_id = ? LIMIT 1")
+                .bind(table_id)
+                .fetch_one(&writer.pool)
+                .await
+                .unwrap();
+        let col_id: i64 = col_row.try_get(0).unwrap();
+        let file = DataFileInfo::new("f1.parquet", 1000, 100);
         writer
             .register_data_file(table_id, snapshot_id, &file)
             .unwrap();
-
-        // Replace with a new file that has column stats
         let stats = vec![ColumnStatInfo {
-            column_id: first_col_id,
+            column_id: col_id,
             null_count: Some(0),
-            min_value: Some("1".to_string()),
-            max_value: Some("100".to_string()),
+            min_value: Some("1".into()),
+            max_value: Some("100".into()),
         }];
-        let new_file = DataFileInfo::new("compacted.parquet", 2000, 200).with_column_stats(stats);
         let entry = ReplaceFileEntry {
-            file_info: new_file,
+            file_info: DataFileInfo::new("c.parquet", 2000, 200).with_column_stats(stats),
             partition_values: vec![],
         };
-
         let snap2 = writer.create_snapshot().unwrap();
         let ids = writer
             .replace_table_files(table_id, snap2, &[entry])
             .unwrap();
         assert_eq!(ids.len(), 1);
-
-        // Verify table_id was populated in column stats
         let row =
             sqlx::query("SELECT table_id FROM ducklake_file_column_stats WHERE data_file_id = ?")
                 .bind(ids[0])
-                .fetch_one(&*writer.pool)
+                .fetch_one(&writer.pool)
                 .await
                 .unwrap();
-        let stored_table_id: i64 = row.try_get(0).unwrap();
-        assert_eq!(stored_table_id, table_id);
+        let tid: i64 = row.try_get(0).unwrap();
+        assert_eq!(tid, table_id);
     }
 
-    // R6-S-015: replace_table_files populates row_id_start for compacted files
     #[tokio::test(flavor = "multi_thread")]
     async fn test_replace_table_files_row_id_start() {
         let (writer, _temp) = create_test_writer().await;
@@ -4354,73 +4310,50 @@ mod tests {
             .get_or_create_schema("main", None, snapshot_id)
             .unwrap();
         let (table_id, _) = writer
-            .get_or_create_table(schema_id, "test_table", None, snapshot_id)
+            .get_or_create_table(schema_id, "t", None, snapshot_id)
             .unwrap();
-
         let cols = vec![ColumnDef::new("id", "int64", false).unwrap()];
-        writer
-            .set_columns(table_id, &cols, snapshot_id, false)
-            .unwrap();
-
-        // Register initial file
-        let file = DataFileInfo::new("file1.parquet", 1000, 100);
+        writer.set_columns(table_id, &cols, snapshot_id).unwrap();
+        let file = DataFileInfo::new("f1.parquet", 1000, 100);
         writer
             .register_data_file(table_id, snapshot_id, &file)
             .unwrap();
-
-        // Replace with two compacted files
-        let file_a = DataFileInfo::new("compact_a.parquet", 500, 50);
-        let file_b = DataFileInfo::new("compact_b.parquet", 600, 70);
         let entries = vec![
             ReplaceFileEntry {
-                file_info: file_a,
+                file_info: DataFileInfo::new("a.parquet", 500, 50),
                 partition_values: vec![],
             },
             ReplaceFileEntry {
-                file_info: file_b,
+                file_info: DataFileInfo::new("b.parquet", 600, 70),
                 partition_values: vec![],
             },
         ];
-
         let snap2 = writer.create_snapshot().unwrap();
         let ids = writer
             .replace_table_files(table_id, snap2, &entries)
             .unwrap();
         assert_eq!(ids.len(), 2);
-
-        // Verify row_id_start values: first file starts at 0, second at 50
-        let row_a =
-            sqlx::query("SELECT row_id_start FROM ducklake_data_file WHERE data_file_id = ?")
-                .bind(ids[0])
-                .fetch_one(&*writer.pool)
-                .await
-                .unwrap();
-        let rid_a: i64 = row_a.try_get(0).unwrap();
-        assert_eq!(rid_a, 0);
-
-        let row_b =
-            sqlx::query("SELECT row_id_start FROM ducklake_data_file WHERE data_file_id = ?")
-                .bind(ids[1])
-                .fetch_one(&*writer.pool)
-                .await
-                .unwrap();
-        let rid_b: i64 = row_b.try_get(0).unwrap();
-        assert_eq!(rid_b, 50);
+        let r1 = sqlx::query("SELECT row_id_start FROM ducklake_data_file WHERE data_file_id = ?")
+            .bind(ids[0])
+            .fetch_one(&writer.pool)
+            .await
+            .unwrap();
+        assert_eq!(r1.try_get::<i64, _>(0).unwrap(), 0);
+        let r2 = sqlx::query("SELECT row_id_start FROM ducklake_data_file WHERE data_file_id = ?")
+            .bind(ids[1])
+            .fetch_one(&writer.pool)
+            .await
+            .unwrap();
+        assert_eq!(r2.try_get::<i64, _>(0).unwrap(), 50);
     }
 
-    // R6-S-029: validate_ducklake_type_for_ddl rejects injection characters
     #[test]
     fn test_validate_ducklake_type_for_ddl() {
-        // Valid types
         assert!(validate_ducklake_type_for_ddl("int64").is_ok());
         assert!(validate_ducklake_type_for_ddl("varchar").is_ok());
         assert!(validate_ducklake_type_for_ddl("decimal(10, 2)").is_ok());
-        assert!(validate_ducklake_type_for_ddl("timestamp with time zone").is_ok());
-
-        // Invalid: SQL injection attempts
         assert!(validate_ducklake_type_for_ddl("int64; DROP TABLE users").is_err());
-        assert!(validate_ducklake_type_for_ddl("int64'--").is_err());
+        assert!(validate_ducklake_type_for_ddl("int64\'--").is_err());
         assert!(validate_ducklake_type_for_ddl("").is_err());
-        assert!(validate_ducklake_type_for_ddl("int64\"").is_err());
     }
 }

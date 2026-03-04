@@ -207,6 +207,7 @@ SELECT
     pd.file_size_bytes AS previous_delete_file_size_bytes,
     pd.footer_size AS previous_delete_footer_size,
 
+    data.encryption_key AS data_encryption_key,
     cd.begin_snapshot
 FROM current_delete cd
 JOIN ducklake_data_file data
@@ -243,6 +244,7 @@ SELECT
     pd.file_size_bytes,
     pd.footer_size,
 
+    data.encryption_key AS data_encryption_key,
     data.end_snapshot
 FROM ducklake_data_file data
 LEFT JOIN LATERAL (
@@ -599,6 +601,9 @@ pub struct DeleteFileChange {
     pub previous_delete_path_is_relative: Option<bool>,
     pub previous_delete_file_size_bytes: Option<i64>,
     pub previous_delete_footer_size: Option<i64>,
+
+    /* -------- Data file encryption (R6-S-012) -------- */
+    pub data_encryption_key: Option<String>,
 
     /* -------- Snapshot where change occurred -------- */
     pub snapshot_id: i64,

@@ -13,7 +13,7 @@ use crate::metadata_provider::{
 };
 use sqlx::Row;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
-use sqlx::types::chrono::NaiveDateTime;
+// R6-S-031: Removed NaiveDateTime — snapshot_time read as String for cross-engine compat
 
 /// Note: This provider requires a multi-threaded Tokio runtime
 /// (`tokio::runtime::Builder::new_multi_thread()`) because it uses
@@ -88,9 +88,8 @@ impl MetadataProvider for SqliteMetadataProvider {
             rows.into_iter()
                 .map(|row| {
                     let snapshot_id: i64 = row.try_get(0)?;
-                    let timestamp: Option<NaiveDateTime> = row.try_get(1)?;
-                    let snapshot_time = timestamp
-                        .map(|ts: NaiveDateTime| ts.format("%Y-%m-%d %H:%M:%S%.6f").to_string());
+                    // R6-S-031: Read snapshot_time as String to handle both TEXT and TIMESTAMPTZ
+                    let snapshot_time: Option<String> = row.try_get(1)?;
 
                     Ok(SnapshotMetadata {
                         snapshot_id,
@@ -632,6 +631,7 @@ SELECT
        AND pd.begin_snapshot < cd.begin_snapshot
      ORDER BY pd.begin_snapshot DESC LIMIT 1) AS prev_delete_footer_size,
 
+    data.encryption_key AS data_encryption_key,
     cd.begin_snapshot AS snapshot_id
 FROM ducklake_delete_file cd
 JOIN ducklake_data_file data ON data.data_file_id = cd.data_file_id
@@ -679,6 +679,7 @@ SELECT
        AND pd.begin_snapshot < data.end_snapshot
      ORDER BY pd.begin_snapshot DESC LIMIT 1) AS prev_delete_footer_size,
 
+    data.encryption_key AS data_encryption_key,
     data.end_snapshot AS snapshot_id
 FROM ducklake_data_file data
 WHERE data.table_id = ?
@@ -730,8 +731,11 @@ WHERE data.table_id = ?
                         previous_delete_file_size_bytes: row.try_get(13)?,
                         previous_delete_footer_size: row.try_get(14)?,
 
+                        // data file encryption key (R6-S-012)
+                        data_encryption_key: row.try_get(15)?,
+
                         // snapshot
-                        snapshot_id: row.try_get(15)?,
+                        snapshot_id: row.try_get(16)?,
                     })
                 })
                 .collect()

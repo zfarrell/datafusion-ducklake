@@ -275,11 +275,8 @@ async fn test_insert_into_read_only_fails() {
             // Planning might fail early with read-only error
             let msg = e.to_string().to_lowercase();
             assert!(
-                msg.contains("read-only")
-                    || msg.contains("read only")
-                    || msg.contains("not supported")
-                    || msg.contains("column count"),
-                "Expected read-only, not supported, or column count error, got: {}",
+                msg.contains("read-only") || msg.contains("read only"),
+                "Expected read-only error, got: {}",
                 e
             );
         },

@@ -560,6 +560,7 @@ impl TableChangesTable {
         size_bytes: i64,
         footer_size: Option<i64>,
         projection: Option<&[usize]>,
+        parquet_source: ParquetSource,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let mut pf = PartitionedFile::new(path, validated_file_size(size_bytes, path)?);
         if let Some(fs) = footer_size
@@ -571,7 +572,7 @@ impl TableChangesTable {
         let mut builder = FileScanConfigBuilder::new(
             self.object_store_url.as_ref().clone(),
             self.table_schema.clone(),
-            Arc::new(ParquetSource::default()),
+            Arc::new(parquet_source),
         )
         .with_file_group(FileGroup::new(vec![pf]));
         if let Some(proj) = projection {
@@ -585,6 +586,7 @@ impl TableChangesTable {
         &self,
         delete_file: &DeleteFileChange,
         proj_info: &CdcProjectionAnalysis,
+        parquet_source: ParquetSource,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         // Resolve data file path
         let data_file_path = resolve_path(
@@ -634,6 +636,7 @@ impl TableChangesTable {
             } else {
                 Some(&proj_info.table_indices)
             },
+            parquet_source,
         )?;
 
         Ok(Arc::new(DeletedRowsExec::new(
@@ -737,9 +740,44 @@ impl TableProvider for TableChangesTable {
             execs.push(exec);
         }
 
-        // Build execution plan for each DELETE change (R5-S-039)
+        // Build execution plan for each DELETE change (R5-S-039, R6-S-012)
+        #[cfg(feature = "encryption")]
+        {
+            let mut builder = EncryptionFactoryBuilder::new();
+            for delete_file in &delete_files {
+                let resolved_path = resolve_path(
+                    &self.table_path,
+                    &delete_file.data_file_path,
+                    delete_file.data_file_path_is_relative,
+                )
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                builder.add_file(&resolved_path, delete_file.data_encryption_key.as_deref());
+            }
+            let del_factory = builder.build();
+            let del_encryption_factory: Option<Arc<dyn EncryptionFactory>> =
+                if del_factory.has_encrypted_files() {
+                    Some(Arc::new(del_factory) as Arc<dyn EncryptionFactory>)
+                } else {
+                    None
+                };
+            for delete_file in &delete_files {
+                let parquet_source = if let Some(ref factory) = del_encryption_factory {
+                    ParquetSource::default().with_encryption_factory(Arc::clone(factory))
+                } else {
+                    ParquetSource::default()
+                };
+                let exec =
+                    self.build_exec_for_delete_entry(delete_file, &proj_info, parquet_source)?;
+                execs.push(exec);
+            }
+        }
+        #[cfg(not(feature = "encryption"))]
         for delete_file in &delete_files {
-            let exec = self.build_exec_for_delete_entry(delete_file, &proj_info)?;
+            let exec = self.build_exec_for_delete_entry(
+                delete_file,
+                &proj_info,
+                ParquetSource::default(),
+            )?;
             execs.push(exec);
         }
 
