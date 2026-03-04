@@ -3,6 +3,7 @@
 //! Requires multi-threaded Tokio runtime (`#[tokio::test(flavor = "multi_thread")]`).
 
 use crate::Result;
+use crate::error::DuckLakeError;
 use crate::metadata_provider::block_on;
 use crate::metadata_writer::{
     AlterTableOp, ColumnDef, ColumnStatInfo, DataFileInfo, DeleteFileInfo, MetadataWriter,
@@ -1103,7 +1104,9 @@ impl MetadataWriter for MySqlMetadataWriter {
             let data_file_id: i64 = id_row.try_get(0)?;
 
             // Update ducklake_table_stats (F-012: table_stats population)
-            let new_next_row_id = row_id_start + file.record_count;
+            let new_next_row_id = row_id_start
+                .checked_add(file.record_count)
+                .ok_or_else(|| DuckLakeError::Internal("row_id overflow".into()))?;
             let updated = sqlx::query(
                 "UPDATE ducklake_table_stats
                  SET record_count = COALESCE(record_count, 0) + ?,
@@ -1224,7 +1227,9 @@ impl MetadataWriter for MySqlMetadataWriter {
                 .await?;
 
                 // Update ducklake_table_stats
-                let new_next_row_id = row_id_start + file.record_count;
+                let new_next_row_id = row_id_start
+                    .checked_add(file.record_count)
+                    .ok_or_else(|| DuckLakeError::Internal("row_id overflow".into()))?;
                 let updated = sqlx::query(
                     "UPDATE ducklake_table_stats
                      SET record_count = COALESCE(record_count, 0) + ?,

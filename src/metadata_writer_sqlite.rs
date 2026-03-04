@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use crate::Result;
+use crate::error::DuckLakeError;
 use crate::metadata_provider::{InlinedDataRow, block_on};
 use crate::metadata_writer::{
     AlterTableOp, ColumnDef, ColumnStatInfo, DataFileInfo, DeleteFileInfo, MetadataWriter,
@@ -117,6 +118,7 @@ CREATE TABLE IF NOT EXISTS ducklake_snapshot_changes (
     commit_extra_info VARCHAR
 );
 
+-- R6-S-030: DataFusion-specific tables use _df_ prefix to avoid conflicts with DuckLake catalog tables.
 CREATE TABLE IF NOT EXISTS _df_change_tracking (
     id INTEGER PRIMARY KEY,
     snapshot_id INTEGER NOT NULL,
@@ -125,6 +127,8 @@ CREATE TABLE IF NOT EXISTS _df_change_tracking (
     schema_id INTEGER
 );
 
+-- R6-S-030: The ducklake_ prefix on the following tables matches DuckDB's catalog schema exactly.
+-- This ensures cross-engine interoperability: DuckDB expects these standard DuckLake table names.
 CREATE TABLE IF NOT EXISTS ducklake_file_column_stats (
     data_file_id INTEGER NOT NULL,
     table_id INTEGER NOT NULL,
@@ -213,6 +217,7 @@ CREATE TABLE IF NOT EXISTS ducklake_files_scheduled_for_deletion (
     schedule_start TEXT  -- R4-S-043: Must use ISO 8601 format (e.g. '2024-01-15T10:30:00Z')
 );
 
+-- R6-S-030: ducklake_ prefix matches DuckDB's catalog naming convention for interoperability.
 CREATE TABLE IF NOT EXISTS ducklake_inlined_data_tables (
     table_id INTEGER,
     table_name VARCHAR,
@@ -987,13 +992,111 @@ fn stat_value_less_than(a: &str, b: &str, is_numeric: bool) -> bool {
         if let (Ok(ia), Ok(ib)) = (a.parse::<i128>(), b.parse::<i128>()) {
             return ia < ib;
         }
-        // Fall back to f64 for floating point
-        if let (Ok(fa), Ok(fb)) = (a.parse::<f64>(), b.parse::<f64>()) {
-            return fa < fb;
+        // R6-S-019: Use string-based decimal comparison to avoid f64 precision loss
+        if let Some(ord) = cmp_decimal_strings(a, b) {
+            return ord == std::cmp::Ordering::Less;
         }
     }
     // Lexicographic comparison for strings, dates, etc.
     a < b
+}
+
+/// Compare two decimal number strings without f64 conversion (R6-S-019).
+fn cmp_decimal_strings(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    fn parse_parts(s: &str) -> Option<(bool, &str, &str)> {
+        let s = s.trim();
+        let (neg, s) = if let Some(rest) = s.strip_prefix('-') {
+            (true, rest)
+        } else if let Some(rest) = s.strip_prefix('+') {
+            (false, rest)
+        } else {
+            (false, s)
+        };
+        if s.is_empty() || s.chars().any(|c| !c.is_ascii_digit() && c != '.') {
+            return None;
+        }
+        if s.matches('.').count() > 1 {
+            return None;
+        }
+        let (int_part, frac_part) = match s.split_once('.') {
+            Some((i, f)) => (i, f),
+            None => (s, ""),
+        };
+        Some((neg, int_part, frac_part))
+    }
+
+    fn cmp_magnitude(a_int: &str, a_frac: &str, b_int: &str, b_frac: &str) -> std::cmp::Ordering {
+        let ai = a_int.trim_start_matches('0');
+        let bi = b_int.trim_start_matches('0');
+        match ai.len().cmp(&bi.len()) {
+            std::cmp::Ordering::Equal => {},
+            ord => return ord,
+        }
+        match ai.cmp(bi) {
+            std::cmp::Ordering::Equal => {},
+            ord => return ord,
+        }
+        let a_bytes = a_frac.as_bytes();
+        let b_bytes = b_frac.as_bytes();
+        let max_len = a_bytes.len().max(b_bytes.len());
+        for i in 0..max_len {
+            let ac = a_bytes.get(i).copied().unwrap_or(b'0');
+            let bc = b_bytes.get(i).copied().unwrap_or(b'0');
+            match ac.cmp(&bc) {
+                std::cmp::Ordering::Equal => continue,
+                ord => return ord,
+            }
+        }
+        std::cmp::Ordering::Equal
+    }
+
+    let (a_neg, a_int, a_frac) = parse_parts(a)?;
+    let (b_neg, b_int, b_frac) = parse_parts(b)?;
+
+    match (a_neg, b_neg) {
+        (true, false) => {
+            let a_zero =
+                a_int.trim_start_matches('0').is_empty() && a_frac.trim_end_matches('0').is_empty();
+            let b_zero =
+                b_int.trim_start_matches('0').is_empty() && b_frac.trim_end_matches('0').is_empty();
+            if a_zero && b_zero {
+                Some(std::cmp::Ordering::Equal)
+            } else {
+                Some(std::cmp::Ordering::Less)
+            }
+        },
+        (false, true) => {
+            let a_zero =
+                a_int.trim_start_matches('0').is_empty() && a_frac.trim_end_matches('0').is_empty();
+            let b_zero =
+                b_int.trim_start_matches('0').is_empty() && b_frac.trim_end_matches('0').is_empty();
+            if a_zero && b_zero {
+                Some(std::cmp::Ordering::Equal)
+            } else {
+                Some(std::cmp::Ordering::Greater)
+            }
+        },
+        (false, false) => Some(cmp_magnitude(a_int, a_frac, b_int, b_frac)),
+        (true, true) => Some(cmp_magnitude(b_int, b_frac, a_int, a_frac)),
+    }
+}
+
+/// R6-S-029: Validate a DuckLake type string for safe use in DDL.
+fn validate_ducklake_type_for_ddl(type_str: &str) -> crate::Result<()> {
+    if type_str.is_empty() {
+        return Err(DuckLakeError::InvalidConfig(
+            "empty DuckLake type in DDL".into(),
+        ));
+    }
+    for ch in type_str.chars() {
+        if !ch.is_alphanumeric() && !matches!(ch, '(' | ')' | ',' | ' ' | '_' | '.') {
+            return Err(DuckLakeError::InvalidConfig(format!(
+                "invalid character \'{}\' in DuckLake type \'{}\' for DDL",
+                ch, type_str
+            )));
+        }
+    }
+    Ok(())
 }
 
 impl MetadataWriter for SqliteMetadataWriter {
@@ -1267,7 +1370,9 @@ impl MetadataWriter for SqliteMetadataWriter {
             let data_file_id: i64 = row.try_get(0)?;
 
             // Update ducklake_table_stats (F-012: table_stats population)
-            let new_next_row_id = row_id_start + file.record_count;
+            let new_next_row_id = row_id_start
+                .checked_add(file.record_count)
+                .ok_or_else(|| DuckLakeError::Internal("row_id overflow".into()))?;
             let updated = sqlx::query(
                 "UPDATE ducklake_table_stats
                  SET record_count = COALESCE(record_count, 0) + ?,
@@ -1357,12 +1462,14 @@ impl MetadataWriter for SqliteMetadataWriter {
             .await?;
 
             let mut ids = Vec::with_capacity(files.len());
+            // R6-S-015: Track cumulative row_id_start for compacted files
+            let mut cumulative_row_id: i64 = 0;
             for entry in files {
-                // Register data file
+                // Register data file (R6-S-015: include row_id_start)
                 let path_is_relative = entry.file_info.path_is_relative;
                 let row = sqlx::query(
-                    "INSERT INTO ducklake_data_file (table_id, path, path_is_relative, file_size_bytes, footer_size, record_count, begin_snapshot)
-                     VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING data_file_id",
+                    "INSERT INTO ducklake_data_file (table_id, path, path_is_relative, file_size_bytes, footer_size, record_count, row_id_start, begin_snapshot)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING data_file_id",
                 )
                 .bind(table_id)
                 .bind(&entry.file_info.path)
@@ -1370,18 +1477,20 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .bind(entry.file_info.file_size_bytes)
                 .bind(entry.file_info.footer_size)
                 .bind(entry.file_info.record_count)
+                .bind(cumulative_row_id)
                 .bind(snapshot_id)
                 .fetch_one(&mut *tx)
                 .await?;
                 let data_file_id: i64 = row.try_get(0)?;
 
-                // Register column stats
+                // Register column stats (R6-S-001: include table_id)
                 for stat in &entry.file_info.column_stats {
                     sqlx::query(
-                        "INSERT INTO ducklake_file_column_stats (data_file_id, column_id, null_count, min_value, max_value)
-                         VALUES (?, ?, ?, ?, ?)",
+                        "INSERT INTO ducklake_file_column_stats (data_file_id, table_id, column_id, null_count, min_value, max_value)
+                         VALUES (?, ?, ?, ?, ?, ?)",
                     )
                     .bind(data_file_id)
+                    .bind(table_id)
                     .bind(stat.column_id)
                     .bind(stat.null_count)
                     .bind(&stat.min_value)
@@ -1404,6 +1513,12 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .await?;
                 }
 
+                // R6-S-015: Advance cumulative row_id for next compacted file
+                cumulative_row_id = cumulative_row_id
+                    .checked_add(entry.file_info.record_count)
+                    .ok_or_else(|| {
+                        DuckLakeError::Internal("row_id overflow during compaction".into())
+                    })?;
                 ids.push(data_file_id);
             }
 
@@ -1548,7 +1663,9 @@ impl MetadataWriter for SqliteMetadataWriter {
                 let data_file_id: i64 = row.try_get(0)?;
 
                 // Update ducklake_table_stats
-                let new_next_row_id = row_id_start + file.record_count;
+                let new_next_row_id = row_id_start
+                    .checked_add(file.record_count)
+                    .ok_or_else(|| DuckLakeError::Internal("row_id overflow".into()))?;
                 let updated = sqlx::query(
                     "UPDATE ducklake_table_stats
                      SET record_count = COALESCE(record_count, 0) + ?,
@@ -2919,10 +3036,31 @@ impl MetadataWriter for SqliteMetadataWriter {
         block_on(async {
             let mut tx = self.pool.begin().await?;
 
-            // R4-S-023: Use DuckDB-compatible naming: ducklake_inlined_data_{table_id}_{schema_version}
-            let schema_version: i64 = 1;
-            let inlined_table_name =
-                format!("ducklake_inlined_data_{}_{}", table_id, schema_version);
+            // R4-S-023 + R6-S-009: Use DuckDB-compatible naming with actual schema_version
+            // First check if an inlined data table already exists for this table_id
+            let existing = sqlx::query(
+                "SELECT table_name, schema_version FROM ducklake_inlined_data_tables WHERE table_id = ?",
+            )
+            .bind(table_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+
+            let (inlined_table_name, schema_version) = if let Some(ref row) = existing {
+                let name: String = row.try_get(0)?;
+                let sv: i64 = row.try_get(1)?;
+                (name, sv)
+            } else {
+                // Look up the current schema_version from the snapshot
+                let sv_row = sqlx::query(
+                    "SELECT schema_version FROM ducklake_snapshot WHERE snapshot_id = ?",
+                )
+                .bind(snapshot_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                let sv: i64 = sv_row.try_get(0)?;
+                let name = format!("ducklake_inlined_data_{}_{}", table_id, sv);
+                (name, sv)
+            };
 
             // Check if inline data table exists; create if not
             let exists =
@@ -2942,11 +3080,10 @@ impl MetadataWriter for SqliteMetadataWriter {
                 for col in columns {
                     // R4-S-023: Use the DuckLake type from column definition (matching DuckDB convention)
                     // instead of TEXT for all columns. quote_identifier() escapes embedded quotes.
-                    create_sql.push_str(&format!(
-                        ", {} {}",
-                        quote_identifier(col.name()),
-                        col.ducklake_type()
-                    ));
+                    // R6-S-029: Validate type string before DDL interpolation
+                    let dl_type = col.ducklake_type();
+                    validate_ducklake_type_for_ddl(dl_type)?;
+                    create_sql.push_str(&format!(", {} {}", quote_identifier(col.name()), dl_type));
                 }
                 create_sql.push(')');
                 sqlx::query(&create_sql).execute(&mut *tx).await?;
@@ -4062,5 +4199,138 @@ mod tests {
         assert!(stat_value_less_than("apple", "banana", false));
         assert!(!stat_value_less_than("banana", "apple", false));
         assert!(!stat_value_less_than("banana", "banana", false));
+    }
+
+    #[test]
+    fn test_cmp_decimal_strings() {
+        use std::cmp::Ordering;
+        assert_eq!(cmp_decimal_strings("1.1", "1.2"), Some(Ordering::Less));
+        assert_eq!(cmp_decimal_strings("1.2", "1.1"), Some(Ordering::Greater));
+        assert_eq!(cmp_decimal_strings("1.1", "1.1"), Some(Ordering::Equal));
+        assert_eq!(
+            cmp_decimal_strings("99999999999999999.1", "99999999999999999.2"),
+            Some(Ordering::Less)
+        );
+        assert_eq!(cmp_decimal_strings("-10.5", "-10.3"), Some(Ordering::Less));
+        assert_eq!(cmp_decimal_strings("-0.0", "0.0"), Some(Ordering::Equal));
+        assert_eq!(cmp_decimal_strings("5", "5.0"), Some(Ordering::Equal));
+        assert_eq!(cmp_decimal_strings("abc", "def"), None);
+    }
+
+    #[test]
+    fn test_stat_value_less_than_decimal_precision() {
+        assert!(stat_value_less_than(
+            "99999999999999999.1",
+            "99999999999999999.2",
+            true
+        ));
+        assert!(!stat_value_less_than(
+            "99999999999999999.2",
+            "99999999999999999.1",
+            true
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_replace_table_files_column_stats_include_table_id() {
+        let (writer, _temp) = create_test_writer().await;
+        let snapshot_id = writer.create_snapshot().unwrap();
+        let (schema_id, _) = writer
+            .get_or_create_schema("main", None, snapshot_id)
+            .unwrap();
+        let (table_id, _) = writer
+            .get_or_create_table(schema_id, "t", None, snapshot_id)
+            .unwrap();
+        let cols = vec![ColumnDef::new("id", "int64", false).unwrap()];
+        writer.set_columns(table_id, &cols, snapshot_id).unwrap();
+        let col_row =
+            sqlx::query("SELECT column_id FROM ducklake_column WHERE table_id = ? LIMIT 1")
+                .bind(table_id)
+                .fetch_one(&writer.pool)
+                .await
+                .unwrap();
+        let col_id: i64 = col_row.try_get(0).unwrap();
+        let file = DataFileInfo::new("f1.parquet", 1000, 100);
+        writer
+            .register_data_file(table_id, snapshot_id, &file)
+            .unwrap();
+        let stats = vec![ColumnStatInfo {
+            column_id: col_id,
+            null_count: Some(0),
+            min_value: Some("1".into()),
+            max_value: Some("100".into()),
+        }];
+        let entry = ReplaceFileEntry {
+            file_info: DataFileInfo::new("c.parquet", 2000, 200).with_column_stats(stats),
+            partition_values: vec![],
+        };
+        let snap2 = writer.create_snapshot().unwrap();
+        let ids = writer
+            .replace_table_files(table_id, snap2, &[entry])
+            .unwrap();
+        assert_eq!(ids.len(), 1);
+        let row =
+            sqlx::query("SELECT table_id FROM ducklake_file_column_stats WHERE data_file_id = ?")
+                .bind(ids[0])
+                .fetch_one(&writer.pool)
+                .await
+                .unwrap();
+        let tid: i64 = row.try_get(0).unwrap();
+        assert_eq!(tid, table_id);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_replace_table_files_row_id_start() {
+        let (writer, _temp) = create_test_writer().await;
+        let snapshot_id = writer.create_snapshot().unwrap();
+        let (schema_id, _) = writer
+            .get_or_create_schema("main", None, snapshot_id)
+            .unwrap();
+        let (table_id, _) = writer
+            .get_or_create_table(schema_id, "t", None, snapshot_id)
+            .unwrap();
+        let cols = vec![ColumnDef::new("id", "int64", false).unwrap()];
+        writer.set_columns(table_id, &cols, snapshot_id).unwrap();
+        let file = DataFileInfo::new("f1.parquet", 1000, 100);
+        writer
+            .register_data_file(table_id, snapshot_id, &file)
+            .unwrap();
+        let entries = vec![
+            ReplaceFileEntry {
+                file_info: DataFileInfo::new("a.parquet", 500, 50),
+                partition_values: vec![],
+            },
+            ReplaceFileEntry {
+                file_info: DataFileInfo::new("b.parquet", 600, 70),
+                partition_values: vec![],
+            },
+        ];
+        let snap2 = writer.create_snapshot().unwrap();
+        let ids = writer
+            .replace_table_files(table_id, snap2, &entries)
+            .unwrap();
+        assert_eq!(ids.len(), 2);
+        let r1 = sqlx::query("SELECT row_id_start FROM ducklake_data_file WHERE data_file_id = ?")
+            .bind(ids[0])
+            .fetch_one(&writer.pool)
+            .await
+            .unwrap();
+        assert_eq!(r1.try_get::<i64, _>(0).unwrap(), 0);
+        let r2 = sqlx::query("SELECT row_id_start FROM ducklake_data_file WHERE data_file_id = ?")
+            .bind(ids[1])
+            .fetch_one(&writer.pool)
+            .await
+            .unwrap();
+        assert_eq!(r2.try_get::<i64, _>(0).unwrap(), 50);
+    }
+
+    #[test]
+    fn test_validate_ducklake_type_for_ddl() {
+        assert!(validate_ducklake_type_for_ddl("int64").is_ok());
+        assert!(validate_ducklake_type_for_ddl("varchar").is_ok());
+        assert!(validate_ducklake_type_for_ddl("decimal(10, 2)").is_ok());
+        assert!(validate_ducklake_type_for_ddl("int64; DROP TABLE users").is_err());
+        assert!(validate_ducklake_type_for_ddl("int64\'--").is_err());
+        assert!(validate_ducklake_type_for_ddl("").is_err());
     }
 }
