@@ -299,7 +299,13 @@ impl DuckLakeTableWriter {
 
                     let current_inline = self.metadata.get_inlined_row_count(setup.table_id)?;
 
-                    if current_inline + total_new_rows <= limit {
+                    let combined_rows =
+                        current_inline.checked_add(total_new_rows).ok_or_else(|| {
+                            crate::error::DuckLakeError::Internal(
+                                "inline row count overflow".to_string(),
+                            )
+                        })?;
+                    if combined_rows <= limit {
                         // Inline path: store data directly in catalog
                         let rows = batches_to_inlined_rows(batches, arrow_schema)?;
                         let stored = self.metadata.store_inlined_data(
@@ -1088,7 +1094,12 @@ fn arrow_array_value_to_string(
                     )
                 })?;
             let epoch_ms = a.value(idx);
-            let epoch_days = (epoch_ms / 86_400_000) as i32;
+            let epoch_days = i32::try_from(epoch_ms / 86_400_000).map_err(|_| {
+                crate::error::DuckLakeError::Internal(format!(
+                    "Date64 epoch days out of i32 range: {}",
+                    epoch_ms / 86_400_000
+                ))
+            })?;
             let date = chrono::NaiveDate::from_num_days_from_ce_opt(epoch_days + 719_163)
                 .ok_or_else(|| {
                     crate::error::DuckLakeError::Internal(format!(
@@ -1278,7 +1289,10 @@ pub(crate) fn extract_column_stats(
                 has_stats[col_idx] = true;
 
                 if let Some(nc) = stats.null_count_opt() {
-                    let nc_i64 = i64::try_from(nc).unwrap_or(i64::MAX);
+                    let nc_i64 = i64::try_from(nc).unwrap_or_else(|_| {
+                        debug_assert!(false, "null count {nc} exceeds i64 range");
+                        i64::MAX
+                    });
                     null_counts[col_idx] = null_counts[col_idx].saturating_add(nc_i64);
                 }
 
@@ -1650,7 +1664,12 @@ impl TableProvider for DeferredFlushProvider {
             vec![
                 Arc::new(arrow::array::Int64Array::from(vec![result.records_written])),
                 Arc::new(arrow::array::Int64Array::from(vec![
-                    i64::try_from(result.files_written).unwrap_or(i64::MAX),
+                    i64::try_from(result.files_written).map_err(|_| {
+                        datafusion::error::DataFusionError::Internal(format!(
+                            "files_written {} exceeds i64 range",
+                            result.files_written
+                        ))
+                    })?,
                 ])),
             ],
         )

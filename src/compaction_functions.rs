@@ -226,7 +226,12 @@ fn collect_string_batch(
             col.push(row.get::<_, Option<String>>(i).map_err(duckdb_err)?);
         }
     }
-    if columns[0].is_empty() {
+    let first_col = columns.first().ok_or_else(|| {
+        datafusion::error::DataFusionError::Internal(
+            "collect_string_batch: schema has zero columns".to_string(),
+        )
+    })?;
+    if first_col.is_empty() {
         Ok(RecordBatch::new_empty(schema.clone()))
     } else {
         let arrays: Vec<ArrayRef> = columns

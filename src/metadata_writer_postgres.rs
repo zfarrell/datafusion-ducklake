@@ -1235,7 +1235,13 @@ impl MetadataWriter for PostgresMetadataWriter {
             }
 
             // Recalculate ducklake_table_stats from new files
-            let total_record_count: i64 = files.iter().map(|f| f.file_info.record_count).sum();
+            let total_record_count: i64 = files.iter().try_fold(0i64, |acc, f| {
+                acc.checked_add(f.file_info.record_count).ok_or_else(|| {
+                    DuckLakeError::Internal(
+                        "record_count sum overflow in replace_table_files".into(),
+                    )
+                })
+            })?;
             let total_file_size: i64 = files.iter().map(|f| f.file_info.file_size_bytes).sum();
             let updated = sqlx::query(
                 "UPDATE ducklake_table_stats

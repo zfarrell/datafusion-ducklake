@@ -783,7 +783,10 @@ impl TableProvider for TableChangesTable {
 
         // Combine with UnionExec if multiple plans
         if execs.len() == 1 {
-            Ok(execs.into_iter().next().expect("checked len == 1 above"))
+            Ok(execs
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| panic!("expected exactly 1 exec, got {}", 0)))
         } else {
             UnionExec::try_new(execs)
         }

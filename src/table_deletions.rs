@@ -344,7 +344,10 @@ impl TableProvider for TableDeletionsTable {
 
         // Combine with UnionExec if multiple
         if execs.len() == 1 {
-            Ok(execs.into_iter().next().expect("checked len == 1 above"))
+            Ok(execs
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| panic!("expected exactly 1 exec, got {}", 0)))
         } else {
             UnionExec::try_new(execs)
         }
