@@ -407,7 +407,9 @@ impl CatalogProvider for DuckLakeCatalog {
                 // Configure writer and object store if this catalog is writable
                 #[cfg(feature = "write")]
                 let schema = if let Some(ref config) = self.write_config {
-                    let s = schema.with_writer(Arc::clone(&config.writer));
+                    let s = schema
+                        .with_writer(Arc::clone(&config.writer))
+                        .with_catalog_snapshot_id(Arc::clone(&self.snapshot_id));
                     if let Some(ref store) = config.object_store {
                         s.with_object_store(Arc::clone(store))
                     } else {

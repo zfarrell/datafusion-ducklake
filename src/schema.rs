@@ -2,6 +2,8 @@
 
 use std::any::Any;
 use std::sync::Arc;
+#[cfg(feature = "write")]
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use async_trait::async_trait;
 use datafusion::catalog::{SchemaProvider, TableProvider};
@@ -90,6 +92,10 @@ pub struct DuckLakeSchema {
     /// If None, defaults to LocalFileSystem.
     #[cfg(feature = "write")]
     write_object_store: Option<Arc<dyn object_store::ObjectStore>>,
+    /// Shared reference to the parent catalog's snapshot_id so DDL operations
+    /// (register_table, deregister_table) can propagate new snapshots back.
+    #[cfg(feature = "write")]
+    catalog_snapshot_id: Option<Arc<AtomicI64>>,
 }
 
 impl DuckLakeSchema {
@@ -113,6 +119,8 @@ impl DuckLakeSchema {
             writer: None,
             #[cfg(feature = "write")]
             write_object_store: None,
+            #[cfg(feature = "write")]
+            catalog_snapshot_id: None,
         }
     }
 
@@ -137,6 +145,14 @@ impl DuckLakeSchema {
     #[cfg(feature = "write")]
     pub fn with_object_store(mut self, object_store: Arc<dyn object_store::ObjectStore>) -> Self {
         self.write_object_store = Some(object_store);
+        self
+    }
+
+    /// Set the parent catalog's shared snapshot_id so DDL operations can propagate
+    /// new snapshot IDs back to the catalog.
+    #[cfg(feature = "write")]
+    pub fn with_catalog_snapshot_id(mut self, snapshot_id: Arc<AtomicI64>) -> Self {
+        self.catalog_snapshot_id = Some(snapshot_id);
         self
     }
 
@@ -354,9 +370,14 @@ impl SchemaProvider for DuckLakeSchema {
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
         // Drop the table in metadata (creates new snapshot, sets end_snapshot)
-        writer
+        let new_snapshot = writer
             .drop_table(meta.table_id)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        // Propagate new snapshot to parent catalog so subsequent lookups see the change
+        if let Some(ref catalog_sid) = self.catalog_snapshot_id {
+            catalog_sid.store(new_snapshot, Ordering::Release);
+        }
 
         Ok(Some(Arc::new(table) as Arc<dyn TableProvider>))
     }
@@ -416,9 +437,13 @@ impl SchemaProvider for DuckLakeSchema {
                 })
                 .collect::<DataFusionResult<Vec<_>>>()?;
 
-            writer
+            let result = writer
                 .begin_write_transaction(&self.schema_name, &name, &columns, WriteMode::Replace)
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            // Propagate new snapshot to parent catalog
+            if let Some(ref catalog_sid) = self.catalog_snapshot_id {
+                catalog_sid.store(result.snapshot_id, Ordering::Release);
+            }
         } else {
             // CTAS with data — write to Parquet and create metadata in one operation.
             // Use the configured object store, falling back to LocalFileSystem.
@@ -432,8 +457,12 @@ impl SchemaProvider for DuckLakeSchema {
             // Filter out empty batches
             let non_empty: Vec<_> = batches.into_iter().filter(|b| b.num_rows() > 0).collect();
 
-            block_on(table_writer.write_table(&self.schema_name, &name, &non_empty))
+            let result = block_on(table_writer.write_table(&self.schema_name, &name, &non_empty))
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            // Propagate new snapshot to parent catalog
+            if let Some(ref catalog_sid) = self.catalog_snapshot_id {
+                catalog_sid.store(result.snapshot_id, Ordering::Release);
+            }
         }
 
         // Return None to indicate a newly created table.

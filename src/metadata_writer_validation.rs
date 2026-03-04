@@ -349,6 +349,11 @@ fn validate_drop_column_default(
     })
 }
 
+// Known limitation: SET NOT NULL only updates catalog metadata without scanning
+// existing data for nulls. If the column already contains NULL values, the
+// constraint will be recorded but not enforced retroactively. This matches
+// DuckDB's DuckLake behavior where the catalog is the source of truth for
+// constraints, but a full table scan would be needed to truly validate.
 fn validate_set_not_null(
     columns: &[ActiveColumnInfo],
     column_name: &str,
@@ -361,6 +366,11 @@ fn validate_set_not_null(
             column_name
         )));
     };
+
+    tracing::warn!(
+        column = %column_name,
+        "SET NOT NULL does not validate existing data — constraint may be violated if column already contains nulls"
+    );
 
     Ok(AlterTableAction::ReplaceColumn {
         end_column_id: target_col.column_id,
@@ -403,6 +413,9 @@ fn validate_drop_not_null(
     })
 }
 
+/// Allowed partition transform values. Empty/None maps to identity.
+const ALLOWED_PARTITION_TRANSFORMS: &[&str] = &["identity", "year", "month", "day", "hour"];
+
 fn validate_set_partitioned_by(
     columns: &[ActiveColumnInfo],
     partition_columns: &[PartitionColumnDef],
@@ -413,8 +426,32 @@ fn validate_set_partitioned_by(
         ));
     }
 
+    // Check for duplicate partition columns
+    let mut seen_columns = std::collections::HashSet::new();
+    for pc in partition_columns {
+        if !seen_columns.insert(&pc.column_name) {
+            return Err(DuckLakeError::InvalidConfig(format!(
+                "Duplicate partition column '{}'",
+                pc.column_name
+            )));
+        }
+    }
+
     let mut validated = Vec::with_capacity(partition_columns.len());
     for pc in partition_columns {
+        // Validate transform value against allowlist
+        if let Some(ref transform) = pc.transform {
+            let t = transform.to_lowercase();
+            if !t.is_empty() && !ALLOWED_PARTITION_TRANSFORMS.contains(&t.as_str()) {
+                return Err(DuckLakeError::InvalidConfig(format!(
+                    "Invalid partition transform '{}' for column '{}'. Allowed transforms: {}",
+                    transform,
+                    pc.column_name,
+                    ALLOWED_PARTITION_TRANSFORMS.join(", ")
+                )));
+            }
+        }
+
         let target = columns.iter().find(|c| c.column_name == pc.column_name);
         let Some(target_col) = target else {
             return Err(DuckLakeError::InvalidConfig(format!(
@@ -837,6 +874,103 @@ mod tests {
         let columns = make_columns(&[("id", "int64", 0, false)]);
         let op = AlterTableOp::DropNotNull {
             column_name: "missing".into(),
+        };
+        assert!(validate_alter_table(&columns, &op).is_err());
+    }
+
+    // --- validate_set_partitioned_by tests ---
+
+    #[test]
+    fn test_partition_valid_transforms() {
+        let columns = make_columns(&[("id", "int64", 0, false), ("ts", "timestamp", 1, true)]);
+        for transform in &["identity", "year", "month", "day", "hour"] {
+            let op = AlterTableOp::SetPartitionedBy {
+                partition_columns: vec![PartitionColumnDef {
+                    column_name: "ts".into(),
+                    transform: Some(transform.to_string()),
+                }],
+            };
+            assert!(
+                validate_alter_table(&columns, &op).is_ok(),
+                "transform '{}' should be allowed",
+                transform
+            );
+        }
+    }
+
+    #[test]
+    fn test_partition_none_transform_ok() {
+        let columns = make_columns(&[("id", "int64", 0, false)]);
+        let op = AlterTableOp::SetPartitionedBy {
+            partition_columns: vec![PartitionColumnDef {
+                column_name: "id".into(),
+                transform: None,
+            }],
+        };
+        assert!(validate_alter_table(&columns, &op).is_ok());
+    }
+
+    #[test]
+    fn test_partition_empty_transform_ok() {
+        let columns = make_columns(&[("id", "int64", 0, false)]);
+        let op = AlterTableOp::SetPartitionedBy {
+            partition_columns: vec![PartitionColumnDef {
+                column_name: "id".into(),
+                transform: Some("".into()),
+            }],
+        };
+        assert!(validate_alter_table(&columns, &op).is_ok());
+    }
+
+    #[test]
+    fn test_partition_invalid_transform_rejected() {
+        let columns = make_columns(&[("id", "int64", 0, false)]);
+        let op = AlterTableOp::SetPartitionedBy {
+            partition_columns: vec![PartitionColumnDef {
+                column_name: "id".into(),
+                transform: Some("bucket".into()),
+            }],
+        };
+        let err = validate_alter_table(&columns, &op).unwrap_err();
+        assert!(err.to_string().contains("Invalid partition transform"));
+    }
+
+    #[test]
+    fn test_partition_duplicate_column_rejected() {
+        let columns = make_columns(&[("id", "int64", 0, false), ("ts", "timestamp", 1, true)]);
+        let op = AlterTableOp::SetPartitionedBy {
+            partition_columns: vec![
+                PartitionColumnDef {
+                    column_name: "id".into(),
+                    transform: None,
+                },
+                PartitionColumnDef {
+                    column_name: "id".into(),
+                    transform: Some("year".into()),
+                },
+            ],
+        };
+        let err = validate_alter_table(&columns, &op).unwrap_err();
+        assert!(err.to_string().contains("Duplicate partition column"));
+    }
+
+    #[test]
+    fn test_partition_nonexistent_column_rejected() {
+        let columns = make_columns(&[("id", "int64", 0, false)]);
+        let op = AlterTableOp::SetPartitionedBy {
+            partition_columns: vec![PartitionColumnDef {
+                column_name: "missing".into(),
+                transform: None,
+            }],
+        };
+        assert!(validate_alter_table(&columns, &op).is_err());
+    }
+
+    #[test]
+    fn test_partition_empty_list_rejected() {
+        let columns = make_columns(&[("id", "int64", 0, false)]);
+        let op = AlterTableOp::SetPartitionedBy {
+            partition_columns: vec![],
         };
         assert!(validate_alter_table(&columns, &op).is_err());
     }
