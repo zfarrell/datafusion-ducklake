@@ -1200,7 +1200,11 @@ pub(crate) fn inlined_rows_to_batch(
         }
 
         // Parse string values into the appropriate Arrow array type
-        let array = parse_string_to_array(&string_values, data_type)?;
+        let array = crate::parse_values::parse_string_values_to_array(
+            &string_values,
+            data_type,
+            crate::parse_values::ParseMode::Strict,
+        )?;
         column_arrays.push(array);
     }
 
@@ -1208,309 +1212,6 @@ pub(crate) fn inlined_rows_to_batch(
         Arc::new(schema.clone()),
         column_arrays,
     )?)
-}
-
-/// Parse a decimal string (e.g. "123.45") to an i128 value scaled by 10^scale.
-fn parse_decimal_string(s: &str, scale: i8) -> Result<i128> {
-    let negative = s.starts_with('-');
-    let s = if negative {
-        &s[1..]
-    } else {
-        s
-    };
-
-    let (integer_part, frac_part) = if let Some(dot_pos) = s.find('.') {
-        (&s[..dot_pos], &s[dot_pos + 1..])
-    } else {
-        (s, "")
-    };
-
-    let integer: i128 = if integer_part.is_empty() {
-        0
-    } else {
-        integer_part.parse::<i128>().map_err(|_| {
-            crate::error::DuckLakeError::Internal(format!(
-                "Failed to parse decimal integer part '{}'",
-                integer_part
-            ))
-        })?
-    };
-
-    let scale_u = scale.max(0) as u32;
-    let frac_len = frac_part.len() as u32;
-    let frac: i128 = if frac_part.is_empty() {
-        0
-    } else if frac_len <= scale_u {
-        let frac_val: i128 = frac_part.parse::<i128>().map_err(|_| {
-            crate::error::DuckLakeError::Internal(format!(
-                "Failed to parse decimal fraction part '{}'",
-                frac_part
-            ))
-        })?;
-        frac_val * 10i128.pow(scale_u - frac_len)
-    } else {
-        // Truncate extra digits
-        let truncated = &frac_part[..scale_u as usize];
-        truncated.parse::<i128>().map_err(|_| {
-            crate::error::DuckLakeError::Internal(format!(
-                "Failed to parse decimal fraction part '{}'",
-                truncated
-            ))
-        })?
-    };
-
-    let unscaled = integer * 10i128.pow(scale_u) + frac;
-    Ok(if negative {
-        -unscaled
-    } else {
-        unscaled
-    })
-}
-
-/// Parse string values into an Arrow array of the given data type.
-fn parse_string_to_array(
-    values: &[Option<String>],
-    data_type: &arrow::datatypes::DataType,
-) -> Result<Arc<dyn arrow::array::Array>> {
-    use arrow::array::*;
-    use arrow::datatypes::DataType;
-
-    macro_rules! parse_primitive {
-        ($builder_ty:ty, $values:expr) => {{
-            let mut builder = <$builder_ty>::with_capacity($values.len());
-            for val in $values {
-                match val {
-                    Some(s) => match s.parse() {
-                        Ok(v) => builder.append_value(v),
-                        Err(_) => {
-                            return Err(crate::error::DuckLakeError::Internal(format!(
-                                "Failed to parse inlined value '{}' as {}",
-                                s,
-                                std::any::type_name::<$builder_ty>()
-                            )));
-                        },
-                    },
-                    None => builder.append_null(),
-                }
-            }
-            Arc::new(builder.finish()) as Arc<dyn Array>
-        }};
-    }
-
-    let array: Arc<dyn arrow::array::Array> = match data_type {
-        DataType::Boolean => {
-            let mut builder = BooleanBuilder::with_capacity(values.len());
-            for val in values {
-                match val {
-                    Some(s) => match s.to_lowercase().as_str() {
-                        "true" | "1" | "t" => builder.append_value(true),
-                        "false" | "0" | "f" => builder.append_value(false),
-                        _ => {
-                            return Err(crate::error::DuckLakeError::Internal(format!(
-                                "Failed to parse inlined value '{}' as Boolean",
-                                s
-                            )));
-                        },
-                    },
-                    None => builder.append_null(),
-                }
-            }
-            Arc::new(builder.finish())
-        },
-        DataType::Int8 => parse_primitive!(Int8Builder, values),
-        DataType::Int16 => parse_primitive!(Int16Builder, values),
-        DataType::Int32 => parse_primitive!(Int32Builder, values),
-        DataType::Int64 => parse_primitive!(Int64Builder, values),
-        DataType::UInt8 => parse_primitive!(UInt8Builder, values),
-        DataType::UInt16 => parse_primitive!(UInt16Builder, values),
-        DataType::UInt32 => parse_primitive!(UInt32Builder, values),
-        DataType::UInt64 => parse_primitive!(UInt64Builder, values),
-        DataType::Float32 => parse_primitive!(Float32Builder, values),
-        DataType::Float64 => parse_primitive!(Float64Builder, values),
-        DataType::Utf8 => {
-            let mut builder = StringBuilder::new();
-            for val in values {
-                match val {
-                    Some(s) => builder.append_value(s),
-                    None => builder.append_null(),
-                }
-            }
-            Arc::new(builder.finish())
-        },
-        DataType::LargeUtf8 => {
-            let mut builder = LargeStringBuilder::new();
-            for val in values {
-                match val {
-                    Some(s) => builder.append_value(s),
-                    None => builder.append_null(),
-                }
-            }
-            Arc::new(builder.finish())
-        },
-        DataType::Date32 => {
-            let mut builder = Date32Builder::with_capacity(values.len());
-            for val in values {
-                match val {
-                    Some(s) => {
-                        // Try ISO date string first ("2024-06-15"), then epoch days
-                        let epoch_days =
-                            if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-                                let epoch: chrono::NaiveDate =
-                                    chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-                                date.signed_duration_since(epoch).num_days() as i32
-                            } else if let Ok(v) = s.parse::<i32>() {
-                                v
-                            } else {
-                                return Err(crate::error::DuckLakeError::Internal(format!(
-                                    "Failed to parse inlined value '{}' as Date32",
-                                    s
-                                )));
-                            };
-                        builder.append_value(epoch_days);
-                    },
-                    None => builder.append_null(),
-                }
-            }
-            Arc::new(builder.finish()) as Arc<dyn Array>
-        },
-        DataType::Date64 => {
-            let mut builder = Date64Builder::with_capacity(values.len());
-            for val in values {
-                match val {
-                    Some(s) => {
-                        let epoch_ms =
-                            if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-                                let epoch: chrono::NaiveDate =
-                                    chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-                                date.signed_duration_since(epoch).num_days() as i64 * 86_400_000
-                            } else if let Ok(v) = s.parse::<i64>() {
-                                v
-                            } else {
-                                return Err(crate::error::DuckLakeError::Internal(format!(
-                                    "Failed to parse inlined value '{}' as Date64",
-                                    s
-                                )));
-                            };
-                        builder.append_value(epoch_ms);
-                    },
-                    None => builder.append_null(),
-                }
-            }
-            Arc::new(builder.finish()) as Arc<dyn Array>
-        },
-        DataType::Timestamp(unit, tz) => {
-            use arrow::datatypes::TimeUnit;
-
-            /// Parse a timestamp string (ISO or epoch integer) to epoch microseconds.
-            fn parse_timestamp_to_us(s: &str) -> std::result::Result<i64, String> {
-                // Try ISO format first: "2024-06-15 12:30:00"
-                if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
-                    let utc: chrono::DateTime<chrono::Utc> = dt.and_utc();
-                    return Ok(utc.timestamp_micros());
-                }
-                // Try with fractional seconds: "2024-06-15 12:30:00.123456"
-                if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
-                    let utc: chrono::DateTime<chrono::Utc> = dt.and_utc();
-                    return Ok(utc.timestamp_micros());
-                }
-                // Fallback: raw integer (epoch microseconds)
-                s.parse::<i64>()
-                    .map_err(|_| format!("Failed to parse '{}' as Timestamp", s))
-            }
-
-            macro_rules! build_timestamp {
-                ($builder_ty:ty, $convert:expr) => {{
-                    let mut builder = <$builder_ty>::with_capacity(values.len());
-                    let convert_fn: fn(i64) -> i64 = $convert;
-                    for val in values {
-                        match val {
-                            Some(s) => match parse_timestamp_to_us(s) {
-                                Ok(us) => builder.append_value(convert_fn(us)),
-                                Err(msg) => {
-                                    return Err(crate::error::DuckLakeError::Internal(msg));
-                                },
-                            },
-                            None => builder.append_null(),
-                        }
-                    }
-                    let arr = builder.finish();
-                    match tz {
-                        Some(tz) => Arc::new(arr.with_timezone(tz.as_ref())) as Arc<dyn Array>,
-                        None => Arc::new(arr) as Arc<dyn Array>,
-                    }
-                }};
-            }
-
-            match unit {
-                TimeUnit::Second => {
-                    build_timestamp!(TimestampSecondBuilder, |us: i64| us / 1_000_000)
-                },
-                TimeUnit::Millisecond => {
-                    build_timestamp!(TimestampMillisecondBuilder, |us: i64| us / 1_000)
-                },
-                TimeUnit::Microsecond => {
-                    build_timestamp!(TimestampMicrosecondBuilder, |us: i64| us)
-                },
-                TimeUnit::Nanosecond => {
-                    build_timestamp!(TimestampNanosecondBuilder, |us: i64| us * 1_000)
-                },
-            }
-        },
-        DataType::Decimal128(precision, scale) => {
-            let mut builder = Decimal128Builder::with_capacity(values.len());
-            for val in values {
-                match val {
-                    Some(s) => {
-                        let i128_val = parse_decimal_string(s, *scale)?;
-                        builder.append_value(i128_val);
-                    },
-                    None => builder.append_null(),
-                }
-            }
-            Arc::new(
-                builder
-                    .finish()
-                    .with_precision_and_scale(*precision, *scale)
-                    .map_err(|e| {
-                        crate::error::DuckLakeError::Internal(format!(
-                            "Invalid Decimal128 precision/scale: {}",
-                            e
-                        ))
-                    })?,
-            ) as Arc<dyn Array>
-        },
-        DataType::Decimal256(precision, scale) => {
-            let mut builder = Decimal256Builder::with_capacity(values.len());
-            for val in values {
-                match val {
-                    Some(s) => {
-                        let i128_val = parse_decimal_string(s, *scale)?;
-                        builder.append_value(arrow::datatypes::i256::from_i128(i128_val));
-                    },
-                    None => builder.append_null(),
-                }
-            }
-            Arc::new(
-                builder
-                    .finish()
-                    .with_precision_and_scale(*precision, *scale)
-                    .map_err(|e| {
-                        crate::error::DuckLakeError::Internal(format!(
-                            "Invalid Decimal256 precision/scale: {}",
-                            e
-                        ))
-                    })?,
-            ) as Arc<dyn Array>
-        },
-        other => {
-            return Err(crate::error::DuckLakeError::UnsupportedType(format!(
-                "Unsupported data type {:?} in parse_string_to_array",
-                other
-            )));
-        },
-    };
-
-    Ok(array)
 }
 
 pub(crate) fn arrow_schema_to_column_defs(schema: &Schema) -> Result<Vec<ColumnDef>> {
@@ -2079,18 +1780,26 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_string_to_array_error_on_invalid() {
+    fn test_parse_string_values_to_array_error_on_invalid() {
         let values = vec![Some("not_a_number".to_string())];
-        let result = parse_string_to_array(&values, &DataType::Int32);
+        let result = crate::parse_values::parse_string_values_to_array(
+            &values,
+            &DataType::Int32,
+            crate::parse_values::ParseMode::Strict,
+        );
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("Failed to parse"));
     }
 
     #[test]
-    fn test_parse_string_to_array_bool_error_on_invalid() {
+    fn test_parse_string_values_to_array_bool_error_on_invalid() {
         let values = vec![Some("maybe".to_string())];
-        let result = parse_string_to_array(&values, &DataType::Boolean);
+        let result = crate::parse_values::parse_string_values_to_array(
+            &values,
+            &DataType::Boolean,
+            crate::parse_values::ParseMode::Strict,
+        );
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("Failed to parse"));
@@ -2106,7 +1815,12 @@ mod tests {
 
         // Read: ISO string "2024-06-15" -> Date32 value 19889
         let values = vec![Some(serialized)];
-        let result = parse_string_to_array(&values, &DataType::Date32).unwrap();
+        let result = crate::parse_values::parse_string_values_to_array(
+            &values,
+            &DataType::Date32,
+            crate::parse_values::ParseMode::Strict,
+        )
+        .unwrap();
         let date_array = result.as_any().downcast_ref::<Date32Array>().unwrap();
         assert_eq!(date_array.value(0), 19889);
     }
@@ -2123,9 +1837,12 @@ mod tests {
 
         // Read: ISO string -> Timestamp microseconds
         let values = vec![Some(serialized)];
-        let result =
-            parse_string_to_array(&values, &DataType::Timestamp(TimeUnit::Microsecond, None))
-                .unwrap();
+        let result = crate::parse_values::parse_string_values_to_array(
+            &values,
+            &DataType::Timestamp(TimeUnit::Microsecond, None),
+            crate::parse_values::ParseMode::Strict,
+        )
+        .unwrap();
         let ts_array = result
             .as_any()
             .downcast_ref::<TimestampMicrosecondArray>()
@@ -2138,7 +1855,12 @@ mod tests {
         use arrow::array::Date32Array;
         // Verify that old epoch-day strings ("19889") are still parseable
         let values = vec![Some("19889".to_string())];
-        let result = parse_string_to_array(&values, &DataType::Date32).unwrap();
+        let result = crate::parse_values::parse_string_values_to_array(
+            &values,
+            &DataType::Date32,
+            crate::parse_values::ParseMode::Strict,
+        )
+        .unwrap();
         let date_array = result.as_any().downcast_ref::<Date32Array>().unwrap();
         assert_eq!(date_array.value(0), 19889);
     }
@@ -2150,9 +1872,12 @@ mod tests {
         // Verify that old epoch-microsecond strings are still parseable
         let epoch_us: i64 = 1_718_451_000_000_000;
         let values = vec![Some(epoch_us.to_string())];
-        let result =
-            parse_string_to_array(&values, &DataType::Timestamp(TimeUnit::Microsecond, None))
-                .unwrap();
+        let result = crate::parse_values::parse_string_values_to_array(
+            &values,
+            &DataType::Timestamp(TimeUnit::Microsecond, None),
+            crate::parse_values::ParseMode::Strict,
+        )
+        .unwrap();
         let ts_array = result
             .as_any()
             .downcast_ref::<TimestampMicrosecondArray>()
@@ -2166,9 +1891,10 @@ mod tests {
         use arrow::datatypes::TimeUnit;
         let epoch_us: i64 = 1_718_451_000_000_000;
         let values = vec![Some(epoch_us.to_string())];
-        let result = parse_string_to_array(
+        let result = crate::parse_values::parse_string_values_to_array(
             &values,
             &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            crate::parse_values::ParseMode::Strict,
         )
         .unwrap();
         let ts_array = result

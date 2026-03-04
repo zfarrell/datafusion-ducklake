@@ -362,7 +362,11 @@ impl DuckLakeTable {
             }
 
             // Parse string values into the appropriate Arrow array type
-            let array = parse_inlined_column(&string_values, data_type)?;
+            let array = crate::parse_values::parse_string_values_to_array(
+                &string_values,
+                data_type,
+                crate::parse_values::ParseMode::Lenient,
+            )?;
             column_arrays.push(array);
         }
 
@@ -1576,7 +1580,9 @@ impl TableProvider for DuckLakeTable {
                 self.build_exec_for_file_with_deletes(state, table_file, real_proj_ref, None)
                     .await?
             } else {
-                self.build_exec_for_single_file(state, table_file, real_proj_ref, limit)
+                // Don't push limit to individual file scans — the combined plan
+                // handles the overall limit, pushing it here would read limit*N rows
+                self.build_exec_for_single_file(state, table_file, real_proj_ref, None)
                     .await?
             };
             execs.push(Arc::new(VirtualColumnExec::new(
@@ -1747,6 +1753,9 @@ impl TableProvider for DuckLakeTable {
                 Some(crate::insert_exec::WritePartitionColumn {
                     column_name: pc.column_name.clone(),
                     column_index: col_idx,
+                    resolved_transform: crate::insert_exec::PartitionTransform::from_str_opt(
+                        pc.transform.as_deref(),
+                    ),
                     transform: pc.transform.clone(),
                 })
             })
@@ -1840,192 +1849,6 @@ fn extract_deleted_positions_from_batch(
     }
 
     Ok(())
-}
-
-/// Parse a column of string values into an Arrow array of the given data type.
-///
-/// Used for converting inlined data (stored as strings in the catalog) back into
-/// typed Arrow arrays for query execution.
-fn parse_inlined_column(
-    values: &[Option<String>],
-    data_type: &DataType,
-) -> DataFusionResult<Arc<dyn Array>> {
-    use arrow::array::*;
-
-    macro_rules! parse_primitive {
-        ($builder_ty:ty, $values:expr) => {{
-            let mut builder = <$builder_ty>::with_capacity($values.len());
-            for val in $values {
-                match val {
-                    Some(s) => match s.parse() {
-                        Ok(v) => builder.append_value(v),
-                        Err(_) => builder.append_null(),
-                    },
-                    None => builder.append_null(),
-                }
-            }
-            Arc::new(builder.finish()) as Arc<dyn Array>
-        }};
-    }
-
-    let array: Arc<dyn Array> = match data_type {
-        DataType::Boolean => {
-            let mut builder = BooleanBuilder::with_capacity(values.len());
-            for val in values {
-                match val {
-                    Some(s) => match s.to_lowercase().as_str() {
-                        "true" | "1" | "t" => builder.append_value(true),
-                        "false" | "0" | "f" => builder.append_value(false),
-                        _ => builder.append_null(),
-                    },
-                    None => builder.append_null(),
-                }
-            }
-            Arc::new(builder.finish())
-        },
-        DataType::Int8 => parse_primitive!(Int8Builder, values),
-        DataType::Int16 => parse_primitive!(Int16Builder, values),
-        DataType::Int32 => parse_primitive!(Int32Builder, values),
-        DataType::Int64 => parse_primitive!(Int64Builder, values),
-        DataType::UInt8 => parse_primitive!(UInt8Builder, values),
-        DataType::UInt16 => parse_primitive!(UInt16Builder, values),
-        DataType::UInt32 => parse_primitive!(UInt32Builder, values),
-        DataType::UInt64 => parse_primitive!(UInt64Builder, values),
-        DataType::Float32 => parse_primitive!(Float32Builder, values),
-        DataType::Float64 => parse_primitive!(Float64Builder, values),
-        DataType::Utf8 => {
-            let mut builder = StringBuilder::new();
-            for val in values {
-                match val {
-                    Some(s) => builder.append_value(s),
-                    None => builder.append_null(),
-                }
-            }
-            Arc::new(builder.finish())
-        },
-        DataType::LargeUtf8 => {
-            let mut builder = LargeStringBuilder::new();
-            for val in values {
-                match val {
-                    Some(s) => builder.append_value(s),
-                    None => builder.append_null(),
-                }
-            }
-            Arc::new(builder.finish())
-        },
-        DataType::Date32 => {
-            let mut builder = Date32Builder::with_capacity(values.len());
-            for val in values {
-                match val {
-                    Some(s) => {
-                        // Try ISO date string ("2024-06-15"), then epoch days
-                        let epoch_days =
-                            if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-                                let epoch: chrono::NaiveDate =
-                                    chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-                                date.signed_duration_since(epoch).num_days() as i32
-                            } else if let Ok(v) = s.parse::<i32>() {
-                                v
-                            } else {
-                                builder.append_null();
-                                continue;
-                            };
-                        builder.append_value(epoch_days);
-                    },
-                    None => builder.append_null(),
-                }
-            }
-            Arc::new(builder.finish()) as Arc<dyn Array>
-        },
-        DataType::Date64 => {
-            let mut builder = Date64Builder::with_capacity(values.len());
-            for val in values {
-                match val {
-                    Some(s) => {
-                        let epoch_ms =
-                            if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-                                let epoch: chrono::NaiveDate =
-                                    chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-                                date.signed_duration_since(epoch).num_days() as i64 * 86_400_000
-                            } else if let Ok(v) = s.parse::<i64>() {
-                                v
-                            } else {
-                                builder.append_null();
-                                continue;
-                            };
-                        builder.append_value(epoch_ms);
-                    },
-                    None => builder.append_null(),
-                }
-            }
-            Arc::new(builder.finish()) as Arc<dyn Array>
-        },
-        DataType::Timestamp(unit, tz) => {
-            use arrow::datatypes::TimeUnit;
-
-            /// Parse a timestamp string (ISO or epoch integer) to epoch microseconds.
-            fn parse_ts_to_us(s: &str) -> Option<i64> {
-                if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
-                    let dt: chrono::NaiveDateTime = dt;
-                    return Some(dt.and_utc().timestamp_micros());
-                }
-                if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
-                    let dt: chrono::NaiveDateTime = dt;
-                    return Some(dt.and_utc().timestamp_micros());
-                }
-                s.parse::<i64>().ok()
-            }
-
-            macro_rules! build_timestamp {
-                ($builder_ty:ty, $convert:expr) => {{
-                    let mut builder = <$builder_ty>::with_capacity(values.len());
-                    let convert_fn: fn(i64) -> i64 = $convert;
-                    for val in values {
-                        match val {
-                            Some(s) => match parse_ts_to_us(s) {
-                                Some(us) => builder.append_value(convert_fn(us)),
-                                None => builder.append_null(),
-                            },
-                            None => builder.append_null(),
-                        }
-                    }
-                    let arr = builder.finish();
-                    match tz {
-                        Some(tz) => Arc::new(arr.with_timezone(tz.as_ref())) as Arc<dyn Array>,
-                        None => Arc::new(arr) as Arc<dyn Array>,
-                    }
-                }};
-            }
-
-            match unit {
-                TimeUnit::Second => {
-                    build_timestamp!(TimestampSecondBuilder, |us: i64| us / 1_000_000)
-                },
-                TimeUnit::Millisecond => {
-                    build_timestamp!(TimestampMillisecondBuilder, |us: i64| us / 1_000)
-                },
-                TimeUnit::Microsecond => {
-                    build_timestamp!(TimestampMicrosecondBuilder, |us: i64| us)
-                },
-                TimeUnit::Nanosecond => {
-                    build_timestamp!(TimestampNanosecondBuilder, |us: i64| us * 1_000)
-                },
-            }
-        },
-        _ => {
-            // Fallback: store as strings
-            let mut builder = StringBuilder::new();
-            for val in values {
-                match val {
-                    Some(s) => builder.append_value(s),
-                    None => builder.append_null(),
-                }
-            }
-            Arc::new(builder.finish())
-        },
-    };
-
-    Ok(array)
 }
 
 /// Check if a DataFusion error is caused by an object store NotFound error.

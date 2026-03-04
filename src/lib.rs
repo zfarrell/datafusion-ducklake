@@ -43,6 +43,7 @@ pub mod encryption;
 pub mod error;
 pub mod information_schema;
 pub mod metadata_provider;
+pub mod parse_values;
 pub mod path_resolver;
 pub mod schema;
 pub mod table;
@@ -124,7 +125,7 @@ pub use metadata_provider_sqlite::SqliteMetadataProvider;
 #[cfg(feature = "write")]
 pub use delete_exec::DuckLakeDeleteExec;
 #[cfg(feature = "write")]
-pub use insert_exec::DuckLakeInsertExec;
+pub use insert_exec::{DuckLakeInsertExec, PartitionTransform};
 #[cfg(feature = "write")]
 pub use merge_exec::{DuckLakeMergeExec, MergeMatchedAction};
 #[cfg(feature = "write")]

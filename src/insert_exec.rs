@@ -37,6 +37,32 @@ use sqlx::types::chrono;
 
 use crate::delete_exec::make_dml_count_schema;
 
+/// Resolved partition transform, computed once at planning time to avoid
+/// repeated `to_lowercase()` + string matching on the hot path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartitionTransform {
+    Identity,
+    Year,
+    Month,
+    Day,
+    Hour,
+}
+
+impl PartitionTransform {
+    /// Parse an optional transform string into a [`PartitionTransform`].
+    /// `None`, empty, or `"identity"` all map to [`PartitionTransform::Identity`].
+    pub fn from_str_opt(s: Option<&str>) -> Self {
+        match s.map(|t| t.to_lowercase()).as_deref() {
+            None | Some("") | Some("identity") => Self::Identity,
+            Some("year") => Self::Year,
+            Some("month") => Self::Month,
+            Some("day") => Self::Day,
+            Some("hour") => Self::Hour,
+            Some(_) => Self::Identity,
+        }
+    }
+}
+
 /// Partition column info for write-side partitioning.
 #[derive(Debug, Clone)]
 pub struct WritePartitionColumn {
@@ -44,7 +70,9 @@ pub struct WritePartitionColumn {
     pub column_name: String,
     /// Index of this column in the table schema
     pub column_index: usize,
-    /// Transform to apply (identity, year, month, day, hour)
+    /// Pre-resolved transform enum (avoids per-row string matching)
+    pub resolved_transform: PartitionTransform,
+    /// Original transform string (kept for metadata/serialization)
     pub transform: Option<String>,
 }
 
@@ -278,7 +306,7 @@ impl ExecutionPlan for DuckLakeInsertExec {
 fn compute_partition_value(
     array: &dyn arrow::array::Array,
     row: usize,
-    transform: Option<&str>,
+    transform: PartitionTransform,
 ) -> crate::Result<Option<String>> {
     use arrow::array::*;
 
@@ -286,12 +314,8 @@ fn compute_partition_value(
         return Ok(None);
     }
 
-    let transform = transform
-        .map(|t| t.to_lowercase())
-        .unwrap_or_else(|| "identity".to_string());
-
-    match transform.as_str() {
-        "identity" | "" => {
+    match transform {
+        PartitionTransform::Identity => {
             // Extract the raw value as a string
             let value = match array.data_type() {
                 DataType::Int8 => array
@@ -371,14 +395,12 @@ fn compute_partition_value(
             };
             Ok(value)
         },
-        "year" => extract_temporal_component(array, row, TemporalComponent::Year),
-        "month" => extract_temporal_component(array, row, TemporalComponent::Month),
-        "day" => extract_temporal_component(array, row, TemporalComponent::Day),
-        "hour" => extract_temporal_component(array, row, TemporalComponent::Hour),
-        other => Err(DuckLakeError::InvalidConfig(format!(
-            "Unknown partition transform '{}'. Valid transforms: identity, year, month, day, hour",
-            other
-        ))),
+        PartitionTransform::Year => extract_temporal_component(array, row, TemporalComponent::Year),
+        PartitionTransform::Month => {
+            extract_temporal_component(array, row, TemporalComponent::Month)
+        },
+        PartitionTransform::Day => extract_temporal_component(array, row, TemporalComponent::Day),
+        PartitionTransform::Hour => extract_temporal_component(array, row, TemporalComponent::Hour),
     }
 }
 
@@ -509,11 +531,9 @@ fn route_batches_to_partitions(
 ) -> crate::Result<BTreeMap<String, (Vec<Option<String>>, Vec<(usize, usize)>)>> {
     // For identity-only partitions, use optimized path that pre-computes
     // partition values per column per batch (avoids per-row type dispatch).
-    let all_identity = partition_columns.iter().all(|pc| {
-        pc.transform.as_deref().map_or(true, |t| {
-            matches!(t.to_lowercase().as_str(), "identity" | "")
-        })
-    });
+    let all_identity = partition_columns
+        .iter()
+        .all(|pc| pc.resolved_transform == PartitionTransform::Identity);
 
     if all_identity {
         route_batches_identity(batches, partition_columns)
@@ -662,8 +682,7 @@ fn route_batches_generic(
             let mut values = Vec::with_capacity(partition_columns.len());
             for pc in partition_columns {
                 let array = batch.column(pc.column_index);
-                let val =
-                    compute_partition_value(array.as_ref(), row_idx, pc.transform.as_deref())?;
+                let val = compute_partition_value(array.as_ref(), row_idx, pc.resolved_transform)?;
                 values.push(val);
             }
             let key = build_hive_dir(partition_columns, &values);
@@ -827,11 +846,13 @@ mod tests {
             WritePartitionColumn {
                 column_name: "category".to_string(),
                 column_index: 1,
+                resolved_transform: PartitionTransform::Identity,
                 transform: None,
             },
             WritePartitionColumn {
                 column_name: "year".to_string(),
                 column_index: 2,
+                resolved_transform: PartitionTransform::Year,
                 transform: Some("year".to_string()),
             },
         ];
@@ -844,6 +865,7 @@ mod tests {
         let cols = vec![WritePartitionColumn {
             column_name: "region".to_string(),
             column_index: 0,
+            resolved_transform: PartitionTransform::Identity,
             transform: None,
         }];
         let values = vec![None];
@@ -858,6 +880,7 @@ mod tests {
         let cols = vec![WritePartitionColumn {
             column_name: "path".to_string(),
             column_index: 0,
+            resolved_transform: PartitionTransform::Identity,
             transform: None,
         }];
         let values = vec![Some("a/b".to_string())];
@@ -877,11 +900,11 @@ mod tests {
     fn test_compute_partition_value_identity() {
         let array = arrow::array::StringArray::from(vec!["hello", "world"]);
         assert_eq!(
-            compute_partition_value(&array, 0, Some("identity")).unwrap(),
+            compute_partition_value(&array, 0, PartitionTransform::Identity).unwrap(),
             Some("hello".to_string())
         );
         assert_eq!(
-            compute_partition_value(&array, 1, None).unwrap(),
+            compute_partition_value(&array, 1, PartitionTransform::Identity).unwrap(),
             Some("world".to_string())
         );
     }
@@ -896,7 +919,7 @@ mod tests {
             .expect("test date within i32 range");
         let array = arrow::array::Date32Array::from(vec![days_since_epoch]);
         assert_eq!(
-            compute_partition_value(&array, 0, Some("year")).unwrap(),
+            compute_partition_value(&array, 0, PartitionTransform::Year).unwrap(),
             Some("2024".to_string())
         );
     }
@@ -911,28 +934,60 @@ mod tests {
             .expect("test date within i32 range");
         let array = arrow::array::Date32Array::from(vec![days_since_epoch]);
         assert_eq!(
-            compute_partition_value(&array, 0, Some("month")).unwrap(),
+            compute_partition_value(&array, 0, PartitionTransform::Month).unwrap(),
             Some("3".to_string())
         );
     }
 
     #[test]
-    fn test_compute_partition_value_unknown_transform_errors() {
-        let array = arrow::array::Int32Array::from(vec![42]);
-        let result = compute_partition_value(&array, 0, Some("yer"));
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Unknown partition transform")
+    fn test_partition_transform_from_str_opt() {
+        assert_eq!(
+            PartitionTransform::from_str_opt(None),
+            PartitionTransform::Identity
+        );
+        assert_eq!(
+            PartitionTransform::from_str_opt(Some("")),
+            PartitionTransform::Identity
+        );
+        assert_eq!(
+            PartitionTransform::from_str_opt(Some("identity")),
+            PartitionTransform::Identity
+        );
+        assert_eq!(
+            PartitionTransform::from_str_opt(Some("IDENTITY")),
+            PartitionTransform::Identity
+        );
+        assert_eq!(
+            PartitionTransform::from_str_opt(Some("year")),
+            PartitionTransform::Year
+        );
+        assert_eq!(
+            PartitionTransform::from_str_opt(Some("Year")),
+            PartitionTransform::Year
+        );
+        assert_eq!(
+            PartitionTransform::from_str_opt(Some("month")),
+            PartitionTransform::Month
+        );
+        assert_eq!(
+            PartitionTransform::from_str_opt(Some("day")),
+            PartitionTransform::Day
+        );
+        assert_eq!(
+            PartitionTransform::from_str_opt(Some("hour")),
+            PartitionTransform::Hour
+        );
+        // Unknown transforms default to Identity
+        assert_eq!(
+            PartitionTransform::from_str_opt(Some("yer")),
+            PartitionTransform::Identity
         );
     }
 
     #[test]
     fn test_compute_partition_value_unsupported_type_errors() {
         let array = arrow::array::BinaryArray::from(vec![b"data".as_slice()]);
-        let result = compute_partition_value(&array, 0, Some("identity"));
+        let result = compute_partition_value(&array, 0, PartitionTransform::Identity);
         assert!(result.is_err());
         assert!(
             result
@@ -949,29 +1004,29 @@ mod tests {
 
         let sec_array = arrow::array::TimestampSecondArray::from(vec![us / 1_000_000]);
         assert_eq!(
-            compute_partition_value(&sec_array, 0, Some("year")).unwrap(),
+            compute_partition_value(&sec_array, 0, PartitionTransform::Year).unwrap(),
             Some("2024".to_string())
         );
         assert_eq!(
-            compute_partition_value(&sec_array, 0, Some("hour")).unwrap(),
+            compute_partition_value(&sec_array, 0, PartitionTransform::Hour).unwrap(),
             Some("9".to_string())
         );
 
         let ms_array = arrow::array::TimestampMillisecondArray::from(vec![us / 1_000]);
         assert_eq!(
-            compute_partition_value(&ms_array, 0, Some("year")).unwrap(),
+            compute_partition_value(&ms_array, 0, PartitionTransform::Year).unwrap(),
             Some("2024".to_string())
         );
 
         let us_array = arrow::array::TimestampMicrosecondArray::from(vec![us]);
         assert_eq!(
-            compute_partition_value(&us_array, 0, Some("month")).unwrap(),
+            compute_partition_value(&us_array, 0, PartitionTransform::Month).unwrap(),
             Some("6".to_string())
         );
 
         let ns_array = arrow::array::TimestampNanosecondArray::from(vec![us * 1_000]);
         assert_eq!(
-            compute_partition_value(&ns_array, 0, Some("day")).unwrap(),
+            compute_partition_value(&ns_array, 0, PartitionTransform::Day).unwrap(),
             Some("15".to_string())
         );
     }
@@ -979,7 +1034,7 @@ mod tests {
     #[test]
     fn test_temporal_transform_on_non_temporal_type_errors() {
         let array = arrow::array::StringArray::from(vec!["not-a-date"]);
-        let result = compute_partition_value(&array, 0, Some("year"));
+        let result = compute_partition_value(&array, 0, PartitionTransform::Year);
         assert!(result.is_err());
         assert!(
             result
@@ -1008,6 +1063,7 @@ mod tests {
         let cols = vec![WritePartitionColumn {
             column_name: "category".to_string(),
             column_index: 1,
+            resolved_transform: PartitionTransform::Identity,
             transform: None,
         }];
 
@@ -1036,6 +1092,7 @@ mod tests {
         let cols = vec![WritePartitionColumn {
             column_name: "category".to_string(),
             column_index: 1,
+            resolved_transform: PartitionTransform::Identity,
             transform: None,
         }];
 
