@@ -894,60 +894,61 @@ impl TableWriteSession {
             .put(&self.object_path, PutPayload::from(buffer))
             .await?;
 
-        // Stage 1: Register data file (critical path).
-        // If this fails, the file is orphaned and can be safely cleaned up.
-        // R5-S-022: Note — end_table_files and register_data_file use separate
-        // transactions. If register_data_file fails after end_table_files commits,
-        // old data is gone but the new file isn't registered. The multi-file
-        // commit_uploaded_files path uses replace_table_files (single transaction)
-        // which is fully atomic. This single-file path accepts the small risk
-        // since a register_data_file failure after successful upload+end is unlikely.
-        if self.write_mode == WriteMode::Replace {
-            if let Err(e) = self
-                .metadata
-                .end_table_files(self.table_id, self.snapshot_id)
-            {
-                // end_table_files failed — file not referenced, safe to clean up
-                if let Err(cleanup_err) = self.object_store.delete(&self.object_path).await {
-                    tracing::warn!(
-                        path = %self.object_path,
-                        error = %cleanup_err,
-                        "Failed to clean up orphaned Parquet file after end_table_files failure"
-                    );
-                }
-                return Err(e);
-            }
-        }
-
+        // R6-S-039: Use replace_table_files for Replace mode (atomic end+register in
+        // a single transaction), matching the multi-file commit_uploaded_files path.
+        // For Append mode, use register_data_file directly (no old files to end).
         let mut file_info = DataFileInfo::new(&self.catalog_path, file_size, self.row_count)
-            .with_footer_size(footer_size);
+            .with_footer_size(footer_size)
+            .with_column_stats(column_stats.clone());
         if !self.path_is_relative {
             file_info = file_info.with_absolute_path();
         }
 
-        let data_file_id = match self.metadata.register_data_file(
-            self.table_id,
-            self.snapshot_id,
-            &file_info,
-        ) {
-            Ok(id) => id,
-            Err(e) => {
-                // register_data_file failed — file not referenced, safe to clean up
-                if let Err(cleanup_err) = self.object_store.delete(&self.object_path).await {
-                    tracing::warn!(
-                        path = %self.object_path,
-                        error = %cleanup_err,
-                        "Failed to clean up orphaned Parquet file after register_data_file failure"
-                    );
-                }
-                return Err(e);
-            },
+        let data_file_id = if self.write_mode == WriteMode::Replace {
+            let entry = ReplaceFileEntry {
+                file_info,
+                partition_values: vec![],
+            };
+            match self
+                .metadata
+                .replace_table_files(self.table_id, self.snapshot_id, &[entry])
+            {
+                Ok(ids) => ids.into_iter().next().unwrap_or(-1),
+                Err(e) => {
+                    if let Err(cleanup_err) = self.object_store.delete(&self.object_path).await {
+                        tracing::warn!(
+                            path = %self.object_path,
+                            error = %cleanup_err,
+                            "Failed to clean up orphaned Parquet file after replace_table_files failure"
+                        );
+                    }
+                    return Err(e);
+                },
+            }
+        } else {
+            match self
+                .metadata
+                .register_data_file(self.table_id, self.snapshot_id, &file_info)
+            {
+                Ok(id) => id,
+                Err(e) => {
+                    if let Err(cleanup_err) = self.object_store.delete(&self.object_path).await {
+                        tracing::warn!(
+                            path = %self.object_path,
+                            error = %cleanup_err,
+                            "Failed to clean up orphaned Parquet file after register_data_file failure"
+                        );
+                    }
+                    return Err(e);
+                },
+            }
         };
 
-        // Stage 2: Register column stats (non-critical).
+        // Stage 2: Register column stats (non-critical, for Append mode only).
+        // For Replace mode, column_stats are handled inside replace_table_files.
         // R4-S-017: If this fails, the data file is already committed in metadata.
         // Do NOT clean up the file — metadata already references it.
-        if !column_stats.is_empty() {
+        if self.write_mode != WriteMode::Replace && !column_stats.is_empty() {
             if let Err(e) =
                 self.metadata
                     .register_column_stats(data_file_id, self.table_id, &column_stats)
