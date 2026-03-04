@@ -1105,24 +1105,6 @@ fn cmp_decimal_strings(a: &str, b: &str) -> Option<std::cmp::Ordering> {
     }
 }
 
-/// R6-S-029: Validate a DuckLake type string for safe use in DDL.
-fn validate_ducklake_type_for_ddl(type_str: &str) -> crate::Result<()> {
-    if type_str.is_empty() {
-        return Err(DuckLakeError::InvalidConfig(
-            "empty DuckLake type in DDL".into(),
-        ));
-    }
-    for ch in type_str.chars() {
-        if !ch.is_alphanumeric() && !matches!(ch, '(' | ')' | ',' | ' ' | '_' | '.') {
-            return Err(DuckLakeError::InvalidConfig(format!(
-                "invalid character \'{}\' in DuckLake type \'{}\' for DDL",
-                ch, type_str
-            )));
-        }
-    }
-    Ok(())
-}
-
 impl MetadataWriter for SqliteMetadataWriter {
     fn create_snapshot(&self) -> Result<i64> {
         block_on(async {
