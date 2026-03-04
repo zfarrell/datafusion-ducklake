@@ -181,6 +181,41 @@ Ten fix agents resolved **~49 of 52** assigned findings. 36 P3 findings were not
 
 Full details in `docs/2026-03-04-r6-review-synthesis.md`.
 
+### Cycle 7 (2026-03-04 R7) — 50 FINDINGS (pending fixes)
+
+A five-part review (idiomatic, correctness, interop, test-harness, codex) of the post-R6 codebase identified 58 raw findings → 50 after deduplication. Zero P0 findings — first cycle with no data corruption or security issues. Two codex false positives (16.7% rate — major improvement from 90%+ in earlier cycles).
+
+| Priority | Count | Status |
+|----------|-------|--------|
+| P0 | 0 | — |
+| P1 | 8 | Pending fix |
+| P2 | 14 | Pending fix |
+| P3 | 28 | Not assigned |
+| **Total** | **50** | — |
+
+**Key findings:**
+- R7-S-001: OnceLock INSTALL failure permanently breaks compaction (3 reviews found this independently)
+- R7-S-002: Snapshot ID rollback race — `store()` should be `fetch_max()` (highest impact)
+- R7-S-003: PartitionTransform silent fallback → data in wrong partitions
+- R7-S-004: register_schema missing snapshot context
+- R7-S-005: Partition pruning string comparison → incorrect file selection
+- R7-S-006: parse_values decimal breaks Lenient mode contract
+- R7-S-007: decode_decimal_bytes panic for >16 bytes
+- R7-S-008: parse_values.rs module is dead code — never wired into production
+
+**Recommended: 6 fix agents** covering all P1+P2 (22 findings). 28 P3 not assigned.
+
+**All deferred items:**
+- F-036: INSERT streaming for OOM prevention
+- F-044: Provider/writer code deduplication
+- F-045: Async trait redesign (sync→async)
+- R4-S-018: PG/MySQL checked write TOCTOU
+- R4-S-036: map_err boilerplate (50+ sites)
+- R4-S-040: Monolithic execute() blocks
+- R6-S-017: Concurrent DML lost-delete race
+
+Full details in `docs/2026-03-04-r7-review-synthesis.md`.
+
 ---
 
 ## 1. Executive Summary

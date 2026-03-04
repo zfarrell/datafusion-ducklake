@@ -49,7 +49,7 @@ Also in `/home/zac/`:
 - Multi-backend (SQLite/Postgres/MySQL): ALL methods implemented, Docker tests passing
 - SLT pass rate: 157/254 (61.8%)
 - ~724 total tests, 62 cross-engine tests, 254 SLT files
-- Code review cycles: 6 complete (R1: 36, R2: 58, R3: 50, R4: 46, R5: 77, R6: 88 — **~280 fixed across R1-R6**)
+- Code review cycles: 7 complete (R1: 36, R2: 58, R3: 50, R4: 46, R5: 77, R6: 88, R7: 50 — **~270 fixed across R1-R6**, R7 pending fixes)
 
 ### What's Been Done (Phases 0-6)
 Everything through Phase 6 is complete. See `docs/project-status.md` for the full verified feature matrix.
@@ -228,6 +228,36 @@ Ten fix agents resolved **~49 of 52** assigned findings (all P1 except 1 unfixab
 - `docs/2026-03-04-r6-review-synthesis.md` (consolidated, deduplicated, prioritized, with **[FIXED]**/**[UNFIXABLE]**/**[DEFERRED]**/**[NOT ASSIGNED]** markers)
 - `docs/2026-03-04-review-idiomatic.md`, `docs/2026-03-04-review-correctness.md`, `docs/2026-03-04-review-interop.md`, `docs/2026-03-04-review-test-harness.md`, `docs/2026-03-04-codex-review.md`
 
+### Code Review Cycle 7 (2026-03-04 R7) — 50 FINDINGS (pending fixes)
+
+A five-part review (idiomatic, correctness, interop, test-harness, codex) of the post-R6 codebase identified **58 raw → 50 after dedup** (0 P0, 8 P1, 14 P2, 28 P3). Two codex findings were false positives (16.7% FP rate — significant improvement over prior cycles). Zero P0 findings — first cycle with no data corruption or security issues.
+
+**Key P1 findings (8):**
+- R7-S-001: OnceLock silently swallows INSTALL ducklake failure (`compaction_functions.rs:81`)
+- R7-S-002: Snapshot ID rollback race in concurrent DDL — `store()` should be `fetch_max()` (`schema.rs`, `catalog.rs`)
+- R7-S-003: PartitionTransform silent fallback for unknown transforms (`insert_exec.rs:62`)
+- R7-S-004: register_schema missing `with_catalog_snapshot_id()` (`catalog.rs:320`)
+- R7-S-005: Partition pruning uses string comparison for all types (`table.rs:957`)
+- R7-S-006: parse_values.rs decimal errors propagate in Lenient mode (`parse_values.rs:244,267`)
+- R7-S-007: decode_decimal_bytes panics for >16 byte input (`table_writer.rs:1692`)
+- R7-S-008: parse_values.rs module is dead code — not wired into production paths
+
+**Recommended fix agents (6):**
+1. r7-fix-correctness (7 P1): OnceLock, fetch_max, partition transform, register_schema, type-aware pruning, decimal Lenient, decimal bytes
+2. r7-fix-dead-code-wiring (1 P1 + 1 P2): Wire parse_values.rs, delete legacy parser
+3. r7-fix-backend-parity (4 P2): Type validation shared, record_count MAX(0), recompute stats PG/MySQL, stats alignment
+4. r7-fix-interop (3 P2): Inlined data schema evolution, PG/MySQL inlined data, flush architecture
+5. r7-fix-defensive (4 P2): Checked arithmetic, bounds checks, pattern simplification
+6. r7-fix-tests (2 P2): Transaction routing e2e test, concurrent write read-back
+
+**28 P3 not assigned**: Optional, low impact.
+
+**Deferred items remain deferred**: F-036, F-044, F-045, R4-S-018, R4-S-036, R4-S-040, R6-S-017.
+
+**Source documents:**
+- `docs/2026-03-04-r7-review-synthesis.md` (consolidated, deduplicated, prioritized)
+- `docs/2026-03-04-r7-review-idiomatic.md`, `docs/2026-03-04-r7-review-correctness.md`, `docs/2026-03-04-r7-review-interop.md`, `docs/2026-03-04-r7-review-test-harness.md`, `docs/2026-03-04-r7-codex-review.md`
+
 ### After Implementation: PR Creation
 Follow `/home/zac/ducklake-pr-strategy.md`:
 - Each PR is a coherent unit re-implemented on branches off main
@@ -266,6 +296,15 @@ Agent tool with:
 # 6. Only after merge agent confirms success, clean up
 TeamDelete
 ```
+
+### Agent Naming (CRITICAL — prevents stale context)
+
+**Use unique agent names per cycle.** Include the cycle identifier in the name:
+- Review agents: `r7-idiomatic-review`, `r7-correctness-review` (NOT `idiomatic-review`)
+- Fix agents: `r7-fix-sqlite-metadata`, `r7-fix-backend-parity` (NOT `fix-sqlite-metadata`)
+- Merge/docs agents: `r7-merge-agent`, `r7-docs-update`
+
+**Rationale**: Reusing the same agent name across cycles (e.g., `idiomatic-review` in both R6 and R7) causes tmux pane reuse. The new agent can inherit a stale pane/session from the prior cycle's agent, which has already consumed most of its context window. This manifests as agents launching with ~10% context remaining and being unable to complete their work. Unique names per cycle ensure each agent gets a fresh pane and full context.
 
 Always tell agents:
 - Work on branch `ducklake-features/integration`
