@@ -237,6 +237,8 @@
 
 **Note (2026-03-04)**: Tests added during R6 review fix cycle: 10 new cross-engine tests, 7 partition validation tests, 9 table function tests, and additional unit tests. Total: 725+ tests passing.
 
+**Note (2026-03-04 R7)**: R7 fix cycle added transaction routing e2e test and concurrent write read-back verification. 365 unit tests pass post-R7. 13 pre-existing cross-engine failures remain (DuckDB extension bugs).
+
 ### 2.2 Test Breakdown by File
 
 **Integration tests (tests/):**

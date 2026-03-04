@@ -181,29 +181,30 @@ Ten fix agents resolved **~49 of 52** assigned findings. 36 P3 findings were not
 
 Full details in `docs/2026-03-04-r6-review-synthesis.md`.
 
-### Cycle 7 (2026-03-04 R7) — 50 FINDINGS (pending fixes)
+### Cycle 7 (2026-03-04 R7) — 22 of 22 ASSIGNED FINDINGS FIXED
 
 A five-part review (idiomatic, correctness, interop, test-harness, codex) of the post-R6 codebase identified 58 raw findings → 50 after deduplication. Zero P0 findings — first cycle with no data corruption or security issues. Two codex false positives (16.7% rate — major improvement from 90%+ in earlier cycles).
 
-| Priority | Count | Status |
-|----------|-------|--------|
-| P0 | 0 | — |
-| P1 | 8 | Pending fix |
-| P2 | 14 | Pending fix |
-| P3 | 28 | Not assigned |
-| **Total** | **50** | — |
+Six fix agents resolved **all 22 assigned findings** (8 P1 + 14 P2). 28 P3 findings were not assigned.
 
-**Key findings:**
-- R7-S-001: OnceLock INSTALL failure permanently breaks compaction (3 reviews found this independently)
-- R7-S-002: Snapshot ID rollback race — `store()` should be `fetch_max()` (highest impact)
-- R7-S-003: PartitionTransform silent fallback → data in wrong partitions
-- R7-S-004: register_schema missing snapshot context
-- R7-S-005: Partition pruning string comparison → incorrect file selection
-- R7-S-006: parse_values decimal breaks Lenient mode contract
-- R7-S-007: decode_decimal_bytes panic for >16 bytes
-- R7-S-008: parse_values.rs module is dead code — never wired into production
+| Priority | Count | Fixed | Not Assigned |
+|----------|-------|-------|--------------|
+| P0 | 0 | — | — |
+| P1 | 8 | 8 | 0 |
+| P2 | 14 | 14 | 0 |
+| P3 | 28 | 0 | 28 |
+| **Total** | **50** | **22** | **28** |
 
-**Recommended: 6 fix agents** covering all P1+P2 (22 findings). 28 P3 not assigned.
+**Fix agents (6):**
+- r7-fix-correctness (`843096a`): R7-S-001–007 (7/7) — OnceLock retry, fetch_max, partition transform, register_schema, type-aware pruning, decimal Lenient, decimal bytes
+- r7-fix-dead-code (`f5f0a2d`): R7-S-008,021 (2/2) — wired parse_values.rs, deleted legacy parser
+- r7-fix-backend-parity (`8500ddf`): R7-S-009–011,022 (4/4) — shared validation, MAX(0) record_count, stats alignment
+- r7-fix-interop (on integration): R7-S-012–014 (3/3) — inlined data schema evolution, PG/MySQL error, deferred flush
+- r7-fix-defensive (`6f611c5`): R7-S-015–017,020 (4/4) — checked arithmetic, bounds, pattern fix
+- r7-fix-tests (`448845f`): R7-S-018–019 (2/2) — transaction routing e2e, concurrent read-back
+
+**Merge**: Fast-forward, final commit `6f611c5`.
+**Tests**: 365 unit tests pass, 13 pre-existing cross-engine failures.
 
 **All deferred items:**
 - F-036: INSERT streaming for OOM prevention

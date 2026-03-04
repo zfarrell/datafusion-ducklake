@@ -18,8 +18,8 @@ Date: 2026-03-04
 | R4 | 74 | 46 | 43 | 2 deferred + 1 open | — |
 | R5 | 95 | 77 | 72 | 4 skipped | 1 FP |
 | R6 | 107 | 88 | ~49 | 1 unfixable + 1 deferred + 36 P3 | 3 codex P0→P1 |
-| R7 | 58 | 50 | — (pending) | — | 2 FP |
-| **Total** | **536** | **405** | **~270** | — | — |
+| R7 | 58 | 50 | 22 | 28 P3 not assigned | 2 FP |
+| **Total** | **536** | **405** | **~292** | — | — |
 
 ## Deduplicated Findings
 
@@ -421,6 +421,58 @@ Date: 2026-03-04
 
 ---
 
+## Resolution Status
+
+All 22 assigned findings (8 P1 + 14 P2) were fixed by 6 agents. 28 P3 findings were not assigned.
+
+### Fix Summary
+
+| Agent | Commit | Findings | Status |
+|-------|--------|----------|--------|
+| r7-fix-correctness | `843096a` | R7-S-001, 002, 003, 004, 005, 006, 007 (7/7) | All P1 fixed |
+| r7-fix-dead-code | `f5f0a2d` | R7-S-008, 021 (2/2) | Wired parse_values.rs, deleted legacy parser |
+| r7-fix-backend-parity | `8500ddf` | R7-S-009, 010, 011, 022 (4/4) | Shared validation, MAX(0) record_count, stats |
+| r7-fix-interop | on integration | R7-S-012, 013, 014 (3/3) | Inlined data, PG/MySQL error, deferred flush |
+| r7-fix-defensive | `6f611c5` | R7-S-015, 016, 017, 020 (4/4) | Checked arithmetic, bounds, pattern fix |
+| r7-fix-tests | `448845f` | R7-S-018, 019 (2/2) | Transaction routing e2e, concurrent read-back |
+
+### Per-Finding Resolution
+
+#### P1 (8/8 FIXED)
+- **R7-S-001** [FIXED `843096a`]: OnceLock retry on INSTALL failure
+- **R7-S-002** [FIXED `843096a`]: Snapshot ID `fetch_max()` replaces `store()`
+- **R7-S-003** [FIXED `843096a`]: PartitionTransform returns error for unknown transforms
+- **R7-S-004** [FIXED `843096a`]: `register_schema` now calls `with_catalog_snapshot_id()`
+- **R7-S-005** [FIXED `843096a`]: Type-aware partition value comparison
+- **R7-S-006** [FIXED `843096a`]: Decimal parsing respects Lenient mode
+- **R7-S-007** [FIXED `843096a`]: `decode_decimal_bytes` bounds check for >16 bytes
+- **R7-S-008** [FIXED `f5f0a2d`]: `parse_values.rs` wired into production, legacy parser deleted
+
+#### P2 (14/14 FIXED)
+- **R7-S-009** [FIXED `8500ddf`]: Type validation moved to shared module
+- **R7-S-010** [FIXED `8500ddf`]: `record_count` clamped with `MAX(0, ...)`
+- **R7-S-011** [FIXED `8500ddf`]: `recompute_table_column_stats` ported to PG/MySQL
+- **R7-S-012** [FIXED on integration]: Inlined data schema evolution after ALTER TABLE
+- **R7-S-013** [FIXED on integration]: PG/MySQL return explicit unsupported error for inlined data
+- **R7-S-014** [FIXED on integration]: `flush_inlined_data` deferred to scan()
+- **R7-S-015** [FIXED `6f611c5`]: Timestamp nanosecond checked multiplication
+- **R7-S-016** [FIXED `6f611c5`]: Partition column index bounds check
+- **R7-S-017** [FIXED `6f611c5`]: Projection index bounds check
+- **R7-S-018** [FIXED `448845f`]: Transaction routing end-to-end test added
+- **R7-S-019** [FIXED `448845f`]: Concurrent write read-back verification added
+- **R7-S-020** [FIXED `6f611c5`]: `is_sqlite_busy` pattern combined
+- **R7-S-021** [FIXED `f5f0a2d`]: Subsumed by R7-S-008 (legacy code deleted)
+- **R7-S-022** [FIXED `8500ddf`]: Cross-backend column stats aligned
+
+#### P3 (28 NOT ASSIGNED)
+- R7-S-023 through R7-S-050 [NOT ASSIGNED]: Optional, low impact
+
+### Test Results
+- **365 unit tests pass** (post-R7 fixes)
+- **13 pre-existing cross-engine failures** (DuckDB extension bugs, not regressions)
+
+---
+
 ## Key Observations
 
 1. **Finding rate is declining**: R6 had 88 dedup findings, R7 has 50. The codebase is stabilizing.
@@ -429,3 +481,4 @@ Date: 2026-03-04
 4. **Most P1 items are S/M effort**: All 8 P1 findings have straightforward fixes. No architectural rewrites needed.
 5. **R6 fixes verified correct**: The interop review confirmed all R6 changes are schema-compatible and well-implemented. The correctness review found R6 error handling and cleanup patterns to be production-grade.
 6. **Snapshot ID race (R7-S-002) is the highest-impact item**: Affects concurrent DDL, made more impactful by R6 changes, but has a simple fix (`fetch_max`).
+7. **100% fix rate on assigned findings**: All 22 P1+P2 findings were successfully resolved by the 6 fix agents.
