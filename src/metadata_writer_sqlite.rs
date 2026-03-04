@@ -36,11 +36,11 @@ const BUSY_RETRY_INITIAL_DELAY_MS: u64 = 10;
 fn is_sqlite_busy(err: &DuckLakeError) -> bool {
     if let DuckLakeError::Sqlx(sqlx::Error::Database(db_err)) = err {
         if let Some(code) = db_err.code() {
-            return code.as_ref() == "5" || code.as_ref() == "517";
+            if code.as_ref() == "5" || code.as_ref() == "517" {
+                return true;
+            }
         }
-    }
-    // Also handle the error message as a fallback
-    if let DuckLakeError::Sqlx(sqlx::Error::Database(db_err)) = err {
+        // Fallback to error message check
         return db_err.message().contains("database is locked");
     }
     false
@@ -2995,22 +2995,51 @@ impl MetadataWriter for SqliteMetadataWriter {
             .fetch_optional(&mut *tx)
             .await?;
 
-            let (inlined_table_name, schema_version) = if let Some(ref row) = existing {
-                // Reuse existing inlined data table
-                let name: String = row.try_get(0)?;
-                let sv: i64 = row.try_get(1)?;
-                (name, sv)
+            // R7-S-012: Look up current schema_version to detect schema evolution
+            let sv_row =
+                sqlx::query("SELECT schema_version FROM ducklake_snapshot WHERE snapshot_id = ?")
+                    .bind(snapshot_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            let current_sv: i64 = sv_row.try_get(0)?;
+
+            let inlined_table_name = if let Some(ref row) = existing {
+                let old_name: String = row.try_get(0)?;
+                let old_sv: i64 = row.try_get(1)?;
+                if old_sv < current_sv {
+                    // Schema evolved (e.g. ALTER TABLE ADD COLUMN).
+                    // Expire old inlined rows and recreate table with updated columns.
+                    let old_exists = sqlx::query(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?",
+                    )
+                    .bind(&old_name)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    if old_exists.try_get::<i64, _>(0)? > 0 {
+                        let expire_sql = format!(
+                            "UPDATE {} SET end_snapshot = ? WHERE end_snapshot IS NULL",
+                            quote_identifier(&old_name)
+                        );
+                        sqlx::query(&expire_sql)
+                            .bind(snapshot_id)
+                            .execute(&mut *tx)
+                            .await?;
+                    }
+                    let new_name = format!("ducklake_inlined_data_{}_{}", table_id, current_sv);
+                    sqlx::query(
+                        "UPDATE ducklake_inlined_data_tables SET table_name = ?, schema_version = ? WHERE table_id = ?",
+                    )
+                    .bind(&new_name)
+                    .bind(current_sv)
+                    .bind(table_id)
+                    .execute(&mut *tx)
+                    .await?;
+                    new_name
+                } else {
+                    old_name
+                }
             } else {
-                // Look up actual schema_version from the snapshot instead of hardcoding 1
-                let sv_row = sqlx::query(
-                    "SELECT schema_version FROM ducklake_snapshot WHERE snapshot_id = ?",
-                )
-                .bind(snapshot_id)
-                .fetch_one(&mut *tx)
-                .await?;
-                let sv: i64 = sv_row.try_get(0)?;
-                let name = format!("ducklake_inlined_data_{}_{}", table_id, sv);
-                (name, sv)
+                format!("ducklake_inlined_data_{}_{}", table_id, current_sv)
             };
 
             // Check if inline data table exists in SQLite; create if not
@@ -3037,15 +3066,17 @@ impl MetadataWriter for SqliteMetadataWriter {
                 create_sql.push(')');
                 sqlx::query(&create_sql).execute(&mut *tx).await?;
 
-                // Register in ducklake_inlined_data_tables
-                sqlx::query(
-                    "INSERT INTO ducklake_inlined_data_tables (table_id, table_name, schema_version) VALUES (?, ?, ?)",
-                )
-                .bind(table_id)
-                .bind(&inlined_table_name)
-                .bind(schema_version)
-                .execute(&mut *tx)
-                .await?;
+                // Register in ducklake_inlined_data_tables (only for new tables)
+                if existing.is_none() {
+                    sqlx::query(
+                        "INSERT INTO ducklake_inlined_data_tables (table_id, table_name, schema_version) VALUES (?, ?, ?)",
+                    )
+                    .bind(table_id)
+                    .bind(&inlined_table_name)
+                    .bind(current_sv)
+                    .execute(&mut *tx)
+                    .await?;
+                }
             }
 
             // Get next row_id
@@ -3257,6 +3288,7 @@ impl MetadataWriter for SqliteMetadataWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metadata_writer_validation::cmp_decimal_strings;
     use tempfile::TempDir;
 
     async fn create_test_writer() -> (SqliteMetadataWriter, TempDir) {
@@ -4274,4 +4306,119 @@ mod tests {
     }
 
     // R7-S-009: validate_ducklake_type_for_ddl test moved to metadata_writer_validation
+
+    /// R7-S-012: After ALTER TABLE ADD COLUMN, store_inlined_data detects
+    /// schema mismatch and recreates the inlined data table with updated columns.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_inlined_data_schema_evolution_after_alter() {
+        use crate::metadata_provider::InlinedDataRow;
+
+        let (writer, _temp) = create_test_writer().await;
+        let snapshot_id = writer.create_snapshot().unwrap();
+        let (schema_id, _) = writer
+            .get_or_create_schema("main", None, snapshot_id)
+            .unwrap();
+        let (table_id, _) = writer
+            .get_or_create_table(schema_id, "items", None, snapshot_id)
+            .unwrap();
+
+        let columns = vec![
+            ColumnDef::new("id", "int64", false).unwrap(),
+            ColumnDef::new("name", "varchar", true).unwrap(),
+        ];
+        writer.set_columns(table_id, &columns, snapshot_id).unwrap();
+
+        // Enable inlining
+        block_on(async {
+            sqlx::query("INSERT INTO ducklake_metadata (key, value) VALUES ('data_inlining_row_limit', '100')")
+                .execute(&writer.pool)
+                .await
+                .unwrap();
+        });
+
+        // Store inlined data with original 2-column schema
+        let col_names = Arc::new(vec!["id".to_string(), "name".to_string()]);
+        let rows = vec![InlinedDataRow {
+            column_names: col_names.clone(),
+            values: vec![Some("1".to_string()), Some("alice".to_string())],
+        }];
+        let stored = writer
+            .store_inlined_data(table_id, snapshot_id, &columns, &rows)
+            .unwrap();
+        assert_eq!(stored, 1);
+
+        // Check original schema_version in registry
+        let sv_row = block_on(async {
+            sqlx::query(
+                "SELECT schema_version FROM ducklake_inlined_data_tables WHERE table_id = ?",
+            )
+            .bind(table_id)
+            .fetch_one(&writer.pool)
+            .await
+            .unwrap()
+        });
+        let original_sv: i64 = sv_row.try_get(0).unwrap();
+
+        // ALTER TABLE ADD COLUMN (bumps schema_version)
+        let op = AlterTableOp::AddColumn {
+            column: ColumnDef::new("email", "varchar", true).unwrap(),
+        };
+        let alter_snapshot = writer.alter_table(table_id, &op).unwrap();
+
+        // Store inlined data with updated 3-column schema
+        let new_columns = vec![
+            ColumnDef::new("id", "int64", false).unwrap(),
+            ColumnDef::new("name", "varchar", true).unwrap(),
+            ColumnDef::new("email", "varchar", true).unwrap(),
+        ];
+        let col_names3 = Arc::new(vec![
+            "id".to_string(),
+            "name".to_string(),
+            "email".to_string(),
+        ]);
+        let rows2 = vec![InlinedDataRow {
+            column_names: col_names3,
+            values: vec![
+                Some("2".to_string()),
+                Some("bob".to_string()),
+                Some("bob@test.com".to_string()),
+            ],
+        }];
+        let stored2 = writer
+            .store_inlined_data(table_id, alter_snapshot, &new_columns, &rows2)
+            .unwrap();
+        assert_eq!(stored2, 1);
+
+        // Verify schema_version was bumped in registry
+        let new_sv_row = block_on(async {
+            sqlx::query(
+                "SELECT schema_version, table_name FROM ducklake_inlined_data_tables WHERE table_id = ?",
+            )
+            .bind(table_id)
+            .fetch_one(&writer.pool)
+            .await
+            .unwrap()
+        });
+        let new_sv: i64 = new_sv_row.try_get(0).unwrap();
+        let new_tbl: String = new_sv_row.try_get(1).unwrap();
+        assert!(
+            new_sv > original_sv,
+            "schema_version should have been bumped"
+        );
+
+        // Verify new table has the email column
+        let cols = block_on(async {
+            let sql = format!("PRAGMA table_info({})", quote_identifier(&new_tbl));
+            sqlx::query(&sql).fetch_all(&writer.pool).await.unwrap()
+        });
+        let col_names_in_table: Vec<String> = cols
+            .iter()
+            .map(|r| r.try_get::<String, _>(1).unwrap())
+            .collect();
+        assert!(
+            col_names_in_table.contains(&"email".to_string()),
+            "New table should have email column, got: {:?}",
+            col_names_in_table
+        );
+    }
 }

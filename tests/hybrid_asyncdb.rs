@@ -1085,10 +1085,13 @@ mod tests {
             .await
             .unwrap();
         match &result {
-            sqllogictest::DBOutput::Rows { rows, .. } => {
+            sqllogictest::DBOutput::Rows {
+                rows,
+                ..
+            } => {
                 assert_eq!(rows.len(), 1, "Should see 1 committed row via DataFusion");
                 assert_eq!(rows[0], vec!["1", "committed"]);
-            }
+            },
             _ => panic!("Expected Rows output"),
         }
 
@@ -1106,7 +1109,10 @@ mod tests {
             .await
             .unwrap();
         match &result {
-            sqllogictest::DBOutput::Rows { rows, .. } => {
+            sqllogictest::DBOutput::Rows {
+                rows,
+                ..
+            } => {
                 assert_eq!(
                     rows.len(),
                     2,
@@ -1114,7 +1120,7 @@ mod tests {
                 );
                 assert_eq!(rows[0], vec!["1", "committed"]);
                 assert_eq!(rows[1], vec!["2", "uncommitted"]);
-            }
+            },
             _ => panic!("Expected Rows output"),
         }
 
@@ -1127,7 +1133,10 @@ mod tests {
             .await
             .unwrap();
         match &result {
-            sqllogictest::DBOutput::Rows { rows, .. } => {
+            sqllogictest::DBOutput::Rows {
+                rows,
+                ..
+            } => {
                 assert_eq!(
                     rows.len(),
                     2,
@@ -1135,7 +1144,7 @@ mod tests {
                 );
                 assert_eq!(rows[0], vec!["1", "committed"]);
                 assert_eq!(rows[1], vec!["2", "uncommitted"]);
-            }
+            },
             _ => panic!("Expected Rows output"),
         }
     }

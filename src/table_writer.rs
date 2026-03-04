@@ -1591,21 +1591,62 @@ impl TableFunctionImpl for DucklakeFlushInlinedDataFunction {
             },
         };
 
-        // Use block_on to bridge async object store operations
-        let result = crate::metadata_provider::block_on(
-            self.table_writer
-                .flush_inlined_data(&schema_name, &table_name),
-        )
-        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        // R7-S-014: Defer execution to scan() to prevent side effects during EXPLAIN
+        Ok(Arc::new(DeferredFlushProvider {
+            table_writer: self.table_writer.clone(),
+            schema_name,
+            table_name,
+            schema: flush_result_schema(),
+        }))
+    }
+}
 
-        // Build result table
-        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
-            arrow::datatypes::Field::new("rows_flushed", arrow::datatypes::DataType::Int64, false),
-            arrow::datatypes::Field::new("files_written", arrow::datatypes::DataType::Int64, false),
-        ]));
+fn flush_result_schema() -> arrow::datatypes::SchemaRef {
+    Arc::new(arrow::datatypes::Schema::new(vec![
+        arrow::datatypes::Field::new("rows_flushed", arrow::datatypes::DataType::Int64, false),
+        arrow::datatypes::Field::new("files_written", arrow::datatypes::DataType::Int64, false),
+    ]))
+}
+
+/// R7-S-014: Deferred flush provider — executes flush_inlined_data in scan(), not call().
+/// Prevents side effects during EXPLAIN, same pattern as DeferredCompactionProvider (R6-S-002).
+#[derive(Debug)]
+struct DeferredFlushProvider {
+    table_writer: Arc<DuckLakeTableWriter>,
+    schema_name: String,
+    table_name: String,
+    schema: arrow::datatypes::SchemaRef,
+}
+
+#[async_trait::async_trait]
+impl TableProvider for DeferredFlushProvider {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn schema(&self) -> arrow::datatypes::SchemaRef {
+        self.schema.clone()
+    }
+
+    fn table_type(&self) -> datafusion::datasource::TableType {
+        datafusion::datasource::TableType::Temporary
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn datafusion::catalog::Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[datafusion::prelude::Expr],
+        limit: Option<usize>,
+    ) -> DataFusionResult<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        let result = self
+            .table_writer
+            .flush_inlined_data(&self.schema_name, &self.table_name)
+            .await
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
 
         let batch = RecordBatch::try_new(
-            schema.clone(),
+            self.schema.clone(),
             vec![
                 Arc::new(arrow::array::Int64Array::from(vec![result.records_written])),
                 Arc::new(arrow::array::Int64Array::from(vec![
@@ -1615,8 +1656,11 @@ impl TableFunctionImpl for DucklakeFlushInlinedDataFunction {
         )
         .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
 
-        let mem = datafusion::datasource::memory::MemTable::try_new(schema, vec![vec![batch]])?;
-        Ok(Arc::new(mem))
+        let mem = datafusion::datasource::memory::MemTable::try_new(
+            self.schema.clone(),
+            vec![vec![batch]],
+        )?;
+        mem.scan(state, projection, filters, limit).await
     }
 }
 

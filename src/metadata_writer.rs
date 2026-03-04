@@ -691,14 +691,18 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// Returns the same format as `MetadataProvider::get_inlined_data`.
     /// Used when flushing inlined data to Parquet.
     fn read_inlined_data(&self, _table_id: i64) -> Result<Vec<InlinedDataRow>> {
-        Ok(Vec::new())
+        Err(crate::DuckLakeError::Unsupported(
+            "Inlined data read not supported by this backend".into(),
+        ))
     }
 
     /// Remove all active inlined data for a table (set end_snapshot).
     ///
     /// Called after flushing inlined data to Parquet.
     fn clear_inlined_data(&self, _table_id: i64, _snapshot_id: i64) -> Result<()> {
-        Ok(())
+        Err(crate::DuckLakeError::Unsupported(
+            "Inlined data clear not supported by this backend".into(),
+        ))
     }
 }
 
