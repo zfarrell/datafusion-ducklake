@@ -28,10 +28,10 @@ use datafusion::prelude::*;
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 
+use datafusion_ducklake::metadata_writer::{AlterTableOp, ColumnDef};
 use datafusion_ducklake::{
-    AlterTableOp, ColumnDef, DuckLakeCatalog, DuckLakeQueryPlanner, DuckLakeTableWriter,
-    DuckdbMetadataProvider, MetadataProvider, MetadataWriter, SqliteMetadataProvider,
-    SqliteMetadataWriter,
+    DuckLakeCatalog, DuckLakeQueryPlanner, DuckLakeTableWriter, DuckdbMetadataProvider,
+    MetadataProvider, MetadataWriter, SqliteMetadataProvider, SqliteMetadataWriter,
 };
 
 // ==================== Setup helpers ====================
@@ -1169,7 +1169,7 @@ async fn cross_engine_df_alter_add_column_duckdb_read() {
         .unwrap()
         .unwrap();
 
-    let new_col = ColumnDef::new("score", "DOUBLE", true).unwrap();
+    let new_col = ColumnDef::new("score", "float64", true).unwrap();
     let op = AlterTableOp::AddColumn {
         column: new_col,
     };
@@ -1311,7 +1311,11 @@ fn duckdb_table_schema(duckdb: &DuckDbConn, table_name: &str) -> Vec<(String, St
         .collect()
 }
 
-/// Query DataFusion schema for column names and types.
+/// Virtual column names added by DuckLake (not user-defined).
+const VIRTUAL_COLUMNS: &[&str] =
+    &["filename", "file_row_number", "rowid", "snapshot_id", "file_index"];
+
+/// Query DataFusion schema for column names and types (excluding virtual columns).
 async fn df_table_schema(ctx: &SessionContext, table_name: &str) -> Vec<(String, String)> {
     let df = ctx
         .sql(&format!(
@@ -1323,6 +1327,7 @@ async fn df_table_schema(ctx: &SessionContext, table_name: &str) -> Vec<(String,
     df.schema()
         .fields()
         .iter()
+        .filter(|f| !VIRTUAL_COLUMNS.contains(&f.name().as_str()))
         .map(|f| (f.name().clone(), format!("{}", f.data_type())))
         .collect()
 }
@@ -1412,9 +1417,9 @@ async fn cross_engine_df_write_schema_duckdb_verifies() {
 
 // ==================== R6-S-049: BOOLEAN type roundtrip ====================
 
-/// R6-S-049: DF writes BOOLEAN values → DuckDB reads, and vice versa.
+/// R6-S-049: DF writes BOOLEAN values → DuckDB reads them back.
 #[tokio::test(flavor = "multi_thread")]
-async fn cross_engine_boolean_type_roundtrip() {
+async fn cross_engine_boolean_type_roundtrip_df_write() {
     let env = setup_ducklake_catalog().await;
     let catalog_path = &env.catalog_db_path;
 
@@ -1446,16 +1451,44 @@ async fn cross_engine_boolean_type_roundtrip() {
         "null boolean should be NULL, got: '{}'",
         rows[2][1]
     );
+}
 
-    // Now DuckDB writes booleans, DF reads
-    let duckdb2 = DuckDbConn::open(catalog_path);
-    duckdb2.execute("CREATE TABLE ducklake.main.bool_duckdb (id INT, active BOOLEAN)");
-    duckdb2
-        .execute("INSERT INTO ducklake.main.bool_duckdb VALUES (1, true), (2, false), (3, NULL)");
-    drop(duckdb2);
+/// R6-S-049: DuckDB writes BOOLEAN values → DF reads them back.
+#[tokio::test(flavor = "multi_thread")]
+async fn cross_engine_boolean_type_roundtrip_duckdb_write() {
+    let temp_dir = TempDir::new().unwrap();
+    let catalog_path = temp_dir.path().join("bool.ducklake");
+    let data_path = temp_dir.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+
+    // DuckDB writes boolean data using native DuckLake catalog
+    {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute("INSTALL ducklake;", []).unwrap();
+        conn.execute("LOAD ducklake;", []).unwrap();
+        conn.execute(
+            &format!(
+                "ATTACH 'ducklake:{}' AS ducklake (DATA_PATH '{}');",
+                catalog_path.display(),
+                data_path.display()
+            ),
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE ducklake.main.bool_duckdb (id INT, active BOOLEAN)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ducklake.main.bool_duckdb VALUES (1, true), (2, false), (3, NULL)",
+            [],
+        )
+        .unwrap();
+    }
 
     // DF reads DuckDB-written booleans
-    let ctx = open_in_datafusion_duckdb(catalog_path);
+    let ctx = open_in_datafusion_duckdb(&catalog_path);
     let rows = df_query(
         &ctx,
         "SELECT id, active FROM ducklake.main.bool_duckdb ORDER BY id",
@@ -1467,7 +1500,7 @@ async fn cross_engine_boolean_type_roundtrip() {
     assert_eq!(rows[2][0], "3");
     // DF might show NULL differently
     assert!(
-        rows[2][1] == "NULL" || rows[2][1].is_empty() || rows[2][1] == "",
+        rows[2][1] == "NULL" || rows[2][1].is_empty(),
         "null boolean from DF should be NULL, got: '{}'",
         rows[2][1]
     );
