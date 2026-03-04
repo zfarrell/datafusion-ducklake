@@ -1152,4 +1152,39 @@ mod tests {
         let quoted = quote_identifier(malicious);
         assert_eq!(quoted, r#""x"" TEXT); DROP TABLE foo; --""#);
     }
+
+    #[test]
+    fn test_validate_ducklake_type_for_ddl() {
+        assert!(validate_ducklake_type_for_ddl("int64").is_ok());
+        assert!(validate_ducklake_type_for_ddl("varchar").is_ok());
+        assert!(validate_ducklake_type_for_ddl("decimal(10, 2)").is_ok());
+        assert!(validate_ducklake_type_for_ddl("int64; DROP TABLE users").is_err());
+        assert!(validate_ducklake_type_for_ddl("int64\'--").is_err());
+        assert!(validate_ducklake_type_for_ddl("").is_err());
+    }
+
+    #[test]
+    fn test_is_numeric_type_shared() {
+        assert!(is_numeric_type("int64"));
+        assert!(is_numeric_type("DECIMAL(10, 2)"));
+        assert!(is_numeric_type("float"));
+        assert!(!is_numeric_type("varchar"));
+        assert!(!is_numeric_type("timestamp"));
+        assert!(!is_numeric_type("boolean"));
+    }
+
+    #[test]
+    fn test_stat_value_less_than_numeric_shared() {
+        assert!(stat_value_less_than("1", "2", true));
+        assert!(!stat_value_less_than("2", "1", true));
+        assert!(!stat_value_less_than("1", "1", true));
+        assert!(stat_value_less_than("-100", "100", true));
+        assert!(stat_value_less_than("1.5", "2.5", true));
+    }
+
+    #[test]
+    fn test_stat_value_less_than_string_shared() {
+        assert!(stat_value_less_than("abc", "def", false));
+        assert!(!stat_value_less_than("def", "abc", false));
+    }
 }

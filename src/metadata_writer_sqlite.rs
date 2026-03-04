@@ -12,8 +12,9 @@ use crate::metadata_writer::{
     ReplaceFileEntry, WriteMode, WriteSetupResult,
 };
 use crate::metadata_writer_validation::{
-    ActiveColumnInfo, AlterTableAction, quote_identifier, validate_alter_table,
-    validate_no_duplicate_columns, validate_schema_evolution, validate_table_has_columns,
+    ActiveColumnInfo, AlterTableAction, is_numeric_type, quote_identifier, stat_value_less_than,
+    validate_alter_table, validate_ducklake_type_for_ddl, validate_no_duplicate_columns,
+    validate_schema_evolution, validate_table_has_columns,
 };
 use sqlx::Row;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
@@ -1023,156 +1024,11 @@ impl SqliteMetadataWriter {
     }
 }
 
-/// Check if a DuckLake column type string represents a numeric type.
-fn is_numeric_type(column_type: &str) -> bool {
-    let t = column_type.to_uppercase();
-    let base = t.split('(').next().unwrap_or(&t).trim();
-    matches!(
-        base,
-        "TINYINT"
-            | "SMALLINT"
-            | "INTEGER"
-            | "INT"
-            | "BIGINT"
-            | "HUGEINT"
-            | "UTINYINT"
-            | "USMALLINT"
-            | "UINTEGER"
-            | "UBIGINT"
-            | "FLOAT"
-            | "REAL"
-            | "DOUBLE"
-            | "DECIMAL"
-            | "NUMERIC"
-            | "INT8"
-            | "INT16"
-            | "INT32"
-            | "INT64"
-            | "UINT8"
-            | "UINT16"
-            | "UINT32"
-            | "UINT64"
-            | "FLOAT4"
-            | "FLOAT8"
-    )
-}
+// R7-S-009/R7-S-022: is_numeric_type moved to metadata_writer_validation.rs
 
-/// R6-S-029: Validate a DuckLake type string for safe use in DDL.
-/// Rejects types containing characters that could enable SQL injection.
-/// Only allows alphanumeric, parentheses, commas, spaces, underscores, and dots (for decimal precision).
-fn validate_ducklake_type_for_ddl(type_str: &str) -> crate::Result<()> {
-    if type_str.is_empty() {
-        return Err(DuckLakeError::InvalidConfig(
-            "empty DuckLake type in DDL".into(),
-        ));
-    }
-    for ch in type_str.chars() {
-        if !ch.is_alphanumeric() && !matches!(ch, '(' | ')' | ',' | ' ' | '_' | '.') {
-            return Err(DuckLakeError::InvalidConfig(format!(
-                "invalid character '{}' in DuckLake type '{}' for DDL",
-                ch, type_str
-            )));
-        }
-    }
-    Ok(())
-}
+// R7-S-009: validate_ducklake_type_for_ddl moved to metadata_writer_validation.rs
 
-/// Compare two stat value strings: returns true if `a < b`.
-/// For numeric types, attempts numeric parsing; falls back to lexicographic.
-fn stat_value_less_than(a: &str, b: &str, is_numeric: bool) -> bool {
-    if is_numeric {
-        // Try i128 first (handles all integer types without precision loss)
-        if let (Ok(ia), Ok(ib)) = (a.parse::<i128>(), b.parse::<i128>()) {
-            return ia < ib;
-        }
-        // R6-S-019: Use string-based decimal comparison to avoid f64 precision loss
-        if let Some(ord) = cmp_decimal_strings(a, b) {
-            return ord == std::cmp::Ordering::Less;
-        }
-    }
-    // Lexicographic comparison for strings, dates, etc.
-    a < b
-}
-
-/// Compare two decimal number strings without f64 conversion (R6-S-019).
-fn cmp_decimal_strings(a: &str, b: &str) -> Option<std::cmp::Ordering> {
-    fn parse_parts(s: &str) -> Option<(bool, &str, &str)> {
-        let s = s.trim();
-        let (neg, s) = if let Some(rest) = s.strip_prefix('-') {
-            (true, rest)
-        } else if let Some(rest) = s.strip_prefix('+') {
-            (false, rest)
-        } else {
-            (false, s)
-        };
-        if s.is_empty() || s.chars().any(|c| !c.is_ascii_digit() && c != '.') {
-            return None;
-        }
-        if s.matches('.').count() > 1 {
-            return None;
-        }
-        let (int_part, frac_part) = match s.split_once('.') {
-            Some((i, f)) => (i, f),
-            None => (s, ""),
-        };
-        Some((neg, int_part, frac_part))
-    }
-
-    fn cmp_magnitude(a_int: &str, a_frac: &str, b_int: &str, b_frac: &str) -> std::cmp::Ordering {
-        let ai = a_int.trim_start_matches('0');
-        let bi = b_int.trim_start_matches('0');
-        match ai.len().cmp(&bi.len()) {
-            std::cmp::Ordering::Equal => {},
-            ord => return ord,
-        }
-        match ai.cmp(bi) {
-            std::cmp::Ordering::Equal => {},
-            ord => return ord,
-        }
-        let a_bytes = a_frac.as_bytes();
-        let b_bytes = b_frac.as_bytes();
-        let max_len = a_bytes.len().max(b_bytes.len());
-        for i in 0..max_len {
-            let ac = a_bytes.get(i).copied().unwrap_or(b'0');
-            let bc = b_bytes.get(i).copied().unwrap_or(b'0');
-            match ac.cmp(&bc) {
-                std::cmp::Ordering::Equal => continue,
-                ord => return ord,
-            }
-        }
-        std::cmp::Ordering::Equal
-    }
-
-    let (a_neg, a_int, a_frac) = parse_parts(a)?;
-    let (b_neg, b_int, b_frac) = parse_parts(b)?;
-
-    match (a_neg, b_neg) {
-        (true, false) => {
-            let a_zero =
-                a_int.trim_start_matches('0').is_empty() && a_frac.trim_end_matches('0').is_empty();
-            let b_zero =
-                b_int.trim_start_matches('0').is_empty() && b_frac.trim_end_matches('0').is_empty();
-            if a_zero && b_zero {
-                Some(std::cmp::Ordering::Equal)
-            } else {
-                Some(std::cmp::Ordering::Less)
-            }
-        },
-        (false, true) => {
-            let a_zero =
-                a_int.trim_start_matches('0').is_empty() && a_frac.trim_end_matches('0').is_empty();
-            let b_zero =
-                b_int.trim_start_matches('0').is_empty() && b_frac.trim_end_matches('0').is_empty();
-            if a_zero && b_zero {
-                Some(std::cmp::Ordering::Equal)
-            } else {
-                Some(std::cmp::Ordering::Greater)
-            }
-        },
-        (false, false) => Some(cmp_magnitude(a_int, a_frac, b_int, b_frac)),
-        (true, true) => Some(cmp_magnitude(b_int, b_frac, a_int, a_frac)),
-    }
-}
+// R7-S-022: stat_value_less_than, cmp_decimal_strings moved to metadata_writer_validation.rs
 
 impl MetadataWriter for SqliteMetadataWriter {
     fn create_snapshot(&self) -> Result<i64> {
@@ -1702,11 +1558,11 @@ impl MetadataWriter for SqliteMetadataWriter {
                 total_net_new_deletions += file.delete_count - old_delete_count;
             }
 
-            // R4-S-013: Decrement record_count by net new deletions
+            // R4-S-013 + R7-S-010: Decrement record_count (clamped to 0)
             if total_net_new_deletions > 0 {
                 sqlx::query(
                     "UPDATE ducklake_table_stats
-                     SET record_count = COALESCE(record_count, 0) - ?
+                     SET record_count = MAX(0, COALESCE(record_count, 0) - ?)
                      WHERE table_id = ?",
                 )
                 .bind(total_net_new_deletions)
@@ -4417,13 +4273,5 @@ mod tests {
         assert_eq!(r2.try_get::<i64, _>(0).unwrap(), 50);
     }
 
-    #[test]
-    fn test_validate_ducklake_type_for_ddl() {
-        assert!(validate_ducklake_type_for_ddl("int64").is_ok());
-        assert!(validate_ducklake_type_for_ddl("varchar").is_ok());
-        assert!(validate_ducklake_type_for_ddl("decimal(10, 2)").is_ok());
-        assert!(validate_ducklake_type_for_ddl("int64; DROP TABLE users").is_err());
-        assert!(validate_ducklake_type_for_ddl("int64\'--").is_err());
-        assert!(validate_ducklake_type_for_ddl("").is_err());
-    }
+    // R7-S-009: validate_ducklake_type_for_ddl test moved to metadata_writer_validation
 }
