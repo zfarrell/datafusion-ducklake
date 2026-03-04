@@ -579,10 +579,14 @@ impl ExecutionPlan for DuckLakeMergeExec {
                 let footer_size = calculate_footer_size_from_bytes(&buffer)
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-                object_store
+                // R6-S-037: Clean up prior uploads on failure
+                if let Err(e) = object_store
                     .put(&delete_object_path, PutPayload::from(buffer))
                     .await
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                {
+                    cleanup_orphaned_files(&*object_store, &uploaded_files).await;
+                    return Err(DataFusionError::External(Box::new(e)));
+                }
                 uploaded_files.push(delete_object_path);
 
                 let delete_file_info = DeleteFileInfo::new(
@@ -676,10 +680,14 @@ impl ExecutionPlan for DuckLakeMergeExec {
                 let footer_size = calculate_footer_size_from_bytes(&buffer)
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-                object_store
+                // R6-S-037: Clean up prior uploads on failure
+                if let Err(e) = object_store
                     .put(&data_object_path, PutPayload::from(buffer))
                     .await
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                {
+                    cleanup_orphaned_files(&*object_store, &uploaded_files).await;
+                    return Err(DataFusionError::External(Box::new(e)));
+                }
                 uploaded_files.push(data_object_path);
 
                 let data_file_info = DataFileInfo::new(&data_file_name, file_size, total_records)
@@ -695,10 +703,14 @@ impl ExecutionPlan for DuckLakeMergeExec {
                 return Ok(RecordBatch::try_new(output_schema, vec![count_array])?);
             }
 
-            // Create a snapshot for this merge operation (deferred until we know rows are affected)
-            let snapshot_id = writer
-                .create_snapshot()
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            // R6-S-038: Create snapshot; clean up uploads if snapshot creation fails
+            let snapshot_id = match writer.create_snapshot() {
+                Ok(id) => id,
+                Err(e) => {
+                    cleanup_orphaned_files(&*object_store, &uploaded_files).await;
+                    return Err(DataFusionError::External(Box::new(e)));
+                },
+            };
 
             // R3F-003: Atomically register all delete files and data files with cleanup on failure
             if let Err(e) = writer.register_dml_files(
