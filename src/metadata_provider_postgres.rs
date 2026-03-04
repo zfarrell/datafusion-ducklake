@@ -626,6 +626,7 @@ SELECT
     prev.path_is_relative,
     prev.file_size_bytes,
     prev.footer_size,
+    data.encryption_key AS data_encryption_key,
     current_delete.begin_snapshot
 FROM current_delete
 JOIN data_files data USING (data_file_id)
@@ -662,6 +663,7 @@ SELECT
     prev.path_is_relative,
     prev.file_size_bytes,
     prev.footer_size,
+    data.encryption_key AS data_encryption_key,
     data.end_snapshot
 FROM ducklake_data_file data
 LEFT JOIN LATERAL (
@@ -712,8 +714,11 @@ WHERE data.table_id = $1
                         previous_delete_file_size_bytes: row.try_get(13)?,
                         previous_delete_footer_size: row.try_get(14)?,
 
+                        // data file encryption key (R6-S-012)
+                        data_encryption_key: row.try_get(15)?,
+
                         // snapshot
-                        snapshot_id: row.try_get(15)?,
+                        snapshot_id: row.try_get(16)?,
                     })
                 })
                 .collect()

@@ -712,8 +712,11 @@ impl MetadataProvider for DuckdbMetadataProvider {
                     previous_delete_file_size_bytes: row.get(13)?,
                     previous_delete_footer_size: row.get(14)?,
 
+                    // data file encryption key (R6-S-012)
+                    data_encryption_key: row.get(15)?,
+
                     // snapshot
-                    snapshot_id: row.get(15)?,
+                    snapshot_id: row.get(16)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
