@@ -48,8 +48,8 @@ Also in `/home/zac/`:
 - Table functions: 14 implemented (incl. `ducklake_flush_inlined_data()`)
 - Multi-backend (SQLite/Postgres/MySQL): ALL methods implemented, Docker tests passing
 - SLT pass rate: 157/254 (61.8%)
-- ~724 total tests, 62 cross-engine tests, 254 SLT files
-- Code review cycles: 7 complete (R1: 36, R2: 58, R3: 50, R4: 46, R5: 77, R6: 88, R7: 50 — **~292 fixed across R1-R7**)
+- ~770 total tests, 72+ cross-engine tests, 254 SLT files
+- Code review cycles: 8 complete (R1: 36, R2: 58, R3: 50, R4: 46, R5: 77, R6: 88, R7: 50, R8: 96 — **~335 fixed across R1-R8**)
 
 ### What's Been Done (Phases 0-6)
 Everything through Phase 6 is complete. See `docs/project-status.md` for the full verified feature matrix.
@@ -252,6 +252,33 @@ Six fix agents resolved **all 22 assigned findings** (8 P1 + 14 P2). 28 P3 findi
 **Source documents:**
 - `docs/2026-03-04-r7-review-synthesis.md` (consolidated, deduplicated, prioritized, with **[FIXED]**/**[NOT ASSIGNED]** markers)
 - `docs/2026-03-04-r7-review-idiomatic.md`, `docs/2026-03-04-r7-review-correctness.md`, `docs/2026-03-04-r7-review-interop.md`, `docs/2026-03-04-r7-review-test-harness.md`, `docs/2026-03-04-r7-codex-review.md`
+
+### Code Review Cycle 8 (2026-03-05 R8) — 43 of 43 P1+P2 FINDINGS FIXED
+
+A five-part review (idiomatic, correctness, interop, test-harness, codex) of the post-R7 codebase identified **125 raw → 96 after dedup** (0 P0, 12 P1, 31 P2, 53 P3). 17 codex P0/P1 were false positives (89% FP rate). Zero P0 findings — third consecutive cycle with no data corruption or security issues.
+
+Eight fix agents resolved **all 43 P1+P2 findings**. 53 P3 findings were not assigned.
+
+**Fix agents (8):**
+- r8-fix-backend-parity (`875814e`): R8-S-007,008,009,026,029,037,038,042,043 (9) — MySQL next_file_id, PG/MySQL partition values, snapshot_changes, LAST_INSERT_ID casts, find_table_id, PG schema, snapshot_time, create_snapshot, created_schema
+- r8-fix-code-quality (`91279ec`): R8-S-013,024,033,034,039,040 (6) — view rewrite O(n²)→single-pass, error swallowing, DML code dedup, orphan file guards, type parsing, async compaction
+- r8-fix-metadata-correctness (`68a14dd`): R8-S-002,012,017,025,027,036,041 (7) — column stats join, append validation, SQLite retry, inlined schema_version, type case-insensitive, DuckDB schema filter, snapshot_changes retry
+- r8-fix-correctness (`c6a62b8`): R8-S-014,015,016,019,020,021,022,028,031,032 (10) — DeleteFilter partition, checked arithmetic, div_euclid, path resolver, partition f64, schema mapping, drop cascade, orphan cleanup, decimal overflow
+- r8-fix-interop (`b59edb1`): R8-S-003,004,010,011,023 (5) — footer size +8, timestamp precision, remove extra DDL columns, date stats ISO
+- r8-fix-compaction (`ed9c86c`): R8-S-001,018 (2) — end delete files, recompute stats after compaction
+- r8-fix-tests (`4687f5d`): R8-S-035 (1) — DF→DuckDB cross-engine partition + MERGE tests
+- r8-fix-pg-concurrency (`71da28c`): R8-S-005,006,030 (3) — PG schema_version sequence, unique partial indexes, conflict re-verification
+
+**Merge**: Final commit `12548a6`.
+**Tests**: 770 pass, 3 pre-existing DuckDB failures.
+
+**53 P3 not assigned**: Optional, low impact.
+
+**Deferred items remain deferred**: F-036, F-044, F-045, R4-S-018, R4-S-036, R4-S-040, R6-S-017.
+
+**Source documents:**
+- `docs/2026-03-05-r8-review-synthesis.md` (consolidated, deduplicated, prioritized, with **[FIXED]**/**[NOT ASSIGNED]** markers)
+- `docs/2026-03-05-r8-review-idiomatic.md`, `docs/2026-03-05-r8-review-correctness.md`, `docs/2026-03-05-r8-review-interop.md`, `docs/2026-03-05-r8-review-test-harness.md`, `docs/2026-03-05-r8-codex-review.md`
 
 ### After Implementation: PR Creation
 Follow `/home/zac/ducklake-pr-strategy.md`:
