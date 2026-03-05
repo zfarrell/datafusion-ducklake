@@ -784,6 +784,18 @@ where
     tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
 }
 
+#[cfg(any(feature = "write-postgres", feature = "write-mysql"))]
+/// Adapter that wraps [`block_on`] with a closure interface matching
+/// [`block_on_with_retry`] so that writer macros can use a uniform
+/// `$block_on(|| async { ... })` call pattern across all backends.
+pub(crate) fn block_on_once<F, Fut, T>(mut f: F) -> crate::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = crate::Result<T>>,
+{
+    block_on(f())
+}
+
 /// Escape a SQL identifier for safe use in double-quoted contexts (SQL standard).
 ///
 /// Doubles any internal double-quotes, then wraps in double quotes.

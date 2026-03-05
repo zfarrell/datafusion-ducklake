@@ -44,6 +44,10 @@ pub(crate) trait SqlDialect: Send + Sync + 'static {
 
     /// Whether existence checks use COUNT(*) (true) or SELECT EXISTS (false).
     fn existence_check_is_count(&self) -> bool;
+
+    /// Greatest of two expressions. SQLite: MAX(a, b), PG/MySQL: GREATEST(a, b).
+    #[cfg(feature = "write")]
+    fn greatest(&self, a: &str, b: &str) -> String;
 }
 
 // --- SQLite ---
@@ -117,6 +121,11 @@ impl SqlDialect for SqliteDialect {
 
     fn existence_check_is_count(&self) -> bool {
         true
+    }
+
+    #[cfg(feature = "write")]
+    fn greatest(&self, a: &str, b: &str) -> String {
+        format!("MAX({a}, {b})")
     }
 }
 
@@ -192,6 +201,11 @@ impl SqlDialect for PostgresDialect {
     fn existence_check_is_count(&self) -> bool {
         false
     }
+
+    #[cfg(feature = "write")]
+    fn greatest(&self, a: &str, b: &str) -> String {
+        format!("GREATEST({a}, {b})")
+    }
 }
 
 // --- MySQL ---
@@ -265,5 +279,10 @@ impl SqlDialect for MySqlDialect {
 
     fn existence_check_is_count(&self) -> bool {
         true
+    }
+
+    #[cfg(feature = "write")]
+    fn greatest(&self, a: &str, b: &str) -> String {
+        format!("GREATEST({a}, {b})")
     }
 }
