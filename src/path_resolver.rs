@@ -25,24 +25,10 @@ fn validate_no_null_bytes(path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Simple percent-decode of path-relevant characters for traversal detection
+/// Percent-decode a path for traversal detection using proper UTF-8 decoding
 fn percent_decode_path(path: &str) -> String {
-    let mut result = String::with_capacity(path.len());
-    let bytes = path.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%'
-            && i + 2 < bytes.len()
-            && let Ok(byte) = u8::from_str_radix(&path[i + 1..i + 3], 16)
-        {
-            result.push(byte as char);
-            i += 3;
-            continue;
-        }
-        result.push(bytes[i] as char);
-        i += 1;
-    }
-    result
+    // R8-S-020: Use percent_encoding crate for correct multi-byte UTF-8 handling
+    percent_decode_str(path).decode_utf8_lossy().into_owned()
 }
 
 /// Check if any path component is ".." when split on `/` and `\`
@@ -65,8 +51,9 @@ fn validate_no_path_traversal(path: &str) -> Result<()> {
     }
     // Also check the percent-decoded path to catch encoded variants
     // (e.g., %2e%2e%2f, ..%2f, %2e%2e%2F, ..%2F, etc.)
+    // R8-S-020: Always check decoded path for traversal, even if decode produces same output
     let decoded = percent_decode_path(path);
-    if decoded != path && has_dotdot_component(&decoded) {
+    if has_dotdot_component(&decoded) {
         return Err(DuckLakeError::InvalidConfig(format!(
             "Path traversal detected: URL-encoded '..': {}",
             path

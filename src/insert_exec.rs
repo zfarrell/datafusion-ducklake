@@ -442,7 +442,7 @@ fn extract_temporal_component(
                 arrow::datatypes::TimeUnit::Nanosecond => array
                     .as_any()
                     .downcast_ref::<TimestampNanosecondArray>()
-                    .map(|a| a.value(row) / 1_000),
+                    .map(|a| a.value(row).div_euclid(1_000)),
             };
             let dt = us.and_then(chrono::DateTime::from_timestamp_micros);
             Ok(dt.map(|d| match component {

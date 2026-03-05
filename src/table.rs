@@ -396,79 +396,87 @@ impl DuckLakeTable {
         ParquetSource::default()
     }
 
-    /// Get the cached schema mapping, computing it once from the first file if needed.
-    /// All files in a DuckLake table have the same schema structure, so we only need to check one.
+    /// Get the cached schema mapping, computing it from a file with field IDs if needed.
+    /// R8-S-022: Skips files without Parquet field IDs (external files) to find a
+    /// representative file for the rename mapping cache.
     async fn get_schema_mapping(
         &self,
         state: &dyn Session,
     ) -> DataFusionResult<&SchemaMappingCache> {
         self.schema_mapping_cache
             .get_or_try_init(|| async {
-                // If no files, use current schema with no rename mapping
-                let Some(first_file) = self.table_files.first() else {
-                    return Ok((self.schema.clone(), HashMap::new()));
-                };
-
-                let resolved_path = self.resolve_file_path(&first_file.file)?;
-                let object_store = state
-                    .runtime_env()
-                    .object_store(self.object_store_url.as_ref())?;
-                let object_path = ObjectPath::from(resolved_path.as_str());
-
-                let reader = ParquetObjectReader::new(object_store, object_path);
-
-                // Build the ParquetRecordBatchStreamBuilder with decryption if needed
-                #[cfg(feature = "encryption")]
-                let builder = {
-                    use parquet::arrow::arrow_reader::ArrowReaderOptions;
-
-                    // Check if file has encryption key
-                    let options = if let Some(ref key) = first_file.file.encryption_key {
-                        if !key.is_empty() {
-                            let key_bytes =
-                                crate::encryption::DuckLakeEncryptionFactory::decode_key(key)?;
-                            let decryption_props =
-                                parquet::encryption::decrypt::FileDecryptionProperties::builder(
-                                    key_bytes,
-                                )
-                                .build()
-                                .map_err(|e| {
-                                    DataFusionError::Execution(format!(
-                                        "Failed to create decryption properties: {}",
-                                        e
-                                    ))
-                                })?;
-                            ArrowReaderOptions::new()
-                                .with_file_decryption_properties(decryption_props)
-                        } else {
-                            ArrowReaderOptions::new()
-                        }
-                    } else {
-                        ArrowReaderOptions::new()
-                    };
-
-                    ParquetRecordBatchStreamBuilder::new_with_options(reader, options)
-                        .await
-                        .map_err(|e| DataFusionError::External(Box::new(e)))?
-                };
-
-                #[cfg(not(feature = "encryption"))]
-                let builder = ParquetRecordBatchStreamBuilder::new(reader)
-                    .await
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-                let field_id_map = extract_parquet_field_ids(builder.metadata());
-
-                // No field_ids means external file - use current schema directly
-                if field_id_map.is_empty() {
+                if self.table_files.is_empty() {
                     return Ok((self.schema.clone(), HashMap::new()));
                 }
 
-                let (read_schema, name_mapping) =
-                    build_read_schema_with_field_id_mapping(&self.columns, &field_id_map)
+                let object_store = state
+                    .runtime_env()
+                    .object_store(self.object_store_url.as_ref())?;
+
+                // R8-S-022: Iterate files to find one with field IDs
+                for table_file in &self.table_files {
+                    let resolved_path = self.resolve_file_path(&table_file.file)?;
+                    let object_path = ObjectPath::from(resolved_path.as_str());
+                    let reader =
+                        ParquetObjectReader::new(object_store.clone(), object_path);
+
+                    #[cfg(feature = "encryption")]
+                    let builder = {
+                        use parquet::arrow::arrow_reader::ArrowReaderOptions;
+
+                        let options =
+                            if let Some(ref key) = table_file.file.encryption_key {
+                                if !key.is_empty() {
+                                    let key_bytes =
+                                        crate::encryption::DuckLakeEncryptionFactory::decode_key(
+                                            key,
+                                        )?;
+                                    let decryption_props =
+                                        parquet::encryption::decrypt::FileDecryptionProperties::builder(
+                                            key_bytes,
+                                        )
+                                        .build()
+                                        .map_err(|e| {
+                                            DataFusionError::Execution(format!(
+                                                "Failed to create decryption properties: {}",
+                                                e
+                                            ))
+                                        })?;
+                                    ArrowReaderOptions::new()
+                                        .with_file_decryption_properties(decryption_props)
+                                } else {
+                                    ArrowReaderOptions::new()
+                                }
+                            } else {
+                                ArrowReaderOptions::new()
+                            };
+
+                        ParquetRecordBatchStreamBuilder::new_with_options(reader, options)
+                            .await
+                            .map_err(|e| DataFusionError::External(Box::new(e)))?
+                    };
+
+                    #[cfg(not(feature = "encryption"))]
+                    let builder = ParquetRecordBatchStreamBuilder::new(reader)
+                        .await
                         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-                Ok((Arc::new(read_schema), name_mapping))
+                    let field_id_map = extract_parquet_field_ids(builder.metadata());
+
+                    // Skip files without field IDs (external files)
+                    if field_id_map.is_empty() {
+                        continue;
+                    }
+
+                    let (read_schema, name_mapping) =
+                        build_read_schema_with_field_id_mapping(&self.columns, &field_id_map)
+                            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+                    return Ok((Arc::new(read_schema), name_mapping));
+                }
+
+                // All files lack field IDs — use current schema directly
+                Ok((self.schema.clone(), HashMap::new()))
             })
             .await
     }
@@ -1298,15 +1306,18 @@ fn scalar_value_to_partition_string(value: &datafusion::common::ScalarValue) -> 
 
 /// Type-aware comparison of partition values (R7-S-005).
 ///
-/// Tries numeric (f64) comparison first so that "10" and "10.0" are considered
-/// equal and ordering is numeric rather than lexicographic. Falls back to
-/// exact string comparison for non-numeric values.
+/// Tries i64 comparison first (exact for integers up to 2^63), then f64
+/// for fractional values, then falls back to exact string comparison.
 fn partition_values_equal(actual: &str, expected: &str) -> bool {
     // Fast path: exact string match
     if actual == expected {
         return true;
     }
-    // Try numeric comparison for values that parse as numbers
+    // R8-S-021: Try i64 first to avoid f64 precision loss for large integers (>2^53)
+    if let (Ok(a), Ok(b)) = (actual.parse::<i64>(), expected.parse::<i64>()) {
+        return a == b;
+    }
+    // Fall back to f64 for fractional values like "10" vs "10.0"
     if let (Ok(a), Ok(b)) = (actual.parse::<f64>(), expected.parse::<f64>()) {
         return a == b;
     }

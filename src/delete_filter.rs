@@ -13,6 +13,7 @@ use arrow::datatypes::SchemaRef;
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::Stream;
 
@@ -35,7 +36,16 @@ impl DeleteFilterExec {
         file_path: String,
         deleted_positions: Arc<HashSet<i64>>,
     ) -> Self {
-        // Clone properties from input plan
+        // R8-S-014: row_offset tracking requires a single partition per file.
+        // If the input has multiple partitions (e.g. row-group splitting) and
+        // we have deletes, coalesce to a single partition to ensure correct offsets.
+        let input = if !deleted_positions.is_empty()
+            && input.properties().output_partitioning().partition_count() > 1
+        {
+            Arc::new(CoalescePartitionsExec::new(input)) as Arc<dyn ExecutionPlan>
+        } else {
+            input
+        };
         let properties = input.properties().clone();
 
         Self {
