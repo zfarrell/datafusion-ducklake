@@ -935,6 +935,7 @@ impl SqliteMetadataWriter {
                  AND df.table_id = fcs.table_id
                  AND df.end_snapshot IS NULL
              INNER JOIN ducklake_column c ON fcs.column_id = c.column_id
+                 AND c.end_snapshot IS NULL AND c.table_id = fcs.table_id
              WHERE fcs.table_id = ?",
         )
         .bind(table_id)
@@ -1737,7 +1738,8 @@ impl MetadataWriter for SqliteMetadataWriter {
 
     // R3F-013: Record changes_made for DML snapshots
     fn record_snapshot_changes(&self, snapshot_id: i64, changes_made: &str) -> Result<()> {
-        block_on(async {
+        let pool = &self.pool;
+        block_on_with_retry(|| async {
             sqlx::query(
                 "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made)
                  VALUES (?, ?)
@@ -1745,7 +1747,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             )
             .bind(snapshot_id)
             .bind(changes_made)
-            .execute(&self.pool)
+            .execute(pool)
             .await?;
             Ok(())
         })
@@ -2242,8 +2244,9 @@ impl MetadataWriter for SqliteMetadataWriter {
     }
 
     fn rename_view(&self, view_id: i64, new_name: &str) -> Result<i64> {
-        block_on(async {
-            let mut tx = self.pool.begin().await?;
+        let pool = &self.pool;
+        block_on_with_retry(|| async {
+            let mut tx = pool.begin().await?;
 
             // Fetch the current active view row
             let view_row = sqlx::query(
@@ -2663,8 +2666,9 @@ impl MetadataWriter for SqliteMetadataWriter {
     }
 
     fn rename_table(&self, table_id: i64, new_name: &str) -> Result<i64> {
-        block_on(async {
-            let mut tx = self.pool.begin().await?;
+        let pool = &self.pool;
+        block_on_with_retry(|| async {
+            let mut tx = pool.begin().await?;
 
             // Fetch the current active table row
             let table_row = sqlx::query(
@@ -2779,8 +2783,9 @@ impl MetadataWriter for SqliteMetadataWriter {
     }
 
     fn set_table_comment(&self, table_id: i64, comment: &str) -> Result<i64> {
-        block_on(async {
-            let mut tx = self.pool.begin().await?;
+        let pool = &self.pool;
+        block_on_with_retry(|| async {
+            let mut tx = pool.begin().await?;
 
             // Increment schema_version for DDL (F-012)
             let prev_sv_row =
@@ -2853,8 +2858,9 @@ impl MetadataWriter for SqliteMetadataWriter {
     }
 
     fn set_column_comment(&self, table_id: i64, column_name: &str, comment: &str) -> Result<i64> {
-        block_on(async {
-            let mut tx = self.pool.begin().await?;
+        let pool = &self.pool;
+        block_on_with_retry(|| async {
+            let mut tx = pool.begin().await?;
 
             // Look up the column_id for the named column
             let col_row = sqlx::query(
