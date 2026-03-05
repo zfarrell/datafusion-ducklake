@@ -3,11 +3,9 @@
 //! Requires multi-threaded Tokio runtime (`#[tokio::test(flavor = "multi_thread")]`).
 
 use crate::Result;
-use crate::error::DuckLakeError;
 use crate::metadata_provider::block_on;
 use crate::metadata_writer::{
-    AlterTableOp, ColumnDef, ColumnStatInfo, DataFileInfo, DeleteFileInfo, MetadataWriter,
-    ReplaceFileEntry, WriteMode, WriteSetupResult,
+    AlterTableOp, ColumnDef, MetadataWriter, WriteMode, WriteSetupResult,
 };
 use crate::metadata_writer_validation::{
     ActiveColumnInfo, AlterTableAction, validate_alter_table, validate_no_duplicate_columns,

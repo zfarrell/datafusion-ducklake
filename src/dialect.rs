@@ -1,5 +1,6 @@
 /// SQL dialect differences between SQLite, PostgreSQL, and MySQL.
 /// Each method returns a SQL fragment or performs a dialect-specific operation.
+#[allow(dead_code)]
 pub(crate) trait SqlDialect: Send + Sync + 'static {
     /// Parameter placeholder. SQLite/MySQL: "?", Postgres: "$1", "$2", etc.
     fn ph(&self, n: usize) -> String;
@@ -70,6 +71,7 @@ pub(crate) trait SqlDialect: Send + Sync + 'static {
 
 // --- SQLite ---
 
+#[allow(dead_code)]
 pub(crate) struct SqliteDialect;
 
 impl SqlDialect for SqliteDialect {
@@ -186,6 +188,7 @@ impl SqlDialect for SqliteDialect {
 
 // --- PostgreSQL ---
 
+#[allow(dead_code)]
 pub(crate) struct PostgresDialect;
 
 impl SqlDialect for PostgresDialect {
@@ -287,6 +290,7 @@ impl SqlDialect for PostgresDialect {
 
 // --- MySQL ---
 
+#[allow(dead_code)]
 pub(crate) struct MySqlDialect;
 
 impl SqlDialect for MySqlDialect {

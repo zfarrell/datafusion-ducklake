@@ -8,13 +8,12 @@ use crate::Result;
 use crate::error::DuckLakeError;
 use crate::metadata_provider::{InlinedDataRow, block_on};
 use crate::metadata_writer::{
-    AlterTableOp, ColumnDef, ColumnStatInfo, DataFileInfo, DeleteFileInfo, MetadataWriter,
-    ReplaceFileEntry, WriteMode, WriteSetupResult,
+    AlterTableOp, ColumnDef, MetadataWriter, WriteMode, WriteSetupResult,
 };
 use crate::metadata_writer_validation::{
-    ActiveColumnInfo, AlterTableAction, is_numeric_type, quote_identifier, stat_value_less_than,
-    validate_alter_table, validate_ducklake_type_for_ddl, validate_no_duplicate_columns,
-    validate_schema_evolution, validate_table_has_columns,
+    ActiveColumnInfo, AlterTableAction, quote_identifier, validate_alter_table,
+    validate_ducklake_type_for_ddl, validate_no_duplicate_columns, validate_schema_evolution,
+    validate_table_has_columns,
 };
 use sqlx::Row;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
@@ -713,12 +712,6 @@ impl SqliteMetadataWriter {
         Ok(row.try_get(0)?)
     }
 }
-
-// R7-S-009/R7-S-022: is_numeric_type moved to metadata_writer_validation.rs
-
-// R7-S-009: validate_ducklake_type_for_ddl moved to metadata_writer_validation.rs
-
-// R7-S-022: stat_value_less_than, cmp_decimal_strings moved to metadata_writer_validation.rs
 
 impl MetadataWriter for SqliteMetadataWriter {
     fn create_snapshot(&self) -> Result<i64> {
@@ -1464,7 +1457,10 @@ impl MetadataWriter for SqliteMetadataWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata_writer_validation::cmp_decimal_strings;
+    use crate::metadata_writer::{ColumnStatInfo, DataFileInfo, DeleteFileInfo, ReplaceFileEntry};
+    use crate::metadata_writer_validation::{
+        cmp_decimal_strings, is_numeric_type, stat_value_less_than,
+    };
     use tempfile::TempDir;
 
     async fn create_test_writer() -> (SqliteMetadataWriter, TempDir) {
