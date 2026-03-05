@@ -39,6 +39,7 @@ pub mod catalog;
 pub mod cdc_common;
 pub mod column_rename;
 pub mod delete_filter;
+pub(crate) mod dialect;
 pub mod encryption;
 pub mod error;
 pub mod information_schema;
@@ -58,6 +59,10 @@ pub mod virtual_column_exec;
 #[cfg(feature = "metadata-duckdb")]
 pub mod compaction_functions;
 
+// Shared provider macro (used by SQLite, PostgreSQL, MySQL providers)
+#[cfg(any(feature = "metadata-sqlite", feature = "metadata-postgres", feature = "metadata-mysql"))]
+pub(crate) mod metadata_provider_impl;
+
 // Metadata providers (feature-gated)
 #[cfg(feature = "metadata-duckdb")]
 pub mod metadata_provider_duckdb;
@@ -67,6 +72,10 @@ pub mod metadata_provider_mysql;
 pub mod metadata_provider_postgres;
 #[cfg(feature = "metadata-sqlite")]
 pub mod metadata_provider_sqlite;
+
+// Shared writer macros (used by SQLite, PostgreSQL, MySQL writers)
+#[cfg(any(feature = "write-sqlite", feature = "write-postgres", feature = "write-mysql"))]
+pub(crate) mod metadata_writer_impl;
 
 // Write support (feature-gated)
 #[cfg(feature = "write")]
