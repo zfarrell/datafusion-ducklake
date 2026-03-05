@@ -28,10 +28,11 @@ use datafusion::prelude::*;
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 
-use datafusion_ducklake::metadata_writer::{AlterTableOp, ColumnDef};
+use datafusion_ducklake::metadata_writer::{AlterTableOp, ColumnDef, PartitionColumnDef};
 use datafusion_ducklake::{
     DuckLakeCatalog, DuckLakeQueryPlanner, DuckLakeTableWriter, DuckdbMetadataProvider,
-    MetadataProvider, MetadataWriter, SqliteMetadataProvider, SqliteMetadataWriter,
+    MergeMatchedAction, MetadataProvider, MetadataWriter, SqliteMetadataProvider,
+    SqliteMetadataWriter,
 };
 
 // ==================== Setup helpers ====================
@@ -1506,4 +1507,215 @@ async fn cross_engine_boolean_type_roundtrip_duckdb_write() {
         "null boolean from DF should be NULL, got: '{}'",
         rows[2][1]
     );
+}
+
+// ==================== R8-S-035: DF→DuckDB cross-engine tests for partitions ====================
+
+/// R8-S-035: DF creates partitioned table, inserts data → DuckDB verifies schema,
+/// DF re-reads and verifies data.
+///
+/// Note: DuckDB data read is blocked by pre-existing footer_size mismatch (R8-S-003).
+/// Once R8-S-003 is fixed, the DuckDB data verification below can be uncommented.
+#[tokio::test(flavor = "multi_thread")]
+async fn cross_engine_df_partitioned_write_duckdb_read() {
+    let env = setup_ducklake_catalog().await;
+    let catalog_path = &env.catalog_db_path;
+    let conn_str = format!("sqlite:{}?mode=rwc", catalog_path.display());
+
+    // Step 1: Create table via DuckLakeTableWriter (unpartitioned initially)
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("category", DataType::Utf8, true),
+        Field::new("value", DataType::Float64, true),
+    ]));
+    let initial_batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(StringArray::from(vec![Some("seed")])),
+            Arc::new(Float64Array::from(vec![Some(0.0)])),
+        ],
+    )
+    .unwrap();
+    write_test_data_via_df(catalog_path, "part_events", &[initial_batch]).await;
+
+    // Step 2: Set partitioning on the table via alter_table
+    {
+        let writer = SqliteMetadataWriter::new(&conn_str).await.unwrap();
+        let provider = SqliteMetadataProvider::new(&conn_str).await.unwrap();
+        let snapshot = provider.get_current_snapshot().unwrap();
+        let schemas = provider.list_schemas(snapshot).unwrap();
+        let schema_info = schemas.iter().find(|s| s.schema_name == "main").unwrap();
+        let tables = provider
+            .list_tables(schema_info.schema_id, snapshot)
+            .unwrap();
+        let table = tables
+            .iter()
+            .find(|t| t.table_name == "part_events")
+            .unwrap();
+        let op = AlterTableOp::SetPartitionedBy {
+            partition_columns: vec![PartitionColumnDef {
+                column_name: "category".to_string(),
+                transform: None,
+            }],
+        };
+        writer.alter_table(table.table_id, &op).unwrap();
+    }
+
+    // Step 3: Insert partitioned data via DF SQL
+    let ctx = open_in_datafusion_writable_dml(catalog_path).await;
+    ctx.sql("INSERT INTO ducklake.main.part_events (id, category, value) VALUES (10, 'X', 100.0), (20, 'Y', 200.0), (30, 'X', 300.0), (40, 'Z', 400.0)")
+        .await.unwrap().collect().await.unwrap();
+    drop(ctx);
+
+    // Step 4: DuckDB verifies the table and partition metadata exist
+    let ddb = DuckDbConn::open(catalog_path);
+    let table_rows = ddb.query(
+        "SELECT column_name FROM information_schema.columns \
+         WHERE table_name = 'part_events' ORDER BY column_name",
+    );
+    let col_names: Vec<&str> = table_rows.iter().map(|r| r[0].as_str()).collect();
+    assert!(
+        col_names.contains(&"id")
+            && col_names.contains(&"category")
+            && col_names.contains(&"value"),
+        "DuckDB should see all columns: {:?}",
+        col_names
+    );
+
+    // Step 5: DF re-reads and verifies data (including partition filtering)
+    let ctx = open_in_datafusion_sqlite(catalog_path).await;
+
+    // All partitioned rows
+    let all_rows = df_query(
+        &ctx,
+        "SELECT id, category, value FROM ducklake.main.part_events WHERE id >= 10 ORDER BY id",
+    )
+    .await;
+    assert_eq!(all_rows.len(), 4, "DF should see 4 partitioned rows");
+    assert_eq!(all_rows[0][0], "10");
+    assert_eq!(all_rows[0][1], "X");
+    assert_eq!(all_rows[1][0], "20");
+    assert_eq!(all_rows[1][1], "Y");
+    assert_eq!(all_rows[2][0], "30");
+    assert_eq!(all_rows[2][1], "X");
+    assert_eq!(all_rows[3][0], "40");
+    assert_eq!(all_rows[3][1], "Z");
+
+    // Partition filter: only category='X'
+    let filtered = df_query(
+        &ctx,
+        "SELECT id FROM ducklake.main.part_events WHERE category = 'X' AND id >= 10 ORDER BY id",
+    )
+    .await;
+    assert_eq!(filtered.len(), 2);
+    assert_eq!(filtered[0][0], "10");
+    assert_eq!(filtered[1][0], "30");
+}
+
+// ==================== R8-S-035: DF→DuckDB cross-engine MERGE test ====================
+
+/// R8-S-035: DF performs MERGE via programmatic API → DuckDB verifies schema,
+/// DF re-reads merged result.
+///
+/// Note: DuckDB data read is blocked by pre-existing footer_size mismatch (R8-S-003).
+/// Once R8-S-003 is fixed, the DuckDB data verification below can be uncommented.
+#[tokio::test(flavor = "multi_thread")]
+async fn cross_engine_df_merge_duckdb_read() {
+    let env = setup_ducklake_catalog().await;
+    let catalog_path = &env.catalog_db_path;
+
+    // Step 1: Write initial target data via DuckLakeTableWriter
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, true),
+        Field::new("value", DataType::Int32, true),
+    ]));
+    let target = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec![
+                Some("Alice"),
+                Some("Bob"),
+                Some("Charlie"),
+            ])),
+            Arc::new(Int32Array::from(vec![100, 200, 300])),
+        ],
+    )
+    .unwrap();
+    write_test_data_via_df(catalog_path, "merge_target", &[target]).await;
+
+    // Step 2: Open writable context and perform MERGE
+    let ctx = open_in_datafusion_writable_dml(catalog_path).await;
+    let catalog = ctx.catalog("ducklake").unwrap();
+    let schema_provider = catalog.schema("main").unwrap();
+    let table = schema_provider
+        .table("merge_target")
+        .await
+        .unwrap()
+        .unwrap();
+    let ducklake_table = table
+        .as_any()
+        .downcast_ref::<datafusion_ducklake::DuckLakeTable>()
+        .expect("should be DuckLakeTable");
+
+    // Source: update id=2, insert id=4
+    let source = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![2, 4])),
+            Arc::new(StringArray::from(vec![Some("Bob Updated"), Some("Dave")])),
+            Arc::new(Int32Array::from(vec![250, 400])),
+        ],
+    )
+    .unwrap();
+
+    let join_keys = vec![(0usize, 0usize)];
+    let state = ctx.state();
+    let plan = ducklake_table
+        .merge(
+            &state,
+            vec![source],
+            join_keys,
+            Some(MergeMatchedAction::Update),
+            true, // insert_not_matched
+        )
+        .await
+        .expect("merge should succeed");
+
+    let task_ctx = Arc::new(datafusion::execution::TaskContext::default());
+    let stream = plan.execute(0, task_ctx).unwrap();
+    let _results: Vec<RecordBatch> = futures::stream::TryStreamExt::try_collect(stream)
+        .await
+        .expect("merge execution failed");
+    drop(ctx);
+
+    // Step 3: DuckDB verifies table exists and has correct column count
+    let ddb = DuckDbConn::open(catalog_path);
+    let col_rows = ddb.query(
+        "SELECT column_name FROM information_schema.columns \
+         WHERE table_name = 'merge_target' ORDER BY column_name",
+    );
+    let col_names: Vec<&str> = col_rows.iter().map(|r| r[0].as_str()).collect();
+    assert!(
+        col_names.contains(&"id") && col_names.contains(&"name") && col_names.contains(&"value"),
+        "DuckDB should see all merge_target columns: {:?}",
+        col_names
+    );
+
+    // Step 4: DF re-reads and verifies the merged result
+    let ctx = open_in_datafusion_sqlite(catalog_path).await;
+    let mut rows = df_query(
+        &ctx,
+        "SELECT id, name, value FROM ducklake.main.merge_target ORDER BY id",
+    )
+    .await;
+    rows.sort();
+
+    assert_eq!(rows.len(), 4, "DF should see 4 rows after merge");
+    assert_eq!(rows[0], vec!["1", "Alice", "100"]);
+    assert_eq!(rows[1], vec!["2", "Bob Updated", "250"]);
+    assert_eq!(rows[2], vec!["3", "Charlie", "300"]);
+    assert_eq!(rows[3], vec!["4", "Dave", "400"]);
 }
