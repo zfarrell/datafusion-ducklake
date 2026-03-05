@@ -1069,3 +1069,1226 @@ macro_rules! impl_writer_file_ops {
 }
 
 pub(crate) use impl_writer_file_ops;
+
+/// Generates DDL-related `MetadataWriter` methods (create_view, drop_view, rename_view,
+/// alter_table, rename_table, set_table_comment, set_column_comment).
+///
+/// Parameters:
+/// - `$struct_name`: The metadata writer struct type
+/// - `pool_type`: The sqlx pool type (SqlitePool, PgPool, MySqlPool)
+/// - `dialect`: SqlDialect implementation expression
+/// - `block_on`: blocking executor (block_on_with_retry or block_on_once)
+/// - `last_insert_id`: async closure to get last inserted ID (MySQL)
+/// - `column_order_type`: Rust type for column_order column (i64 for SQLite/MySQL, i32 for PG)
+macro_rules! impl_writer_ddl_ops {
+    (
+        $struct_name:ty,
+        pool_type = $pool_type:ty,
+        dialect = $dialect:expr,
+        block_on = $block_on:path,
+        last_insert_id = $last_id:expr,
+        column_order_type = $co_type:ty
+    ) => {
+            fn create_view(&self, schema_id: i64, view_name: &str, sql: &str) -> Result<(i64, i64)> {
+                let pool = &self.pool;
+                $block_on(|| async {
+                    use crate::dialect::SqlDialect;
+                    use sqlx::Row;
+                    let d = $dialect;
+                    let mut tx = pool.begin().await?;
+
+                    // Create DDL snapshot with schema_version increment (F-012)
+                    let snapshot_id: i64 = {
+                        let prev_sv_row = sqlx::query("SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot")
+                            .fetch_one(&mut *tx).await?;
+                        let new_sv: i64 = prev_sv_row.try_get::<i64, _>(0)? + 1;
+
+                        let sid: i64 = if d.supports_returning() {
+                            let ins = format!(
+                                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES ({}, {}) RETURNING snapshot_id",
+                                d.now(), d.ph(1)
+                            );
+                            let row = sqlx::query(&ins).bind(new_sv).fetch_one(&mut *tx).await?;
+                            row.try_get(0)?
+                        } else {
+                            let ins = format!(
+                                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES ({}, {})",
+                                d.now(), d.ph(1)
+                            );
+                            sqlx::query(&ins).bind(new_sv).execute(&mut *tx).await?;
+                            let last_id_fn = $last_id;
+                            (last_id_fn)(&mut tx).await?
+                        };
+
+                        let sv_sql = format!(
+                            "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version) VALUES ({}, {})",
+                            d.ph(1), d.ph(2)
+                        );
+                        sqlx::query(&sv_sql).bind(sid).bind(new_sv).execute(&mut *tx).await?;
+                        sid
+                    };
+
+                    // Get next view_id
+                    let view_id = <$struct_name>::next_entity_id(&mut tx, "view_id", None).await?;
+
+                    // Generate UUID (F-026) and insert view row
+                    let view_uuid = uuid::Uuid::new_v4().to_string();
+                    let view_ins = format!(
+                        "INSERT INTO ducklake_view (view_id, view_uuid, schema_id, view_name, {}, begin_snapshot) VALUES ({}, {}, {}, {}, {}, {})",
+                        d.col("sql"),
+                        d.ph(1), d.uuid_ph(2), d.ph(3), d.ph(4), d.ph(5), d.ph(6)
+                    );
+                    sqlx::query(&view_ins)
+                        .bind(view_id).bind(&view_uuid).bind(schema_id)
+                        .bind(view_name).bind(sql).bind(snapshot_id)
+                        .execute(&mut *tx).await?;
+
+                    // Record changes_made (F-027)
+                    let schema_row = sqlx::query(&format!(
+                        "SELECT schema_name FROM ducklake_schema WHERE schema_id = {} AND end_snapshot IS NULL",
+                        d.ph(1)
+                    ))
+                    .bind(schema_id)
+                    .fetch_optional(&mut *tx).await?;
+                    let schema_name = schema_row
+                        .map(|r| r.try_get::<String, _>(0).unwrap_or_default())
+                        .unwrap_or_default();
+
+                    let changes_sql = format!(
+                        "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made) VALUES ({}, {}) {}",
+                        d.ph(1), d.ph(2), d.upsert("snapshot_id", &["changes_made"])
+                    );
+                    sqlx::query(&changes_sql)
+                        .bind(snapshot_id)
+                        .bind(format!("created_view:\"{}\".\"{}\"",
+                            schema_name.replace('"', "\"\""),
+                            view_name.replace('"', "\"\"")))
+                        .execute(&mut *tx).await?;
+
+                    tx.commit().await?;
+                    Ok((view_id, snapshot_id))
+                })
+            }
+
+            fn drop_view(&self, view_id: i64) -> Result<i64> {
+                let pool = &self.pool;
+                $block_on(|| async {
+                    use crate::dialect::SqlDialect;
+                    use sqlx::Row;
+                    let d = $dialect;
+                    let mut tx = pool.begin().await?;
+
+                    // R4-S-014: Validate view exists and is active
+                    let exists = sqlx::query(&format!(
+                        "SELECT COUNT(*) FROM ducklake_view WHERE view_id = {} AND end_snapshot IS NULL",
+                        d.ph(1)
+                    ))
+                    .bind(view_id)
+                    .fetch_one(&mut *tx).await?;
+                    if exists.try_get::<i64, _>(0)? == 0 {
+                        return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                            "View with id {} not found or already dropped", view_id
+                        )));
+                    }
+
+                    // Create DDL snapshot
+                    let snapshot_id: i64 = {
+                        let prev_sv_row = sqlx::query("SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot")
+                            .fetch_one(&mut *tx).await?;
+                        let new_sv: i64 = prev_sv_row.try_get::<i64, _>(0)? + 1;
+
+                        let sid: i64 = if d.supports_returning() {
+                            let ins = format!(
+                                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES ({}, {}) RETURNING snapshot_id",
+                                d.now(), d.ph(1)
+                            );
+                            let row = sqlx::query(&ins).bind(new_sv).fetch_one(&mut *tx).await?;
+                            row.try_get(0)?
+                        } else {
+                            let ins = format!(
+                                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES ({}, {})",
+                                d.now(), d.ph(1)
+                            );
+                            sqlx::query(&ins).bind(new_sv).execute(&mut *tx).await?;
+                            let last_id_fn = $last_id;
+                            (last_id_fn)(&mut tx).await?
+                        };
+
+                        let sv_sql = format!(
+                            "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version) VALUES ({}, {})",
+                            d.ph(1), d.ph(2)
+                        );
+                        sqlx::query(&sv_sql).bind(sid).bind(new_sv).execute(&mut *tx).await?;
+                        sid
+                    };
+
+                    // End the view
+                    let end_sql = format!(
+                        "UPDATE ducklake_view SET end_snapshot = {} WHERE view_id = {} AND end_snapshot IS NULL",
+                        d.ph(1), d.ph(2)
+                    );
+                    sqlx::query(&end_sql).bind(snapshot_id).bind(view_id)
+                        .execute(&mut *tx).await?;
+
+                    // Record changes
+                    let changes_sql = format!(
+                        "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made) VALUES ({}, {}) {}",
+                        d.ph(1), d.ph(2), d.upsert("snapshot_id", &["changes_made"])
+                    );
+                    sqlx::query(&changes_sql)
+                        .bind(snapshot_id)
+                        .bind(format!("dropped_view:{}", view_id))
+                        .execute(&mut *tx).await?;
+
+                    tx.commit().await?;
+                    Ok(snapshot_id)
+                })
+            }
+
+            fn rename_view(&self, view_id: i64, new_name: &str) -> Result<i64> {
+                let pool = &self.pool;
+                $block_on(|| async {
+                    use crate::dialect::SqlDialect;
+                    use sqlx::Row;
+                    let d = $dialect;
+                    let mut tx = pool.begin().await?;
+
+                    // Fetch current active view row
+                    let view_row = sqlx::query(&format!(
+                        "SELECT schema_id, {}, {}, dialect, column_aliases FROM ducklake_view WHERE view_id = {} AND end_snapshot IS NULL",
+                        d.read_uuid("view_uuid"), d.col("sql"), d.ph(1)
+                    ))
+                    .bind(view_id)
+                    .fetch_optional(&mut *tx).await?;
+
+                    let Some(view_row) = view_row else {
+                        return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                            "View with id {} not found or already dropped", view_id
+                        )));
+                    };
+
+                    let schema_id: i64 = view_row.try_get(0)?;
+                    let view_uuid: Option<String> = view_row.try_get(1)?;
+                    let sql_text: String = view_row.try_get(2)?;
+                    let dialect_val: Option<String> = view_row.try_get(3)?;
+                    let column_aliases: Option<String> = view_row.try_get(4)?;
+
+                    // R4-S-015: Check for duplicate active view name in same schema
+                    let dup = sqlx::query(&format!(
+                        "SELECT COUNT(*) FROM ducklake_view WHERE schema_id = {} AND view_name = {} AND end_snapshot IS NULL",
+                        d.ph(1), d.ph(2)
+                    ))
+                    .bind(schema_id).bind(new_name)
+                    .fetch_one(&mut *tx).await?;
+                    if dup.try_get::<i64, _>(0)? > 0 {
+                        return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                            "A view named '{}' already exists in schema {}", new_name, schema_id
+                        )));
+                    }
+
+                    // Create DDL snapshot
+                    let snapshot_id: i64 = {
+                        let prev_sv_row = sqlx::query("SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot")
+                            .fetch_one(&mut *tx).await?;
+                        let new_sv: i64 = prev_sv_row.try_get::<i64, _>(0)? + 1;
+
+                        let sid: i64 = if d.supports_returning() {
+                            let ins = format!(
+                                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES ({}, {}) RETURNING snapshot_id",
+                                d.now(), d.ph(1)
+                            );
+                            let row = sqlx::query(&ins).bind(new_sv).fetch_one(&mut *tx).await?;
+                            row.try_get(0)?
+                        } else {
+                            let ins = format!(
+                                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES ({}, {})",
+                                d.now(), d.ph(1)
+                            );
+                            sqlx::query(&ins).bind(new_sv).execute(&mut *tx).await?;
+                            let last_id_fn = $last_id;
+                            (last_id_fn)(&mut tx).await?
+                        };
+
+                        let sv_sql = format!(
+                            "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version) VALUES ({}, {})",
+                            d.ph(1), d.ph(2)
+                        );
+                        sqlx::query(&sv_sql).bind(sid).bind(new_sv).execute(&mut *tx).await?;
+                        sid
+                    };
+
+                    // End existing view row
+                    let end_sql = format!(
+                        "UPDATE ducklake_view SET end_snapshot = {} WHERE view_id = {} AND end_snapshot IS NULL",
+                        d.ph(1), d.ph(2)
+                    );
+                    sqlx::query(&end_sql).bind(snapshot_id).bind(view_id)
+                        .execute(&mut *tx).await?;
+
+                    // Insert new view row with updated name
+                    let view_ins = format!(
+                        "INSERT INTO ducklake_view (view_id, view_uuid, schema_id, view_name, dialect, {}, column_aliases, begin_snapshot) VALUES ({}, {}, {}, {}, {}, {}, {}, {})",
+                        d.col("sql"),
+                        d.ph(1), d.uuid_ph(2), d.ph(3), d.ph(4), d.ph(5), d.ph(6), d.ph(7), d.ph(8)
+                    );
+                    sqlx::query(&view_ins)
+                        .bind(view_id).bind(&view_uuid).bind(schema_id)
+                        .bind(new_name).bind(&dialect_val).bind(&sql_text)
+                        .bind(&column_aliases).bind(snapshot_id)
+                        .execute(&mut *tx).await?;
+
+                    // Record change for conflict detection
+                    let ct_sql = format!(
+                        "INSERT INTO _df_change_tracking (snapshot_id, change_type, table_id) VALUES ({}, 'ALTER_VIEW', {})",
+                        d.ph(1), d.ph(2)
+                    );
+                    sqlx::query(&ct_sql).bind(snapshot_id).bind(view_id)
+                        .execute(&mut *tx).await?;
+
+                    // Record snapshot changes
+                    let changes_sql = format!(
+                        "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made) VALUES ({}, {}) {}",
+                        d.ph(1), d.ph(2), d.upsert("snapshot_id", &["changes_made"])
+                    );
+                    sqlx::query(&changes_sql)
+                        .bind(snapshot_id)
+                        .bind(format!("altered_view:{}", view_id))
+                        .execute(&mut *tx).await?;
+
+                    tx.commit().await?;
+                    Ok(snapshot_id)
+                })
+            }
+
+            fn alter_table(&self, table_id: i64, op: &AlterTableOp) -> Result<i64> {
+                let pool = &self.pool;
+                $block_on(|| async {
+                    use crate::dialect::SqlDialect;
+                    use sqlx::Row;
+                    let d = $dialect;
+                    let mut tx = pool.begin().await?;
+
+                    // Get active columns for validation
+                    let col_rows = sqlx::query(&format!(
+                        "SELECT column_id, column_name, column_type, column_order, nulls_allowed, \
+                                initial_default, default_value, parent_column, default_value_type, default_value_dialect \
+                         FROM ducklake_column WHERE table_id = {} AND end_snapshot IS NULL ORDER BY column_order",
+                        d.ph(1)
+                    ))
+                    .bind(table_id)
+                    .fetch_all(&mut *tx).await?;
+
+                    let columns: Vec<ActiveColumnInfo> = col_rows
+                        .iter()
+                        .map(|r| {
+                            Ok(ActiveColumnInfo {
+                                column_id: r.try_get(0)?,
+                                column_name: r.try_get(1)?,
+                                column_type: r.try_get(2)?,
+                                column_order: r.try_get::<$co_type, _>(3)? as i64,
+                                is_nullable: r.try_get::<Option<bool>, _>(4)?.unwrap_or(true),
+                                initial_default: r.try_get(5)?,
+                                default_value: r.try_get(6)?,
+                                parent_column: r.try_get(7)?,
+                                default_value_type: r.try_get(8)?,
+                                default_value_dialect: r.try_get(9)?,
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+
+                    validate_table_has_columns(&columns)?;
+                    let action = validate_alter_table(&columns, op)?;
+
+                    // Create DDL snapshot
+                    let snapshot_id: i64 = {
+                        let prev_sv_row = sqlx::query("SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot")
+                            .fetch_one(&mut *tx).await?;
+                        let new_sv: i64 = prev_sv_row.try_get::<i64, _>(0)? + 1;
+
+                        let sid: i64 = if d.supports_returning() {
+                            let ins = format!(
+                                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES ({}, {}) RETURNING snapshot_id",
+                                d.now(), d.ph(1)
+                            );
+                            let row = sqlx::query(&ins).bind(new_sv).fetch_one(&mut *tx).await?;
+                            row.try_get(0)?
+                        } else {
+                            let ins = format!(
+                                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES ({}, {})",
+                                d.now(), d.ph(1)
+                            );
+                            sqlx::query(&ins).bind(new_sv).execute(&mut *tx).await?;
+                            let last_id_fn = $last_id;
+                            (last_id_fn)(&mut tx).await?
+                        };
+
+                        let sv_sql = format!(
+                            "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version) VALUES ({}, {})",
+                            d.ph(1), d.ph(2)
+                        );
+                        sqlx::query(&sv_sql).bind(sid).bind(new_sv).execute(&mut *tx).await?;
+                        sid
+                    };
+
+                    match action {
+                        AlterTableAction::InsertColumn {
+                            column_name,
+                            column_type,
+                            column_order,
+                            is_nullable,
+                        } => {
+                            let next_column_id = <$struct_name>::next_entity_id(&mut tx, "column_id", Some(table_id)).await?;
+
+                            // Extract ColumnDef fields from AddColumn op
+                            let (initial_default, default_value, parent_column, default_value_type, default_value_dialect) =
+                                if let AlterTableOp::AddColumn { column } = op {
+                                    (&column.initial_default, &column.default_value, column.parent_column,
+                                     &column.default_value_type, &column.default_value_dialect)
+                                } else {
+                                    (&None, &None, None, &None, &None)
+                                };
+
+                            let col_ins = format!(
+                                "INSERT INTO ducklake_column (column_id, table_id, column_name, column_type, column_order, \
+                                 nulls_allowed, initial_default, default_value, parent_column, default_value_type, \
+                                 default_value_dialect, begin_snapshot) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                                d.ph(1), d.ph(2), d.ph(3), d.ph(4), d.ph(5), d.ph(6),
+                                d.ph(7), d.ph(8), d.ph(9), d.ph(10), d.ph(11), d.ph(12)
+                            );
+                            sqlx::query(&col_ins)
+                                .bind(next_column_id).bind(table_id).bind(&column_name)
+                                .bind(&column_type).bind(column_order).bind(is_nullable)
+                                .bind(initial_default).bind(default_value).bind(parent_column)
+                                .bind(default_value_type).bind(default_value_dialect).bind(snapshot_id)
+                                .execute(&mut *tx).await?;
+
+                            // Initialize table-level column stats (R3F-001)
+                            let stats_sql = format!(
+                                "INSERT INTO ducklake_table_column_stats (table_id, column_id, contains_null, contains_nan) \
+                                 VALUES ({}, {}, {}, NULL)",
+                                d.ph(1), d.ph(2), d.bool_lit(true)
+                            );
+                            sqlx::query(&stats_sql)
+                                .bind(table_id).bind(next_column_id)
+                                .execute(&mut *tx).await?;
+                        },
+                        AlterTableAction::EndColumn { column_id } => {
+                            let end_sql = format!(
+                                "UPDATE ducklake_column SET end_snapshot = {} WHERE column_id = {} AND end_snapshot IS NULL",
+                                d.ph(1), d.ph(2)
+                            );
+                            sqlx::query(&end_sql).bind(snapshot_id).bind(column_id)
+                                .execute(&mut *tx).await?;
+                        },
+                        AlterTableAction::ReplaceColumn {
+                            end_column_id, column_name, column_type, column_order,
+                            is_nullable, initial_default, default_value, parent_column,
+                            default_value_type, default_value_dialect,
+                        } => {
+                            // End existing column row
+                            let end_sql = format!(
+                                "UPDATE ducklake_column SET end_snapshot = {} WHERE column_id = {} AND end_snapshot IS NULL",
+                                d.ph(1), d.ph(2)
+                            );
+                            sqlx::query(&end_sql).bind(snapshot_id).bind(end_column_id)
+                                .execute(&mut *tx).await?;
+
+                            // Reuse same column_id (critical for Parquet field_id mapping)
+                            let col_ins = format!(
+                                "INSERT INTO ducklake_column (column_id, table_id, column_name, column_type, column_order, \
+                                 nulls_allowed, initial_default, default_value, parent_column, default_value_type, \
+                                 default_value_dialect, begin_snapshot) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                                d.ph(1), d.ph(2), d.ph(3), d.ph(4), d.ph(5), d.ph(6),
+                                d.ph(7), d.ph(8), d.ph(9), d.ph(10), d.ph(11), d.ph(12)
+                            );
+                            sqlx::query(&col_ins)
+                                .bind(end_column_id).bind(table_id).bind(&column_name)
+                                .bind(&column_type).bind(column_order).bind(is_nullable)
+                                .bind(&initial_default).bind(&default_value).bind(parent_column)
+                                .bind(&default_value_type).bind(&default_value_dialect).bind(snapshot_id)
+                                .execute(&mut *tx).await?;
+                        },
+                        AlterTableAction::SetPartitionedBy { partition_columns } => {
+                            // End any existing partition info
+                            let end_part = format!(
+                                "UPDATE ducklake_partition_info SET end_snapshot = {} WHERE table_id = {} AND end_snapshot IS NULL",
+                                d.ph(1), d.ph(2)
+                            );
+                            sqlx::query(&end_part).bind(snapshot_id).bind(table_id)
+                                .execute(&mut *tx).await?;
+
+                            // Create new partition_info entry
+                            let partition_id = <$struct_name>::next_entity_id(&mut tx, "partition_id", None).await?;
+
+                            let part_ins = format!(
+                                "INSERT INTO ducklake_partition_info (partition_id, table_id, begin_snapshot) VALUES ({}, {}, {})",
+                                d.ph(1), d.ph(2), d.ph(3)
+                            );
+                            sqlx::query(&part_ins).bind(partition_id).bind(table_id).bind(snapshot_id)
+                                .execute(&mut *tx).await?;
+
+                            // Create partition_column entries
+                            for (key_index, (column_id, _column_name, transform)) in partition_columns.iter().enumerate() {
+                                let pc_ins = format!(
+                                    "INSERT INTO ducklake_partition_column (partition_id, table_id, partition_key_index, column_id, transform) \
+                                     VALUES ({}, {}, {}, {}, {})",
+                                    d.ph(1), d.ph(2), d.ph(3), d.ph(4), d.ph(5)
+                                );
+                                sqlx::query(&pc_ins)
+                                    .bind(partition_id).bind(table_id).bind(key_index as i64)
+                                    .bind(column_id).bind(transform.as_deref().unwrap_or("identity"))
+                                    .execute(&mut *tx).await?;
+                            }
+                        },
+                    }
+
+                    // Record change for conflict detection
+                    let ct_sql = format!(
+                        "INSERT INTO _df_change_tracking (snapshot_id, change_type, table_id) VALUES ({}, 'ALTER_TABLE', {})",
+                        d.ph(1), d.ph(2)
+                    );
+                    sqlx::query(&ct_sql).bind(snapshot_id).bind(table_id)
+                        .execute(&mut *tx).await?;
+
+                    // Record snapshot changes
+                    let changes_sql = format!(
+                        "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made) VALUES ({}, {}) {}",
+                        d.ph(1), d.ph(2), d.upsert("snapshot_id", &["changes_made"])
+                    );
+                    sqlx::query(&changes_sql)
+                        .bind(snapshot_id)
+                        .bind(format!("altered_table:{}", table_id))
+                        .execute(&mut *tx).await?;
+
+                    tx.commit().await?;
+                    Ok(snapshot_id)
+                })
+            }
+
+            fn rename_table(&self, table_id: i64, new_name: &str) -> Result<i64> {
+                let pool = &self.pool;
+                $block_on(|| async {
+                    use crate::dialect::SqlDialect;
+                    use sqlx::Row;
+                    let d = $dialect;
+                    let mut tx = pool.begin().await?;
+
+                    // Fetch current active table row
+                    let table_row = sqlx::query(&format!(
+                        "SELECT schema_id, {}, path, path_is_relative FROM ducklake_table WHERE table_id = {} AND end_snapshot IS NULL",
+                        d.read_uuid("table_uuid"), d.ph(1)
+                    ))
+                    .bind(table_id)
+                    .fetch_optional(&mut *tx).await?;
+
+                    let Some(table_row) = table_row else {
+                        return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                            "Table with id {} not found or already dropped", table_id
+                        )));
+                    };
+
+                    let schema_id: i64 = table_row.try_get(0)?;
+                    let table_uuid: Option<String> = table_row.try_get(1)?;
+                    let path: String = table_row.try_get(2)?;
+                    let path_is_relative: bool = table_row.try_get(3)?;
+
+                    // R4-S-015: Check for duplicate active table name in same schema
+                    let dup = sqlx::query(&format!(
+                        "SELECT COUNT(*) FROM ducklake_table WHERE schema_id = {} AND table_name = {} AND end_snapshot IS NULL",
+                        d.ph(1), d.ph(2)
+                    ))
+                    .bind(schema_id).bind(new_name)
+                    .fetch_one(&mut *tx).await?;
+                    if dup.try_get::<i64, _>(0)? > 0 {
+                        return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                            "A table named '{}' already exists in schema {}", new_name, schema_id
+                        )));
+                    }
+
+                    // Create DDL snapshot
+                    let snapshot_id: i64 = {
+                        let prev_sv_row = sqlx::query("SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot")
+                            .fetch_one(&mut *tx).await?;
+                        let new_sv: i64 = prev_sv_row.try_get::<i64, _>(0)? + 1;
+
+                        let sid: i64 = if d.supports_returning() {
+                            let ins = format!(
+                                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES ({}, {}) RETURNING snapshot_id",
+                                d.now(), d.ph(1)
+                            );
+                            let row = sqlx::query(&ins).bind(new_sv).fetch_one(&mut *tx).await?;
+                            row.try_get(0)?
+                        } else {
+                            let ins = format!(
+                                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES ({}, {})",
+                                d.now(), d.ph(1)
+                            );
+                            sqlx::query(&ins).bind(new_sv).execute(&mut *tx).await?;
+                            let last_id_fn = $last_id;
+                            (last_id_fn)(&mut tx).await?
+                        };
+
+                        let sv_sql = format!(
+                            "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version) VALUES ({}, {})",
+                            d.ph(1), d.ph(2)
+                        );
+                        sqlx::query(&sv_sql).bind(sid).bind(new_sv).execute(&mut *tx).await?;
+                        sid
+                    };
+
+                    // End existing table row
+                    let end_sql = format!(
+                        "UPDATE ducklake_table SET end_snapshot = {} WHERE table_id = {} AND end_snapshot IS NULL",
+                        d.ph(1), d.ph(2)
+                    );
+                    sqlx::query(&end_sql).bind(snapshot_id).bind(table_id)
+                        .execute(&mut *tx).await?;
+
+                    // Insert new table row with updated name
+                    let table_ins = format!(
+                        "INSERT INTO ducklake_table (table_id, table_uuid, schema_id, table_name, path, path_is_relative, begin_snapshot) \
+                         VALUES ({}, {}, {}, {}, {}, {}, {})",
+                        d.ph(1), d.uuid_ph(2), d.ph(3), d.ph(4), d.ph(5), d.ph(6), d.ph(7)
+                    );
+                    sqlx::query(&table_ins)
+                        .bind(table_id).bind(&table_uuid).bind(schema_id)
+                        .bind(new_name).bind(&path).bind(path_is_relative).bind(snapshot_id)
+                        .execute(&mut *tx).await?;
+
+                    // Record change for conflict detection
+                    let ct_sql = format!(
+                        "INSERT INTO _df_change_tracking (snapshot_id, change_type, table_id) VALUES ({}, 'ALTER_TABLE', {})",
+                        d.ph(1), d.ph(2)
+                    );
+                    sqlx::query(&ct_sql).bind(snapshot_id).bind(table_id)
+                        .execute(&mut *tx).await?;
+
+                    // Record snapshot changes
+                    let changes_sql = format!(
+                        "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made) VALUES ({}, {}) {}",
+                        d.ph(1), d.ph(2), d.upsert("snapshot_id", &["changes_made"])
+                    );
+                    sqlx::query(&changes_sql)
+                        .bind(snapshot_id)
+                        .bind(format!("altered_table:{}", table_id))
+                        .execute(&mut *tx).await?;
+
+                    tx.commit().await?;
+                    Ok(snapshot_id)
+                })
+            }
+
+            fn set_table_comment(&self, table_id: i64, comment: &str) -> Result<i64> {
+                let pool = &self.pool;
+                $block_on(|| async {
+                    use crate::dialect::SqlDialect;
+                    use sqlx::Row;
+                    let d = $dialect;
+                    let mut tx = pool.begin().await?;
+
+                    // Create DDL snapshot
+                    let snapshot_id: i64 = {
+                        let prev_sv_row = sqlx::query("SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot")
+                            .fetch_one(&mut *tx).await?;
+                        let new_sv: i64 = prev_sv_row.try_get::<i64, _>(0)? + 1;
+
+                        let sid: i64 = if d.supports_returning() {
+                            let ins = format!(
+                                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES ({}, {}) RETURNING snapshot_id",
+                                d.now(), d.ph(1)
+                            );
+                            let row = sqlx::query(&ins).bind(new_sv).fetch_one(&mut *tx).await?;
+                            row.try_get(0)?
+                        } else {
+                            let ins = format!(
+                                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES ({}, {})",
+                                d.now(), d.ph(1)
+                            );
+                            sqlx::query(&ins).bind(new_sv).execute(&mut *tx).await?;
+                            let last_id_fn = $last_id;
+                            (last_id_fn)(&mut tx).await?
+                        };
+
+                        let sv_sql = format!(
+                            "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version) VALUES ({}, {})",
+                            d.ph(1), d.ph(2)
+                        );
+                        sqlx::query(&sv_sql).bind(sid).bind(new_sv).execute(&mut *tx).await?;
+                        sid
+                    };
+
+                    // End any existing comment tag for this table
+                    let end_tag = format!(
+                        "UPDATE ducklake_tag SET end_snapshot = {} WHERE object_id = {} AND {} = 'comment' AND end_snapshot IS NULL",
+                        d.ph(1), d.ph(2), d.col("key")
+                    );
+                    sqlx::query(&end_tag).bind(snapshot_id).bind(table_id)
+                        .execute(&mut *tx).await?;
+
+                    // Insert new comment tag
+                    let ins_tag = format!(
+                        "INSERT INTO ducklake_tag (object_id, begin_snapshot, {}, value) VALUES ({}, {}, 'comment', {})",
+                        d.col("key"), d.ph(1), d.ph(2), d.ph(3)
+                    );
+                    sqlx::query(&ins_tag).bind(table_id).bind(snapshot_id).bind(comment)
+                        .execute(&mut *tx).await?;
+
+                    // Record change for conflict detection
+                    let ct_sql = format!(
+                        "INSERT INTO _df_change_tracking (snapshot_id, change_type, table_id) VALUES ({}, 'ALTER_TABLE', {})",
+                        d.ph(1), d.ph(2)
+                    );
+                    sqlx::query(&ct_sql).bind(snapshot_id).bind(table_id)
+                        .execute(&mut *tx).await?;
+
+                    // Record snapshot changes
+                    let changes_sql = format!(
+                        "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made) VALUES ({}, {}) {}",
+                        d.ph(1), d.ph(2), d.upsert("snapshot_id", &["changes_made"])
+                    );
+                    sqlx::query(&changes_sql)
+                        .bind(snapshot_id)
+                        .bind(format!("altered_table:{}", table_id))
+                        .execute(&mut *tx).await?;
+
+                    tx.commit().await?;
+                    Ok(snapshot_id)
+                })
+            }
+
+            fn set_column_comment(&self, table_id: i64, column_name: &str, comment: &str) -> Result<i64> {
+                let pool = &self.pool;
+                $block_on(|| async {
+                    use crate::dialect::SqlDialect;
+                    use sqlx::Row;
+                    let d = $dialect;
+                    let mut tx = pool.begin().await?;
+
+                    // Look up the column_id for the named column
+                    let col_row = sqlx::query(&format!(
+                        "SELECT column_id FROM ducklake_column WHERE table_id = {} AND column_name = {} AND end_snapshot IS NULL",
+                        d.ph(1), d.ph(2)
+                    ))
+                    .bind(table_id).bind(column_name)
+                    .fetch_optional(&mut *tx).await?;
+
+                    let Some(col_row) = col_row else {
+                        return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                            "Column '{}' not found in table", column_name
+                        )));
+                    };
+                    let column_id: i64 = col_row.try_get(0)?;
+
+                    // Create DDL snapshot
+                    let snapshot_id: i64 = {
+                        let prev_sv_row = sqlx::query("SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot")
+                            .fetch_one(&mut *tx).await?;
+                        let new_sv: i64 = prev_sv_row.try_get::<i64, _>(0)? + 1;
+
+                        let sid: i64 = if d.supports_returning() {
+                            let ins = format!(
+                                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES ({}, {}) RETURNING snapshot_id",
+                                d.now(), d.ph(1)
+                            );
+                            let row = sqlx::query(&ins).bind(new_sv).fetch_one(&mut *tx).await?;
+                            row.try_get(0)?
+                        } else {
+                            let ins = format!(
+                                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES ({}, {})",
+                                d.now(), d.ph(1)
+                            );
+                            sqlx::query(&ins).bind(new_sv).execute(&mut *tx).await?;
+                            let last_id_fn = $last_id;
+                            (last_id_fn)(&mut tx).await?
+                        };
+
+                        let sv_sql = format!(
+                            "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version) VALUES ({}, {})",
+                            d.ph(1), d.ph(2)
+                        );
+                        sqlx::query(&sv_sql).bind(sid).bind(new_sv).execute(&mut *tx).await?;
+                        sid
+                    };
+
+                    // End any existing comment tag for this column
+                    let end_tag = format!(
+                        "UPDATE ducklake_column_tag SET end_snapshot = {} WHERE table_id = {} AND column_id = {} AND {} = 'comment' AND end_snapshot IS NULL",
+                        d.ph(1), d.ph(2), d.ph(3), d.col("key")
+                    );
+                    sqlx::query(&end_tag).bind(snapshot_id).bind(table_id).bind(column_id)
+                        .execute(&mut *tx).await?;
+
+                    // Insert new comment tag
+                    let ins_tag = format!(
+                        "INSERT INTO ducklake_column_tag (table_id, column_id, begin_snapshot, {}, value) VALUES ({}, {}, {}, 'comment', {})",
+                        d.col("key"), d.ph(1), d.ph(2), d.ph(3), d.ph(4)
+                    );
+                    sqlx::query(&ins_tag)
+                        .bind(table_id).bind(column_id).bind(snapshot_id).bind(comment)
+                        .execute(&mut *tx).await?;
+
+                    // Record change for conflict detection
+                    let ct_sql = format!(
+                        "INSERT INTO _df_change_tracking (snapshot_id, change_type, table_id) VALUES ({}, 'ALTER_TABLE', {})",
+                        d.ph(1), d.ph(2)
+                    );
+                    sqlx::query(&ct_sql).bind(snapshot_id).bind(table_id)
+                        .execute(&mut *tx).await?;
+
+                    // Record snapshot changes
+                    let changes_sql = format!(
+                        "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made) VALUES ({}, {}) {}",
+                        d.ph(1), d.ph(2), d.upsert("snapshot_id", &["changes_made"])
+                    );
+                    sqlx::query(&changes_sql)
+                        .bind(snapshot_id)
+                        .bind(format!("altered_table:{}", table_id))
+                        .execute(&mut *tx).await?;
+
+                    tx.commit().await?;
+                    Ok(snapshot_id)
+                })
+            }
+    };
+}
+
+pub(crate) use impl_writer_ddl_ops;
+
+/// Generates `drop_table_inner` and `drop_schema_inner` async helper methods.
+/// These are invoked inside `impl $struct_name` blocks (not trait impls).
+macro_rules! impl_writer_drop_inner {
+    (
+        $tx_type:ty,
+        dialect = $dialect:expr,
+        last_insert_id = $last_id:expr
+    ) => {
+        async fn drop_table_inner(
+            mut tx: $tx_type,
+            table_id: i64,
+        ) -> Result<i64> {
+            use crate::dialect::SqlDialect;
+            let d = $dialect;
+
+            // R4-S-014: Validate table exists and is active before creating snapshot
+            let exists = sqlx::query(
+                &format!("SELECT COUNT(*) FROM ducklake_table WHERE table_id = {} AND end_snapshot IS NULL", d.ph(1)),
+            )
+            .bind(table_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if exists.try_get::<i64, _>(0)? == 0 {
+                return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                    "Table with id {} not found or already dropped",
+                    table_id
+                )));
+            }
+
+            // Increment schema_version for DDL (F-012)
+            let prev_sv_row =
+                sqlx::query("SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot")
+                    .fetch_one(&mut *tx)
+                    .await?;
+            let new_schema_version: i64 = prev_sv_row.try_get::<i64, _>(0)? + 1;
+
+            let snapshot_id: i64 = if d.supports_returning() {
+                let row = sqlx::query(
+                    &format!(
+                        "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES ({}, {}) RETURNING snapshot_id",
+                        d.now(), d.ph(1)
+                    ),
+                )
+                .bind(new_schema_version)
+                .fetch_one(&mut *tx)
+                .await?;
+                row.try_get(0)?
+            } else {
+                sqlx::query(
+                    &format!(
+                        "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES ({}, {})",
+                        d.now(), d.ph(1)
+                    ),
+                )
+                .bind(new_schema_version)
+                .execute(&mut *tx)
+                .await?;
+                ($last_id)(&mut tx).await?
+            };
+
+            sqlx::query(
+                &format!(
+                    "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version) VALUES ({}, {})",
+                    d.ph(1), d.ph(2)
+                ),
+            )
+            .bind(snapshot_id)
+            .bind(new_schema_version)
+            .execute(&mut *tx)
+            .await?;
+
+            // Mark the table as dropped by setting end_snapshot
+            sqlx::query(
+                &format!(
+                    "UPDATE ducklake_table SET end_snapshot = {} WHERE table_id = {} AND end_snapshot IS NULL",
+                    d.ph(1), d.ph(2)
+                ),
+            )
+            .bind(snapshot_id)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // End all active columns for this table
+            sqlx::query(
+                &format!(
+                    "UPDATE ducklake_column SET end_snapshot = {} WHERE table_id = {} AND end_snapshot IS NULL",
+                    d.ph(1), d.ph(2)
+                ),
+            )
+            .bind(snapshot_id)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // End all active data files for this table
+            sqlx::query(
+                &format!(
+                    "UPDATE ducklake_data_file SET end_snapshot = {} WHERE table_id = {} AND end_snapshot IS NULL",
+                    d.ph(1), d.ph(2)
+                ),
+            )
+            .bind(snapshot_id)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // End all active delete files for this table
+            sqlx::query(
+                &format!(
+                    "UPDATE ducklake_delete_file SET end_snapshot = {} WHERE table_id = {} AND end_snapshot IS NULL",
+                    d.ph(1), d.ph(2)
+                ),
+            )
+            .bind(snapshot_id)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // Record the change for conflict detection
+            sqlx::query(
+                &format!(
+                    "INSERT INTO _df_change_tracking (snapshot_id, change_type, table_id) VALUES ({}, 'DROP_TABLE', {})",
+                    d.ph(1), d.ph(2)
+                ),
+            )
+            .bind(snapshot_id)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // Record in spec-compliant snapshot changes
+            let upsert = d.upsert("snapshot_id", &["changes_made"]);
+            sqlx::query(
+                &format!(
+                    "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made) VALUES ({}, {}) {}",
+                    d.ph(1), d.ph(2), upsert
+                ),
+            )
+            .bind(snapshot_id)
+            .bind(format!("dropped_table:{}", table_id))
+            .execute(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
+            Ok(snapshot_id)
+        }
+
+        async fn drop_schema_inner(
+            mut tx: $tx_type,
+            schema_id: i64,
+        ) -> Result<i64> {
+            use crate::dialect::SqlDialect;
+            let d = $dialect;
+
+            // R4-S-014: Validate schema exists and is active before creating snapshot
+            let exists = sqlx::query(
+                &format!("SELECT COUNT(*) FROM ducklake_schema WHERE schema_id = {} AND end_snapshot IS NULL", d.ph(1)),
+            )
+            .bind(schema_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if exists.try_get::<i64, _>(0)? == 0 {
+                return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                    "Schema with id {} not found or already dropped",
+                    schema_id
+                )));
+            }
+
+            // Increment schema_version for DDL (F-012)
+            let prev_sv_row =
+                sqlx::query("SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot")
+                    .fetch_one(&mut *tx)
+                    .await?;
+            let new_schema_version: i64 = prev_sv_row.try_get::<i64, _>(0)? + 1;
+
+            let snapshot_id: i64 = if d.supports_returning() {
+                let row = sqlx::query(
+                    &format!(
+                        "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES ({}, {}) RETURNING snapshot_id",
+                        d.now(), d.ph(1)
+                    ),
+                )
+                .bind(new_schema_version)
+                .fetch_one(&mut *tx)
+                .await?;
+                row.try_get(0)?
+            } else {
+                sqlx::query(
+                    &format!(
+                        "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES ({}, {})",
+                        d.now(), d.ph(1)
+                    ),
+                )
+                .bind(new_schema_version)
+                .execute(&mut *tx)
+                .await?;
+                ($last_id)(&mut tx).await?
+            };
+
+            sqlx::query(
+                &format!(
+                    "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version) VALUES ({}, {})",
+                    d.ph(1), d.ph(2)
+                ),
+            )
+            .bind(snapshot_id)
+            .bind(new_schema_version)
+            .execute(&mut *tx)
+            .await?;
+
+            // Cascade: end columns for all active tables in this schema
+            sqlx::query(
+                &format!(
+                    "UPDATE ducklake_column SET end_snapshot = {} \
+                     WHERE table_id IN (SELECT table_id FROM ducklake_table WHERE schema_id = {} AND end_snapshot IS NULL) \
+                     AND end_snapshot IS NULL",
+                    d.ph(1), d.ph(2)
+                ),
+            )
+            .bind(snapshot_id)
+            .bind(schema_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // Cascade: end data files for all active tables in this schema
+            sqlx::query(
+                &format!(
+                    "UPDATE ducklake_data_file SET end_snapshot = {} \
+                     WHERE table_id IN (SELECT table_id FROM ducklake_table WHERE schema_id = {} AND end_snapshot IS NULL) \
+                     AND end_snapshot IS NULL",
+                    d.ph(1), d.ph(2)
+                ),
+            )
+            .bind(snapshot_id)
+            .bind(schema_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // Cascade: end delete files for all active tables in this schema
+            sqlx::query(
+                &format!(
+                    "UPDATE ducklake_delete_file SET end_snapshot = {} \
+                     WHERE table_id IN (SELECT table_id FROM ducklake_table WHERE schema_id = {} AND end_snapshot IS NULL) \
+                     AND end_snapshot IS NULL",
+                    d.ph(1), d.ph(2)
+                ),
+            )
+            .bind(snapshot_id)
+            .bind(schema_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // End all active tables in this schema
+            sqlx::query(
+                &format!(
+                    "UPDATE ducklake_table SET end_snapshot = {} WHERE schema_id = {} AND end_snapshot IS NULL",
+                    d.ph(1), d.ph(2)
+                ),
+            )
+            .bind(snapshot_id)
+            .bind(schema_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // Mark the schema as dropped
+            sqlx::query(
+                &format!(
+                    "UPDATE ducklake_schema SET end_snapshot = {} WHERE schema_id = {} AND end_snapshot IS NULL",
+                    d.ph(1), d.ph(2)
+                ),
+            )
+            .bind(snapshot_id)
+            .bind(schema_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // Record the change for conflict detection
+            sqlx::query(
+                &format!(
+                    "INSERT INTO _df_change_tracking (snapshot_id, change_type, schema_id) VALUES ({}, 'DROP_SCHEMA', {})",
+                    d.ph(1), d.ph(2)
+                ),
+            )
+            .bind(snapshot_id)
+            .bind(schema_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // Record in spec-compliant snapshot changes
+            let upsert = d.upsert("snapshot_id", &["changes_made"]);
+            sqlx::query(
+                &format!(
+                    "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made) VALUES ({}, {}) {}",
+                    d.ph(1), d.ph(2), upsert
+                ),
+            )
+            .bind(snapshot_id)
+            .bind(format!("dropped_schema:{}", schema_id))
+            .execute(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
+            Ok(snapshot_id)
+        }
+    };
+}
+
+pub(crate) use impl_writer_drop_inner;
+
+/// Generates `drop_table`, `drop_schema`, `drop_table_checked`, `drop_schema_checked`
+/// trait methods. Invoked inside `impl MetadataWriter for $struct_name` blocks.
+macro_rules! impl_writer_drop_ops {
+    (
+        $struct_name:ty,
+        pool_type = $pool_type:ty,
+        dialect = $dialect:expr,
+        block_on = $block_on:path
+    ) => {
+            fn drop_table(&self, table_id: i64) -> Result<i64> {
+                let pool = &self.pool;
+                $block_on(|| async {
+                    let tx = pool.begin().await?;
+                    <$struct_name>::drop_table_inner(tx, table_id).await
+                })
+            }
+
+            fn drop_schema(&self, schema_id: i64) -> Result<i64> {
+                let pool = &self.pool;
+                $block_on(|| async {
+                    let tx = pool.begin().await?;
+                    <$struct_name>::drop_schema_inner(tx, schema_id).await
+                })
+            }
+
+            fn drop_table_checked(&self, table_id: i64, since_snapshot: i64) -> Result<i64> {
+                use crate::dialect::SqlDialect;
+                let d = $dialect;
+                let pool = &self.pool;
+                $block_on(|| async {
+                    let mut tx = pool.begin().await?;
+
+                    // Check DF-originated drops
+                    let drop_check = sqlx::query(
+                        &format!(
+                            "SELECT COUNT(*) FROM _df_change_tracking \
+                             WHERE snapshot_id > {} AND table_id = {} AND change_type = 'DROP_TABLE'",
+                            d.ph(1), d.ph(2)
+                        ),
+                    )
+                    .bind(since_snapshot)
+                    .bind(table_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    if drop_check.try_get::<i64, _>(0)? > 0 {
+                        return Err(crate::error::DuckLakeError::TransactionConflict(format!(
+                            "Transaction conflict: table (id={}) was already dropped by another transaction since snapshot {}",
+                            table_id, since_snapshot
+                        )));
+                    }
+
+                    // Check DuckDB-originated drops via catalog metadata (R5-S-018)
+                    let table_ended = sqlx::query(
+                        &format!(
+                            "SELECT COUNT(*) FROM ducklake_table \
+                             WHERE table_id = {} AND end_snapshot IS NOT NULL AND end_snapshot > {}",
+                            d.ph(1), d.ph(2)
+                        ),
+                    )
+                    .bind(table_id)
+                    .bind(since_snapshot)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    if table_ended.try_get::<i64, _>(0)? > 0 {
+                        return Err(crate::error::DuckLakeError::TransactionConflict(format!(
+                            "Transaction conflict: table (id={}) was already dropped (possibly by DuckDB) since snapshot {}",
+                            table_id, since_snapshot
+                        )));
+                    }
+
+                    // No conflict — perform drop in the same transaction.
+                    <$struct_name>::drop_table_inner(tx, table_id).await
+                })
+            }
+
+            fn drop_schema_checked(&self, schema_id: i64, since_snapshot: i64) -> Result<i64> {
+                use crate::dialect::SqlDialect;
+                let d = $dialect;
+                let pool = &self.pool;
+                $block_on(|| async {
+                    let mut tx = pool.begin().await?;
+
+                    // Check DF-originated drops
+                    let drop_check = sqlx::query(
+                        &format!(
+                            "SELECT COUNT(*) FROM _df_change_tracking \
+                             WHERE snapshot_id > {} AND schema_id = {} AND change_type = 'DROP_SCHEMA'",
+                            d.ph(1), d.ph(2)
+                        ),
+                    )
+                    .bind(since_snapshot)
+                    .bind(schema_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    if drop_check.try_get::<i64, _>(0)? > 0 {
+                        return Err(crate::error::DuckLakeError::TransactionConflict(format!(
+                            "Transaction conflict: schema (id={}) was already dropped by another transaction since snapshot {}",
+                            schema_id, since_snapshot
+                        )));
+                    }
+
+                    // Check DuckDB-originated drops via catalog metadata (R5-S-018)
+                    let schema_ended = sqlx::query(
+                        &format!(
+                            "SELECT COUNT(*) FROM ducklake_schema \
+                             WHERE schema_id = {} AND end_snapshot IS NOT NULL AND end_snapshot > {}",
+                            d.ph(1), d.ph(2)
+                        ),
+                    )
+                    .bind(schema_id)
+                    .bind(since_snapshot)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    if schema_ended.try_get::<i64, _>(0)? > 0 {
+                        return Err(crate::error::DuckLakeError::TransactionConflict(format!(
+                            "Transaction conflict: schema (id={}) was already dropped (possibly by DuckDB) since snapshot {}",
+                            schema_id, since_snapshot
+                        )));
+                    }
+
+                    // No conflict — perform drop in the same transaction.
+                    <$struct_name>::drop_schema_inner(tx, schema_id).await
+                })
+            }
+    };
+}
+
+pub(crate) use impl_writer_drop_ops;

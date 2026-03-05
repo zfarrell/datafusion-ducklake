@@ -48,6 +48,24 @@ pub(crate) trait SqlDialect: Send + Sync + 'static {
     /// Greatest of two expressions. SQLite: MAX(a, b), PG/MySQL: GREATEST(a, b).
     #[cfg(feature = "write")]
     fn greatest(&self, a: &str, b: &str) -> String;
+
+    /// Read a UUID column as a String. PG: CAST(col AS VARCHAR), others: col as-is.
+    #[cfg(feature = "write")]
+    fn read_uuid(&self, col: &str) -> String;
+
+    /// Bind placeholder for a UUID value. PG: $n::UUID, others: ph(n).
+    #[cfg(feature = "write")]
+    fn uuid_ph(&self, n: usize) -> String;
+
+    /// SQL to allocate the next ID for a given entity.
+    /// `entity` is "schema_version", "view_id", "column_id", or "partition_id".
+    /// `table_id_bind` is an optional extra bind parameter placeholder for per-table scoping.
+    /// Returns (sql, needs_table_id_bind).
+    /// SQLite: SELECT COALESCE(MAX(col), 0) + 1 FROM table [WHERE table_id = ?]
+    /// PG: SELECT nextval('ducklake_{entity}_seq')
+    /// MySQL: not used — each backend provides its own next_id async fn.
+    #[cfg(feature = "write")]
+    fn next_id_sql(&self, entity: &str) -> (String, bool);
 }
 
 // --- SQLite ---
@@ -126,6 +144,43 @@ impl SqlDialect for SqliteDialect {
     #[cfg(feature = "write")]
     fn greatest(&self, a: &str, b: &str) -> String {
         format!("MAX({a}, {b})")
+    }
+
+    #[cfg(feature = "write")]
+    fn read_uuid(&self, col: &str) -> String {
+        col.to_string()
+    }
+
+    #[cfg(feature = "write")]
+    fn uuid_ph(&self, _n: usize) -> String {
+        "?".to_string()
+    }
+
+    #[cfg(feature = "write")]
+    fn next_id_sql(&self, entity: &str) -> (String, bool) {
+        match entity {
+            "schema_version" => (
+                "SELECT COALESCE(MAX(schema_version), 0) + 1 FROM ducklake_snapshot".to_string(),
+                false,
+            ),
+            "view_id" => (
+                "SELECT COALESCE(MAX(view_id), 0) + 1 FROM ducklake_view".to_string(),
+                false,
+            ),
+            "column_id" => (
+                format!(
+                    "SELECT COALESCE(MAX(column_id), 0) + 1 FROM ducklake_column WHERE table_id = {}",
+                    self.ph(1)
+                ),
+                true,
+            ),
+            "partition_id" => (
+                "SELECT COALESCE(MAX(partition_id), 0) + 1 FROM ducklake_partition_info"
+                    .to_string(),
+                false,
+            ),
+            _ => panic!("unknown entity for next_id_sql: {entity}"),
+        }
     }
 }
 
@@ -206,6 +261,28 @@ impl SqlDialect for PostgresDialect {
     fn greatest(&self, a: &str, b: &str) -> String {
         format!("GREATEST({a}, {b})")
     }
+
+    #[cfg(feature = "write")]
+    fn read_uuid(&self, col: &str) -> String {
+        format!("CAST({col} AS VARCHAR)")
+    }
+
+    #[cfg(feature = "write")]
+    fn uuid_ph(&self, n: usize) -> String {
+        format!("${n}::UUID")
+    }
+
+    #[cfg(feature = "write")]
+    fn next_id_sql(&self, entity: &str) -> (String, bool) {
+        let seq = match entity {
+            "schema_version" => "ducklake_schema_version_seq",
+            "view_id" => "ducklake_view_id_seq",
+            "column_id" => "ducklake_column_id_seq",
+            "partition_id" => "ducklake_partition_id_seq",
+            _ => panic!("unknown entity for next_id_sql: {entity}"),
+        };
+        (format!("SELECT nextval('{seq}')"), false)
+    }
 }
 
 // --- MySQL ---
@@ -284,5 +361,23 @@ impl SqlDialect for MySqlDialect {
     #[cfg(feature = "write")]
     fn greatest(&self, a: &str, b: &str) -> String {
         format!("GREATEST({a}, {b})")
+    }
+
+    #[cfg(feature = "write")]
+    fn read_uuid(&self, col: &str) -> String {
+        col.to_string()
+    }
+
+    #[cfg(feature = "write")]
+    fn uuid_ph(&self, _n: usize) -> String {
+        "?".to_string()
+    }
+
+    #[cfg(feature = "write")]
+    fn next_id_sql(&self, entity: &str) -> (String, bool) {
+        // MySQL uses next_sequence_id() function instead of SQL-only approach,
+        // but we implement this for trait completeness. The macro uses $next_id callback.
+        let _ = entity;
+        ("SELECT 0".to_string(), false)
     }
 }
