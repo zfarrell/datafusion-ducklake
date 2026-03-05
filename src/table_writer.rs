@@ -1557,6 +1557,122 @@ pub async fn cleanup_orphaned_files(object_store: &dyn ObjectStore, paths: &[Obj
     }
 }
 
+/// Scoped guard that cleans up uploaded files on drop (when not disarmed).
+/// Ensures orphaned files are cleaned up on any error path in DML exec plans.
+pub(crate) struct UploadCleanupGuard {
+    object_store: Arc<dyn ObjectStore>,
+    uploaded_files: Vec<ObjectPath>,
+    armed: bool,
+}
+
+impl UploadCleanupGuard {
+    pub fn new(object_store: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            object_store,
+            uploaded_files: Vec::new(),
+            armed: true,
+        }
+    }
+
+    /// Record a successfully uploaded file path.
+    pub fn push(&mut self, path: ObjectPath) {
+        self.uploaded_files.push(path);
+    }
+
+    /// Disarm the guard, preventing cleanup on drop (call after successful commit).
+    pub fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for UploadCleanupGuard {
+    fn drop(&mut self) {
+        if self.armed && !self.uploaded_files.is_empty() {
+            let store = Arc::clone(&self.object_store);
+            let files: Vec<ObjectPath> = std::mem::take(&mut self.uploaded_files);
+            // Spawn best-effort async cleanup; ignore join errors since we're in drop.
+            let _ = std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build();
+                if let Ok(rt) = rt {
+                    rt.block_on(async {
+                        cleanup_orphaned_files(&*store, &files).await;
+                    });
+                }
+            });
+        }
+    }
+}
+
+/// Write a Parquet delete file and upload it to the object store.
+///
+/// Shared by DELETE, UPDATE, and MERGE exec plans.
+/// Returns the `DeleteFileInfo` for metadata registration.
+pub(crate) async fn write_delete_file(
+    object_store: &dyn ObjectStore,
+    table_path: &str,
+    resolved_data_path: &str,
+    data_file_id: i64,
+    all_positions: Vec<i64>,
+    upload_guard: &mut UploadCleanupGuard,
+) -> datafusion::common::Result<crate::metadata_writer::DeleteFileInfo> {
+    use arrow::array::{ArrayRef, Int64Array, StringArray};
+    use datafusion::error::DataFusionError;
+
+    let delete_file_name = format!("ducklake-{}-delete.parquet", uuid::Uuid::new_v4());
+    let schema_table_prefix = table_path.trim_start_matches('/');
+    let delete_object_key =
+        crate::path_resolver::join_paths(schema_table_prefix, &delete_file_name)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let delete_object_path = ObjectPath::from(delete_object_key.trim_start_matches('/'));
+
+    let del_schema = crate::table::delete_file_schema();
+    let total_delete_count = i64::try_from(all_positions.len())
+        .map_err(|e| DataFusionError::Execution(format!("Delete count overflow: {}", e)))?;
+
+    let file_path_values: Vec<&str> = vec![resolved_data_path; all_positions.len()];
+    let file_path_array: ArrayRef = Arc::new(StringArray::from(file_path_values));
+    let pos_array: ArrayRef = Arc::new(Int64Array::from(all_positions));
+
+    let delete_batch = RecordBatch::try_new(del_schema.clone(), vec![file_path_array, pos_array])?;
+
+    let props = WriterProperties::builder()
+        .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
+        .build();
+    let mut arrow_writer = ArrowWriter::try_new(Vec::new(), del_schema, Some(props))
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    arrow_writer
+        .write(&delete_batch)
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let buffer = arrow_writer
+        .into_inner()
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+    let file_size = i64::try_from(buffer.len())
+        .map_err(|e| DataFusionError::Execution(format!("File size overflow: {}", e)))?;
+    let footer_size = calculate_footer_size_from_bytes(&buffer)
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+    if let Err(e) = object_store
+        .put(&delete_object_path, PutPayload::from(buffer))
+        .await
+    {
+        return Err(DataFusionError::External(Box::new(e)));
+    }
+    upload_guard.push(delete_object_path);
+
+    let delete_file_info = crate::metadata_writer::DeleteFileInfo::new(
+        data_file_id,
+        &delete_file_name,
+        file_size,
+        total_delete_count,
+    )
+    .with_footer_size(footer_size);
+
+    Ok(delete_file_info)
+}
+
 // ==================== ducklake_flush_inlined_data table function ====================
 
 use datafusion::catalog::TableFunctionImpl;

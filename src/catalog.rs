@@ -422,7 +422,15 @@ impl CatalogProvider for DuckLakeCatalog {
 
                 Some(Arc::new(schema) as Arc<dyn SchemaProvider>)
             },
-            _ => None,
+            Ok(None) => None,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    schema_name = %name,
+                    "Failed to query schema from metadata provider"
+                );
+                None
+            },
         }
     }
 }

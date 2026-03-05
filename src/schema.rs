@@ -189,25 +189,59 @@ impl DuckLakeSchema {
     /// Rewrite DuckDB-specific SQL in view definitions to DataFusion-compatible SQL.
     /// DuckDB serializes some functions differently (e.g., COUNT(*) becomes count_star()).
     fn rewrite_duckdb_view_sql(sql: &str) -> String {
+        const PATTERN: &str = "count_star()";
+        const REPLACEMENT: &str = "COUNT(*)";
+
         let mut result = String::with_capacity(sql.len());
-        let lower = sql.to_lowercase();
-        let mut i = 0;
         let chars: Vec<char> = sql.chars().collect();
-        let lower_chars: Vec<char> = lower.chars().collect();
+        let lower_chars: Vec<char> = sql.to_lowercase().chars().collect();
+        let pattern_chars: Vec<char> = PATTERN.chars().collect();
+        let mut i = 0;
+        let mut in_string = false;
+        let mut string_char: char = '\'';
 
         while i < chars.len() {
-            // Check for "count_star()" case-insensitively
-            let remaining: String = lower_chars[i..].iter().collect();
-            if remaining.starts_with("count_star()") {
-                // Check word boundary: char before must not be alphanumeric or '_'
-                let is_word_start = i == 0 || {
-                    let prev = chars[i - 1];
-                    !prev.is_alphanumeric() && prev != '_'
-                };
-                if is_word_start {
-                    result.push_str("COUNT(*)");
-                    i += "count_star()".len();
-                    continue;
+            // Track string literals to avoid matching inside them
+            if !in_string && (chars[i] == '\'' || chars[i] == '"') {
+                in_string = true;
+                string_char = chars[i];
+                result.push(chars[i]);
+                i += 1;
+                continue;
+            }
+            if in_string {
+                if chars[i] == string_char {
+                    // Check for escaped quote (doubled)
+                    if i + 1 < chars.len() && chars[i + 1] == string_char {
+                        result.push(chars[i]);
+                        result.push(chars[i + 1]);
+                        i += 2;
+                        continue;
+                    }
+                    in_string = false;
+                }
+                result.push(chars[i]);
+                i += 1;
+                continue;
+            }
+
+            // Check for pattern match using index-based comparison (O(1) per position)
+            if i + pattern_chars.len() <= lower_chars.len() {
+                let matches = pattern_chars
+                    .iter()
+                    .enumerate()
+                    .all(|(j, &pc)| lower_chars[i + j] == pc);
+                if matches {
+                    // Check word boundary: char before must not be alphanumeric or '_'
+                    let is_word_start = i == 0 || {
+                        let prev = chars[i - 1];
+                        !prev.is_alphanumeric() && prev != '_'
+                    };
+                    if is_word_start {
+                        result.push_str(REPLACEMENT);
+                        i += pattern_chars.len();
+                        continue;
+                    }
                 }
             }
             result.push(chars[i]);

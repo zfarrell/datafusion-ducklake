@@ -28,6 +28,8 @@ pub fn ducklake_to_arrow_type(ducklake_type: &str) -> Result<DataType> {
         || normalized.starts_with("nvarchar(")
         || normalized.starts_with("text(")
     {
+        // Validate closing paren with no trailing content
+        validate_no_trailing_after_paren(&normalized, ducklake_type)?;
         return Ok(DataType::Utf8);
     }
 
@@ -249,6 +251,26 @@ fn validate_decimal_precision_scale(precision: u8, scale: i8, type_str: &str) ->
         )));
     }
     Ok(())
+}
+
+/// Validate that a parameterized type like `varchar(10)` has no trailing content after `)`.
+fn validate_no_trailing_after_paren(normalized: &str, original: &str) -> Result<()> {
+    match normalized.rfind(')') {
+        Some(pos) => {
+            let after = &normalized[pos + 1..];
+            if !after.is_empty() {
+                return Err(DuckLakeError::UnsupportedType(format!(
+                    "Unexpected trailing characters '{}' after closing parenthesis in type '{}'",
+                    after, original
+                )));
+            }
+            Ok(())
+        },
+        None => Err(DuckLakeError::UnsupportedType(format!(
+            "Missing closing parenthesis in type '{}'",
+            original
+        ))),
+    }
 }
 
 /// Parse decimal type with precision and scale

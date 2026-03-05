@@ -20,7 +20,7 @@ use std::fmt::{self, Debug};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, BooleanArray, Int64Array, RecordBatch, StringArray, UInt64Array};
+use arrow::array::{ArrayRef, BooleanArray, RecordBatch, UInt64Array};
 use arrow::compute;
 use arrow::datatypes::{DataType, SchemaRef};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
@@ -39,10 +39,8 @@ use uuid::Uuid;
 use crate::metadata_provider::DuckLakeTableFile;
 use crate::metadata_writer::{DataFileInfo, DeleteFileInfo, MetadataWriter};
 use crate::path_resolver::join_paths;
-use crate::table::delete_file_schema;
 use crate::table_writer::{
-    build_schema_with_field_ids, calculate_footer_size_from_bytes, cleanup_orphaned_files,
-    extract_column_stats,
+    build_schema_with_field_ids, calculate_footer_size_from_bytes, extract_column_stats,
 };
 
 use crate::delete_exec::make_dml_count_schema;
@@ -393,8 +391,9 @@ impl ExecutionPlan for DuckLakeMergeExec {
             let mut new_data_batches: Vec<RecordBatch> = Vec::new();
             // Collect file metadata for atomic registration
             let mut pending_delete_files: Vec<DeleteFileInfo> = Vec::new();
-            // R3F-003: Track uploaded files for cleanup on metadata failure
-            let mut uploaded_files: Vec<ObjectPath> = Vec::new();
+            // Cleanup guard ensures orphan files are removed on any error path
+            let mut upload_guard =
+                crate::table_writer::UploadCleanupGuard::new(Arc::clone(&object_store));
 
             // Build hash index on source join keys for O(1) lookups instead of O(N*M)
             let source_hash_index = build_source_hash_index(&source_batches, &join_key_pairs)?;
@@ -551,61 +550,16 @@ impl ExecutionPlan for DuckLakeMergeExec {
                     all_positions.dedup();
                 }
 
-                // Write delete file
-                let delete_file_name = format!("ducklake-{}-delete.parquet", Uuid::new_v4());
-                let schema_table_prefix = table_path.trim_start_matches('/');
-                let delete_object_key = join_paths(schema_table_prefix, &delete_file_name)?;
-                let delete_object_path =
-                    ObjectPath::from(delete_object_key.trim_start_matches('/'));
-
-                let del_schema = delete_file_schema();
-                // R3F-034: delete_count tracks total positions in delete file, not just new matches
-                let total_delete_count = i64::try_from(all_positions.len()).map_err(|e| {
-                    DataFusionError::Execution(format!("Delete count overflow: {}", e))
-                })?;
-                // R4-S-009: Use resolved path (from data_path root) instead of raw catalog filename
-                let file_path_values: Vec<&str> = vec![resolved_path.as_str(); all_positions.len()];
-                let file_path_array: ArrayRef = Arc::new(StringArray::from(file_path_values));
-                let pos_array: ArrayRef = Arc::new(Int64Array::from(all_positions));
-
-                let delete_batch =
-                    RecordBatch::try_new(del_schema.clone(), vec![file_path_array, pos_array])?;
-
-                let props = WriterProperties::builder()
-                    .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
-                    .build();
-                let mut arrow_writer = ArrowWriter::try_new(Vec::new(), del_schema, Some(props))
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                arrow_writer
-                    .write(&delete_batch)
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                let buffer = arrow_writer
-                    .into_inner()
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-                let file_size = i64::try_from(buffer.len()).map_err(|e| {
-                    DataFusionError::Execution(format!("File size overflow: {}", e))
-                })?;
-                let footer_size = calculate_footer_size_from_bytes(&buffer)
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-                // R6-S-037: Clean up prior uploads on failure
-                if let Err(e) = object_store
-                    .put(&delete_object_path, PutPayload::from(buffer))
-                    .await
-                {
-                    cleanup_orphaned_files(&*object_store, &uploaded_files).await;
-                    return Err(DataFusionError::External(Box::new(e)));
-                }
-                uploaded_files.push(delete_object_path);
-
-                let delete_file_info = DeleteFileInfo::new(
+                // Write and upload delete file using shared helper
+                let delete_file_info = crate::table_writer::write_delete_file(
+                    &*object_store,
+                    &table_path,
+                    &resolved_path,
                     data_file_id,
-                    &delete_file_name,
-                    file_size,
-                    total_delete_count,
+                    all_positions,
+                    &mut upload_guard,
                 )
-                .with_footer_size(footer_size);
+                .await?;
 
                 pending_delete_files.push(delete_file_info);
             }
@@ -690,15 +644,12 @@ impl ExecutionPlan for DuckLakeMergeExec {
                 let footer_size = calculate_footer_size_from_bytes(&buffer)
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-                // R6-S-037: Clean up prior uploads on failure
-                if let Err(e) = object_store
+                // Upload data file (guard cleans up on error)
+                object_store
                     .put(&data_object_path, PutPayload::from(buffer))
                     .await
-                {
-                    cleanup_orphaned_files(&*object_store, &uploaded_files).await;
-                    return Err(DataFusionError::External(Box::new(e)));
-                }
-                uploaded_files.push(data_object_path);
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                upload_guard.push(data_object_path);
 
                 let data_file_info = DataFileInfo::new(&data_file_name, file_size, total_records)
                     .with_footer_size(footer_size)
@@ -713,25 +664,23 @@ impl ExecutionPlan for DuckLakeMergeExec {
                 return Ok(RecordBatch::try_new(output_schema, vec![count_array])?);
             }
 
-            // R6-S-038: Create snapshot; clean up uploads if snapshot creation fails
-            let snapshot_id = match writer.create_snapshot() {
-                Ok(id) => id,
-                Err(e) => {
-                    cleanup_orphaned_files(&*object_store, &uploaded_files).await;
-                    return Err(DataFusionError::External(Box::new(e)));
-                },
-            };
+            // Create snapshot (guard cleans up uploaded files on error)
+            let snapshot_id = writer
+                .create_snapshot()
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-            // R3F-003: Atomically register all delete files and data files with cleanup on failure
-            if let Err(e) = writer.register_dml_files(
-                table_id,
-                snapshot_id,
-                &pending_delete_files,
-                &pending_data_files,
-            ) {
-                cleanup_orphaned_files(&*object_store, &uploaded_files).await;
-                return Err(DataFusionError::External(Box::new(e)));
-            }
+            // Atomically register all delete files and data files (guard cleans up on error)
+            writer
+                .register_dml_files(
+                    table_id,
+                    snapshot_id,
+                    &pending_delete_files,
+                    &pending_data_files,
+                )
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+            // Success — disarm the cleanup guard
+            upload_guard.disarm();
 
             // R3F-013: Record snapshot changes for MERGE
             // R4-S-008: Use standard DuckDB tokens (inserted + deleted) instead of non-standard "merged_into_table"

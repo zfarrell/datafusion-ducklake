@@ -404,10 +404,11 @@ fn attack_type_varchar_negative_length() {
 #[test]
 fn attack_type_varchar_sql_injection() {
     let result = ducklake_to_arrow_type("varchar(255); DROP TABLE x;--");
-    // starts_with("varchar(") is true, so returns Utf8.
-    // BUG: This accepts clearly malformed input without any validation.
-    // While it doesn't cause harm (just returns Utf8), it's sloppy parsing.
-    assert!(result.is_ok());
+    // R8-S-039: Now correctly rejects trailing content after closing paren.
+    assert!(
+        result.is_err(),
+        "Malformed trailing input should be rejected"
+    );
 }
 
 // ---------- Struct field parsing edge cases ----------
