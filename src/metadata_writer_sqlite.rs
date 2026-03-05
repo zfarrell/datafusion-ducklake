@@ -158,7 +158,6 @@ CREATE TABLE IF NOT EXISTS ducklake_data_file (
     file_order INTEGER,
     file_format VARCHAR DEFAULT 'parquet',
     partition_id INTEGER,
-    partial_max INTEGER,
     partial_file_info VARCHAR,
     begin_snapshot INTEGER NOT NULL,
     end_snapshot INTEGER
@@ -175,7 +174,6 @@ CREATE TABLE IF NOT EXISTS ducklake_delete_file (
     encryption_key VARCHAR,
     delete_count INTEGER,
     format VARCHAR DEFAULT 'parquet',
-    partial_max INTEGER,
     begin_snapshot INTEGER NOT NULL,
     end_snapshot INTEGER
 );
@@ -311,8 +309,7 @@ CREATE TABLE IF NOT EXISTS ducklake_name_mapping (
 
 CREATE TABLE IF NOT EXISTS ducklake_schema_versions (
     begin_snapshot INTEGER,
-    schema_version INTEGER,
-    table_id INTEGER
+    schema_version INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS ducklake_macro (

@@ -1835,8 +1835,29 @@ fn parse_stat_value(s: &str, data_type: &DataType) -> Option<datafusion::common:
         DataType::Float64 => s.parse::<f64>().ok().map(|v| ScalarValue::Float64(Some(v))),
         DataType::Utf8 => Some(ScalarValue::Utf8(Some(s.to_string()))),
         DataType::LargeUtf8 => Some(ScalarValue::LargeUtf8(Some(s.to_string()))),
-        DataType::Date32 => s.parse::<i32>().ok().map(|v| ScalarValue::Date32(Some(v))),
-        DataType::Date64 => s.parse::<i64>().ok().map(|v| ScalarValue::Date64(Some(v))),
+        DataType::Date32 => s
+            .parse::<i32>()
+            .ok()
+            .or_else(|| {
+                chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                    .ok()
+                    .map(|d| {
+                        (d - chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()).num_days() as i32
+                    })
+            })
+            .map(|v| ScalarValue::Date32(Some(v))),
+        DataType::Date64 => s
+            .parse::<i64>()
+            .ok()
+            .or_else(|| {
+                chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                    .ok()
+                    .map(|d| {
+                        (d - chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()).num_days()
+                            * 86_400_000
+                    })
+            })
+            .map(|v| ScalarValue::Date64(Some(v))),
         _ => None,
     }
 }
