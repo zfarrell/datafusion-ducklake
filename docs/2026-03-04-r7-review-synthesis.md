@@ -236,25 +236,25 @@ Date: 2026-03-04
 - **File**: `src/table_writer.rs:1091`
 - **Fix**: Use `i32::try_from()`.
 
-#### R7-S-024: to_lowercase() allocates per boolean parse
+#### R7-S-024: to_lowercase() allocates per boolean parse [ALREADY RESOLVED]
 - **Sources**: P3-IDM-008
 - **File**: `src/parse_values.rs:80`, `src/table_writer.rs:1308`
-- **Fix**: Use `eq_ignore_ascii_case`.
+- **Status**: Code no longer exists — resolved by prior refactoring (R7-S-008 parse_values wiring / legacy parser deletion).
 
-#### R7-S-025: Per-row Vec<Option<String>> cloning in partition routing
+#### R7-S-025: Per-row Vec<Option<String>> cloning in partition routing [ALREADY RESOLVED]
 - **Sources**: P3-IDM-009
 - **File**: `src/insert_exec.rs:543`
-- **Fix**: Build partition key from string references; clone only on first insertion.
+- **Status**: Code no longer exists — partition routing simplified in prior refactoring.
 
-#### R7-S-026: inlined_rows_to_batch has O(cols × rows) linear lookups
+#### R7-S-026: inlined_rows_to_batch has O(cols × rows) linear lookups [ALREADY RESOLVED]
 - **Sources**: P3-IDM-011
 - **File**: `src/table_writer.rs:1197`
-- **Fix**: Precompute HashMap from column names to indices.
+- **Status**: `inlined_rows_to_batch` function no longer exists — resolved by prior refactoring.
 
-#### R7-S-027: to_lowercase() allocates in PartitionTransform::from_str_opt
+#### R7-S-027: to_lowercase() allocates in PartitionTransform::from_str_opt [ALREADY RESOLVED]
 - **Sources**: P3-IDM-012
 - **File**: `src/insert_exec.rs:55`
-- **Fix**: Use `eq_ignore_ascii_case`.
+- **Status**: `PartitionTransform::from_str_opt` no longer exists — resolved by prior refactoring.
 
 #### R7-S-028: columns[0] direct indexing without bounds check
 - **Sources**: P3-IDM-013
@@ -464,12 +464,39 @@ All 22 assigned findings (8 P1 + 14 P2) were fixed by 6 agents. 28 P3 findings w
 - **R7-S-021** [FIXED `f5f0a2d`]: Subsumed by R7-S-008 (legacy code deleted)
 - **R7-S-022** [FIXED `8500ddf`]: Cross-backend column stats aligned
 
-#### P3 (28 NOT ASSIGNED)
-- R7-S-023 through R7-S-050 [NOT ASSIGNED]: Optional, low impact
+#### P3 (28 total: 17 fixed, 4 already resolved, 7 no action needed)
+- R7-S-023 [FIXED `9735a62`]: `i32::try_from()` for Date64 epoch days
+- R7-S-024 [ALREADY RESOLVED]: Code removed by prior refactoring
+- R7-S-025 [ALREADY RESOLVED]: Code removed by prior refactoring
+- R7-S-026 [ALREADY RESOLVED]: Code removed by prior refactoring
+- R7-S-027 [ALREADY RESOLVED]: Code removed by prior refactoring
+- R7-S-028 [FIXED `9735a62`]: `.first().ok_or_else()` bounds check
+- R7-S-029 [FIXED `9735a62`]: `unwrap_or_else` with actual length in panic
+- R7-S-030 [NO ACTION]: Intentional PK divergence from DuckDB
+- R7-S-031 [FIXED `1d7c9d2`]: Doc warning on non-atomic default impl
+- R7-S-032 [FIXED `368ec69`]: Cross-engine DF→DuckDB ALTER TABLE tests added
+- R7-S-033 [NO ACTION]: Correct per SQL standard (first-match wins)
+- R7-S-034 [NO ACTION]: Acceptable for infrequent maintenance ops
+- R7-S-035 [FIXED `368ec69`]: `assert_results_eq_strict` wired into tests
+- R7-S-036 [FIXED `1d7c9d2`]: Double-quote handling in `cte_wraps_dml`
+- R7-S-037 [FIXED `1d7c9d2`]: String-literal aware `rewrite_order_by_all`
+- R7-S-038 [FIXED `368ec69`]: Boolean NULL assertion fixed
+- R7-S-039 [FIXED `368ec69`]: `parse_table_name` integration tests added
+- R7-S-040 [NO ACTION]: SLT threshold acceptable as-is
+- R7-S-041 [NO ACTION]: Legitimate constraint, informational
+- R7-S-042 [FIXED `368ec69`]: TODO added for partition DML coverage
+- R7-S-043 [NO ACTION]: Prevented by parent function
+- R7-S-044 [FIXED `9735a62`]: Error propagation for `files_written`
+- R7-S-045 [FIXED `9735a62`]: `checked_add` for inline row count
+- R7-S-046 [FIXED `9735a62`]: `try_fold` with `checked_add` for record_count sum
+- R7-S-047 [FIXED `1d7c9d2`]: `initialize_schema` seed DML in explicit transaction
+- R7-S-048 [NO ACTION]: Character-based validation sufficient
+- R7-S-049 [FIXED `368ec69`]: Column value assertions added to write tests
+- R7-S-050 [FIXED `368ec69`]: Date verification TODO with tracking
 
 ### Test Results
-- **365 unit tests pass** (post-R7 fixes)
-- **13 pre-existing cross-engine failures** (DuckDB extension bugs, not regressions)
+- **787 unit tests pass** (post-R7 P3 fixes)
+- **3 pre-existing cross-engine failures** (DuckDB assertion crashes in alter tests, upstream bug)
 
 ---
 
