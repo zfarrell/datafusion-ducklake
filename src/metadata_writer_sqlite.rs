@@ -1400,6 +1400,16 @@ impl MetadataWriter for SqliteMetadataWriter {
             .execute(&mut *tx)
             .await?;
 
+            // R8-S-001: End all active delete files (compaction rewrites data, old deletes are absorbed)
+            sqlx::query(
+                "UPDATE ducklake_delete_file SET end_snapshot = ?
+                 WHERE table_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(snapshot_id)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
             let mut ids = Vec::with_capacity(files.len());
             // R6-S-015: Track cumulative row_id_start for compacted files
             let mut cumulative_row_id: i64 = 0;
@@ -1496,6 +1506,9 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .execute(&mut *tx)
                 .await?;
             }
+
+            // R8-S-018: Recompute table column stats from new compacted files
+            Self::recompute_table_column_stats(&mut tx, table_id).await?;
 
             tx.commit().await?;
             Ok(ids)
