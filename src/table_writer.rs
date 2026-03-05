@@ -1167,7 +1167,7 @@ fn arrow_array_value_to_string(
                     epoch_us
                 ))
             })?;
-            Ok(dt.format("%Y-%m-%d %H:%M:%S").to_string())
+            Ok(dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string())
         },
         _ => {
             // Fallback: use Arrow's default display
@@ -1513,7 +1513,7 @@ pub(crate) fn calculate_footer_size_from_bytes(buffer: &[u8]) -> Result<i64> {
             metadata_len
         )));
     }
-    Ok(i64::from(metadata_len))
+    Ok(i64::from(metadata_len) + 8)
 }
 
 /// Validate NOT NULL constraints on a set of record batches.
@@ -1904,11 +1904,11 @@ mod tests {
     fn test_timestamp_inlined_roundtrip() {
         use arrow::array::TimestampMicrosecondArray;
         use arrow::datatypes::TimeUnit;
-        // Write: Timestamp microseconds value -> ISO string "2024-06-15 11:30:00"
+        // Write: Timestamp microseconds value -> ISO string with sub-second precision
         let epoch_us: i64 = 1_718_451_000_000_000; // 2024-06-15T11:30:00 UTC
         let array = TimestampMicrosecondArray::from(vec![epoch_us]);
         let serialized = arrow_array_value_to_string(&array, 0).unwrap();
-        assert_eq!(serialized, "2024-06-15 11:30:00");
+        assert_eq!(serialized, "2024-06-15 11:30:00.000000");
 
         // Read: ISO string -> Timestamp microseconds
         let values = vec![Some(serialized)];

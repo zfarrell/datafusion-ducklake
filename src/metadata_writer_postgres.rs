@@ -81,7 +81,6 @@ const SQL_CREATE_TABLES: &[&str] = &[
         file_order INTEGER,
         file_format VARCHAR DEFAULT 'parquet',
         partition_id BIGINT,
-        partial_max BIGINT,
         partial_file_info VARCHAR,
         begin_snapshot BIGINT NOT NULL,
         end_snapshot BIGINT
@@ -97,7 +96,6 @@ const SQL_CREATE_TABLES: &[&str] = &[
         encryption_key VARCHAR,
         delete_count BIGINT,
         format VARCHAR DEFAULT 'parquet',
-        partial_max BIGINT,
         begin_snapshot BIGINT NOT NULL,
         end_snapshot BIGINT
     )",
@@ -213,8 +211,7 @@ const SQL_CREATE_TABLES: &[&str] = &[
     )",
     "CREATE TABLE IF NOT EXISTS ducklake_schema_versions (
         begin_snapshot BIGINT,
-        schema_version BIGINT,
-        table_id BIGINT
+        schema_version BIGINT
     )",
     "CREATE TABLE IF NOT EXISTS ducklake_macro (
         schema_id BIGINT,
