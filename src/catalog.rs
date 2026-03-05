@@ -241,10 +241,14 @@ impl CatalogProvider for DuckLakeCatalog {
         // If cascade, drop all tables first
         if cascade {
             for table_id in &active_table_ids {
-                config
+                let table_drop_snapshot = config
                     .writer
                     .drop_table(*table_id)
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                // R8-S-028: Update snapshot after each table drop so subsequent
+                // drops see the correct snapshot chain
+                self.snapshot_id
+                    .fetch_max(table_drop_snapshot, Ordering::Release);
             }
         }
 

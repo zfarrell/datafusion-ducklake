@@ -357,7 +357,16 @@ fn parse_decimal_string(s: &str, scale: i8) -> crate::Result<i128> {
                 frac_part
             ))
         })?;
-        frac_val * 10i128.pow(scale_u - frac_len)
+        // R8-S-032: checked arithmetic for fraction scaling
+        frac_val
+            .checked_mul(10i128.pow(scale_u - frac_len))
+            .ok_or_else(|| {
+                crate::error::DuckLakeError::Internal(format!(
+                    "Decimal fraction overflow: {} * 10^{}",
+                    frac_val,
+                    scale_u - frac_len
+                ))
+            })?
     } else {
         // Truncate extra digits
         let truncated = &frac_part[..scale_u as usize];
@@ -369,7 +378,19 @@ fn parse_decimal_string(s: &str, scale: i8) -> crate::Result<i128> {
         })?
     };
 
-    let unscaled = integer * 10i128.pow(scale_u) + frac;
+    // R8-S-032: checked arithmetic for integer scaling and final addition
+    let scaled_integer = integer.checked_mul(10i128.pow(scale_u)).ok_or_else(|| {
+        crate::error::DuckLakeError::Internal(format!(
+            "Decimal integer overflow: {} * 10^{}",
+            integer, scale_u
+        ))
+    })?;
+    let unscaled = scaled_integer.checked_add(frac).ok_or_else(|| {
+        crate::error::DuckLakeError::Internal(format!(
+            "Decimal overflow: {} + {}",
+            scaled_integer, frac
+        ))
+    })?;
     Ok(if negative {
         -unscaled
     } else {

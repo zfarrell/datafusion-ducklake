@@ -529,9 +529,25 @@ impl DuckLakeTableWriter {
 
         let file_info =
             DataFileInfo::new(&file_name, file_size, row_count).with_footer_size(footer_size);
-        let data_file_id =
-            self.metadata
-                .register_data_file(setup.table_id, setup.snapshot_id, &file_info)?;
+        // R8-S-031: Clean up orphaned file if metadata registration fails
+        let data_file_id = match self.metadata.register_data_file(
+            setup.table_id,
+            setup.snapshot_id,
+            &file_info,
+        ) {
+            Ok(id) => id,
+            Err(e) => {
+                // Best-effort cleanup of the uploaded file
+                if let Err(cleanup_err) = self.object_store.delete(&object_path).await {
+                    tracing::warn!(
+                        path = %object_path,
+                        error = %cleanup_err,
+                        "Failed to clean up orphaned Parquet file after register_data_file failure"
+                    );
+                }
+                return Err(e);
+            },
+        };
 
         // R5-S-025: Treat column-stats as non-fatal after data file is committed.
         // The data file is already registered; failing here would roll back only the
@@ -1155,7 +1171,7 @@ fn arrow_array_value_to_string(
                                     "Failed to downcast TimestampNanosecond array".to_string(),
                                 )
                             })?;
-                        a.value(idx) / 1_000
+                        a.value(idx).div_euclid(1_000)
                     },
                 }
             };

@@ -1422,7 +1422,13 @@ impl MetadataWriter for MySqlMetadataWriter {
                     )
                 })
             })?;
-            let total_file_size: i64 = files.iter().map(|f| f.file_info.file_size_bytes).sum();
+            let total_file_size: i64 = files.iter().try_fold(0i64, |acc, f| {
+                acc.checked_add(f.file_info.file_size_bytes).ok_or_else(|| {
+                    DuckLakeError::Internal(
+                        "file_size_bytes sum overflow in replace_table_files".into(),
+                    )
+                })
+            })?;
             let updated = sqlx::query(
                 "UPDATE ducklake_table_stats
                  SET record_count = ?,
@@ -1516,7 +1522,23 @@ impl MetadataWriter for MySqlMetadataWriter {
                 .execute(&mut *tx)
                 .await?;
 
-                total_net_new_deletions += file.delete_count - old_delete_count;
+                // R8-S-016: use checked arithmetic to prevent overflow/underflow
+                let net_delta =
+                    file.delete_count
+                        .checked_sub(old_delete_count)
+                        .ok_or_else(|| {
+                            DuckLakeError::Internal(format!(
+                                "delete_count underflow: new {} < old {}",
+                                file.delete_count, old_delete_count
+                            ))
+                        })?;
+                total_net_new_deletions = total_net_new_deletions
+                    .checked_add(net_delta)
+                    .ok_or_else(|| {
+                        DuckLakeError::Internal(
+                            "total_net_new_deletions overflow in register_dml_files".into(),
+                        )
+                    })?;
             }
 
             // R6-S-003 + R7-S-010: Decrement record_count (clamped to 0)
