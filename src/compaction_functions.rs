@@ -168,18 +168,24 @@ impl TableProvider for DeferredCompactionProvider {
         filters: &[datafusion::prelude::Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
-        let conn = open_compaction_connection(&self.catalog_path)?;
-        let batch = match &self.result_type {
-            CompactionResultType::BooleanSuccess => {
-                collect_boolean_batch(&conn, &self.sql, &self.schema)?
-            },
-            CompactionResultType::AllStrings => {
-                collect_string_batch(&conn, &self.sql, &self.schema)?
-            },
-            CompactionResultType::ExpireSnapshots => {
-                collect_expire_snapshots_batch(&conn, &self.sql, &self.schema)?
-            },
-        };
+        // Run synchronous DuckDB operations on a blocking thread to avoid
+        // blocking the async executor (R8-S-040).
+        let catalog_path = self.catalog_path.clone();
+        let sql = self.sql.clone();
+        let schema = self.schema.clone();
+        let result_type = self.result_type.clone();
+        let batch = tokio::task::spawn_blocking(move || {
+            let conn = open_compaction_connection(&catalog_path)?;
+            match &result_type {
+                CompactionResultType::BooleanSuccess => collect_boolean_batch(&conn, &sql, &schema),
+                CompactionResultType::AllStrings => collect_string_batch(&conn, &sql, &schema),
+                CompactionResultType::ExpireSnapshots => {
+                    collect_expire_snapshots_batch(&conn, &sql, &schema)
+                },
+            }
+        })
+        .await
+        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))??;
         let mem = datafusion::datasource::memory::MemTable::try_new(
             self.schema.clone(),
             vec![vec![batch]],

@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug};
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray, UInt64Array};
+use arrow::array::{Array, ArrayRef, RecordBatch, UInt64Array};
 use arrow::compute;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::DFSchema;
@@ -28,16 +28,9 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::stream::{self, TryStreamExt};
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, PutPayload};
-use parquet::arrow::ArrowWriter;
-use parquet::file::properties::WriterProperties;
-use uuid::Uuid;
 
 use crate::metadata_provider::DuckLakeTableFile;
 use crate::metadata_writer::{DeleteFileInfo, MetadataWriter};
-use crate::path_resolver::join_paths;
-use crate::table::delete_file_schema;
-use crate::table_writer::{calculate_footer_size_from_bytes, cleanup_orphaned_files};
 
 /// Schema for the output of DML operations (count of rows affected).
 /// Shared by DELETE, UPDATE, INSERT, and MERGE exec plans.
@@ -204,8 +197,9 @@ impl ExecutionPlan for DuckLakeDeleteExec {
                 .collect::<DataFusionResult<Vec<_>>>()?;
 
             let mut total_deleted: u64 = 0;
-            // Track uploaded files for cleanup if metadata commit fails
-            let mut uploaded_files: Vec<ObjectPath> = Vec::new();
+            // Cleanup guard ensures orphan files are removed on any error path
+            let mut upload_guard =
+                crate::table_writer::UploadCleanupGuard::new(Arc::clone(&object_store));
             // Collect delete file metadata for atomic registration
             let mut pending_delete_files: Vec<DeleteFileInfo> = Vec::new();
 
@@ -322,62 +316,16 @@ impl ExecutionPlan for DuckLakeDeleteExec {
                     positions_to_delete.dedup();
                 }
 
-                // R3F-034: delete_count tracks total positions in delete file, not just new deletions
-                let delete_count = i64::try_from(positions_to_delete.len()).map_err(|e| {
-                    DataFusionError::Execution(format!("Delete count overflow: {}", e))
-                })?;
-
-                // Write the delete file
-                let delete_file_name = format!("ducklake-{}-delete.parquet", Uuid::new_v4());
-                // Use the table path structure for delete files
-                let schema_table_prefix = table_path.trim_start_matches('/');
-                let delete_object_key = join_paths(schema_table_prefix, &delete_file_name)?;
-                let delete_object_path =
-                    ObjectPath::from(delete_object_key.trim_start_matches('/'));
-
-                // Build the delete file content
-                let del_schema = delete_file_schema();
-                // R4-S-009: Use resolved path (from data_path root) instead of raw catalog filename
-                let file_path_values: Vec<&str> =
-                    vec![resolved_path.as_str(); positions_to_delete.len()];
-                let file_path_array: ArrayRef = Arc::new(StringArray::from(file_path_values));
-                let pos_array: ArrayRef = Arc::new(Int64Array::from(positions_to_delete));
-
-                let delete_batch =
-                    RecordBatch::try_new(del_schema.clone(), vec![file_path_array, pos_array])?;
-
-                let props = WriterProperties::builder()
-                    .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
-                    .build();
-                let mut arrow_writer = ArrowWriter::try_new(Vec::new(), del_schema, Some(props))
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                arrow_writer
-                    .write(&delete_batch)
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                let buffer = arrow_writer
-                    .into_inner()
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-                let file_size = i64::try_from(buffer.len()).map_err(|e| {
-                    DataFusionError::Execution(format!("File size overflow: {}", e))
-                })?;
-                let footer_size = calculate_footer_size_from_bytes(&buffer)
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-                // R6-S-037: Upload to object store; clean up prior uploads on failure
-                if let Err(e) = object_store
-                    .put(&delete_object_path, PutPayload::from(buffer))
-                    .await
-                {
-                    cleanup_orphaned_files(&*object_store, &uploaded_files).await;
-                    return Err(DataFusionError::External(Box::new(e)));
-                }
-                uploaded_files.push(delete_object_path);
-
-                // Collect delete file info for atomic batch registration
-                let delete_file_info =
-                    DeleteFileInfo::new(data_file_id, &delete_file_name, file_size, delete_count)
-                        .with_footer_size(footer_size);
+                // Write and upload delete file using shared helper
+                let delete_file_info = crate::table_writer::write_delete_file(
+                    &*object_store,
+                    &table_path,
+                    &resolved_path,
+                    data_file_id,
+                    positions_to_delete,
+                    &mut upload_guard,
+                )
+                .await?;
 
                 pending_delete_files.push(delete_file_info);
             }
@@ -388,22 +336,18 @@ impl ExecutionPlan for DuckLakeDeleteExec {
                 return Ok(RecordBatch::try_new(output_schema, vec![count_array])?);
             }
 
-            // R6-S-038: Create snapshot; clean up uploads if snapshot creation fails
-            let snapshot_id = match writer.create_snapshot() {
-                Ok(id) => id,
-                Err(e) => {
-                    cleanup_orphaned_files(&*object_store, &uploaded_files).await;
-                    return Err(DataFusionError::External(Box::new(e)));
-                },
-            };
+            // Create snapshot (guard cleans up uploaded files on error)
+            let snapshot_id = writer
+                .create_snapshot()
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-            // Atomically register all delete files
-            if let Err(e) =
-                writer.register_dml_files(table_id, snapshot_id, &pending_delete_files, &[])
-            {
-                cleanup_orphaned_files(&*object_store, &uploaded_files).await;
-                return Err(DataFusionError::External(Box::new(e)));
-            }
+            // Atomically register all delete files (guard cleans up on error)
+            writer
+                .register_dml_files(table_id, snapshot_id, &pending_delete_files, &[])
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+            // Success — disarm the cleanup guard
+            upload_guard.disarm();
 
             // R3F-013: Record snapshot changes for DELETE
             // R4-S-016: Non-fatal — DML data is already committed
