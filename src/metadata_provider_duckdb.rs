@@ -80,10 +80,13 @@ impl DuckdbMetadataProvider {
         table_id: i64,
         snapshot_id: i64,
     ) -> crate::Result<i64> {
-        // Look up the inlined data table name
+        // Look up the inlined data table name, filtered by schema_version (R8-S-025)
         let result = conn.query_row(
-            "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?",
-            [table_id],
+            "SELECT table_name FROM ducklake_inlined_data_tables \
+             WHERE table_id = ? \
+               AND schema_version <= (SELECT schema_version FROM ducklake_snapshot WHERE snapshot_id = ?) \
+             ORDER BY schema_version DESC LIMIT 1",
+            [table_id, snapshot_id],
             |row| {
                 let table_name: String = row.get(0)?;
                 Ok(table_name)
@@ -96,10 +99,10 @@ impl DuckdbMetadataProvider {
             Err(e) => return Err(DuckLakeError::DuckDb(e)),
         };
 
-        // Verify the table actually exists
+        // Verify the table actually exists (R8-S-036: filter by table_schema)
         let table_exists: bool = conn
             .query_row(
-                "SELECT COUNT(*) > 0 FROM information_schema.tables WHERE table_name = ?",
+                "SELECT COUNT(*) > 0 FROM information_schema.tables WHERE table_schema = 'main' AND table_name = ?",
                 [&inlined_table_name],
                 |row| row.get(0),
             )

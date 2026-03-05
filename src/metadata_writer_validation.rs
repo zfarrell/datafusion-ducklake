@@ -82,9 +82,9 @@ pub(crate) fn validate_no_duplicate_columns(columns: &[ColumnDef]) -> Result<()>
 /// Validate schema evolution rules for append mode.
 ///
 /// Checks that:
-/// - Existing columns have matching types in the new schema
+/// - All existing columns are present in the new schema (no implicit removal)
+/// - Existing columns have matching types in the new schema (case-insensitive)
 /// - New columns (not in existing schema) are nullable
-/// - Columns removed from the new schema are allowed (implicit removal)
 pub(crate) fn validate_schema_evolution(
     existing: &[(String, String, bool)],
     new: &[ColumnDef],
@@ -101,9 +101,22 @@ pub(crate) fn validate_schema_evolution(
         .map(|(name, col_type, nullable)| (name.as_str(), (col_type.as_str(), *nullable)))
         .collect();
 
+    // R8-S-012: Check that all existing columns are present in the new schema.
+    // Append mode must not silently drop columns.
+    let new_names: std::collections::HashSet<&str> = new.iter().map(|c| c.name.as_str()).collect();
+    for (existing_name, _) in &existing_map {
+        if !new_names.contains(existing_name) {
+            return Err(DuckLakeError::InvalidConfig(format!(
+                "Schema evolution error: existing column '{}' is missing from the new schema. Removing columns is not allowed in append mode.",
+                existing_name
+            )));
+        }
+    }
+
     for new_col in new.iter() {
         if let Some((existing_type, _existing_nullable)) = existing_map.get(new_col.name.as_str()) {
-            if *existing_type != new_col.ducklake_type {
+            // R8-S-027: Use case-insensitive comparison for type strings
+            if !existing_type.eq_ignore_ascii_case(&new_col.ducklake_type) {
                 return Err(DuckLakeError::InvalidConfig(format!(
                     "Schema evolution error: column '{}' has type '{}' in existing table but '{}' in new schema. Type changes are not allowed.",
                     new_col.name, existing_type, new_col.ducklake_type

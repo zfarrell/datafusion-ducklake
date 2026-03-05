@@ -889,6 +889,7 @@ impl MySqlMetadataWriter {
                  AND df.table_id = fcs.table_id
                  AND df.end_snapshot IS NULL
              INNER JOIN ducklake_column c ON fcs.column_id = c.column_id
+                 AND c.end_snapshot IS NULL AND c.table_id = fcs.table_id
              WHERE fcs.table_id = ?",
         )
         .bind(table_id)

@@ -1041,11 +1041,16 @@ WHERE data.table_id = $1
 impl PostgresMetadataProvider {
     /// Count inlined rows for a table at a given snapshot.
     async fn count_inlined_rows(&self, table_id: i64, snapshot_id: i64) -> Result<i64> {
-        let table_info =
-            sqlx::query("SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = $1")
-                .bind(table_id)
-                .fetch_optional(&self.pool)
-                .await?;
+        let table_info = sqlx::query(
+            "SELECT table_name FROM ducklake_inlined_data_tables \
+             WHERE table_id = $1 \
+               AND schema_version <= (SELECT schema_version FROM ducklake_snapshot WHERE snapshot_id = $2) \
+             ORDER BY schema_version DESC LIMIT 1",
+        )
+        .bind(table_id)
+        .bind(snapshot_id)
+        .fetch_optional(&self.pool)
+        .await?;
 
         let Some(info_row) = table_info else {
             return Ok(0);
