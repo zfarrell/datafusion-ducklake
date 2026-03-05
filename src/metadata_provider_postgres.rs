@@ -11,7 +11,6 @@ use crate::metadata_provider::{
 };
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions};
-use sqlx::types::chrono::NaiveDateTime;
 
 /// Note: This provider requires a multi-threaded Tokio runtime
 /// (`tokio::runtime::Builder::new_multi_thread()`) because it uses
@@ -72,7 +71,8 @@ impl MetadataProvider for PostgresMetadataProvider {
     fn list_snapshots(&self) -> Result<Vec<SnapshotMetadata>> {
         block_on(async {
             let rows = sqlx::query(
-                "SELECT s.snapshot_id, s.snapshot_time, s.schema_version,
+                // R8-S-038: Cast snapshot_time to text to preserve timezone (parity with SQLite)
+                "SELECT s.snapshot_id, CAST(s.snapshot_time AS VARCHAR), s.schema_version,
                         c.changes_made, c.author, c.commit_message, c.commit_extra_info
                  FROM ducklake_snapshot s
                  LEFT JOIN ducklake_snapshot_changes c ON s.snapshot_id = c.snapshot_id
@@ -84,9 +84,7 @@ impl MetadataProvider for PostgresMetadataProvider {
             rows.into_iter()
                 .map(|row| {
                     let snapshot_id: i64 = row.try_get(0)?;
-                    let timestamp: Option<NaiveDateTime> = row.try_get(1)?;
-                    let snapshot_time = timestamp
-                        .map(|ts: NaiveDateTime| ts.format("%Y-%m-%d %H:%M:%S%.6f").to_string());
+                    let snapshot_time: Option<String> = row.try_get(1)?;
 
                     Ok(SnapshotMetadata {
                         snapshot_id,
@@ -925,7 +923,7 @@ WHERE data.table_id = $1
             // Check if the inlined data table exists (Postgres uses information_schema)
             let exists = sqlx::query(
                 "SELECT COUNT(*) FROM information_schema.tables
-                 WHERE table_schema = 'public' AND table_name = $1",
+                 WHERE table_schema = current_schema() AND table_name = $1",
             )
             .bind(&inlined_table_name)
             .fetch_one(&self.pool)
@@ -938,7 +936,7 @@ WHERE data.table_id = $1
             // Get column names from information_schema (Postgres equivalent of PRAGMA table_info)
             let columns = sqlx::query(
                 "SELECT column_name FROM information_schema.columns
-                 WHERE table_schema = 'public' AND table_name = $1
+                 WHERE table_schema = current_schema() AND table_name = $1
                  ORDER BY ordinal_position",
             )
             .bind(&inlined_table_name)
@@ -1041,11 +1039,16 @@ WHERE data.table_id = $1
 impl PostgresMetadataProvider {
     /// Count inlined rows for a table at a given snapshot.
     async fn count_inlined_rows(&self, table_id: i64, snapshot_id: i64) -> Result<i64> {
-        let table_info =
-            sqlx::query("SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = $1")
-                .bind(table_id)
-                .fetch_optional(&self.pool)
-                .await?;
+        let table_info = sqlx::query(
+            "SELECT table_name FROM ducklake_inlined_data_tables \
+             WHERE table_id = $1 \
+               AND schema_version <= (SELECT schema_version FROM ducklake_snapshot WHERE snapshot_id = $2) \
+             ORDER BY schema_version DESC LIMIT 1",
+        )
+        .bind(table_id)
+        .bind(snapshot_id)
+        .fetch_optional(&self.pool)
+        .await?;
 
         let Some(info_row) = table_info else {
             return Ok(0);
@@ -1056,7 +1059,7 @@ impl PostgresMetadataProvider {
         // Check if the inlined data table exists
         let exists = sqlx::query(
             "SELECT COUNT(*) FROM information_schema.tables
-             WHERE table_schema = 'public' AND table_name = $1",
+             WHERE table_schema = current_schema() AND table_name = $1",
         )
         .bind(&inlined_table_name)
         .fetch_one(&self.pool)

@@ -81,7 +81,6 @@ const SQL_CREATE_TABLES: &[&str] = &[
         file_order INTEGER,
         file_format VARCHAR DEFAULT 'parquet',
         partition_id BIGINT,
-        partial_max BIGINT,
         partial_file_info VARCHAR,
         begin_snapshot BIGINT NOT NULL,
         end_snapshot BIGINT
@@ -97,7 +96,6 @@ const SQL_CREATE_TABLES: &[&str] = &[
         encryption_key VARCHAR,
         delete_count BIGINT,
         format VARCHAR DEFAULT 'parquet',
-        partial_max BIGINT,
         begin_snapshot BIGINT NOT NULL,
         end_snapshot BIGINT
     )",
@@ -213,8 +211,7 @@ const SQL_CREATE_TABLES: &[&str] = &[
     )",
     "CREATE TABLE IF NOT EXISTS ducklake_schema_versions (
         begin_snapshot BIGINT,
-        schema_version BIGINT,
-        table_id BIGINT
+        schema_version BIGINT
     )",
     "CREATE TABLE IF NOT EXISTS ducklake_macro (
         schema_id BIGINT,
@@ -340,17 +337,20 @@ impl PostgresMetadataWriter {
 
         let is_ddl = !schema_exists || !table_exists;
 
-        // Get current schema_version for the new snapshot (F-012)
-        let prev_sv_row =
-            sqlx::query("SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot")
+        // Get schema_version for the new snapshot (F-012, R8-S-005).
+        // For DDL, use a PG sequence to atomically allocate the next version,
+        // preventing concurrent DDL from producing duplicate schema_versions.
+        let new_schema_version: i64 = if is_ddl {
+            let sv_row = sqlx::query("SELECT nextval('ducklake_schema_version_seq')")
                 .fetch_one(&mut *tx)
                 .await?;
-        let prev_schema_version: i64 = prev_sv_row.try_get(0)?;
-
-        let new_schema_version = if is_ddl {
-            prev_schema_version + 1
+            sv_row.try_get(0)?
         } else {
-            prev_schema_version
+            let prev_sv_row =
+                sqlx::query("SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot")
+                    .fetch_one(&mut *tx)
+                    .await?;
+            prev_sv_row.try_get(0)?
         };
 
         // Create snapshot with correct schema_version
@@ -493,17 +493,24 @@ impl PostgresMetadataWriter {
 
         // Record in snapshot_changes with DuckDB-compatible format (F-027)
         if !table_exists {
+            // R8-S-043: Include created_schema if schema was also new (parity with SQLite)
+            let esc_schema = schema_name.replace('"', "\"\"");
+            let esc_table = table_name.replace('"', "\"\"");
+            let changes = if !schema_exists {
+                format!(
+                    "created_schema:\"{}\",created_table:\"{}\".\"{}\"",
+                    esc_schema, esc_schema, esc_table
+                )
+            } else {
+                format!("created_table:\"{}\".\"{}\"", esc_schema, esc_table)
+            };
             sqlx::query(
                 "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made)
                  VALUES ($1, $2)
                  ON CONFLICT (snapshot_id) DO UPDATE SET changes_made = EXCLUDED.changes_made",
             )
             .bind(snapshot_id)
-            .bind(format!(
-                "created_table:\"{}\".\"{}\"",
-                schema_name.replace('"', "\"\""),
-                table_name.replace('"', "\"\"")
-            ))
+            .bind(changes)
             .execute(&mut *tx)
             .await?;
         }
@@ -764,6 +771,7 @@ impl PostgresMetadataWriter {
                  AND df.table_id = fcs.table_id
                  AND df.end_snapshot IS NULL
              INNER JOIN ducklake_column c ON fcs.column_id = c.column_id
+                 AND c.end_snapshot IS NULL AND c.table_id = fcs.table_id
              WHERE fcs.table_id = $1",
         )
         .bind(table_id)
@@ -850,10 +858,19 @@ impl PostgresMetadataWriter {
 }
 
 impl MetadataWriter for PostgresMetadataWriter {
+    // R8-S-042: Include schema_version and next_file_id (parity with SQLite)
     fn create_snapshot(&self) -> Result<i64> {
         block_on(async {
             let row = sqlx::query(
-                "INSERT INTO ducklake_snapshot (snapshot_time) VALUES (CURRENT_TIMESTAMP) RETURNING snapshot_id",
+                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version, next_file_id)
+                 VALUES (
+                     CURRENT_TIMESTAMP,
+                     COALESCE((SELECT MAX(schema_version) FROM ducklake_snapshot), 1),
+                     COALESCE(GREATEST(
+                         (SELECT COALESCE(MAX(data_file_id), 0) + 1 FROM ducklake_data_file),
+                         (SELECT COALESCE(MAX(delete_file_id), 0) + 1 FROM ducklake_delete_file)
+                     ), 0)
+                 ) RETURNING snapshot_id",
             )
             .fetch_one(&self.pool)
             .await?;
@@ -891,18 +908,35 @@ impl MetadataWriter for PostgresMetadataWriter {
                 format!("{}/", base_path)
             };
             // F-026: generate UUID
-            let row = sqlx::query(
+            // R8-S-006: Use ON CONFLICT DO NOTHING to handle concurrent INSERT race.
+            // The partial unique index ducklake_schema_active_name prevents duplicates.
+            let result = sqlx::query(
                 "INSERT INTO ducklake_schema (schema_uuid, schema_name, path, path_is_relative, begin_snapshot)
-                 VALUES (gen_random_uuid(), $1, $2, TRUE, $3) RETURNING schema_id",
+                 VALUES (gen_random_uuid(), $1, $2, TRUE, $3)
+                 ON CONFLICT (schema_name) WHERE end_snapshot IS NULL DO NOTHING
+                 RETURNING schema_id",
             )
             .bind(name)
             .bind(&schema_path)
             .bind(snapshot_id)
-            .fetch_one(&mut *tx)
+            .fetch_optional(&mut *tx)
             .await?;
 
-            tx.commit().await?;
-            Ok((row.try_get(0)?, true))
+            if let Some(row) = result {
+                tx.commit().await?;
+                Ok((row.try_get(0)?, true))
+            } else {
+                // Concurrent transaction inserted first — fetch the existing row
+                let row = sqlx::query(
+                    "SELECT schema_id FROM ducklake_schema
+                     WHERE schema_name = $1 AND end_snapshot IS NULL",
+                )
+                .bind(name)
+                .fetch_one(&mut *tx)
+                .await?;
+                tx.commit().await?;
+                Ok((row.try_get(0)?, false))
+            }
         })
     }
 
@@ -942,20 +976,38 @@ impl MetadataWriter for PostgresMetadataWriter {
             let next_table_id: i64 = next_tid_row.try_get(0)?;
 
             // F-026: generate UUID
-            sqlx::query(
+            // R8-S-006: Use ON CONFLICT DO NOTHING to handle concurrent INSERT race.
+            // The partial unique index ducklake_table_active_name prevents duplicates.
+            let result = sqlx::query(
                 "INSERT INTO ducklake_table (table_id, table_uuid, schema_id, table_name, path, path_is_relative, begin_snapshot)
-                 VALUES ($1, gen_random_uuid(), $2, $3, $4, TRUE, $5)",
+                 VALUES ($1, gen_random_uuid(), $2, $3, $4, TRUE, $5)
+                 ON CONFLICT (schema_id, table_name) WHERE end_snapshot IS NULL DO NOTHING
+                 RETURNING table_id",
             )
             .bind(next_table_id)
             .bind(schema_id)
             .bind(name)
             .bind(&table_path)
             .bind(snapshot_id)
-            .execute(&mut *tx)
+            .fetch_optional(&mut *tx)
             .await?;
 
-            tx.commit().await?;
-            Ok((next_table_id, true))
+            if let Some(row) = result {
+                tx.commit().await?;
+                Ok((row.try_get(0)?, true))
+            } else {
+                // Concurrent transaction inserted first — fetch the existing row
+                let row = sqlx::query(
+                    "SELECT table_id FROM ducklake_table
+                     WHERE schema_id = $1 AND table_name = $2 AND end_snapshot IS NULL",
+                )
+                .bind(schema_id)
+                .bind(name)
+                .fetch_one(&mut *tx)
+                .await?;
+                tx.commit().await?;
+                Ok((row.try_get(0)?, false))
+            }
         })
     }
 
@@ -1114,6 +1166,19 @@ impl MetadataWriter for PostgresMetadataWriter {
                 .await?;
             }
 
+            // R8-S-007: Update snapshot's next_file_id (parity with SQLite/register_dml_files)
+            sqlx::query(
+                "UPDATE ducklake_snapshot
+                 SET next_file_id = COALESCE(GREATEST(
+                     (SELECT COALESCE(MAX(data_file_id), 0) + 1 FROM ducklake_data_file),
+                     (SELECT COALESCE(MAX(delete_file_id), 0) + 1 FROM ducklake_delete_file)
+                 ), 0)
+                 WHERE snapshot_id = $1",
+            )
+            .bind(snapshot_id)
+            .execute(&mut *tx)
+            .await?;
+
             tx.commit().await?;
             Ok(data_file_id)
         })
@@ -1169,6 +1234,16 @@ impl MetadataWriter for PostgresMetadataWriter {
             // End all existing data files
             sqlx::query(
                 "UPDATE ducklake_data_file SET end_snapshot = $1
+                 WHERE table_id = $2 AND end_snapshot IS NULL",
+            )
+            .bind(snapshot_id)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // R8-S-001: End all active delete files (compaction rewrites data, old deletes are absorbed)
+            sqlx::query(
+                "UPDATE ducklake_delete_file SET end_snapshot = $1
                  WHERE table_id = $2 AND end_snapshot IS NULL",
             )
             .bind(snapshot_id)
@@ -1269,6 +1344,9 @@ impl MetadataWriter for PostgresMetadataWriter {
                 .execute(&mut *tx)
                 .await?;
             }
+
+            // R8-S-018: Recompute table column stats from new compacted files
+            Self::recompute_table_column_stats(&mut tx, table_id).await?;
 
             tx.commit().await?;
             Ok(ids)
@@ -1551,6 +1629,28 @@ impl MetadataWriter for PostgresMetadataWriter {
                 .execute(&mut *tx)
                 .await?;
 
+            // R8-S-005: Sequence for concurrency-safe schema_version generation.
+            // Prevents concurrent DDL from reading the same MAX and producing duplicates.
+            sqlx::query("CREATE SEQUENCE IF NOT EXISTS ducklake_schema_version_seq")
+                .execute(&mut *tx)
+                .await?;
+
+            // R8-S-006: Partial unique indexes to prevent duplicate active schema/table names.
+            // Under READ COMMITTED, two concurrent transactions can both SELECT → find nothing → INSERT.
+            // These indexes enforce uniqueness at the DB level for rows with end_snapshot IS NULL.
+            sqlx::query(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ducklake_schema_active_name
+                 ON ducklake_schema (schema_name) WHERE end_snapshot IS NULL",
+            )
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ducklake_table_active_name
+                 ON ducklake_table (schema_id, table_name) WHERE end_snapshot IS NULL",
+            )
+            .execute(&mut *tx)
+            .await?;
+
             // Insert initial schema_version entry (F-012)
             sqlx::query(
                 "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version)
@@ -1579,6 +1679,12 @@ impl MetadataWriter for PostgresMetadataWriter {
             .await?;
             sqlx::query(
                 "SELECT setval('ducklake_partition_id_seq', MAX(partition_id)) FROM ducklake_partition_info HAVING MAX(partition_id) IS NOT NULL",
+            )
+            .fetch_optional(&mut *tx)
+            .await?;
+            // R8-S-005: Sync schema_version sequence with existing data
+            sqlx::query(
+                "SELECT setval('ducklake_schema_version_seq', MAX(schema_version)) FROM ducklake_snapshot HAVING MAX(schema_version) IS NOT NULL",
             )
             .fetch_optional(&mut *tx)
             .await?;
@@ -1672,11 +1778,14 @@ impl MetadataWriter for PostgresMetadataWriter {
         block_on(async {
             let mut tx = self.pool.begin().await?;
 
-            // Conflict check: look for DROP operations since our snapshot.
+            // R8-S-030: Use FOR UPDATE to lock schema/table rows during conflict check.
+            // This prevents a concurrent DROP from committing between our check and the
+            // actual write in write_transaction_inner.
             let schema_row = sqlx::query(
                 "SELECT schema_id FROM ducklake_schema
                  WHERE schema_name = $1
-                 ORDER BY schema_id DESC LIMIT 1",
+                 ORDER BY schema_id DESC LIMIT 1
+                 FOR UPDATE",
             )
             .bind(schema_name)
             .fetch_optional(&mut *tx)
@@ -1720,7 +1829,8 @@ impl MetadataWriter for PostgresMetadataWriter {
                 let table_row = sqlx::query(
                     "SELECT table_id FROM ducklake_table
                      WHERE schema_id = $1 AND table_name = $2
-                     ORDER BY table_id DESC LIMIT 1",
+                     ORDER BY table_id DESC LIMIT 1
+                     FOR UPDATE",
                 )
                 .bind(schema_id)
                 .bind(table_name)
@@ -2677,6 +2787,96 @@ impl MetadataWriter for PostgresMetadataWriter {
 
             tx.commit().await?;
             Ok(snapshot_id)
+        })
+    }
+
+    // R8-S-008: Implement register_file_partition_value (parity with SQLite)
+    fn register_file_partition_value(
+        &self,
+        data_file_id: i64,
+        table_id: i64,
+        partition_key_index: i32,
+        partition_value: Option<&str>,
+    ) -> Result<()> {
+        block_on(async {
+            sqlx::query(
+                "INSERT INTO ducklake_file_partition_value (data_file_id, table_id, partition_key_index, partition_value)
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(data_file_id)
+            .bind(table_id)
+            .bind(partition_key_index as i64)
+            .bind(partition_value)
+            .execute(&self.pool)
+            .await?;
+            Ok(())
+        })
+    }
+
+    // R8-S-008: Implement get_active_partition_columns (parity with SQLite)
+    fn get_active_partition_columns(
+        &self,
+        table_id: i64,
+    ) -> Result<Vec<(String, i64, Option<String>)>> {
+        block_on(async {
+            let rows = sqlx::query(
+                "SELECT c.column_name, pc.column_id, pc.transform
+                 FROM ducklake_partition_info pi
+                 JOIN ducklake_partition_column pc
+                     ON pi.partition_id = pc.partition_id AND pi.table_id = pc.table_id
+                 JOIN ducklake_column c ON pc.column_id = c.column_id AND c.end_snapshot IS NULL
+                 WHERE pi.table_id = $1 AND pi.end_snapshot IS NULL
+                 ORDER BY pc.partition_key_index",
+            )
+            .bind(table_id)
+            .fetch_all(&self.pool)
+            .await?;
+
+            let mut result = Vec::with_capacity(rows.len());
+            for row in rows {
+                let name: String = row.try_get(0)?;
+                let col_id: i64 = row.try_get(1)?;
+                let transform: Option<String> = row.try_get(2)?;
+                result.push((name, col_id, transform));
+            }
+            Ok(result)
+        })
+    }
+
+    // R8-S-009: Implement record_snapshot_changes (parity with SQLite)
+    fn record_snapshot_changes(&self, snapshot_id: i64, changes_made: &str) -> Result<()> {
+        block_on(async {
+            sqlx::query(
+                "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made)
+                 VALUES ($1, $2)
+                 ON CONFLICT (snapshot_id) DO UPDATE SET changes_made = EXCLUDED.changes_made",
+            )
+            .bind(snapshot_id)
+            .bind(changes_made)
+            .execute(&self.pool)
+            .await?;
+            Ok(())
+        })
+    }
+
+    // R8-S-029: Implement find_table_id (parity with SQLite)
+    fn find_table_id(&self, schema_name: &str, table_name: &str) -> Result<Option<i64>> {
+        block_on(async {
+            let row = sqlx::query(
+                "SELECT t.table_id FROM ducklake_table t
+                 JOIN ducklake_schema s ON t.schema_id = s.schema_id
+                 WHERE s.schema_name = $1 AND s.end_snapshot IS NULL
+                   AND t.table_name = $2 AND t.end_snapshot IS NULL",
+            )
+            .bind(schema_name)
+            .bind(table_name)
+            .fetch_optional(&self.pool)
+            .await?;
+
+            match row {
+                Some(r) => Ok(Some(r.try_get(0)?)),
+                None => Ok(None),
+            }
         })
     }
 }
