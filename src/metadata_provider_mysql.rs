@@ -12,7 +12,6 @@ use crate::metadata_provider::{
 };
 use sqlx::Row;
 use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
-use sqlx::types::chrono::NaiveDateTime;
 
 /// Note: This provider requires a multi-threaded Tokio runtime
 /// (`tokio::runtime::Builder::new_multi_thread()`) because it uses
@@ -74,7 +73,8 @@ impl MetadataProvider for MySqlMetadataProvider {
     fn list_snapshots(&self) -> Result<Vec<SnapshotMetadata>> {
         block_on(async {
             let rows = sqlx::query(
-                "SELECT s.snapshot_id, s.snapshot_time, s.schema_version,
+                // R8-S-038: Cast snapshot_time to text to preserve timezone (parity with SQLite)
+                "SELECT s.snapshot_id, CAST(s.snapshot_time AS CHAR), s.schema_version,
                         c.changes_made, c.author, c.commit_message, c.commit_extra_info
                  FROM ducklake_snapshot s
                  LEFT JOIN ducklake_snapshot_changes c ON s.snapshot_id = c.snapshot_id
@@ -86,9 +86,7 @@ impl MetadataProvider for MySqlMetadataProvider {
             rows.into_iter()
                 .map(|row| {
                     let snapshot_id: i64 = row.try_get(0)?;
-                    let timestamp: Option<NaiveDateTime> = row.try_get(1)?;
-                    let snapshot_time = timestamp
-                        .map(|ts: NaiveDateTime| ts.format("%Y-%m-%d %H:%M:%S%.6f").to_string());
+                    let snapshot_time: Option<String> = row.try_get(1)?;
 
                     Ok(SnapshotMetadata {
                         snapshot_id,
@@ -1017,11 +1015,16 @@ WHERE data.table_id = ?
 impl MySqlMetadataProvider {
     /// Count inlined rows for a table at a given snapshot.
     async fn count_inlined_rows(&self, table_id: i64, snapshot_id: i64) -> Result<i64> {
-        let table_info =
-            sqlx::query("SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?")
-                .bind(table_id)
-                .fetch_optional(&self.pool)
-                .await?;
+        let table_info = sqlx::query(
+            "SELECT table_name FROM ducklake_inlined_data_tables \
+             WHERE table_id = ? \
+               AND schema_version <= (SELECT schema_version FROM ducklake_snapshot WHERE snapshot_id = ?) \
+             ORDER BY schema_version DESC LIMIT 1",
+        )
+        .bind(table_id)
+        .bind(snapshot_id)
+        .fetch_optional(&self.pool)
+        .await?;
 
         let Some(info_row) = table_info else {
             return Ok(0);
