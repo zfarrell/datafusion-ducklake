@@ -459,17 +459,17 @@ impl MySqlMetadataWriter {
 
         let is_ddl = !schema_exists || !table_exists;
 
-        // Get current schema_version for the new snapshot (F-012)
-        let prev_sv_row =
-            sqlx::query("SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot")
-                .fetch_one(&mut *tx)
-                .await?;
-        let prev_schema_version: i64 = prev_sv_row.try_get(0)?;
-
-        let new_schema_version = if is_ddl {
-            prev_schema_version + 1
+        // Get schema_version for the new snapshot (F-012, R8-S-005).
+        // For DDL, use the _df_sequences table to atomically allocate the next version,
+        // preventing concurrent DDL from producing duplicate schema_versions.
+        let new_schema_version: i64 = if is_ddl {
+            next_sequence_value(&mut tx, "schema_version").await?
         } else {
-            prev_schema_version
+            let prev_sv_row =
+                sqlx::query("SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot")
+                    .fetch_one(&mut *tx)
+                    .await?;
+            prev_sv_row.try_get(0)?
         };
 
         // Create snapshot with correct schema_version
@@ -995,9 +995,12 @@ impl MetadataWriter for MySqlMetadataWriter {
             // Use a transaction to prevent TOCTOU race between SELECT and INSERT
             let mut tx = self.pool.begin().await?;
 
+            // R8-S-006: Use FOR UPDATE to acquire a gap lock under REPEATABLE READ,
+            // preventing concurrent transactions from inserting a duplicate active schema.
             let existing = sqlx::query(
                 "SELECT schema_id FROM ducklake_schema
-                 WHERE schema_name = ? AND end_snapshot IS NULL",
+                 WHERE schema_name = ? AND end_snapshot IS NULL
+                 FOR UPDATE",
             )
             .bind(name)
             .fetch_optional(&mut *tx)
@@ -1043,9 +1046,12 @@ impl MetadataWriter for MySqlMetadataWriter {
         block_on(async {
             let mut tx = self.pool.begin().await?;
 
+            // R8-S-006: Use FOR UPDATE to acquire a gap lock under REPEATABLE READ,
+            // preventing concurrent transactions from inserting a duplicate active table.
             let existing = sqlx::query(
                 "SELECT table_id FROM ducklake_table
-                 WHERE schema_id = ? AND table_name = ? AND end_snapshot IS NULL",
+                 WHERE schema_id = ? AND table_name = ? AND end_snapshot IS NULL
+                 FOR UPDATE",
             )
             .bind(schema_id)
             .bind(name)
@@ -1747,6 +1753,8 @@ impl MetadataWriter for MySqlMetadataWriter {
                 ("column_id", "ducklake_column", "column_id"),
                 ("view_id", "ducklake_view", "view_id"),
                 ("partition_id", "ducklake_partition_info", "partition_id"),
+                // R8-S-005: Sync schema_version sequence for concurrent DDL safety
+                ("schema_version", "ducklake_snapshot", "schema_version"),
             ] {
                 let sync_sql = format!(
                     "INSERT INTO _df_sequences (seq_name, seq_value)
@@ -1849,11 +1857,14 @@ impl MetadataWriter for MySqlMetadataWriter {
         block_on(async {
             let mut tx = self.pool.begin().await?;
 
-            // Conflict check: look for DROP operations since our snapshot.
+            // R8-S-030: Use FOR UPDATE to lock schema/table rows during conflict check.
+            // This prevents a concurrent DROP from committing between our check and the
+            // actual write in write_transaction_inner.
             let schema_row = sqlx::query(
                 "SELECT schema_id FROM ducklake_schema
                  WHERE schema_name = ?
-                 ORDER BY schema_id DESC LIMIT 1",
+                 ORDER BY schema_id DESC LIMIT 1
+                 FOR UPDATE",
             )
             .bind(schema_name)
             .fetch_optional(&mut *tx)
@@ -1897,7 +1908,8 @@ impl MetadataWriter for MySqlMetadataWriter {
                 let table_row = sqlx::query(
                     "SELECT table_id FROM ducklake_table
                      WHERE schema_id = ? AND table_name = ?
-                     ORDER BY table_id DESC LIMIT 1",
+                     ORDER BY table_id DESC LIMIT 1
+                     FOR UPDATE",
                 )
                 .bind(schema_id)
                 .bind(table_name)
