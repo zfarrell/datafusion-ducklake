@@ -361,7 +361,7 @@ impl TableFunctionImpl for DucklakeRewriteDataFilesFunction {
         let sql = match exprs.len() {
             1 => {
                 let threshold = extract_float_arg(&exprs[0], "ducklake_rewrite_data_files", 1)?;
-                if threshold < 0.0 || threshold > 1.0 {
+                if !threshold.is_finite() || threshold < 0.0 || threshold > 1.0 {
                     return plan_err!(
                         "delete_threshold must be between 0.0 and 1.0, got {}",
                         threshold
@@ -375,7 +375,7 @@ impl TableFunctionImpl for DucklakeRewriteDataFilesFunction {
             2 => {
                 let table_name = extract_string_arg(&exprs[0], "ducklake_rewrite_data_files", 1)?;
                 let threshold = extract_float_arg(&exprs[1], "ducklake_rewrite_data_files", 2)?;
-                if threshold < 0.0 || threshold > 1.0 {
+                if !threshold.is_finite() || threshold < 0.0 || threshold > 1.0 {
                     return plan_err!(
                         "delete_threshold must be between 0.0 and 1.0, got {}",
                         threshold
