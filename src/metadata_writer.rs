@@ -85,8 +85,10 @@ pub struct AlterColumnTypeOp {
 /// - float → double
 /// - Unsigned integers can widen to larger signed integers
 pub fn is_type_promotion_allowed(source: &str, target: &str) -> bool {
+    let source_lower = source.to_lowercase();
+    let target_lower = target.to_lowercase();
     matches!(
-        (source, target),
+        (source_lower.as_str(), target_lower.as_str()),
         // Signed integer widening chain
         ("int8", "int16" | "int32" | "int64")
             | ("int16", "int32" | "int64")
@@ -868,5 +870,15 @@ mod tests {
         assert!(!is_type_promotion_allowed("varchar", "int32"));
         assert!(!is_type_promotion_allowed("int32", "varchar"));
         assert!(!is_type_promotion_allowed("float", "int32"));
+    }
+
+    #[test]
+    fn test_type_promotion_case_insensitive() {
+        assert!(is_type_promotion_allowed("INT8", "INT16"));
+        assert!(is_type_promotion_allowed("Int32", "Int64"));
+        assert!(is_type_promotion_allowed("Float", "Double"));
+        assert!(is_type_promotion_allowed("FLOAT", "DOUBLE"));
+        assert!(is_type_promotion_allowed("Timestamp", "TimestampTZ"));
+        assert!(!is_type_promotion_allowed("VARCHAR", "INT32"));
     }
 }
