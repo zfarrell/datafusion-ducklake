@@ -1089,7 +1089,11 @@ pub(crate) use impl_writer_file_ops;
 /// `$tx` must be a mutable sqlx Transaction variable name.
 macro_rules! create_ddl_snapshot {
     ($tx:expr, $d:expr, $last_id:expr) => {{
-        let prev_sv_row = sqlx::query("SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot")
+        let sv_lock_sql = format!(
+            "SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot{}",
+            $d.for_update()
+        );
+        let prev_sv_row = sqlx::query(&sv_lock_sql)
             .fetch_one(&mut *$tx).await?;
         let new_sv: i64 = prev_sv_row.try_get::<i64, _>(0)? + 1;
 
