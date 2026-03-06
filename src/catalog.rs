@@ -238,21 +238,8 @@ impl CatalogProvider for DuckLakeCatalog {
             )));
         }
 
-        // If cascade, drop all tables first
-        if cascade {
-            for table_id in &active_table_ids {
-                let table_drop_snapshot = config
-                    .writer
-                    .drop_table(*table_id)
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                // R8-S-028: Update snapshot after each table drop so subsequent
-                // drops see the correct snapshot chain
-                self.snapshot_id
-                    .fetch_max(table_drop_snapshot, Ordering::Release);
-            }
-        }
-
-        // Drop the schema itself
+        // Drop the schema (cascade is handled atomically inside drop_schema_inner,
+        // which ends all tables, columns, data files, and delete files in one transaction)
         let new_snapshot = config
             .writer
             .drop_schema(meta.schema_id)
