@@ -557,8 +557,10 @@ impl SqliteMetadataWriter {
         // F-013: Check if schema is identical — if so, preserve column IDs
         let schema_matches = existing_columns.len() == columns.len()
             && existing_columns.iter().zip(columns.iter()).all(
-                |((name, col_type, _nullable), col)| {
-                    name == &col.name && col_type == &col.ducklake_type
+                |((name, col_type, nullable), col)| {
+                    name == &col.name
+                        && col_type == &col.ducklake_type
+                        && *nullable == col.is_nullable
                 },
             );
 
@@ -703,7 +705,11 @@ impl SqliteMetadataWriter {
         let (sql, needs_table_id) = crate::dialect::SqliteDialect.next_id_sql(entity);
         let row = if needs_table_id {
             sqlx::query(&sql)
-                .bind(table_id.unwrap())
+                .bind(table_id.ok_or_else(|| {
+                    crate::error::DuckLakeError::Internal(
+                        "table_id required for entity ID generation".to_string(),
+                    )
+                })?)
                 .fetch_one(&mut **tx)
                 .await?
         } else {
