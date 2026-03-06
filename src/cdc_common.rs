@@ -95,14 +95,18 @@ pub(crate) fn analyze_cdc_projection(
                     0
                 };
 
+            // Precompute table column index -> natural position for O(1) lookups
+            let table_idx_to_natural: std::collections::HashMap<usize, usize> = table_indices
+                .iter()
+                .enumerate()
+                .map(|(pos, &ti)| (ti, pos))
+                .collect();
+
             let natural_pos_map: Vec<usize> = indices
                 .iter()
                 .map(|&idx| {
                     if idx < num_table_cols {
-                        // Find position of this table column index in table_indices.
-                        // Use position-by-position scan to handle duplicate projections:
-                        // each occurrence maps to the corresponding table_indices position.
-                        table_indices.iter().position(|&ti| ti == idx).unwrap_or(0)
+                        table_idx_to_natural.get(&idx).copied().unwrap_or(0)
                     } else if idx == snapshot_id_idx {
                         snapshot_natural_pos
                     } else {
