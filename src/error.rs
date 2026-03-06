@@ -81,6 +81,12 @@ impl From<DuckLakeError> for datafusion::error::DataFusionError {
         match err {
             // If it's already a DataFusion error, unwrap it
             DuckLakeError::DataFusion(e) => e,
+            // Preserve Arrow error type information
+            DuckLakeError::Arrow(e) => {
+                datafusion::error::DataFusionError::ArrowError(Box::new(e), None)
+            },
+            // Preserve IO error type information
+            DuckLakeError::Io(e) => datafusion::error::DataFusionError::IoError(e),
             // For all other errors, wrap them as External
             other => datafusion::error::DataFusionError::External(Box::new(other)),
         }
