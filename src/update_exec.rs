@@ -66,7 +66,7 @@ pub struct DuckLakeUpdateExec {
     /// Column IDs from catalog metadata (for embedding PARQUET:field_id in written files)
     column_ids: Vec<i64>,
     /// Files in the table
-    table_files: Vec<DuckLakeTableFile>,
+    table_files: Arc<Vec<DuckLakeTableFile>>,
     /// Filter expressions (WHERE clause). Empty means update all rows.
     filters: Vec<Expr>,
     /// Column assignments (SET clause)
@@ -78,7 +78,7 @@ pub struct DuckLakeUpdateExec {
     /// Table path for resolving relative file paths
     table_path: String,
     /// Existing deleted positions per file (pre-loaded)
-    existing_deletes: HashMap<String, HashSet<i64>>,
+    existing_deletes: Arc<HashMap<String, HashSet<i64>>>,
     /// Cached plan properties
     cache: PlanProperties,
 }
@@ -104,13 +104,13 @@ impl DuckLakeUpdateExec {
             table_name,
             table_schema,
             column_ids,
-            table_files,
+            table_files: Arc::new(table_files),
             filters,
             assignments,
             writer,
             object_store_url,
             table_path,
-            existing_deletes,
+            existing_deletes: Arc::new(existing_deletes),
             cache,
         }
     }
@@ -196,17 +196,17 @@ impl ExecutionPlan for DuckLakeUpdateExec {
             )));
         }
 
-        // Clone everything needed for the async block
+        // Clone Arcs (cheap) instead of data for the async block
         let table_id = self.table_id;
         let table_schema = Arc::clone(&self.table_schema);
         let column_ids = self.column_ids.clone();
-        let table_files = self.table_files.clone();
+        let table_files = Arc::clone(&self.table_files);
         let filters = self.filters.clone();
         let assignments = self.assignments.clone();
         let writer = Arc::clone(&self.writer);
         let object_store_url = self.object_store_url.clone();
         let table_path = self.table_path.clone();
-        let existing_deletes = self.existing_deletes.clone();
+        let existing_deletes = Arc::clone(&self.existing_deletes);
         let output_schema = make_dml_count_schema();
 
         let stream = stream::once(async move {
