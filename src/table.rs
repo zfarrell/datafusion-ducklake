@@ -1862,6 +1862,31 @@ fn parse_stat_value(s: &str, data_type: &DataType) -> Option<datafusion::common:
                     })
             })
             .map(|v| ScalarValue::Date64(Some(v))),
+        DataType::Timestamp(unit, tz) => {
+            use arrow::datatypes::TimeUnit;
+            let epoch_val = s.parse::<i64>().ok().or_else(|| {
+                let ndt = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S")
+                    .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S"))
+                    .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f"))
+                    .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f"))
+                    .ok()?;
+                let ts = ndt.and_utc();
+                Some(match unit {
+                    TimeUnit::Second => ts.timestamp(),
+                    TimeUnit::Millisecond => ts.timestamp_millis(),
+                    TimeUnit::Microsecond => ts.timestamp_micros(),
+                    TimeUnit::Nanosecond => ts
+                        .timestamp_nanos_opt()
+                        .unwrap_or(ts.timestamp_micros() * 1_000),
+                })
+            });
+            epoch_val.map(|v| match unit {
+                TimeUnit::Second => ScalarValue::TimestampSecond(Some(v), tz.clone()),
+                TimeUnit::Millisecond => ScalarValue::TimestampMillisecond(Some(v), tz.clone()),
+                TimeUnit::Microsecond => ScalarValue::TimestampMicrosecond(Some(v), tz.clone()),
+                TimeUnit::Nanosecond => ScalarValue::TimestampNanosecond(Some(v), tz.clone()),
+            })
+        },
         _ => None,
     }
 }
