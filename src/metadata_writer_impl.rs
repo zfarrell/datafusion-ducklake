@@ -623,6 +623,14 @@ macro_rules! impl_writer_file_ops {
                  VALUES ({}, {}, {}, {})",
                 d.ph(1), d.ph(2), d.ph(3), d.ph(4),
             );
+            let next_file_id_sql = format!(
+                "UPDATE ducklake_snapshot SET next_file_id = COALESCE({}, 0) WHERE snapshot_id = {}",
+                d.greatest(
+                    &format!("(SELECT COALESCE(MAX(data_file_id), 0) + 1 FROM ducklake_data_file)"),
+                    &format!("(SELECT COALESCE(MAX(delete_file_id), 0) + 1 FROM ducklake_delete_file)"),
+                ),
+                d.ph(1),
+            );
             #[allow(unused_variables)]
             let last_id_fn = $last_id;
             $block_on(|| async {
@@ -742,6 +750,12 @@ macro_rules! impl_writer_file_ops {
 
                 // Recompute table column stats from new compacted files
                 Self::recompute_table_column_stats(&mut tx, table_id).await?;
+
+                // Update snapshot's next_file_id
+                sqlx::query(&next_file_id_sql)
+                    .bind(snapshot_id)
+                    .execute(&mut *tx)
+                    .await?;
 
                 tx.commit().await?;
                 Ok(ids)
@@ -1068,6 +1082,44 @@ macro_rules! impl_writer_file_ops {
 
 pub(crate) use impl_writer_file_ops;
 
+/// Creates a DDL snapshot: increments schema_version, inserts snapshot row,
+/// inserts schema_version record. Returns the new snapshot_id.
+///
+/// Must be called inside an async block with `sqlx::Row` in scope.
+/// `$tx` must be a mutable sqlx Transaction variable name.
+macro_rules! create_ddl_snapshot {
+    ($tx:expr, $d:expr, $last_id:expr) => {{
+        let prev_sv_row = sqlx::query("SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot")
+            .fetch_one(&mut *$tx).await?;
+        let new_sv: i64 = prev_sv_row.try_get::<i64, _>(0)? + 1;
+
+        let sid: i64 = if $d.supports_returning() {
+            let ins = format!(
+                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES ({}, {}) RETURNING snapshot_id",
+                $d.now(), $d.ph(1)
+            );
+            let row = sqlx::query(&ins).bind(new_sv).fetch_one(&mut *$tx).await?;
+            row.try_get(0)?
+        } else {
+            let ins = format!(
+                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES ({}, {})",
+                $d.now(), $d.ph(1)
+            );
+            sqlx::query(&ins).bind(new_sv).execute(&mut *$tx).await?;
+            ($last_id)(&mut $tx).await?
+        };
+
+        let sv_sql = format!(
+            "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version) VALUES ({}, {})",
+            $d.ph(1), $d.ph(2)
+        );
+        sqlx::query(&sv_sql).bind(sid).bind(new_sv).execute(&mut *$tx).await?;
+        sid
+    }};
+}
+
+pub(crate) use create_ddl_snapshot;
+
 /// Generates DDL-related `MetadataWriter` methods (create_view, drop_view, rename_view,
 /// alter_table, rename_table, set_table_comment, set_column_comment).
 ///
@@ -1076,14 +1128,12 @@ pub(crate) use impl_writer_file_ops;
 /// - `dialect`: SqlDialect implementation expression
 /// - `block_on`: blocking executor (block_on_with_retry or block_on_no_retry)
 /// - `last_insert_id`: async closure to get last inserted ID (MySQL)
-/// - `column_order_type`: Rust type for column_order column (i64 for SQLite/MySQL, i32 for PG)
 macro_rules! impl_writer_ddl_ops {
     (
         $struct_name:ty,
         dialect = $dialect:expr,
         block_on = $block_on:path,
-        last_insert_id = $last_id:expr,
-        column_order_type = $co_type:ty
+        last_insert_id = $last_id:expr
     ) => {
             fn create_view(&self, schema_id: i64, view_name: &str, sql: &str) -> Result<(i64, i64)> {
                 let pool = &self.pool;
@@ -1094,35 +1144,7 @@ macro_rules! impl_writer_ddl_ops {
                     let mut tx = pool.begin().await?;
 
                     // Create DDL snapshot with schema_version increment (F-012)
-                    let snapshot_id: i64 = {
-                        let prev_sv_row = sqlx::query("SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot")
-                            .fetch_one(&mut *tx).await?;
-                        let new_sv: i64 = prev_sv_row.try_get::<i64, _>(0)? + 1;
-
-                        let sid: i64 = if d.supports_returning() {
-                            let ins = format!(
-                                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES ({}, {}) RETURNING snapshot_id",
-                                d.now(), d.ph(1)
-                            );
-                            let row = sqlx::query(&ins).bind(new_sv).fetch_one(&mut *tx).await?;
-                            row.try_get(0)?
-                        } else {
-                            let ins = format!(
-                                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES ({}, {})",
-                                d.now(), d.ph(1)
-                            );
-                            sqlx::query(&ins).bind(new_sv).execute(&mut *tx).await?;
-                            let last_id_fn = $last_id;
-                            (last_id_fn)(&mut tx).await?
-                        };
-
-                        let sv_sql = format!(
-                            "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version) VALUES ({}, {})",
-                            d.ph(1), d.ph(2)
-                        );
-                        sqlx::query(&sv_sql).bind(sid).bind(new_sv).execute(&mut *tx).await?;
-                        sid
-                    };
+                    let snapshot_id: i64 = crate::metadata_writer_impl::create_ddl_snapshot!(tx, d, $last_id);
 
                     // Get next view_id
                     let view_id = <$struct_name>::next_entity_id(&mut tx, "view_id", None).await?;
@@ -1146,9 +1168,10 @@ macro_rules! impl_writer_ddl_ops {
                     ))
                     .bind(schema_id)
                     .fetch_optional(&mut *tx).await?;
-                    let schema_name = schema_row
-                        .map(|r| r.try_get::<String, _>(0).unwrap_or_default())
-                        .unwrap_or_default();
+                    let schema_name = match schema_row {
+                        Some(r) => r.try_get::<String, _>(0)?,
+                        None => String::new(),
+                    };
 
                     let changes_sql = format!(
                         "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made) VALUES ({}, {}) {}",
@@ -1188,35 +1211,7 @@ macro_rules! impl_writer_ddl_ops {
                     }
 
                     // Create DDL snapshot
-                    let snapshot_id: i64 = {
-                        let prev_sv_row = sqlx::query("SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot")
-                            .fetch_one(&mut *tx).await?;
-                        let new_sv: i64 = prev_sv_row.try_get::<i64, _>(0)? + 1;
-
-                        let sid: i64 = if d.supports_returning() {
-                            let ins = format!(
-                                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES ({}, {}) RETURNING snapshot_id",
-                                d.now(), d.ph(1)
-                            );
-                            let row = sqlx::query(&ins).bind(new_sv).fetch_one(&mut *tx).await?;
-                            row.try_get(0)?
-                        } else {
-                            let ins = format!(
-                                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES ({}, {})",
-                                d.now(), d.ph(1)
-                            );
-                            sqlx::query(&ins).bind(new_sv).execute(&mut *tx).await?;
-                            let last_id_fn = $last_id;
-                            (last_id_fn)(&mut tx).await?
-                        };
-
-                        let sv_sql = format!(
-                            "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version) VALUES ({}, {})",
-                            d.ph(1), d.ph(2)
-                        );
-                        sqlx::query(&sv_sql).bind(sid).bind(new_sv).execute(&mut *tx).await?;
-                        sid
-                    };
+                    let snapshot_id: i64 = crate::metadata_writer_impl::create_ddl_snapshot!(tx, d, $last_id);
 
                     // End the view
                     let end_sql = format!(
@@ -1283,35 +1278,7 @@ macro_rules! impl_writer_ddl_ops {
                     }
 
                     // Create DDL snapshot
-                    let snapshot_id: i64 = {
-                        let prev_sv_row = sqlx::query("SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot")
-                            .fetch_one(&mut *tx).await?;
-                        let new_sv: i64 = prev_sv_row.try_get::<i64, _>(0)? + 1;
-
-                        let sid: i64 = if d.supports_returning() {
-                            let ins = format!(
-                                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES ({}, {}) RETURNING snapshot_id",
-                                d.now(), d.ph(1)
-                            );
-                            let row = sqlx::query(&ins).bind(new_sv).fetch_one(&mut *tx).await?;
-                            row.try_get(0)?
-                        } else {
-                            let ins = format!(
-                                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES ({}, {})",
-                                d.now(), d.ph(1)
-                            );
-                            sqlx::query(&ins).bind(new_sv).execute(&mut *tx).await?;
-                            let last_id_fn = $last_id;
-                            (last_id_fn)(&mut tx).await?
-                        };
-
-                        let sv_sql = format!(
-                            "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version) VALUES ({}, {})",
-                            d.ph(1), d.ph(2)
-                        );
-                        sqlx::query(&sv_sql).bind(sid).bind(new_sv).execute(&mut *tx).await?;
-                        sid
-                    };
+                    let snapshot_id: i64 = crate::metadata_writer_impl::create_ddl_snapshot!(tx, d, $last_id);
 
                     // End existing view row
                     let end_sql = format!(
@@ -1381,7 +1348,7 @@ macro_rules! impl_writer_ddl_ops {
                                 column_id: r.try_get(0)?,
                                 column_name: r.try_get(1)?,
                                 column_type: r.try_get(2)?,
-                                column_order: r.try_get::<$co_type, _>(3)? as i64,
+                                column_order: r.try_get::<i32, _>(3)? as i64,
                                 is_nullable: r.try_get::<Option<bool>, _>(4)?.unwrap_or(true),
                                 initial_default: r.try_get(5)?,
                                 default_value: r.try_get(6)?,
@@ -1396,35 +1363,7 @@ macro_rules! impl_writer_ddl_ops {
                     let action = validate_alter_table(&columns, op)?;
 
                     // Create DDL snapshot
-                    let snapshot_id: i64 = {
-                        let prev_sv_row = sqlx::query("SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot")
-                            .fetch_one(&mut *tx).await?;
-                        let new_sv: i64 = prev_sv_row.try_get::<i64, _>(0)? + 1;
-
-                        let sid: i64 = if d.supports_returning() {
-                            let ins = format!(
-                                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES ({}, {}) RETURNING snapshot_id",
-                                d.now(), d.ph(1)
-                            );
-                            let row = sqlx::query(&ins).bind(new_sv).fetch_one(&mut *tx).await?;
-                            row.try_get(0)?
-                        } else {
-                            let ins = format!(
-                                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES ({}, {})",
-                                d.now(), d.ph(1)
-                            );
-                            sqlx::query(&ins).bind(new_sv).execute(&mut *tx).await?;
-                            let last_id_fn = $last_id;
-                            (last_id_fn)(&mut tx).await?
-                        };
-
-                        let sv_sql = format!(
-                            "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version) VALUES ({}, {})",
-                            d.ph(1), d.ph(2)
-                        );
-                        sqlx::query(&sv_sql).bind(sid).bind(new_sv).execute(&mut *tx).await?;
-                        sid
-                    };
+                    let snapshot_id: i64 = crate::metadata_writer_impl::create_ddl_snapshot!(tx, d, $last_id);
 
                     match action {
                         AlterTableAction::InsertColumn {
@@ -1602,35 +1541,7 @@ macro_rules! impl_writer_ddl_ops {
                     }
 
                     // Create DDL snapshot
-                    let snapshot_id: i64 = {
-                        let prev_sv_row = sqlx::query("SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot")
-                            .fetch_one(&mut *tx).await?;
-                        let new_sv: i64 = prev_sv_row.try_get::<i64, _>(0)? + 1;
-
-                        let sid: i64 = if d.supports_returning() {
-                            let ins = format!(
-                                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES ({}, {}) RETURNING snapshot_id",
-                                d.now(), d.ph(1)
-                            );
-                            let row = sqlx::query(&ins).bind(new_sv).fetch_one(&mut *tx).await?;
-                            row.try_get(0)?
-                        } else {
-                            let ins = format!(
-                                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES ({}, {})",
-                                d.now(), d.ph(1)
-                            );
-                            sqlx::query(&ins).bind(new_sv).execute(&mut *tx).await?;
-                            let last_id_fn = $last_id;
-                            (last_id_fn)(&mut tx).await?
-                        };
-
-                        let sv_sql = format!(
-                            "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version) VALUES ({}, {})",
-                            d.ph(1), d.ph(2)
-                        );
-                        sqlx::query(&sv_sql).bind(sid).bind(new_sv).execute(&mut *tx).await?;
-                        sid
-                    };
+                    let snapshot_id: i64 = crate::metadata_writer_impl::create_ddl_snapshot!(tx, d, $last_id);
 
                     // End existing table row
                     let end_sql = format!(
@@ -1683,35 +1594,7 @@ macro_rules! impl_writer_ddl_ops {
                     let mut tx = pool.begin().await?;
 
                     // Create DDL snapshot
-                    let snapshot_id: i64 = {
-                        let prev_sv_row = sqlx::query("SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot")
-                            .fetch_one(&mut *tx).await?;
-                        let new_sv: i64 = prev_sv_row.try_get::<i64, _>(0)? + 1;
-
-                        let sid: i64 = if d.supports_returning() {
-                            let ins = format!(
-                                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES ({}, {}) RETURNING snapshot_id",
-                                d.now(), d.ph(1)
-                            );
-                            let row = sqlx::query(&ins).bind(new_sv).fetch_one(&mut *tx).await?;
-                            row.try_get(0)?
-                        } else {
-                            let ins = format!(
-                                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES ({}, {})",
-                                d.now(), d.ph(1)
-                            );
-                            sqlx::query(&ins).bind(new_sv).execute(&mut *tx).await?;
-                            let last_id_fn = $last_id;
-                            (last_id_fn)(&mut tx).await?
-                        };
-
-                        let sv_sql = format!(
-                            "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version) VALUES ({}, {})",
-                            d.ph(1), d.ph(2)
-                        );
-                        sqlx::query(&sv_sql).bind(sid).bind(new_sv).execute(&mut *tx).await?;
-                        sid
-                    };
+                    let snapshot_id: i64 = crate::metadata_writer_impl::create_ddl_snapshot!(tx, d, $last_id);
 
                     // End any existing comment tag for this table
                     let end_tag = format!(
@@ -1776,35 +1659,7 @@ macro_rules! impl_writer_ddl_ops {
                     let column_id: i64 = col_row.try_get(0)?;
 
                     // Create DDL snapshot
-                    let snapshot_id: i64 = {
-                        let prev_sv_row = sqlx::query("SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot")
-                            .fetch_one(&mut *tx).await?;
-                        let new_sv: i64 = prev_sv_row.try_get::<i64, _>(0)? + 1;
-
-                        let sid: i64 = if d.supports_returning() {
-                            let ins = format!(
-                                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES ({}, {}) RETURNING snapshot_id",
-                                d.now(), d.ph(1)
-                            );
-                            let row = sqlx::query(&ins).bind(new_sv).fetch_one(&mut *tx).await?;
-                            row.try_get(0)?
-                        } else {
-                            let ins = format!(
-                                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES ({}, {})",
-                                d.now(), d.ph(1)
-                            );
-                            sqlx::query(&ins).bind(new_sv).execute(&mut *tx).await?;
-                            let last_id_fn = $last_id;
-                            (last_id_fn)(&mut tx).await?
-                        };
-
-                        let sv_sql = format!(
-                            "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version) VALUES ({}, {})",
-                            d.ph(1), d.ph(2)
-                        );
-                        sqlx::query(&sv_sql).bind(sid).bind(new_sv).execute(&mut *tx).await?;
-                        sid
-                    };
+                    let snapshot_id: i64 = crate::metadata_writer_impl::create_ddl_snapshot!(tx, d, $last_id);
 
                     // End any existing comment tag for this column
                     let end_tag = format!(
@@ -1880,46 +1735,7 @@ macro_rules! impl_writer_drop_inner {
             }
 
             // Increment schema_version for DDL (F-012)
-            let prev_sv_row =
-                sqlx::query("SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot")
-                    .fetch_one(&mut *tx)
-                    .await?;
-            let new_schema_version: i64 = prev_sv_row.try_get::<i64, _>(0)? + 1;
-
-            let snapshot_id: i64 = if d.supports_returning() {
-                let row = sqlx::query(
-                    &format!(
-                        "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES ({}, {}) RETURNING snapshot_id",
-                        d.now(), d.ph(1)
-                    ),
-                )
-                .bind(new_schema_version)
-                .fetch_one(&mut *tx)
-                .await?;
-                row.try_get(0)?
-            } else {
-                sqlx::query(
-                    &format!(
-                        "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES ({}, {})",
-                        d.now(), d.ph(1)
-                    ),
-                )
-                .bind(new_schema_version)
-                .execute(&mut *tx)
-                .await?;
-                ($last_id)(&mut tx).await?
-            };
-
-            sqlx::query(
-                &format!(
-                    "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version) VALUES ({}, {})",
-                    d.ph(1), d.ph(2)
-                ),
-            )
-            .bind(snapshot_id)
-            .bind(new_schema_version)
-            .execute(&mut *tx)
-            .await?;
+            let snapshot_id: i64 = crate::metadata_writer_impl::create_ddl_snapshot!(tx, d, $last_id);
 
             // Mark the table as dropped by setting end_snapshot
             sqlx::query(
@@ -2020,46 +1836,7 @@ macro_rules! impl_writer_drop_inner {
             }
 
             // Increment schema_version for DDL (F-012)
-            let prev_sv_row =
-                sqlx::query("SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot")
-                    .fetch_one(&mut *tx)
-                    .await?;
-            let new_schema_version: i64 = prev_sv_row.try_get::<i64, _>(0)? + 1;
-
-            let snapshot_id: i64 = if d.supports_returning() {
-                let row = sqlx::query(
-                    &format!(
-                        "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES ({}, {}) RETURNING snapshot_id",
-                        d.now(), d.ph(1)
-                    ),
-                )
-                .bind(new_schema_version)
-                .fetch_one(&mut *tx)
-                .await?;
-                row.try_get(0)?
-            } else {
-                sqlx::query(
-                    &format!(
-                        "INSERT INTO ducklake_snapshot (snapshot_time, schema_version) VALUES ({}, {})",
-                        d.now(), d.ph(1)
-                    ),
-                )
-                .bind(new_schema_version)
-                .execute(&mut *tx)
-                .await?;
-                ($last_id)(&mut tx).await?
-            };
-
-            sqlx::query(
-                &format!(
-                    "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version) VALUES ({}, {})",
-                    d.ph(1), d.ph(2)
-                ),
-            )
-            .bind(snapshot_id)
-            .bind(new_schema_version)
-            .execute(&mut *tx)
-            .await?;
+            let snapshot_id: i64 = crate::metadata_writer_impl::create_ddl_snapshot!(tx, d, $last_id);
 
             // Cascade: end columns for all active tables in this schema
             sqlx::query(
