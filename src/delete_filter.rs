@@ -157,7 +157,13 @@ impl Stream for DeleteFilterStream {
                                 )))));
                             },
                         };
-                        self.row_offset += num_rows;
+                        self.row_offset =
+                            self.row_offset.checked_add(num_rows).ok_or_else(|| {
+                                DataFusionError::Internal(format!(
+                                    "row_offset overflow: {} + {}",
+                                    self.row_offset, num_rows
+                                ))
+                            })?;
                         Poll::Ready(Some(Ok(filtered_batch)))
                     },
                     Err(e) => Poll::Ready(Some(Err(e))),
@@ -185,7 +191,12 @@ impl DeleteFilterStream {
         let mut keep_indices: Vec<u32> = Vec::with_capacity(num_rows);
 
         for i in 0..num_rows_u32 {
-            let global_pos = self.row_offset + i64::from(i);
+            let global_pos = self.row_offset.checked_add(i64::from(i)).ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "global position overflow: {} + {}",
+                    self.row_offset, i
+                ))
+            })?;
             if !self.deleted_positions.contains(&global_pos) {
                 keep_indices.push(i);
             }
