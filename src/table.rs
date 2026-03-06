@@ -1776,23 +1776,27 @@ impl TableProvider for DuckLakeTable {
         let write_partition_cols: Vec<crate::insert_exec::WritePartitionColumn> = self
             .partition_columns
             .iter()
-            .filter_map(|pc| {
+            .map(|pc| {
                 let col_idx = self
                     .schema
                     .fields()
                     .iter()
-                    .position(|f| f.name() == &pc.column_name)?;
+                    .position(|f| f.name() == &pc.column_name)
+                    .ok_or_else(|| {
+                        DataFusionError::Internal(format!(
+                            "Partition column '{}' not found in table schema",
+                            pc.column_name
+                        ))
+                    })?;
                 let resolved_transform =
                     crate::insert_exec::PartitionTransform::from_str_opt(pc.transform.as_deref())
-                        .map_err(|e| DataFusionError::External(Box::new(e)));
-                Some(
-                    resolved_transform.map(|rt| crate::insert_exec::WritePartitionColumn {
-                        column_name: pc.column_name.clone(),
-                        column_index: col_idx,
-                        resolved_transform: rt,
-                        transform: pc.transform.clone(),
-                    }),
-                )
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                Ok(crate::insert_exec::WritePartitionColumn {
+                    column_name: pc.column_name.clone(),
+                    column_index: col_idx,
+                    resolved_transform,
+                    transform: pc.transform.clone(),
+                })
             })
             .collect::<DataFusionResult<Vec<_>>>()?;
 
