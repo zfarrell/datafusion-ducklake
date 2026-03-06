@@ -458,6 +458,10 @@ impl ExecutionPlan for DuckLakeMergeExec {
                     .map(|b| vec![false; b.num_rows()])
                     .collect();
 
+                // Reusable key buffer to avoid per-row Vec allocation
+                let mut target_key: Vec<HashableKeyValue> =
+                    Vec::with_capacity(target_col_indices.len());
+
                 while let Some(batch) = parquet_stream.try_next().await? {
                     let num_rows = batch.num_rows();
 
@@ -475,12 +479,13 @@ impl ExecutionPlan for DuckLakeMergeExec {
                         }
 
                         // Build target key and look up in hash index (O(1) instead of O(M))
-                        let target_key: Vec<HashableKeyValue> = target_col_indices
-                            .iter()
-                            .map(|&col_idx| {
-                                extract_key_value(batch.column(col_idx).as_ref(), target_row_idx)
-                            })
-                            .collect::<DataFusionResult<Vec<_>>>()?;
+                        target_key.clear();
+                        for &col_idx in &target_col_indices {
+                            target_key.push(extract_key_value(
+                                batch.column(col_idx).as_ref(),
+                                target_row_idx,
+                            )?);
+                        }
 
                         // NULL keys never match (SQL semantics)
                         if target_key
