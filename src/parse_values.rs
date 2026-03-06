@@ -362,6 +362,12 @@ fn parse_decimal_string(s: &str, scale: i8) -> crate::Result<i128> {
     };
 
     let scale_u = scale.max(0) as u32;
+    if scale_u > 38 {
+        return Err(crate::error::DuckLakeError::Internal(format!(
+            "Decimal scale {} exceeds maximum supported scale of 38",
+            scale_u
+        )));
+    }
     let frac_len = frac_part.len() as u32;
     let frac: i128 = if frac_part.is_empty() {
         0
