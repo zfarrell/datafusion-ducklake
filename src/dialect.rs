@@ -643,11 +643,10 @@ mod tests {
         }
 
         #[test]
+        #[should_panic(expected = "MySQL uses next_sequence_id()")]
         fn test_mysql_next_id_sql_returns_placeholder() {
             let d = MySqlDialect;
-            let (sql, needs_bind) = d.next_id_sql("schema_version");
-            assert_eq!(sql, "SELECT 0");
-            assert!(!needs_bind);
+            let _ = d.next_id_sql("schema_version");
         }
 
         #[test]
