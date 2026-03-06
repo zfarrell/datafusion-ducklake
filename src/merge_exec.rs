@@ -74,8 +74,9 @@ pub struct DuckLakeMergeExec {
     column_ids: Vec<i64>,
     /// Files in the target table
     table_files: Arc<Vec<DuckLakeTableFile>>,
-    /// Source data to merge (pre-collected RecordBatches)
-    source_batches: Vec<RecordBatch>,
+    /// Source data to merge (pre-collected RecordBatches).
+    /// Wrapped in Arc to prevent deep cloning during optimizer passes.
+    source_batches: Arc<Vec<RecordBatch>>,
     /// Join condition columns: (target_col_index, source_col_index) pairs
     /// For simple equi-join conditions like `target.id = source.id`
     join_key_pairs: Vec<(usize, usize)>,
@@ -119,7 +120,7 @@ impl DuckLakeMergeExec {
             table_schema,
             column_ids,
             table_files: Arc::new(table_files),
-            source_batches,
+            source_batches: Arc::new(source_batches),
             join_key_pairs,
             matched_action,
             insert_unmatched,
@@ -370,7 +371,7 @@ impl ExecutionPlan for DuckLakeMergeExec {
         let table_schema = Arc::clone(&self.table_schema);
         let column_ids = self.column_ids.clone();
         let table_files = Arc::clone(&self.table_files);
-        let source_batches = self.source_batches.clone();
+        let source_batches = Arc::clone(&self.source_batches);
         let join_key_pairs = self.join_key_pairs.clone();
         let matched_action = self.matched_action.clone();
         let insert_unmatched = self.insert_unmatched;
@@ -396,7 +397,7 @@ impl ExecutionPlan for DuckLakeMergeExec {
                 crate::table_writer::UploadCleanupGuard::new(Arc::clone(&object_store));
 
             // Build hash index on source join keys for O(1) lookups instead of O(N*M)
-            let source_hash_index = build_source_hash_index(&source_batches, &join_key_pairs)?;
+            let source_hash_index = build_source_hash_index(&*source_batches, &join_key_pairs)?;
             let target_col_indices: Vec<usize> = join_key_pairs.iter().map(|&(t, _)| t).collect();
 
             // Track how many target rows each source row has matched
@@ -408,7 +409,7 @@ impl ExecutionPlan for DuckLakeMergeExec {
             let source_batch_offsets: Vec<usize> = {
                 let mut offsets = Vec::with_capacity(source_batches.len());
                 let mut acc = 0usize;
-                for b in &source_batches {
+                for b in &*source_batches {
                     offsets.push(acc);
                     acc += b.num_rows();
                 }
@@ -575,7 +576,7 @@ impl ExecutionPlan for DuckLakeMergeExec {
             // Collect unmatched source rows for INSERT
             if insert_unmatched {
                 let mut source_global_idx = 0usize;
-                for src_batch in &source_batches {
+                for src_batch in &*source_batches {
                     let mut mask_values = vec![false; src_batch.num_rows()];
                     for (i, mask_val) in mask_values.iter_mut().enumerate() {
                         if source_match_count[source_global_idx + i] == 0 {
