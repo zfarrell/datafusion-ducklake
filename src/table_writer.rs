@@ -174,6 +174,7 @@ impl DuckLakeTableWriter {
 
         let props = WriterProperties::builder()
             .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
+            .set_compression(parquet::basic::Compression::SNAPPY)
             .build();
         let writer = ArrowWriter::try_new(Vec::new(), schema_with_ids.clone(), Some(props))?;
 
@@ -366,8 +367,19 @@ impl DuckLakeTableWriter {
                         .await?;
 
                     // R4-S-001: Clear inlined data only AFTER successful Parquet write
+                    // R10-S-001: Non-fatal — Parquet + metadata already committed.
+                    // If clear fails and error propagates, a user retry would
+                    // re-include already-committed inline rows, causing duplicates.
                     if had_inline {
-                        self.metadata.clear_inlined_data(table_id, snapshot_id)?;
+                        if let Err(e) = self.metadata.clear_inlined_data(table_id, snapshot_id) {
+                            tracing::warn!(
+                                table_id,
+                                snapshot_id,
+                                error = %e,
+                                "Failed to clear inlined data after successful Parquet commit; \
+                                 data is safe but inline rows may be stale"
+                            );
+                        }
                     }
 
                     return Ok(result);
@@ -458,7 +470,16 @@ impl DuckLakeTableWriter {
             .await?;
 
         // R4-S-001: Clear inlined data only AFTER successful Parquet write
-        self.metadata.clear_inlined_data(table_id, snapshot_id)?;
+        // R10-S-001: Non-fatal — Parquet + metadata already committed.
+        if let Err(e) = self.metadata.clear_inlined_data(table_id, snapshot_id) {
+            tracing::warn!(
+                table_id,
+                snapshot_id,
+                error = %e,
+                "Failed to clear inlined data after successful flush to Parquet; \
+                 data is safe but inline rows may be stale"
+            );
+        }
 
         Ok(result)
     }
@@ -498,6 +519,7 @@ impl DuckLakeTableWriter {
 
         let props = WriterProperties::builder()
             .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
+            .set_compression(parquet::basic::Compression::SNAPPY)
             .build();
         let mut writer = ArrowWriter::try_new(Vec::new(), schema_with_ids.clone(), Some(props))?;
 
@@ -506,10 +528,16 @@ impl DuckLakeTableWriter {
             let batch_with_ids =
                 RecordBatch::try_new(schema_with_ids.clone(), batch.columns().to_vec())?;
             writer.write(&batch_with_ids)?;
-            row_count += i64::try_from(batch.num_rows()).map_err(|_| {
+            let batch_rows = i64::try_from(batch.num_rows()).map_err(|_| {
                 crate::error::DuckLakeError::Internal(format!(
                     "Batch row count {} exceeds i64 range",
                     batch.num_rows()
+                ))
+            })?;
+            row_count = row_count.checked_add(batch_rows).ok_or_else(|| {
+                crate::error::DuckLakeError::Internal(format!(
+                    "Total row count overflow: {} + {} exceeds i64::MAX",
+                    row_count, batch_rows
                 ))
             })?;
         }
@@ -605,6 +633,7 @@ impl DuckLakeTableWriter {
 
         let props = WriterProperties::builder()
             .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
+            .set_compression(parquet::basic::Compression::SNAPPY)
             .build();
         let writer = ArrowWriter::try_new(Vec::new(), schema_with_ids.clone(), Some(props))?;
 
@@ -666,7 +695,12 @@ impl DuckLakeTableWriter {
                 file_info,
                 partition_values: pvals,
             });
-            total_rows += upload.row_count;
+            total_rows = total_rows.checked_add(upload.row_count).ok_or_else(|| {
+                crate::error::DuckLakeError::Internal(format!(
+                    "Total row count overflow: {} + {} exceeds i64::MAX",
+                    total_rows, upload.row_count
+                ))
+            })?;
         }
 
         if write_mode == WriteMode::Replace {
@@ -792,10 +826,16 @@ impl TableWriteSession {
             crate::error::DuckLakeError::Internal("Writer already closed".to_string())
         })?;
         writer.write(&batch_with_ids)?;
-        self.row_count += i64::try_from(batch.num_rows()).map_err(|_| {
+        let batch_rows = i64::try_from(batch.num_rows()).map_err(|_| {
             crate::error::DuckLakeError::Internal(format!(
                 "batch row count {} exceeds i64::MAX",
                 batch.num_rows()
+            ))
+        })?;
+        self.row_count = self.row_count.checked_add(batch_rows).ok_or_else(|| {
+            crate::error::DuckLakeError::Internal(format!(
+                "Total row count overflow: {} + {} exceeds i64::MAX",
+                self.row_count, batch_rows
             ))
         })?;
         Ok(())
@@ -1606,17 +1646,24 @@ impl Drop for UploadCleanupGuard {
         if self.armed && !self.uploaded_files.is_empty() {
             let store = Arc::clone(&self.object_store);
             let files: Vec<ObjectPath> = std::mem::take(&mut self.uploaded_files);
-            // Spawn best-effort async cleanup; ignore join errors since we're in drop.
-            let _ = std::thread::spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build();
-                if let Ok(rt) = rt {
-                    rt.block_on(async {
-                        cleanup_orphaned_files(&*store, &files).await;
-                    });
-                }
-            });
+            // Prefer spawning on the existing tokio runtime if available,
+            // falling back to a new OS thread + runtime otherwise.
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    cleanup_orphaned_files(&*store, &files).await;
+                });
+            } else {
+                let _ = std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build();
+                    if let Ok(rt) = rt {
+                        rt.block_on(async {
+                            cleanup_orphaned_files(&*store, &files).await;
+                        });
+                    }
+                });
+            }
         }
     }
 }
@@ -1655,6 +1702,7 @@ pub(crate) async fn write_delete_file(
 
     let props = WriterProperties::builder()
         .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
+        .set_compression(parquet::basic::Compression::SNAPPY)
         .build();
     let mut arrow_writer = ArrowWriter::try_new(Vec::new(), del_schema, Some(props))
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
