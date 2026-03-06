@@ -127,7 +127,22 @@ pub fn parse_string_values_to_array(
                         let epoch_days = if let Ok(date) =
                             chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
                         {
-                            date.signed_duration_since(UNIX_EPOCH_DATE).num_days() as i32
+                            match i32::try_from(
+                                date.signed_duration_since(UNIX_EPOCH_DATE).num_days(),
+                            ) {
+                                Ok(d) => d,
+                                Err(_) => match mode {
+                                    ParseMode::Lenient => {
+                                        builder.append_null();
+                                        continue;
+                                    },
+                                    ParseMode::Strict => {
+                                        return Err(crate::error::DuckLakeError::Internal(
+                                            format!("Date32 days overflow for date '{}'", s),
+                                        ));
+                                    },
+                                },
+                            }
                         } else if let Ok(v) = s.parse::<i32>() {
                             v
                         } else {
