@@ -691,6 +691,7 @@ macro_rules! impl_metadata_provider {
                      FROM ducklake_file_column_stats s
                      JOIN ducklake_data_file f ON s.data_file_id = f.data_file_id
                      JOIN ducklake_column c ON s.column_id = c.column_id
+                       AND c.table_id = s.table_id AND c.end_snapshot IS NULL
                      WHERE s.table_id = {}
                        AND {} >= f.begin_snapshot
                        AND ({} < f.end_snapshot OR f.end_snapshot IS NULL)",
