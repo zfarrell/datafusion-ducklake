@@ -762,6 +762,127 @@ macro_rules! impl_writer_file_ops {
             })
         }
 
+        fn append_table_files(
+            &self,
+            table_id: i64,
+            snapshot_id: i64,
+            files: &[crate::metadata_writer::ReplaceFileEntry],
+        ) -> crate::Result<Vec<i64>> {
+            use crate::dialect::SqlDialect;
+            use crate::error::DuckLakeError;
+            use sqlx::Row;
+            let d = $dialect;
+            let insert_file_sql = if d.supports_returning() {
+                format!(
+                    "INSERT INTO ducklake_data_file (table_id, path, path_is_relative, file_size_bytes, footer_size, record_count, row_id_start, begin_snapshot)
+                     VALUES ({}, {}, {}, {}, {}, {}, {}, {}) RETURNING data_file_id",
+                    d.ph(1), d.ph(2), d.ph(3), d.ph(4), d.ph(5), d.ph(6), d.ph(7), d.ph(8),
+                )
+            } else {
+                format!(
+                    "INSERT INTO ducklake_data_file (table_id, path, path_is_relative, file_size_bytes, footer_size, record_count, row_id_start, begin_snapshot)
+                     VALUES ({}, {}, {}, {}, {}, {}, {}, {})",
+                    d.ph(1), d.ph(2), d.ph(3), d.ph(4), d.ph(5), d.ph(6), d.ph(7), d.ph(8),
+                )
+            };
+            let insert_stats_query = format!(
+                "INSERT INTO ducklake_file_column_stats (data_file_id, table_id, column_id, null_count, min_value, max_value)
+                 VALUES ({}, {}, {}, {}, {}, {})",
+                d.ph(1), d.ph(2), d.ph(3), d.ph(4), d.ph(5), d.ph(6),
+            );
+            let insert_partition_sql = format!(
+                "INSERT INTO ducklake_file_partition_value (data_file_id, table_id, partition_key_index, partition_value)
+                 VALUES ({}, {}, {}, {})",
+                d.ph(1), d.ph(2), d.ph(3), d.ph(4),
+            );
+            let next_file_id_sql = format!(
+                "UPDATE ducklake_snapshot SET next_file_id = COALESCE({}, 0) WHERE snapshot_id = {}",
+                d.greatest(
+                    &format!("(SELECT COALESCE(MAX(data_file_id), 0) + 1 FROM ducklake_data_file)"),
+                    &format!("(SELECT COALESCE(MAX(delete_file_id), 0) + 1 FROM ducklake_delete_file)"),
+                ),
+                d.ph(1),
+            );
+            #[allow(unused_variables)]
+            let last_id_fn = $last_id;
+            $block_on(|| async {
+                let mut tx = self.pool.begin().await?;
+
+                let mut ids = Vec::with_capacity(files.len());
+                let mut cumulative_row_id: i64 = 0;
+                for entry in files {
+                    let path_is_relative = entry.file_info.path_is_relative;
+                    let data_file_id: i64 = if d.supports_returning() {
+                        let row = sqlx::query(&insert_file_sql)
+                            .bind(table_id)
+                            .bind(&entry.file_info.path)
+                            .bind(path_is_relative)
+                            .bind(entry.file_info.file_size_bytes)
+                            .bind(entry.file_info.footer_size)
+                            .bind(entry.file_info.record_count)
+                            .bind(cumulative_row_id)
+                            .bind(snapshot_id)
+                            .fetch_one(&mut *tx)
+                            .await?;
+                        row.try_get(0)?
+                    } else {
+                        sqlx::query(&insert_file_sql)
+                            .bind(table_id)
+                            .bind(&entry.file_info.path)
+                            .bind(path_is_relative)
+                            .bind(entry.file_info.file_size_bytes)
+                            .bind(entry.file_info.footer_size)
+                            .bind(entry.file_info.record_count)
+                            .bind(cumulative_row_id)
+                            .bind(snapshot_id)
+                            .execute(&mut *tx)
+                            .await?;
+                        (last_id_fn)(&mut tx).await?
+                    };
+
+                    // Register column stats
+                    for stat in &entry.file_info.column_stats {
+                        sqlx::query(&insert_stats_query)
+                            .bind(data_file_id)
+                            .bind(table_id)
+                            .bind(stat.column_id)
+                            .bind(stat.null_count)
+                            .bind(&stat.min_value)
+                            .bind(&stat.max_value)
+                            .execute(&mut *tx)
+                            .await?;
+                    }
+
+                    // Register partition values
+                    for (key_index, val) in &entry.partition_values {
+                        sqlx::query(&insert_partition_sql)
+                            .bind(data_file_id)
+                            .bind(table_id)
+                            .bind(key_index)
+                            .bind(val.as_deref())
+                            .execute(&mut *tx)
+                            .await?;
+                    }
+
+                    cumulative_row_id = cumulative_row_id
+                        .checked_add(entry.file_info.record_count)
+                        .ok_or_else(|| {
+                            DuckLakeError::Internal("row_id overflow during append".into())
+                        })?;
+                    ids.push(data_file_id);
+                }
+
+                // Update snapshot's next_file_id
+                sqlx::query(&next_file_id_sql)
+                    .bind(snapshot_id)
+                    .execute(&mut *tx)
+                    .await?;
+
+                tx.commit().await?;
+                Ok(ids)
+            })
+        }
+
         fn register_dml_files(
             &self,
             table_id: i64,

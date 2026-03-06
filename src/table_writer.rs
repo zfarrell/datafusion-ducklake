@@ -712,36 +712,13 @@ impl DuckLakeTableWriter {
                 last_data_file_id = id;
             }
         } else {
-            // Append mode: register files individually.
-            // R5-S-024: Each register_data_file call is a separate transaction.
-            // A mid-loop failure leaves previously registered files committed.
-            // This is acceptable for append mode since partial results are valid
-            // (no old data is removed), and the caller can retry the remaining files.
-            for entry in &entries {
-                let data_file_id = self.metadata.register_data_file(
-                    setup.table_id,
-                    setup.snapshot_id,
-                    &entry.file_info,
-                )?;
-
-                if !entry.file_info.column_stats.is_empty() {
-                    self.metadata.register_column_stats(
-                        data_file_id,
-                        setup.table_id,
-                        &entry.file_info.column_stats,
-                    )?;
-                }
-
-                for (key_index, val) in &entry.partition_values {
-                    self.metadata.register_file_partition_value(
-                        data_file_id,
-                        setup.table_id,
-                        *key_index,
-                        val.as_deref(),
-                    )?;
-                }
-
-                last_data_file_id = data_file_id;
+            // Append mode: register all files atomically in a single transaction.
+            // Each file's data_file + stats + partition values are committed together.
+            let ids =
+                self.metadata
+                    .append_table_files(setup.table_id, setup.snapshot_id, &entries)?;
+            if let Some(&id) = ids.last() {
+                last_data_file_id = id;
             }
         }
 

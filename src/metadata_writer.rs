@@ -522,6 +522,45 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         Ok(ids)
     }
 
+    /// Atomically append new files to a table (without ending existing files).
+    ///
+    /// Registers each new file with its column stats and partition values,
+    /// all within a single transaction. Unlike `replace_table_files`, this does
+    /// NOT end existing data files — it only adds new ones.
+    ///
+    /// Returns the data_file_id for each registered file.
+    ///
+    /// # Warning: Default implementation is NOT atomic
+    ///
+    /// The default implementation calls individual `register_data_file` /
+    /// `register_column_stats` / `register_file_partition_value` calls
+    /// **without** a wrapping transaction. Backends **should** override this
+    /// method to wrap the entire operation in a single transaction.
+    fn append_table_files(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        files: &[ReplaceFileEntry],
+    ) -> Result<Vec<i64>> {
+        let mut ids = Vec::with_capacity(files.len());
+        for entry in files {
+            let data_file_id = self.register_data_file(table_id, snapshot_id, &entry.file_info)?;
+            if !entry.file_info.column_stats.is_empty() {
+                self.register_column_stats(data_file_id, table_id, &entry.file_info.column_stats)?;
+            }
+            for (key_index, val) in &entry.partition_values {
+                self.register_file_partition_value(
+                    data_file_id,
+                    table_id,
+                    *key_index,
+                    val.as_deref(),
+                )?;
+            }
+            ids.push(data_file_id);
+        }
+        Ok(ids)
+    }
+
     /// Drop a table by setting its end_snapshot.
     /// Creates a new snapshot and marks the table as dropped.
     /// Data files are NOT deleted (preserved for time travel).
