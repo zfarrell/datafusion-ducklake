@@ -1,4 +1,5 @@
 use crate::DuckLakeError;
+use crate::dialect::{SqlDialect, SqliteDialect};
 use crate::metadata_provider::{
     ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileData, DuckLakeTableColumn,
     DuckLakeTableFile, FileColumnStats, FilePartitionValue, FileWithTable, InlinedDataRow,
@@ -10,7 +11,7 @@ use crate::metadata_provider::{
     SQL_GET_VIEW_BY_NAME, SQL_LIST_ALL_COLUMNS, SQL_LIST_ALL_FILES, SQL_LIST_ALL_TABLES,
     SQL_LIST_SCHEMAS, SQL_LIST_SNAPSHOTS, SQL_LIST_TABLES, SQL_LIST_VIEWS, SQL_TABLE_EXISTS,
     SQL_VIEW_EXISTS, SchemaMetadata, SnapshotMetadata, TableMetadata, TableWithSchema,
-    ViewMetadata, quote_identifier,
+    ViewMetadata,
 };
 use duckdb::AccessMode::ReadOnly;
 use duckdb::{Config, Connection, params};
@@ -114,7 +115,7 @@ impl DuckdbMetadataProvider {
         // Count active inlined rows at this snapshot
         let count_sql = format!(
             "SELECT COUNT(*) FROM {} WHERE ? >= begin_snapshot AND (? < end_snapshot OR end_snapshot IS NULL)",
-            quote_identifier(&inlined_table_name)
+            SqliteDialect.quote_id(&inlined_table_name)
         );
         let count: i64 = conn.query_row(&count_sql, params![snapshot_id, snapshot_id], |row| {
             row.get(0)
@@ -637,7 +638,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
         // Get column names from the inlined data table (skip row_id, begin_snapshot, end_snapshot)
         let pragma_sql = format!(
             "PRAGMA table_info({})",
-            quote_identifier(&inlined_table_name)
+            SqliteDialect.quote_id(&inlined_table_name)
         );
         let mut pragma_stmt = conn.prepare(&pragma_sql)?;
         let user_columns: Vec<String> = pragma_stmt
@@ -654,12 +655,12 @@ impl MetadataProvider for DuckdbMetadataProvider {
         // Build select query with quoted identifiers to prevent SQL injection
         let col_list: Vec<String> = user_columns
             .iter()
-            .map(|c| format!("CAST({} AS VARCHAR)", quote_identifier(c)))
+            .map(|c| format!("CAST({} AS VARCHAR)", SqliteDialect.quote_id(c)))
             .collect();
         let select_sql = format!(
             "SELECT {} FROM {} WHERE begin_snapshot <= ? AND (end_snapshot IS NULL OR ? < end_snapshot)",
             col_list.join(", "),
-            quote_identifier(&inlined_table_name),
+            SqliteDialect.quote_id(&inlined_table_name),
         );
 
         let num_columns = user_columns.len();

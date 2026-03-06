@@ -3,12 +3,12 @@
 use std::sync::Arc;
 
 use crate::Result;
-use crate::dialect::PostgresDialect;
+use crate::dialect::{PostgresDialect, SqlDialect};
 use crate::metadata_provider::{
     ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileData, DuckLakeTableColumn,
     DuckLakeTableFile, FileColumnStats, FilePartitionValue, FileWithTable, InlinedDataRow,
     MetadataProvider, PartitionColumn, SchemaMetadata, SnapshotMetadata, TableMetadata,
-    TableWithSchema, ViewMetadata, block_on, quote_identifier,
+    TableWithSchema, ViewMetadata, block_on,
 };
 use crate::metadata_provider_impl::impl_metadata_provider;
 use sqlx::Row;
@@ -244,12 +244,12 @@ WHERE data.table_id = $1
 
             let col_list: Vec<String> = user_columns
                 .iter()
-                .map(|c| format!("CAST({} AS TEXT)", quote_identifier(c)))
+                .map(|c| format!("CAST({} AS TEXT)", PostgresDialect.quote_id(c)))
                 .collect();
             let select_sql = format!(
                 "SELECT {} FROM {} WHERE begin_snapshot <= $1 AND (end_snapshot IS NULL OR $2 < end_snapshot)",
                 col_list.join(", "),
-                quote_identifier(&inlined_table_name),
+                PostgresDialect.quote_id(&inlined_table_name),
             );
 
             let rows = sqlx::query(&select_sql)
@@ -313,7 +313,7 @@ WHERE data.table_id = $1
 
         let count_sql = format!(
             "SELECT COUNT(*) FROM {} WHERE begin_snapshot <= $1 AND (end_snapshot IS NULL OR $2 < end_snapshot)",
-            quote_identifier(&inlined_table_name),
+            PostgresDialect.quote_id(&inlined_table_name),
         );
 
         let row = sqlx::query(&count_sql)

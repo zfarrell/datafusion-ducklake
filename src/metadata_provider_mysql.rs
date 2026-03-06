@@ -3,12 +3,12 @@
 use std::sync::Arc;
 
 use crate::Result;
-use crate::dialect::MySqlDialect;
+use crate::dialect::{MySqlDialect, SqlDialect};
 use crate::metadata_provider::{
     ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileData, DuckLakeTableColumn,
     DuckLakeTableFile, FileColumnStats, FilePartitionValue, FileWithTable, InlinedDataRow,
     MetadataProvider, PartitionColumn, SchemaMetadata, SnapshotMetadata, TableMetadata,
-    TableWithSchema, ViewMetadata, block_on, quote_mysql_identifier,
+    TableWithSchema, ViewMetadata, block_on,
 };
 use crate::metadata_provider_impl::impl_metadata_provider;
 use sqlx::Row;
@@ -249,12 +249,12 @@ WHERE data.table_id = ?
 
             let col_list: Vec<String> = user_columns
                 .iter()
-                .map(|c| format!("CAST({} AS CHAR)", quote_mysql_identifier(c)))
+                .map(|c| format!("CAST({} AS CHAR)", MySqlDialect.quote_id(c)))
                 .collect();
             let select_sql = format!(
                 "SELECT {} FROM {} WHERE begin_snapshot <= ? AND (end_snapshot IS NULL OR ? < end_snapshot)",
                 col_list.join(", "),
-                quote_mysql_identifier(&inlined_table_name),
+                MySqlDialect.quote_id(&inlined_table_name),
             );
 
             let rows = sqlx::query(&select_sql)
@@ -317,7 +317,7 @@ WHERE data.table_id = ?
 
         let count_sql = format!(
             "SELECT COUNT(*) FROM {} WHERE begin_snapshot <= ? AND (end_snapshot IS NULL OR ? < end_snapshot)",
-            quote_mysql_identifier(&inlined_table_name),
+            MySqlDialect.quote_id(&inlined_table_name),
         );
 
         let row = sqlx::query(&count_sql)

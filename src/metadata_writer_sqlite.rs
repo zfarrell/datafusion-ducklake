@@ -5,15 +5,15 @@
 use std::sync::Arc;
 
 use crate::Result;
+use crate::dialect::{SqlDialect, SqliteDialect};
 use crate::error::DuckLakeError;
 use crate::metadata_provider::{InlinedDataRow, block_on};
 use crate::metadata_writer::{
     AlterTableOp, ColumnDef, MetadataWriter, WriteMode, WriteSetupResult,
 };
 use crate::metadata_writer_validation::{
-    ActiveColumnInfo, AlterTableAction, quote_identifier, validate_alter_table,
-    validate_ducklake_type_for_ddl, validate_no_duplicate_columns, validate_schema_evolution,
-    validate_table_has_columns,
+    ActiveColumnInfo, AlterTableAction, validate_alter_table, validate_ducklake_type_for_ddl,
+    validate_no_duplicate_columns, validate_schema_evolution, validate_table_has_columns,
 };
 use sqlx::Row;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
@@ -1181,7 +1181,7 @@ impl MetadataWriter for SqliteMetadataWriter {
 
             let count_sql = format!(
                 "SELECT COUNT(*) FROM {} WHERE end_snapshot IS NULL",
-                quote_identifier(&inlined_table_name)
+                SqliteDialect.quote_id(&inlined_table_name)
             );
             let row = sqlx::query(&count_sql).fetch_one(&self.pool).await?;
             Ok(row.try_get(0)?)
@@ -1233,7 +1233,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                     if old_exists.try_get::<i64, _>(0)? > 0 {
                         let expire_sql = format!(
                             "UPDATE {} SET end_snapshot = ? WHERE end_snapshot IS NULL",
-                            quote_identifier(&old_name)
+                            SqliteDialect.quote_id(&old_name)
                         );
                         sqlx::query(&expire_sql)
                             .bind(snapshot_id)
@@ -1270,13 +1270,17 @@ impl MetadataWriter for SqliteMetadataWriter {
                 // row_id, begin_snapshot, end_snapshot, then user columns
                 let mut create_sql = format!(
                     "CREATE TABLE {} (row_id INTEGER, begin_snapshot INTEGER, end_snapshot INTEGER",
-                    quote_identifier(&inlined_table_name)
+                    SqliteDialect.quote_id(&inlined_table_name)
                 );
                 for col in columns {
                     // R6-S-029: Validate type string before DDL interpolation
                     let dl_type = col.ducklake_type();
                     validate_ducklake_type_for_ddl(dl_type)?;
-                    create_sql.push_str(&format!(", {} {}", quote_identifier(col.name()), dl_type));
+                    create_sql.push_str(&format!(
+                        ", {} {}",
+                        SqliteDialect.quote_id(col.name()),
+                        dl_type
+                    ));
                 }
                 create_sql.push(')');
                 sqlx::query(&create_sql).execute(&mut *tx).await?;
@@ -1297,18 +1301,20 @@ impl MetadataWriter for SqliteMetadataWriter {
             // Get next row_id
             let next_row_id_sql = format!(
                 "SELECT COALESCE(MAX(row_id), -1) + 1 FROM {}",
-                quote_identifier(&inlined_table_name)
+                SqliteDialect.quote_id(&inlined_table_name)
             );
             let next_row_id_row = sqlx::query(&next_row_id_sql).fetch_one(&mut *tx).await?;
             let mut row_id: i64 = next_row_id_row.try_get(0)?;
 
             // Build column names for the INSERT (properly quoted to prevent injection)
-            let col_names: Vec<String> =
-                columns.iter().map(|c| quote_identifier(c.name())).collect();
+            let col_names: Vec<String> = columns
+                .iter()
+                .map(|c| SqliteDialect.quote_id(c.name()))
+                .collect();
             let placeholders: Vec<&str> = (0..columns.len()).map(|_| "?").collect();
             let insert_sql = format!(
                 "INSERT INTO {} (row_id, begin_snapshot, {}) VALUES (?, ?, {})",
-                quote_identifier(&inlined_table_name),
+                SqliteDialect.quote_id(&inlined_table_name),
                 col_names.join(", "),
                 placeholders.join(", ")
             );
@@ -1367,7 +1373,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             // Get column names
             let pragma_query = format!(
                 "PRAGMA table_info({})",
-                quote_identifier(&inlined_table_name)
+                SqliteDialect.quote_id(&inlined_table_name)
             );
             let columns = sqlx::query(&pragma_query).fetch_all(&self.pool).await?;
 
@@ -1390,12 +1396,12 @@ impl MetadataWriter for SqliteMetadataWriter {
             // Query active rows (properly quoted to prevent injection)
             let col_list: Vec<String> = user_columns
                 .iter()
-                .map(|c| format!("CAST({} AS TEXT)", quote_identifier(c)))
+                .map(|c| format!("CAST({} AS TEXT)", SqliteDialect.quote_id(c)))
                 .collect();
             let select_sql = format!(
                 "SELECT {} FROM {} WHERE end_snapshot IS NULL",
                 col_list.join(", "),
-                quote_identifier(&inlined_table_name),
+                SqliteDialect.quote_id(&inlined_table_name),
             );
 
             let rows = sqlx::query(&select_sql).fetch_all(&self.pool).await?;
@@ -1437,7 +1443,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             // Set end_snapshot on all active rows
             let update_sql = format!(
                 "UPDATE {} SET end_snapshot = ? WHERE end_snapshot IS NULL",
-                quote_identifier(&inlined_table_name)
+                SqliteDialect.quote_id(&inlined_table_name)
             );
             sqlx::query(&update_sql)
                 .bind(snapshot_id)
@@ -2575,7 +2581,7 @@ mod tests {
 
         // Verify new table has the email column
         let cols = block_on(async {
-            let sql = format!("PRAGMA table_info({})", quote_identifier(&new_tbl));
+            let sql = format!("PRAGMA table_info({})", SqliteDialect.quote_id(&new_tbl));
             sqlx::query(&sql).fetch_all(&writer.pool).await.unwrap()
         });
         let col_names_in_table: Vec<String> = cols

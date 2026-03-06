@@ -59,9 +59,6 @@ pub(crate) enum AlterTableAction {
     },
 }
 
-// Re-export from metadata_provider to avoid duplication (R5-S-044)
-pub(crate) use crate::metadata_provider::quote_identifier;
-
 /// Validate that column names are unique within the provided column list.
 ///
 /// Returns an error if any two columns share the same name (case-sensitive).
@@ -1139,31 +1136,42 @@ mod tests {
         assert!(validate_alter_table(&columns, &op).is_err());
     }
 
-    // --- quote_identifier tests ---
+    // --- SqlDialect::quote_id tests ---
 
     #[test]
-    fn test_quote_identifier_simple() {
-        assert_eq!(quote_identifier("name"), "\"name\"");
+    fn test_quote_id_simple() {
+        use crate::dialect::{SqlDialect, SqliteDialect};
+        assert_eq!(SqliteDialect.quote_id("name"), "\"name\"");
     }
 
     #[test]
-    fn test_quote_identifier_with_double_quote() {
-        assert_eq!(quote_identifier(r#"my"col"#), r#""my""col""#);
+    fn test_quote_id_with_double_quote() {
+        use crate::dialect::{SqlDialect, SqliteDialect};
+        assert_eq!(SqliteDialect.quote_id(r#"my"col"#), r#""my""col""#);
     }
 
     #[test]
-    fn test_quote_identifier_with_semicolon() {
+    fn test_quote_id_with_semicolon() {
+        use crate::dialect::{SqlDialect, SqliteDialect};
         assert_eq!(
-            quote_identifier("col; DROP TABLE users"),
+            SqliteDialect.quote_id("col; DROP TABLE users"),
             "\"col; DROP TABLE users\""
         );
     }
 
     #[test]
-    fn test_quote_identifier_injection_attempt() {
+    fn test_quote_id_injection_attempt() {
+        use crate::dialect::{SqlDialect, SqliteDialect};
         let malicious = r#"x" TEXT); DROP TABLE foo; --"#;
-        let quoted = quote_identifier(malicious);
+        let quoted = SqliteDialect.quote_id(malicious);
         assert_eq!(quoted, r#""x"" TEXT); DROP TABLE foo; --""#);
+    }
+
+    #[test]
+    fn test_mysql_quote_id() {
+        use crate::dialect::{MySqlDialect, SqlDialect};
+        assert_eq!(MySqlDialect.quote_id("name"), "`name`");
+        assert_eq!(MySqlDialect.quote_id("my`col"), "`my``col`");
     }
 
     #[test]
