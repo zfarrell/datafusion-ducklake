@@ -695,7 +695,11 @@ const HYBRID_INCOMPATIBLE_PATTERNS: &[(&str, Option<&str>, &str)] = &[
         None,
         "hybrid adapter always has writable DuckDB",
     ),
-    ("DOES NOT EXIST!", None, "DETACH is skipped in hybrid mode"),
+    (
+        "DOES NOT EXIST!",
+        Some("DETACH"),
+        "DETACH is skipped in hybrid mode",
+    ),
     (
         "MISSING EXTENSION ERROR",
         None,
