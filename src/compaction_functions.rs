@@ -17,7 +17,8 @@
 
 #![cfg(feature = "metadata-duckdb")]
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use arrow::array::{ArrayRef, BooleanArray, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -33,9 +34,9 @@ use datafusion::logical_expr::Expr;
 const DEFAULT_OLDER_THAN: &str = "2099-01-01";
 
 /// Global flag to track whether `INSTALL ducklake` has succeeded (R6-S-026, R7-S-001).
-/// Uses `Mutex<bool>` instead of `OnceLock<()>` so that a failed INSTALL can be retried
-/// on the next call rather than permanently caching the failure.
-static DUCKLAKE_INSTALLED: Mutex<bool> = Mutex::new(false);
+/// Uses `AtomicBool` for lock-free reads on the fast path. Retries on failure
+/// (unlike `Once` which would permanently cache the failure).
+static DUCKLAKE_INSTALLED: AtomicBool = AtomicBool::new(false);
 
 // ==================== Schemas ====================
 
@@ -80,14 +81,11 @@ fn open_compaction_connection(catalog_path: &str) -> DataFusionResult<duckdb::Co
         .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
     // Only INSTALL once per process — the extension is cached on disk (R6-S-026).
     // INSTALL is idempotent but has overhead; LOAD is still needed per-connection.
-    // Uses Mutex<bool> so failures can be retried on subsequent calls (R7-S-001).
-    {
-        let mut installed = DUCKLAKE_INSTALLED.lock().unwrap_or_else(|e| e.into_inner());
-        if !*installed {
-            conn.execute("INSTALL ducklake;", [])
-                .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
-            *installed = true;
-        }
+    // Uses AtomicBool so failures can be retried on subsequent calls (R7-S-001).
+    if !DUCKLAKE_INSTALLED.load(Ordering::Acquire) {
+        conn.execute("INSTALL ducklake;", [])
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        DUCKLAKE_INSTALLED.store(true, Ordering::Release);
     }
     conn.execute("LOAD ducklake;", [])
         .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
