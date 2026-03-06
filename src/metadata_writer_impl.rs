@@ -1077,7 +1077,7 @@ pub(crate) use impl_writer_file_ops;
 /// - `$struct_name`: The metadata writer struct type
 /// - `pool_type`: The sqlx pool type (SqlitePool, PgPool, MySqlPool)
 /// - `dialect`: SqlDialect implementation expression
-/// - `block_on`: blocking executor (block_on_with_retry or block_on_once)
+/// - `block_on`: blocking executor (block_on_with_retry or block_on_no_retry)
 /// - `last_insert_id`: async closure to get last inserted ID (MySQL)
 /// - `column_order_type`: Rust type for column_order column (i64 for SQLite/MySQL, i32 for PG)
 macro_rules! impl_writer_ddl_ops {

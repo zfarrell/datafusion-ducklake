@@ -785,29 +785,16 @@ where
 }
 
 #[cfg(any(feature = "write-postgres", feature = "write-mysql"))]
-/// Adapter that wraps [`block_on`] with a closure interface matching
-/// [`block_on_with_retry`] so that writer macros can use a uniform
-/// `$block_on(|| async { ... })` call pattern across all backends.
-pub(crate) fn block_on_once<F, Fut, T>(mut f: F) -> crate::Result<T>
+/// Single-attempt blocking executor (no retry on transient errors).
+///
+/// Matches the closure interface of [`block_on_with_retry`] so that writer
+/// macros can use a uniform `$block_on(|| async { ... })` call pattern.
+/// Unlike SQLite's `block_on_with_retry`, this does not retry on failure —
+/// PostgreSQL and MySQL handle contention at the database level.
+pub(crate) fn block_on_no_retry<F, Fut, T>(mut f: F) -> crate::Result<T>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = crate::Result<T>>,
 {
     block_on(f())
-}
-
-/// Escape a SQL identifier for safe use in double-quoted contexts (SQL standard).
-///
-/// Doubles any internal double-quotes, then wraps in double quotes.
-/// Works for DuckDB, SQLite, and PostgreSQL.
-pub(crate) fn quote_identifier(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
-}
-
-/// Escape a SQL identifier for safe use in backtick-quoted contexts (MySQL).
-///
-/// Doubles any internal backticks, then wraps in backticks.
-#[cfg(feature = "metadata-mysql")]
-pub(crate) fn quote_mysql_identifier(name: &str) -> String {
-    format!("`{}`", name.replace('`', "``"))
 }

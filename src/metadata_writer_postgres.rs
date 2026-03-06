@@ -761,7 +761,7 @@ impl MetadataWriter for PostgresMetadataWriter {
         PostgresMetadataWriter,
         pool_type = PgPool,
         dialect = crate::dialect::PostgresDialect,
-        block_on = crate::metadata_provider::block_on_once,
+        block_on = crate::metadata_provider::block_on_no_retry,
         last_insert_id = |_tx: &mut sqlx::Transaction<'_, sqlx::Postgres>| async {
             Ok::<i64, crate::error::DuckLakeError>(0)
         }
@@ -771,14 +771,14 @@ impl MetadataWriter for PostgresMetadataWriter {
         PostgresMetadataWriter,
         pool_type = PgPool,
         dialect = crate::dialect::PostgresDialect,
-        block_on = crate::metadata_provider::block_on_once
+        block_on = crate::metadata_provider::block_on_no_retry
     );
 
     crate::metadata_writer_impl::impl_writer_ddl_ops!(
         PostgresMetadataWriter,
         pool_type = PgPool,
         dialect = crate::dialect::PostgresDialect,
-        block_on = crate::metadata_provider::block_on_once,
+        block_on = crate::metadata_provider::block_on_no_retry,
         last_insert_id = |_tx: &mut sqlx::Transaction<'_, sqlx::Postgres>| async {
             Ok::<i64, crate::error::DuckLakeError>(0)
         },
@@ -913,7 +913,7 @@ impl MetadataWriter for PostgresMetadataWriter {
         PostgresMetadataWriter,
         pool_type = PgPool,
         dialect = crate::dialect::PostgresDialect,
-        block_on = crate::metadata_provider::block_on_once
+        block_on = crate::metadata_provider::block_on_no_retry
     );
 
     fn begin_checked_write_transaction(

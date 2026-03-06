@@ -1,15 +1,18 @@
 /// SQL dialect differences between SQLite, PostgreSQL, and MySQL.
 /// Each method returns a SQL fragment or performs a dialect-specific operation.
-#[allow(dead_code)]
 pub(crate) trait SqlDialect: Send + Sync + 'static {
     /// Parameter placeholder. SQLite/MySQL: "?", Postgres: "$1", "$2", etc.
-    fn ph(&self, n: usize) -> String;
+    fn ph(&self, n: usize) -> std::borrow::Cow<'static, str>;
 
     /// Quote an identifier. SQLite/Postgres: "col", MySQL: `col`.
     fn quote_id(&self, name: &str) -> String;
 
     /// Quote a column name only if it's a reserved word in this dialect.
     /// MySQL must quote `key`, `sql`, `type`. Others return as-is.
+    ///
+    /// # Safety (SQL injection)
+    /// Interpolates the result directly into SQL. Only pass known catalog
+    /// column names or compile-time constants — never user input.
     fn col(&self, name: &str) -> String;
 
     /// SQL expression for current timestamp.
@@ -17,6 +20,7 @@ pub(crate) trait SqlDialect: Send + Sync + 'static {
 
     /// Generate a UUID. Returns (sql_expr_or_placeholder, Option<bind_value>).
     #[cfg(feature = "write")]
+    #[allow(dead_code)]
     fn uuid_value(&self) -> (String, Option<String>);
 
     /// Boolean literal in SQL text. SQLite: "1"/"0", PG/MySQL: "TRUE"/"FALSE".
@@ -32,6 +36,10 @@ pub(crate) trait SqlDialect: Send + Sync + 'static {
     fn clamp_zero(&self, expr: &str) -> String;
 
     /// Upsert clause. Returns the full ON CONFLICT / ON DUPLICATE KEY clause.
+    ///
+    /// # Safety (SQL injection)
+    /// `conflict_col` and `set_cols` are interpolated directly into SQL.
+    /// Only pass known catalog column names — never user input.
     fn upsert(&self, conflict_col: &str, set_cols: &[&str]) -> String;
 
     /// Whether this dialect supports RETURNING on INSERT. SQLite/PG: true, MySQL: false.
@@ -41,6 +49,11 @@ pub(crate) trait SqlDialect: Send + Sync + 'static {
     fn for_update(&self) -> &'static str;
 
     /// INSERT-or-ignore syntax.
+    ///
+    /// # Safety (SQL injection)
+    /// `table`, `columns`, and `values` are interpolated directly into SQL.
+    /// Only pass known catalog table/column names and placeholders — never user input.
+    #[allow(dead_code)]
     fn insert_or_ignore(&self, table: &str, columns: &str, values: &str) -> String;
 
     /// Whether existence checks use COUNT(*) (true) or SELECT EXISTS (false).
@@ -71,12 +84,12 @@ pub(crate) trait SqlDialect: Send + Sync + 'static {
 
 // --- SQLite ---
 
-#[allow(dead_code)]
+#[cfg_attr(not(feature = "write"), allow(dead_code))]
 pub(crate) struct SqliteDialect;
 
 impl SqlDialect for SqliteDialect {
-    fn ph(&self, _n: usize) -> String {
-        "?".to_string()
+    fn ph(&self, _n: usize) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("?")
     }
 
     fn quote_id(&self, name: &str) -> String {
@@ -117,6 +130,7 @@ impl SqlDialect for SqliteDialect {
     }
 
     fn upsert(&self, conflict_col: &str, set_cols: &[&str]) -> String {
+        debug_assert!(!set_cols.is_empty(), "upsert requires at least one column");
         let sets: Vec<String> = set_cols
             .iter()
             .map(|c| format!("{c} = excluded.{c}"))
@@ -181,19 +195,19 @@ impl SqlDialect for SqliteDialect {
                     .to_string(),
                 false,
             ),
-            _ => panic!("unknown entity for next_id_sql: {entity}"),
+            _ => unreachable!("next_id_sql called with unknown entity: {entity}"),
         }
     }
 }
 
 // --- PostgreSQL ---
 
-#[allow(dead_code)]
+#[cfg_attr(not(feature = "write"), allow(dead_code))]
 pub(crate) struct PostgresDialect;
 
 impl SqlDialect for PostgresDialect {
-    fn ph(&self, n: usize) -> String {
-        format!("${n}")
+    fn ph(&self, n: usize) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Owned(format!("${n}"))
     }
 
     fn quote_id(&self, name: &str) -> String {
@@ -234,6 +248,7 @@ impl SqlDialect for PostgresDialect {
     }
 
     fn upsert(&self, conflict_col: &str, set_cols: &[&str]) -> String {
+        debug_assert!(!set_cols.is_empty(), "upsert requires at least one column");
         let sets: Vec<String> = set_cols
             .iter()
             .map(|c| format!("{c} = EXCLUDED.{c}"))
@@ -282,7 +297,7 @@ impl SqlDialect for PostgresDialect {
             "view_id" => "ducklake_view_id_seq",
             "column_id" => "ducklake_column_id_seq",
             "partition_id" => "ducklake_partition_id_seq",
-            _ => panic!("unknown entity for next_id_sql: {entity}"),
+            _ => unreachable!("next_id_sql called with unknown entity: {entity}"),
         };
         (format!("SELECT nextval('{seq}')"), false)
     }
@@ -290,12 +305,12 @@ impl SqlDialect for PostgresDialect {
 
 // --- MySQL ---
 
-#[allow(dead_code)]
+#[cfg_attr(not(feature = "write"), allow(dead_code))]
 pub(crate) struct MySqlDialect;
 
 impl SqlDialect for MySqlDialect {
-    fn ph(&self, _n: usize) -> String {
-        "?".to_string()
+    fn ph(&self, _n: usize) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("?")
     }
 
     fn quote_id(&self, name: &str) -> String {
@@ -339,6 +354,7 @@ impl SqlDialect for MySqlDialect {
     }
 
     fn upsert(&self, _conflict_col: &str, set_cols: &[&str]) -> String {
+        debug_assert!(!set_cols.is_empty(), "upsert requires at least one column");
         let sets: Vec<String> = set_cols
             .iter()
             .map(|c| format!("{c} = VALUES({c})"))
@@ -378,10 +394,7 @@ impl SqlDialect for MySqlDialect {
     }
 
     #[cfg(feature = "write")]
-    fn next_id_sql(&self, entity: &str) -> (String, bool) {
-        // MySQL uses next_sequence_id() function instead of SQL-only approach,
-        // but we implement this for trait completeness. The macro uses $next_id callback.
-        let _ = entity;
-        ("SELECT 0".to_string(), false)
+    fn next_id_sql(&self, _entity: &str) -> (String, bool) {
+        unreachable!("MySQL uses next_sequence_id() instead of next_id_sql()")
     }
 }

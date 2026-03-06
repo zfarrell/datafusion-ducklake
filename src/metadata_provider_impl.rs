@@ -878,7 +878,7 @@ macro_rules! impl_metadata_provider {
                         .bind(snapshot_id)
                         .fetch_all(&self.pool)
                         .await?
-                        .iter()
+                        .into_iter()
                         .map(|row| {
                             Ok(ViewMetadata {
                                 view_id: row.try_get(0)?,

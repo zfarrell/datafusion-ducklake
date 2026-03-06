@@ -847,7 +847,7 @@ impl MetadataWriter for MySqlMetadataWriter {
         MySqlMetadataWriter,
         pool_type = MySqlPool,
         dialect = crate::dialect::MySqlDialect,
-        block_on = crate::metadata_provider::block_on_once,
+        block_on = crate::metadata_provider::block_on_no_retry,
         last_insert_id = last_insert_id
     );
 
@@ -855,14 +855,14 @@ impl MetadataWriter for MySqlMetadataWriter {
         MySqlMetadataWriter,
         pool_type = MySqlPool,
         dialect = crate::dialect::MySqlDialect,
-        block_on = crate::metadata_provider::block_on_once
+        block_on = crate::metadata_provider::block_on_no_retry
     );
 
     crate::metadata_writer_impl::impl_writer_ddl_ops!(
         MySqlMetadataWriter,
         pool_type = MySqlPool,
         dialect = crate::dialect::MySqlDialect,
-        block_on = crate::metadata_provider::block_on_once,
+        block_on = crate::metadata_provider::block_on_no_retry,
         last_insert_id = last_insert_id,
         column_order_type = i64
     );
@@ -1003,7 +1003,7 @@ impl MetadataWriter for MySqlMetadataWriter {
         MySqlMetadataWriter,
         pool_type = MySqlPool,
         dialect = crate::dialect::MySqlDialect,
-        block_on = crate::metadata_provider::block_on_once
+        block_on = crate::metadata_provider::block_on_no_retry
     );
 
     fn begin_checked_write_transaction(
