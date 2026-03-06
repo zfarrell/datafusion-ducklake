@@ -41,11 +41,7 @@ impl MySqlMetadataProvider {
     }
 }
 
-impl_metadata_provider!(
-    MySqlMetadataProvider,
-    pool_type = MySqlPool,
-    dialect = MySqlDialect
-);
+impl_metadata_provider!(MySqlMetadataProvider, dialect = MySqlDialect);
 
 // Override methods that differ structurally from other backends
 impl MySqlMetadataProvider {

@@ -41,11 +41,7 @@ impl PostgresMetadataProvider {
     }
 }
 
-impl_metadata_provider!(
-    PostgresMetadataProvider,
-    pool_type = PgPool,
-    dialect = PostgresDialect
-);
+impl_metadata_provider!(PostgresMetadataProvider, dialect = PostgresDialect);
 
 // Override methods that differ structurally from other backends
 impl PostgresMetadataProvider {

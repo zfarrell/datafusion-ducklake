@@ -43,11 +43,7 @@ impl SqliteMetadataProvider {
     }
 }
 
-impl_metadata_provider!(
-    SqliteMetadataProvider,
-    pool_type = SqlitePool,
-    dialect = SqliteDialect
-);
+impl_metadata_provider!(SqliteMetadataProvider, dialect = SqliteDialect);
 
 // Override methods that differ structurally from other backends
 impl SqliteMetadataProvider {

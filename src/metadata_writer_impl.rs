@@ -138,7 +138,6 @@ pub(crate) use impl_recompute_table_column_stats;
 macro_rules! impl_writer_query_ops {
     (
         $struct_name:ty,
-        pool_type = $pool_type:ty,
         dialect = $dialect:expr,
         block_on = $block_on:path
     ) => {
@@ -367,7 +366,6 @@ pub(crate) use impl_writer_query_ops;
 macro_rules! impl_writer_file_ops {
     (
         $struct_name:ty,
-        pool_type = $pool_type:ty,
         dialect = $dialect:expr,
         block_on = $block_on:path,
         last_insert_id = $last_id:expr
@@ -1075,7 +1073,6 @@ pub(crate) use impl_writer_file_ops;
 ///
 /// Parameters:
 /// - `$struct_name`: The metadata writer struct type
-/// - `pool_type`: The sqlx pool type (SqlitePool, PgPool, MySqlPool)
 /// - `dialect`: SqlDialect implementation expression
 /// - `block_on`: blocking executor (block_on_with_retry or block_on_no_retry)
 /// - `last_insert_id`: async closure to get last inserted ID (MySQL)
@@ -1083,7 +1080,6 @@ pub(crate) use impl_writer_file_ops;
 macro_rules! impl_writer_ddl_ops {
     (
         $struct_name:ty,
-        pool_type = $pool_type:ty,
         dialect = $dialect:expr,
         block_on = $block_on:path,
         last_insert_id = $last_id:expr,
@@ -2169,7 +2165,6 @@ pub(crate) use impl_writer_drop_inner;
 macro_rules! impl_writer_drop_ops {
     (
         $struct_name:ty,
-        pool_type = $pool_type:ty,
         dialect = $dialect:expr,
         block_on = $block_on:path
     ) => {

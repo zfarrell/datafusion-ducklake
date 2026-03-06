@@ -7,7 +7,6 @@
 macro_rules! impl_metadata_provider {
     (
         $struct_name:ty,
-        pool_type = $pool_type:ty,
         dialect = $dialect:expr
     ) => {
         impl MetadataProvider for $struct_name {
