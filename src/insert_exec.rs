@@ -433,11 +433,11 @@ fn extract_temporal_component(
                 arrow::datatypes::TimeUnit::Second => array
                     .as_any()
                     .downcast_ref::<TimestampSecondArray>()
-                    .map(|a| a.value(row) * 1_000_000),
+                    .and_then(|a| a.value(row).checked_mul(1_000_000)),
                 arrow::datatypes::TimeUnit::Millisecond => array
                     .as_any()
                     .downcast_ref::<TimestampMillisecondArray>()
-                    .map(|a| a.value(row) * 1_000),
+                    .and_then(|a| a.value(row).checked_mul(1_000)),
                 arrow::datatypes::TimeUnit::Microsecond => array
                     .as_any()
                     .downcast_ref::<TimestampMicrosecondArray>()

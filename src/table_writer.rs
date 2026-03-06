@@ -1155,7 +1155,12 @@ fn arrow_array_value_to_string(
                                     "Failed to downcast TimestampSecond array".to_string(),
                                 )
                             })?;
-                        a.value(idx) * 1_000_000
+                        a.value(idx).checked_mul(1_000_000).ok_or_else(|| {
+                            crate::error::DuckLakeError::Internal(format!(
+                                "Timestamp second-to-microsecond overflow: {}",
+                                a.value(idx)
+                            ))
+                        })?
                     },
                     TimeUnit::Millisecond => {
                         let a = array
@@ -1166,7 +1171,12 @@ fn arrow_array_value_to_string(
                                     "Failed to downcast TimestampMillisecond array".to_string(),
                                 )
                             })?;
-                        a.value(idx) * 1_000
+                        a.value(idx).checked_mul(1_000).ok_or_else(|| {
+                            crate::error::DuckLakeError::Internal(format!(
+                                "Timestamp millisecond-to-microsecond overflow: {}",
+                                a.value(idx)
+                            ))
+                        })?
                     },
                     TimeUnit::Microsecond => {
                         let a = array
