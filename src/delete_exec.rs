@@ -13,7 +13,7 @@
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use arrow::array::{Array, ArrayRef, RecordBatch, UInt64Array};
 use arrow::compute;
@@ -34,12 +34,16 @@ use crate::metadata_writer::{DeleteFileInfo, MetadataWriter};
 
 /// Schema for the output of DML operations (count of rows affected).
 /// Shared by DELETE, UPDATE, INSERT, and MERGE exec plans.
-pub(crate) fn make_dml_count_schema() -> SchemaRef {
+static DML_COUNT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(Schema::new(vec![Field::new(
         "count",
         DataType::UInt64,
         false,
     )]))
+});
+
+pub(crate) fn make_dml_count_schema() -> SchemaRef {
+    Arc::clone(&DML_COUNT_SCHEMA)
 }
 
 /// Execution plan that deletes rows from a DuckLake table by writing delete files.
