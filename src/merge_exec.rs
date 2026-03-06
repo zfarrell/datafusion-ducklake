@@ -419,7 +419,7 @@ impl ExecutionPlan for DuckLakeMergeExec {
             let mut matched_source_rows: Vec<RecordBatch> = Vec::new();
 
             // Process each target data file
-            for table_file in &table_files {
+            for table_file in &*table_files {
                 let data_file_id = table_file.data_file_id.ok_or_else(|| {
                     DataFusionError::Internal(
                         "data_file_id is required for MERGE operations".to_string(),
@@ -526,7 +526,12 @@ impl ExecutionPlan for DuckLakeMergeExec {
                 let new_match_count = u64::try_from(positions_to_delete.len()).map_err(|e| {
                     DataFusionError::Execution(format!("Delete count overflow: {}", e))
                 })?;
-                total_affected += new_match_count;
+                total_affected = total_affected.checked_add(new_match_count).ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "Total affected row count overflow: {} + {} exceeds u64::MAX",
+                        total_affected, new_match_count
+                    ))
+                })?;
 
                 // For UPDATE: collect the matched source rows (these replace the deleted target rows)
                 if matches!(&matched_action, Some(MergeMatchedAction::Update)) {
@@ -581,9 +586,16 @@ impl ExecutionPlan for DuckLakeMergeExec {
                     if unmatched_mask.true_count() > 0 {
                         let filtered = compute::filter_record_batch(src_batch, &unmatched_mask)
                             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-                        total_affected += u64::try_from(filtered.num_rows()).map_err(|e| {
+                        let unmatched_count = u64::try_from(filtered.num_rows()).map_err(|e| {
                             DataFusionError::Execution(format!("Row count overflow: {}", e))
                         })?;
+                        total_affected =
+                            total_affected.checked_add(unmatched_count).ok_or_else(|| {
+                                DataFusionError::Execution(format!(
+                                    "Total affected row count overflow: {} + {} exceeds u64::MAX",
+                                    total_affected, unmatched_count
+                                ))
+                            })?;
                         new_data_batches.push(filtered);
                     }
                     source_global_idx += src_batch.num_rows();
@@ -610,6 +622,7 @@ impl ExecutionPlan for DuckLakeMergeExec {
 
                 let props = WriterProperties::builder()
                     .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
+                    .set_compression(parquet::basic::Compression::SNAPPY)
                     .build();
                 let mut arrow_writer =
                     ArrowWriter::try_new(Vec::new(), write_schema.clone(), Some(props))
@@ -619,8 +632,14 @@ impl ExecutionPlan for DuckLakeMergeExec {
                 for batch in &new_data_batches {
                     let batch_with_ids =
                         RecordBatch::try_new(write_schema.clone(), batch.columns().to_vec())?;
-                    total_records += i64::try_from(batch_with_ids.num_rows()).map_err(|e| {
+                    let batch_rows = i64::try_from(batch_with_ids.num_rows()).map_err(|e| {
                         DataFusionError::Execution(format!("Row count overflow: {}", e))
+                    })?;
+                    total_records = total_records.checked_add(batch_rows).ok_or_else(|| {
+                        DataFusionError::Execution(format!(
+                            "Total record count overflow: {} + {} exceeds i64::MAX",
+                            total_records, batch_rows
+                        ))
                     })?;
                     arrow_writer
                         .write(&batch_with_ids)

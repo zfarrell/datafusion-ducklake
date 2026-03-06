@@ -208,7 +208,7 @@ impl ExecutionPlan for DuckLakeDeleteExec {
             let mut pending_delete_files: Vec<DeleteFileInfo> = Vec::new();
 
             // Process each data file
-            for table_file in &table_files {
+            for table_file in &*table_files {
                 let data_file_id = table_file.data_file_id.ok_or_else(|| {
                     DataFusionError::Internal(
                         "data_file_id is required for DELETE operations".to_string(),
@@ -309,7 +309,12 @@ impl ExecutionPlan for DuckLakeDeleteExec {
                 let new_delete_count = u64::try_from(positions_to_delete.len()).map_err(|e| {
                     DataFusionError::Execution(format!("Delete count overflow: {}", e))
                 })?;
-                total_deleted += new_delete_count;
+                total_deleted = total_deleted.checked_add(new_delete_count).ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "Total deleted row count overflow: {} + {} exceeds u64::MAX",
+                        total_deleted, new_delete_count
+                    ))
+                })?;
 
                 // Merge with existing deletes if any
                 if let Some(existing) = existing_positions {

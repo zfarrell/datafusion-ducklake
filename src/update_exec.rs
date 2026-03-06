@@ -243,7 +243,7 @@ impl ExecutionPlan for DuckLakeUpdateExec {
             let mut pending_delete_files: Vec<DeleteFileInfo> = Vec::new();
 
             // Process each data file
-            for table_file in &table_files {
+            for table_file in &*table_files {
                 let data_file_id = table_file.data_file_id.ok_or_else(|| {
                     DataFusionError::Internal(
                         "data_file_id is required for UPDATE operations".to_string(),
@@ -353,7 +353,12 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                 let new_update_count = u64::try_from(positions_to_delete.len()).map_err(|e| {
                     DataFusionError::Execution(format!("Update count overflow: {}", e))
                 })?;
-                total_updated += new_update_count;
+                total_updated = total_updated.checked_add(new_update_count).ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "Total updated row count overflow: {} + {} exceeds u64::MAX",
+                        total_updated, new_update_count
+                    ))
+                })?;
 
                 // Apply SET transformations to matching rows
                 for matched_batch in &matching_rows {
@@ -438,6 +443,7 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                 // Write all updated rows to a single Parquet file
                 let props = WriterProperties::builder()
                     .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
+                    .set_compression(parquet::basic::Compression::SNAPPY)
                     .build();
                 let mut arrow_writer =
                     ArrowWriter::try_new(Vec::new(), write_schema.clone(), Some(props))
@@ -447,8 +453,14 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                 for batch in &updated_batches {
                     let batch_with_ids =
                         RecordBatch::try_new(write_schema.clone(), batch.columns().to_vec())?;
-                    total_records += i64::try_from(batch_with_ids.num_rows()).map_err(|e| {
+                    let batch_rows = i64::try_from(batch_with_ids.num_rows()).map_err(|e| {
                         DataFusionError::Execution(format!("Row count overflow: {}", e))
+                    })?;
+                    total_records = total_records.checked_add(batch_rows).ok_or_else(|| {
+                        DataFusionError::Execution(format!(
+                            "Total record count overflow: {} + {} exceeds i64::MAX",
+                            total_records, batch_rows
+                        ))
                     })?;
                     arrow_writer
                         .write(&batch_with_ids)
