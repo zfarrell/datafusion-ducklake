@@ -1374,9 +1374,9 @@ impl TableProvider for DuckLakeTable {
                 continue;
             }
 
-            // Accumulate null counts
+            // Accumulate null counts (saturate to avoid overflow)
             if let Some(nc) = fs.null_count {
-                null_counts[col_idx] += nc;
+                null_counts[col_idx] = null_counts[col_idx].saturating_add(nc);
                 has_null_count[col_idx] = true;
             }
 
