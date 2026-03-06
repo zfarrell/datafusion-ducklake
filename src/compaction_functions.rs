@@ -81,11 +81,17 @@ fn open_compaction_connection(catalog_path: &str) -> DataFusionResult<duckdb::Co
         .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
     // Only INSTALL once per process — the extension is cached on disk (R6-S-026).
     // INSTALL is idempotent but has overhead; LOAD is still needed per-connection.
-    // Uses AtomicBool so failures can be retried on subsequent calls (R7-S-001).
-    if !DUCKLAKE_INSTALLED.load(Ordering::Acquire) {
-        conn.execute("INSTALL ducklake;", [])
-            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
-        DUCKLAKE_INSTALLED.store(true, Ordering::Release);
+    // Uses compare_exchange to prevent double-install races (R11-S-027).
+    // AtomicBool allows retry on failure (R7-S-001).
+    if DUCKLAKE_INSTALLED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        if let Err(e) = conn.execute("INSTALL ducklake;", []) {
+            // Reset so next call can retry
+            DUCKLAKE_INSTALLED.store(false, Ordering::Release);
+            return Err(datafusion::error::DataFusionError::External(Box::new(e)));
+        }
     }
     conn.execute("LOAD ducklake;", [])
         .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
