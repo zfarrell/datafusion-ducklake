@@ -788,6 +788,7 @@ macro_rules! impl_metadata_provider {
                      JOIN ducklake_partition_column pc
                          ON pi.partition_id = pc.partition_id AND pi.table_id = pc.table_id
                      JOIN ducklake_column c ON pc.column_id = c.column_id
+                       AND c.table_id = pi.table_id AND c.end_snapshot IS NULL
                      WHERE pi.table_id = {}
                        AND {} >= pi.begin_snapshot
                        AND ({} < pi.end_snapshot OR pi.end_snapshot IS NULL)
