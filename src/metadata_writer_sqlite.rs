@@ -1329,13 +1329,19 @@ impl MetadataWriter for SqliteMetadataWriter {
             for inlined_row in rows {
                 let mut query = sqlx::query(&insert_sql).bind(row_id).bind(snapshot_id);
 
-                // Bind each column value
+                // Precompute column name -> index map to avoid O(cols) scan per column
+                let col_map: std::collections::HashMap<&str, usize> = inlined_row
+                    .column_names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| (name.as_str(), i))
+                    .collect();
+
+                // Bind each column value using precomputed map
                 for col in columns {
-                    let value = inlined_row
-                        .column_names
-                        .iter()
-                        .position(|n| n == col.name())
-                        .and_then(|pos| inlined_row.values.get(pos))
+                    let value = col_map
+                        .get(col.name().as_str())
+                        .and_then(|&pos| inlined_row.values.get(pos))
                         .and_then(|v| v.clone());
                     query = query.bind(value);
                 }
