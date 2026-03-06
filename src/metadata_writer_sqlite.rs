@@ -2480,6 +2480,495 @@ mod tests {
 
     // R7-S-009: validate_ducklake_type_for_ddl test moved to metadata_writer_validation
 
+    // --- R9-S-001: Direct unit test for register_dml_files ---
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_register_dml_files_with_insert_and_delete() {
+        let (writer, _temp) = create_test_writer().await;
+        let snapshot_id = writer.create_snapshot().unwrap();
+        let (schema_id, _) = writer
+            .get_or_create_schema("main", None, snapshot_id)
+            .unwrap();
+        let (table_id, _) = writer
+            .get_or_create_table(schema_id, "t", None, snapshot_id)
+            .unwrap();
+        let cols = vec![
+            ColumnDef::new("id", "int64", false).unwrap(),
+            ColumnDef::new("val", "varchar", true).unwrap(),
+        ];
+        let col_ids = writer.set_columns(table_id, &cols, snapshot_id).unwrap();
+
+        // Register an initial data file so we have a data_file_id to reference
+        let initial_file = DataFileInfo::new("initial.parquet", 2000, 200);
+        let data_file_id = writer
+            .register_data_file(table_id, snapshot_id, &initial_file)
+            .unwrap();
+        assert_eq!(data_file_id, 1);
+
+        // Now register DML files: a delete file (referencing the initial data file)
+        // and a new insert data file with column stats
+        let snap2 = writer.create_snapshot().unwrap();
+
+        let delete_file = DeleteFileInfo {
+            data_file_id,
+            path: "delete1.parquet".to_string(),
+            path_is_relative: true,
+            file_size_bytes: 500,
+            footer_size: Some(50),
+            delete_count: 10,
+        };
+
+        let insert_file = DataFileInfo::new("insert1.parquet", 1500, 150).with_column_stats(vec![
+            ColumnStatInfo {
+                column_id: col_ids[0],
+                null_count: Some(0),
+                min_value: Some("100".into()),
+                max_value: Some("200".into()),
+            },
+            ColumnStatInfo {
+                column_id: col_ids[1],
+                null_count: Some(5),
+                min_value: Some("aaa".into()),
+                max_value: Some("zzz".into()),
+            },
+        ]);
+
+        writer
+            .register_dml_files(table_id, snap2, &[delete_file], &[insert_file])
+            .unwrap();
+
+        // Verify delete file was created with correct data_file_id linkage
+        let del_rows = block_on(async {
+            sqlx::query(
+                "SELECT data_file_id, delete_count, path FROM ducklake_delete_file
+                 WHERE table_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(table_id)
+            .fetch_all(&writer.pool)
+            .await
+            .unwrap()
+        });
+        assert_eq!(del_rows.len(), 1);
+        let linked_data_id: i64 = del_rows[0].try_get(0).unwrap();
+        let del_count: i64 = del_rows[0].try_get(1).unwrap();
+        let del_path: String = del_rows[0].try_get(2).unwrap();
+        assert_eq!(linked_data_id, data_file_id);
+        assert_eq!(del_count, 10);
+        assert_eq!(del_path, "delete1.parquet");
+
+        // Verify new data file was inserted
+        let data_rows = block_on(async {
+            sqlx::query(
+                "SELECT data_file_id, path, record_count FROM ducklake_data_file
+                 WHERE table_id = ? AND end_snapshot IS NULL AND path = 'insert1.parquet'",
+            )
+            .bind(table_id)
+            .fetch_all(&writer.pool)
+            .await
+            .unwrap()
+        });
+        assert_eq!(data_rows.len(), 1);
+        let new_file_id: i64 = data_rows[0].try_get(0).unwrap();
+        assert!(new_file_id > data_file_id);
+
+        // Verify per-file column stats were recorded for the new data file
+        let stats_rows = block_on(async {
+            sqlx::query(
+                "SELECT column_id, null_count, min_value, max_value
+                 FROM ducklake_file_column_stats
+                 WHERE data_file_id = ? AND table_id = ?
+                 ORDER BY column_id",
+            )
+            .bind(new_file_id)
+            .bind(table_id)
+            .fetch_all(&writer.pool)
+            .await
+            .unwrap()
+        });
+        assert_eq!(stats_rows.len(), 2);
+        let stat_col1: i64 = stats_rows[0].try_get(0).unwrap();
+        let stat_null1: Option<i64> = stats_rows[0].try_get(1).unwrap();
+        let stat_min1: Option<String> = stats_rows[0].try_get(2).unwrap();
+        let stat_max1: Option<String> = stats_rows[0].try_get(3).unwrap();
+        assert_eq!(stat_col1, col_ids[0]);
+        assert_eq!(stat_null1, Some(0));
+        assert_eq!(stat_min1.as_deref(), Some("100"));
+        assert_eq!(stat_max1.as_deref(), Some("200"));
+
+        // Verify table-level column stats were recomputed
+        let table_stats = block_on(async {
+            sqlx::query(
+                "SELECT column_id, contains_null, min_value, max_value
+                 FROM ducklake_table_column_stats WHERE table_id = ?
+                 ORDER BY column_id",
+            )
+            .bind(table_id)
+            .fetch_all(&writer.pool)
+            .await
+            .unwrap()
+        });
+        assert!(!table_stats.is_empty());
+    }
+
+    // --- R9-S-007: Tests for macro-generated methods ---
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_record_snapshot_changes() {
+        let (writer, _temp) = create_test_writer().await;
+        let snap = writer.create_snapshot().unwrap();
+
+        writer.record_snapshot_changes(snap, "test_change").unwrap();
+
+        // Verify
+        let rows = block_on(async {
+            sqlx::query("SELECT changes_made FROM ducklake_snapshot_changes WHERE snapshot_id = ?")
+                .bind(snap)
+                .fetch_all(&writer.pool)
+                .await
+                .unwrap()
+        });
+        assert_eq!(rows.len(), 1);
+        let changes: String = rows[0].try_get(0).unwrap();
+        assert_eq!(changes, "test_change");
+
+        // Upsert should overwrite
+        writer
+            .record_snapshot_changes(snap, "updated_change")
+            .unwrap();
+
+        let rows2 = block_on(async {
+            sqlx::query("SELECT changes_made FROM ducklake_snapshot_changes WHERE snapshot_id = ?")
+                .bind(snap)
+                .fetch_all(&writer.pool)
+                .await
+                .unwrap()
+        });
+        assert_eq!(rows2.len(), 1);
+        let changes2: String = rows2[0].try_get(0).unwrap();
+        assert_eq!(changes2, "updated_change");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_find_table_id() {
+        let (writer, _temp) = create_test_writer().await;
+        let snap = writer.create_snapshot().unwrap();
+        let (schema_id, _) = writer.get_or_create_schema("myschema", None, snap).unwrap();
+        let (table_id, _) = writer
+            .get_or_create_table(schema_id, "mytable", None, snap)
+            .unwrap();
+
+        // Found
+        let found = writer.find_table_id("myschema", "mytable").unwrap();
+        assert_eq!(found, Some(table_id));
+
+        // Not found - wrong table name
+        let not_found = writer.find_table_id("myschema", "nonexistent").unwrap();
+        assert_eq!(not_found, None);
+
+        // Not found - wrong schema name
+        let not_found2 = writer.find_table_id("other", "mytable").unwrap();
+        assert_eq!(not_found2, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_register_delete_file() {
+        let (writer, _temp) = create_test_writer().await;
+        let snap = writer.create_snapshot().unwrap();
+        let (schema_id, _) = writer.get_or_create_schema("main", None, snap).unwrap();
+        let (table_id, _) = writer
+            .get_or_create_table(schema_id, "t", None, snap)
+            .unwrap();
+
+        // Register a data file first
+        let data_file = DataFileInfo::new("data.parquet", 1000, 100);
+        let data_file_id = writer
+            .register_data_file(table_id, snap, &data_file)
+            .unwrap();
+
+        // Register delete file referencing the data file
+        let del_file = DeleteFileInfo {
+            data_file_id,
+            path: "del.parquet".to_string(),
+            path_is_relative: true,
+            file_size_bytes: 200,
+            footer_size: Some(20),
+            delete_count: 5,
+        };
+        let del_file_id = writer
+            .register_delete_file(table_id, snap, &del_file)
+            .unwrap();
+        assert!(del_file_id > 0);
+
+        // Verify
+        let rows = block_on(async {
+            sqlx::query(
+                "SELECT data_file_id, path, delete_count FROM ducklake_delete_file
+                 WHERE delete_file_id = ?",
+            )
+            .bind(del_file_id)
+            .fetch_all(&writer.pool)
+            .await
+            .unwrap()
+        });
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].try_get::<i64, _>(0).unwrap(), data_file_id);
+        assert_eq!(rows[0].try_get::<String, _>(1).unwrap(), "del.parquet");
+        assert_eq!(rows[0].try_get::<i64, _>(2).unwrap(), 5);
+
+        // Register a second delete file for the same data file - should end the first
+        let snap2 = writer.create_snapshot().unwrap();
+        let del_file2 = DeleteFileInfo {
+            data_file_id,
+            path: "del2.parquet".to_string(),
+            path_is_relative: true,
+            file_size_bytes: 300,
+            footer_size: Some(30),
+            delete_count: 8,
+        };
+        let del_file_id2 = writer
+            .register_delete_file(table_id, snap2, &del_file2)
+            .unwrap();
+        assert!(del_file_id2 > del_file_id);
+
+        // First delete file should now be ended
+        let ended = block_on(async {
+            sqlx::query("SELECT end_snapshot FROM ducklake_delete_file WHERE delete_file_id = ?")
+                .bind(del_file_id)
+                .fetch_one(&writer.pool)
+                .await
+                .unwrap()
+        });
+        let end_snap: Option<i64> = ended.try_get(0).unwrap();
+        assert!(end_snap.is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_create_and_drop_view() {
+        let (writer, _temp) = create_test_writer().await;
+        let snap = writer.create_snapshot().unwrap();
+        let (schema_id, _) = writer.get_or_create_schema("main", None, snap).unwrap();
+
+        // Create view
+        let (view_id, create_snap) = writer
+            .create_view(schema_id, "v1", "SELECT 42 AS answer")
+            .unwrap();
+        assert!(view_id > 0);
+        assert!(create_snap > snap);
+
+        // Verify view exists
+        let rows = block_on(async {
+            sqlx::query(
+                "SELECT view_name, sql FROM ducklake_view
+                 WHERE view_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(view_id)
+            .fetch_all(&writer.pool)
+            .await
+            .unwrap()
+        });
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].try_get::<String, _>(0).unwrap(), "v1");
+        assert_eq!(
+            rows[0].try_get::<String, _>(1).unwrap(),
+            "SELECT 42 AS answer"
+        );
+
+        // Drop view
+        let drop_snap = writer.drop_view(view_id).unwrap();
+        assert!(drop_snap > create_snap);
+
+        // Verify view is ended
+        let active = block_on(async {
+            sqlx::query(
+                "SELECT COUNT(*) FROM ducklake_view WHERE view_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(view_id)
+            .fetch_one(&writer.pool)
+            .await
+            .unwrap()
+        });
+        assert_eq!(active.try_get::<i64, _>(0).unwrap(), 0);
+
+        // Drop again should fail
+        let result = writer.drop_view(view_id);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_drop_table() {
+        let (writer, _temp) = create_test_writer().await;
+        let snap = writer.create_snapshot().unwrap();
+        let (schema_id, _) = writer.get_or_create_schema("main", None, snap).unwrap();
+        let (table_id, _) = writer
+            .get_or_create_table(schema_id, "to_drop", None, snap)
+            .unwrap();
+        let cols = vec![ColumnDef::new("id", "int64", false).unwrap()];
+        writer.set_columns(table_id, &cols, snap).unwrap();
+
+        // Register a file so drop also ends files
+        let file = DataFileInfo::new("f.parquet", 100, 10);
+        writer.register_data_file(table_id, snap, &file).unwrap();
+
+        let drop_snap = writer.drop_table(table_id).unwrap();
+        assert!(drop_snap > snap);
+
+        // Verify table is ended
+        let active_tables = block_on(async {
+            sqlx::query(
+                "SELECT COUNT(*) FROM ducklake_table WHERE table_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(table_id)
+            .fetch_one(&writer.pool)
+            .await
+            .unwrap()
+        });
+        assert_eq!(active_tables.try_get::<i64, _>(0).unwrap(), 0);
+
+        // Verify columns are ended
+        let active_cols = block_on(async {
+            sqlx::query(
+                "SELECT COUNT(*) FROM ducklake_column WHERE table_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(table_id)
+            .fetch_one(&writer.pool)
+            .await
+            .unwrap()
+        });
+        assert_eq!(active_cols.try_get::<i64, _>(0).unwrap(), 0);
+
+        // Verify data files are ended
+        let active_files = block_on(async {
+            sqlx::query(
+                "SELECT COUNT(*) FROM ducklake_data_file WHERE table_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(table_id)
+            .fetch_one(&writer.pool)
+            .await
+            .unwrap()
+        });
+        assert_eq!(active_files.try_get::<i64, _>(0).unwrap(), 0);
+
+        // Drop again should fail
+        assert!(writer.drop_table(table_id).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_drop_schema() {
+        let (writer, _temp) = create_test_writer().await;
+        let snap = writer.create_snapshot().unwrap();
+        let (schema_id, _) = writer.get_or_create_schema("to_drop", None, snap).unwrap();
+
+        let drop_snap = writer.drop_schema(schema_id).unwrap();
+        assert!(drop_snap > snap);
+
+        // Verify schema is ended
+        let active = block_on(async {
+            sqlx::query(
+                "SELECT COUNT(*) FROM ducklake_schema WHERE schema_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(schema_id)
+            .fetch_one(&writer.pool)
+            .await
+            .unwrap()
+        });
+        assert_eq!(active.try_get::<i64, _>(0).unwrap(), 0);
+
+        // Drop again should fail
+        assert!(writer.drop_schema(schema_id).is_err());
+    }
+
+    // --- R9-S-012: Test recompute_table_column_stats ---
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_recompute_table_column_stats_aggregation() {
+        let (writer, _temp) = create_test_writer().await;
+        let snap = writer.create_snapshot().unwrap();
+        let (schema_id, _) = writer.get_or_create_schema("main", None, snap).unwrap();
+        let (table_id, _) = writer
+            .get_or_create_table(schema_id, "stats_test", None, snap)
+            .unwrap();
+        let cols = vec![
+            ColumnDef::new("id", "int64", false).unwrap(),
+            ColumnDef::new("name", "varchar", true).unwrap(),
+        ];
+        let col_ids = writer.set_columns(table_id, &cols, snap).unwrap();
+
+        // Register two data files with different stats
+        let file1 = DataFileInfo::new("f1.parquet", 1000, 100);
+        let file1_id = writer.register_data_file(table_id, snap, &file1).unwrap();
+
+        let file2 = DataFileInfo::new("f2.parquet", 2000, 200);
+        let file2_id = writer.register_data_file(table_id, snap, &file2).unwrap();
+
+        // Register column stats for file1: id=[10,50], name=["alice","charlie"], no nulls
+        let stats1 = vec![
+            ColumnStatInfo {
+                column_id: col_ids[0],
+                null_count: Some(0),
+                min_value: Some("10".into()),
+                max_value: Some("50".into()),
+            },
+            ColumnStatInfo {
+                column_id: col_ids[1],
+                null_count: Some(0),
+                min_value: Some("alice".into()),
+                max_value: Some("charlie".into()),
+            },
+        ];
+        writer
+            .register_column_stats(file1_id, table_id, &stats1)
+            .unwrap();
+
+        // Register column stats for file2: id=[5,100], name=["bob","zebra"], has nulls
+        let stats2 = vec![
+            ColumnStatInfo {
+                column_id: col_ids[0],
+                null_count: Some(0),
+                min_value: Some("5".into()),
+                max_value: Some("100".into()),
+            },
+            ColumnStatInfo {
+                column_id: col_ids[1],
+                null_count: Some(3),
+                min_value: Some("bob".into()),
+                max_value: Some("zebra".into()),
+            },
+        ];
+        writer
+            .register_column_stats(file2_id, table_id, &stats2)
+            .unwrap();
+
+        // Verify aggregated table-level column stats
+        let table_stats = block_on(async {
+            sqlx::query(
+                "SELECT column_id, contains_null, min_value, max_value
+                 FROM ducklake_table_column_stats WHERE table_id = ?
+                 ORDER BY column_id",
+            )
+            .bind(table_id)
+            .fetch_all(&writer.pool)
+            .await
+            .unwrap()
+        });
+        assert_eq!(table_stats.len(), 2);
+
+        // id column: min=5 (numeric), max=100 (numeric), no nulls
+        let id_null: bool = table_stats[0].try_get(1).unwrap();
+        let id_min: Option<String> = table_stats[0].try_get(2).unwrap();
+        let id_max: Option<String> = table_stats[0].try_get(3).unwrap();
+        assert!(!id_null);
+        assert_eq!(id_min.as_deref(), Some("5"));
+        assert_eq!(id_max.as_deref(), Some("100"));
+
+        // name column: min="alice" (string), max="zebra" (string), has nulls
+        let name_null: bool = table_stats[1].try_get(1).unwrap();
+        let name_min: Option<String> = table_stats[1].try_get(2).unwrap();
+        let name_max: Option<String> = table_stats[1].try_get(3).unwrap();
+        assert!(name_null);
+        assert_eq!(name_min.as_deref(), Some("alice"));
+        assert_eq!(name_max.as_deref(), Some("zebra"));
+    }
+
     /// R7-S-012: After ALTER TABLE ADD COLUMN, store_inlined_data detects
     /// schema mismatch and recreates the inlined data table with updated columns.
     #[tokio::test(flavor = "multi_thread")]

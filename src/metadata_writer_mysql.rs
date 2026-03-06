@@ -1128,3 +1128,44 @@ impl MetadataWriter for MySqlMetadataWriter {
 
     // R8-S-008: Implement register_file_partition_value (parity with SQLite)
 }
+
+#[cfg(test)]
+#[cfg(all(feature = "metadata-mysql", not(feature = "skip-tests-with-docker")))]
+mod tests {
+    use super::*;
+    use crate::metadata_writer::DataFileInfo;
+
+    /// R9-S-002: Verify MySQL LAST_INSERT_ID path returns correct sequential IDs.
+    #[tokio::test]
+    async fn test_mysql_register_data_file_sequential_ids() {
+        // Connect to Docker MySQL (standard test credentials)
+        let conn_str = std::env::var("MYSQL_CONNECTION_STRING")
+            .unwrap_or_else(|_| "mysql://root:ducklake@localhost:3306/ducklake_test".to_string());
+
+        let writer = match MySqlMetadataWriter::new_with_init(&conn_str).await {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("Skipping MySQL test (connection failed): {e}");
+                return;
+            },
+        };
+
+        let snap = writer.create_snapshot().unwrap();
+        let (schema_id, _) = writer
+            .get_or_create_schema("test_schema", None, snap)
+            .unwrap();
+        let (table_id, _) = writer
+            .get_or_create_table(schema_id, "test_seq_ids", None, snap)
+            .unwrap();
+
+        // Register two data files and verify IDs are sequential
+        let file1 = DataFileInfo::new("file1.parquet", 1000, 100);
+        let id1 = writer.register_data_file(table_id, snap, &file1).unwrap();
+
+        let file2 = DataFileInfo::new("file2.parquet", 2000, 200);
+        let id2 = writer.register_data_file(table_id, snap, &file2).unwrap();
+
+        assert!(id1 > 0, "First file ID should be positive");
+        assert_eq!(id2, id1 + 1, "Second file ID should be sequential");
+    }
+}

@@ -398,3 +398,277 @@ impl SqlDialect for MySqlDialect {
         unreachable!("MySQL uses next_sequence_id() instead of next_id_sql()")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- ph() ---
+
+    #[test]
+    fn test_sqlite_ph() {
+        let d = SqliteDialect;
+        assert_eq!(d.ph(1), "?");
+        assert_eq!(d.ph(99), "?");
+    }
+
+    #[test]
+    fn test_postgres_ph() {
+        let d = PostgresDialect;
+        assert_eq!(d.ph(1), "$1");
+        assert_eq!(d.ph(5), "$5");
+    }
+
+    #[test]
+    fn test_mysql_ph() {
+        let d = MySqlDialect;
+        assert_eq!(d.ph(1), "?");
+        assert_eq!(d.ph(99), "?");
+    }
+
+    // --- quote_id() ---
+
+    #[test]
+    fn test_sqlite_quote_id() {
+        let d = SqliteDialect;
+        assert_eq!(d.quote_id("col"), "\"col\"");
+        assert_eq!(d.quote_id("a\"b"), "\"a\"\"b\"");
+    }
+
+    #[test]
+    fn test_postgres_quote_id() {
+        let d = PostgresDialect;
+        assert_eq!(d.quote_id("col"), "\"col\"");
+        assert_eq!(d.quote_id("a\"b"), "\"a\"\"b\"");
+    }
+
+    #[test]
+    fn test_mysql_quote_id() {
+        let d = MySqlDialect;
+        assert_eq!(d.quote_id("col"), "`col`");
+        assert_eq!(d.quote_id("a`b"), "`a``b`");
+    }
+
+    // --- col() ---
+
+    #[test]
+    fn test_sqlite_col_no_quoting() {
+        let d = SqliteDialect;
+        assert_eq!(d.col("key"), "key");
+        assert_eq!(d.col("sql"), "sql");
+        assert_eq!(d.col("name"), "name");
+    }
+
+    #[test]
+    fn test_postgres_col_no_quoting() {
+        let d = PostgresDialect;
+        assert_eq!(d.col("key"), "key");
+        assert_eq!(d.col("sql"), "sql");
+    }
+
+    #[test]
+    fn test_mysql_col_quotes_reserved() {
+        let d = MySqlDialect;
+        assert_eq!(d.col("key"), "`key`");
+        assert_eq!(d.col("sql"), "`sql`");
+        assert_eq!(d.col("type"), "`type`");
+        assert_eq!(d.col("name"), "name");
+    }
+
+    // --- bool_lit() ---
+
+    #[test]
+    fn test_sqlite_bool_lit() {
+        let d = SqliteDialect;
+        assert_eq!(d.bool_lit(true), "1");
+        assert_eq!(d.bool_lit(false), "0");
+    }
+
+    #[test]
+    fn test_postgres_bool_lit() {
+        let d = PostgresDialect;
+        assert_eq!(d.bool_lit(true), "TRUE");
+        assert_eq!(d.bool_lit(false), "FALSE");
+    }
+
+    #[test]
+    fn test_mysql_bool_lit() {
+        let d = MySqlDialect;
+        assert_eq!(d.bool_lit(true), "TRUE");
+        assert_eq!(d.bool_lit(false), "FALSE");
+    }
+
+    // --- upsert() ---
+
+    #[test]
+    fn test_sqlite_upsert() {
+        let d = SqliteDialect;
+        let result = d.upsert("id", &["name", "value"]);
+        assert_eq!(
+            result,
+            "ON CONFLICT(id) DO UPDATE SET name = excluded.name, value = excluded.value"
+        );
+    }
+
+    #[test]
+    fn test_postgres_upsert() {
+        let d = PostgresDialect;
+        let result = d.upsert("id", &["name", "value"]);
+        assert_eq!(
+            result,
+            "ON CONFLICT(id) DO UPDATE SET name = EXCLUDED.name, value = EXCLUDED.value"
+        );
+    }
+
+    #[test]
+    fn test_mysql_upsert() {
+        let d = MySqlDialect;
+        let result = d.upsert("id", &["name", "value"]);
+        assert_eq!(
+            result,
+            "ON DUPLICATE KEY UPDATE name = VALUES(name), value = VALUES(value)"
+        );
+    }
+
+    // --- insert_or_ignore() ---
+
+    #[test]
+    fn test_sqlite_insert_or_ignore() {
+        let d = SqliteDialect;
+        assert_eq!(
+            d.insert_or_ignore("t", "a, b", "?, ?"),
+            "INSERT OR IGNORE INTO t (a, b) VALUES (?, ?)"
+        );
+    }
+
+    #[test]
+    fn test_postgres_insert_or_ignore() {
+        let d = PostgresDialect;
+        assert_eq!(
+            d.insert_or_ignore("t", "a, b", "$1, $2"),
+            "INSERT INTO t (a, b) VALUES ($1, $2) ON CONFLICT DO NOTHING"
+        );
+    }
+
+    #[test]
+    fn test_mysql_insert_or_ignore() {
+        let d = MySqlDialect;
+        assert_eq!(
+            d.insert_or_ignore("t", "a, b", "?, ?"),
+            "INSERT IGNORE INTO t (a, b) VALUES (?, ?)"
+        );
+    }
+
+    // --- supports_returning / for_update / existence_check ---
+
+    #[test]
+    fn test_supports_returning() {
+        assert!(SqliteDialect.supports_returning());
+        assert!(PostgresDialect.supports_returning());
+        assert!(!MySqlDialect.supports_returning());
+    }
+
+    #[test]
+    fn test_for_update() {
+        assert_eq!(SqliteDialect.for_update(), "");
+        assert_eq!(PostgresDialect.for_update(), " FOR UPDATE");
+        assert_eq!(MySqlDialect.for_update(), " FOR UPDATE");
+    }
+
+    #[test]
+    fn test_existence_check_is_count() {
+        assert!(SqliteDialect.existence_check_is_count());
+        assert!(!PostgresDialect.existence_check_is_count());
+        assert!(MySqlDialect.existence_check_is_count());
+    }
+
+    // --- cast / clamp ---
+
+    #[test]
+    fn test_cast_text() {
+        assert_eq!(SqliteDialect.cast_text("x"), "CAST(x AS TEXT)");
+        assert_eq!(PostgresDialect.cast_text("x"), "CAST(x AS VARCHAR)");
+        assert_eq!(MySqlDialect.cast_text("x"), "CAST(x AS CHAR)");
+    }
+
+    #[test]
+    fn test_cast_int() {
+        assert_eq!(SqliteDialect.cast_int("x"), "x");
+        assert_eq!(PostgresDialect.cast_int("x"), "CAST(x AS BIGINT)");
+        assert_eq!(MySqlDialect.cast_int("x"), "CAST(x AS SIGNED)");
+    }
+
+    #[test]
+    fn test_clamp_zero() {
+        assert_eq!(SqliteDialect.clamp_zero("x"), "MAX(0, x)");
+        assert_eq!(PostgresDialect.clamp_zero("x"), "GREATEST(0, x)");
+        assert_eq!(MySqlDialect.clamp_zero("x"), "GREATEST(0, x)");
+    }
+
+    #[test]
+    fn test_now() {
+        assert_eq!(
+            SqliteDialect.now(),
+            "strftime('%Y-%m-%d %H:%M:%f+00:00','now')"
+        );
+        assert_eq!(PostgresDialect.now(), "CURRENT_TIMESTAMP");
+        assert_eq!(MySqlDialect.now(), "NOW(6)");
+    }
+
+    // --- write-feature-gated methods ---
+
+    #[cfg(feature = "write")]
+    mod write_tests {
+        use super::*;
+
+        #[test]
+        fn test_sqlite_next_id_sql() {
+            let d = SqliteDialect;
+            let (sql, needs_bind) = d.next_id_sql("schema_version");
+            assert!(sql.contains("ducklake_snapshot"));
+            assert!(!needs_bind);
+
+            let (sql, needs_bind) = d.next_id_sql("column_id");
+            assert!(sql.contains("ducklake_column"));
+            assert!(needs_bind);
+        }
+
+        #[test]
+        fn test_postgres_next_id_sql() {
+            let d = PostgresDialect;
+            let (sql, needs_bind) = d.next_id_sql("schema_version");
+            assert!(sql.contains("nextval"));
+            assert!(sql.contains("ducklake_schema_version_seq"));
+            assert!(!needs_bind);
+        }
+
+        #[test]
+        fn test_mysql_next_id_sql_returns_placeholder() {
+            let d = MySqlDialect;
+            let (sql, needs_bind) = d.next_id_sql("schema_version");
+            assert_eq!(sql, "SELECT 0");
+            assert!(!needs_bind);
+        }
+
+        #[test]
+        fn test_greatest() {
+            assert_eq!(SqliteDialect.greatest("a", "b"), "MAX(a, b)");
+            assert_eq!(PostgresDialect.greatest("a", "b"), "GREATEST(a, b)");
+            assert_eq!(MySqlDialect.greatest("a", "b"), "GREATEST(a, b)");
+        }
+
+        #[test]
+        fn test_read_uuid() {
+            assert_eq!(SqliteDialect.read_uuid("col"), "col");
+            assert_eq!(PostgresDialect.read_uuid("col"), "CAST(col AS VARCHAR)");
+            assert_eq!(MySqlDialect.read_uuid("col"), "col");
+        }
+
+        #[test]
+        fn test_uuid_ph() {
+            assert_eq!(SqliteDialect.uuid_ph(1), "?");
+            assert_eq!(PostgresDialect.uuid_ph(3), "$3::UUID");
+            assert_eq!(MySqlDialect.uuid_ph(1), "?");
+        }
+    }
+}
