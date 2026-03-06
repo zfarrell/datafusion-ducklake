@@ -1240,18 +1240,28 @@ pub(crate) fn inlined_rows_to_batch(
     let num_rows = rows.len();
     let mut column_arrays: Vec<Arc<dyn arrow::array::Array>> = Vec::new();
 
+    // Precompute column name -> index maps per row to avoid O(rows*cols) linear scans
+    let row_col_maps: Vec<HashMap<&str, usize>> = rows
+        .iter()
+        .map(|row| {
+            row.column_names
+                .iter()
+                .enumerate()
+                .map(|(i, name)| (name.as_str(), i))
+                .collect()
+        })
+        .collect();
+
     for field in schema.fields().iter() {
         let col_name = field.name();
         let data_type = field.data_type();
 
-        // Collect values for this column from all rows
+        // Collect values for this column from all rows using precomputed maps
         let mut string_values: Vec<Option<String>> = Vec::with_capacity(num_rows);
-        for row in rows {
-            let value = row
-                .column_names
-                .iter()
-                .position(|n| n == col_name)
-                .and_then(|pos| row.values.get(pos))
+        for (row, col_map) in rows.iter().zip(row_col_maps.iter()) {
+            let value = col_map
+                .get(col_name.as_str())
+                .and_then(|&pos| row.values.get(pos))
                 .and_then(|v| v.clone());
             string_values.push(value);
         }
