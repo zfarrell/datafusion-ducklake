@@ -813,9 +813,25 @@ async fn write_partitioned(
     }
 
     // 3. Atomic commit: end old files (if Replace) and register all new files + partition values
-    let result = table_writer
+    // R11-S-002: Collect object paths before commit so we can clean up on failure
+    let cleanup_paths: Vec<_> = uploaded_files
+        .iter()
+        .map(|(u, _)| u.object_path.clone())
+        .collect();
+    let result = match table_writer
         .commit_uploaded_files(&setup, uploaded_files, write_mode)
-        .await?;
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            crate::table_writer::cleanup_orphaned_files(
+                table_writer.object_store.as_ref(),
+                &cleanup_paths,
+            )
+            .await;
+            return Err(e);
+        },
+    };
 
     Ok(u64::try_from(result.records_written)
         .map_err(|e| DataFusionError::Execution(format!("Record count overflow: {}", e)))?)

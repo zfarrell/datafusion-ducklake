@@ -52,7 +52,7 @@ use crate::path_resolver::join_paths;
 #[derive(Debug)]
 pub struct DuckLakeTableWriter {
     metadata: Arc<dyn MetadataWriter>,
-    object_store: Arc<dyn ObjectStore>,
+    pub(crate) object_store: Arc<dyn ObjectStore>,
     /// The key path portion of the data_path (e.g., "/prefix/data/")
     base_key_path: String,
 }
