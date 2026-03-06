@@ -491,6 +491,17 @@ impl ExecutionPlan for DuckLakeMergeExec {
                         }
 
                         if let Some(candidates) = source_hash_index.get(&target_key) {
+                            // R11-S-003: SQL standard requires error when multiple source
+                            // rows match the same target row.
+                            if candidates.len() > 1 {
+                                return Err(DataFusionError::Execution(
+                                    "MERGE violation: multiple source rows matched the same \
+                                     target row. SQL standard requires each target row to be \
+                                     matched by at most one source row."
+                                        .to_string(),
+                                ));
+                            }
+
                             for &(batch_idx, src_row_idx) in candidates {
                                 let src_global = source_batch_offsets[batch_idx] + src_row_idx;
                                 source_match_count[src_global] += 1;
