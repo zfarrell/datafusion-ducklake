@@ -778,8 +778,7 @@ impl MetadataWriter for PostgresMetadataWriter {
         block_on = crate::metadata_provider::block_on_no_retry,
         last_insert_id = |_tx: &mut sqlx::Transaction<'_, sqlx::Postgres>| async {
             Ok::<i64, crate::error::DuckLakeError>(0)
-        },
-        column_order_type = i32
+        }
     );
 
     fn initialize_schema(&self) -> Result<()> {

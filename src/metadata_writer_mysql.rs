@@ -860,8 +860,7 @@ impl MetadataWriter for MySqlMetadataWriter {
         MySqlMetadataWriter,
         dialect = crate::dialect::MySqlDialect,
         block_on = crate::metadata_provider::block_on_no_retry,
-        last_insert_id = last_insert_id,
-        column_order_type = i64
+        last_insert_id = last_insert_id
     );
 
     fn initialize_schema(&self) -> Result<()> {

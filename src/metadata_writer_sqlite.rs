@@ -937,8 +937,7 @@ impl MetadataWriter for SqliteMetadataWriter {
         block_on = block_on_with_retry,
         last_insert_id = |_tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>| async {
             Ok::<i64, crate::error::DuckLakeError>(0)
-        },
-        column_order_type = i64
+        }
     );
 
     // --- remaining per-backend methods below ---
