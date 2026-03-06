@@ -1340,7 +1340,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 // Bind each column value using precomputed map
                 for col in columns {
                     let value = col_map
-                        .get(col.name().as_str())
+                        .get(col.name().as_ref())
                         .and_then(|&pos| inlined_row.values.get(pos))
                         .and_then(|v| v.clone());
                     query = query.bind(value);
