@@ -19,6 +19,7 @@ use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::ExecutionPlanProperties;
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::stream::{self, TryStreamExt};
@@ -233,14 +234,16 @@ impl ExecutionPlan for DuckLakeInsertExec {
         let output_schema = make_dml_count_schema();
 
         let stream = stream::once(async move {
-            // Collect batches from ALL input partitions to avoid dropping data
-            let num_partitions = input.output_partitioning().partition_count();
-            let mut batches: Vec<RecordBatch> = Vec::new();
-            for p in 0..num_partitions {
-                let partition_stream = input.execute(p, Arc::clone(&context))?;
-                let partition_batches: Vec<RecordBatch> = partition_stream.try_collect().await?;
-                batches.extend(partition_batches);
-            }
+            // Coalesce all input partitions into a single stream via
+            // CoalescePartitionsExec (idiomatic DataFusion approach).
+            let coalesced: Arc<dyn ExecutionPlan> =
+                if input.output_partitioning().partition_count() > 1 {
+                    Arc::new(CoalescePartitionsExec::new(input))
+                } else {
+                    input
+                };
+            let coalesced_stream = coalesced.execute(0, Arc::clone(&context))?;
+            let batches: Vec<RecordBatch> = coalesced_stream.try_collect().await?;
 
             if batches.is_empty() {
                 let count_array: ArrayRef = Arc::new(UInt64Array::from(vec![0u64]));
