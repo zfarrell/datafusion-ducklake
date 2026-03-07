@@ -30,7 +30,6 @@ use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::stream::{self, TryStreamExt};
-use object_store::ObjectStore;
 use object_store::path::Path as ObjectPath;
 
 use crate::metadata_provider::DuckLakeTableFile;

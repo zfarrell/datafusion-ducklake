@@ -1247,7 +1247,7 @@ pub(crate) fn inlined_rows_to_batch(
             row.column_names
                 .iter()
                 .enumerate()
-                .map(|(i, name)| (name.as_str(), i))
+                .map(|(i, name)| (&**name, i))
                 .collect()
         })
         .collect();
@@ -1260,7 +1260,7 @@ pub(crate) fn inlined_rows_to_batch(
         let mut string_values: Vec<Option<String>> = Vec::with_capacity(num_rows);
         for (row, col_map) in rows.iter().zip(row_col_maps.iter()) {
             let value = col_map
-                .get(col_name.as_str())
+                .get(&**col_name)
                 .and_then(|&pos| row.values.get(pos))
                 .and_then(|v| v.clone());
             string_values.push(value);
