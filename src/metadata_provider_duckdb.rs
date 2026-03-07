@@ -141,12 +141,16 @@ impl MetadataProvider for DuckdbMetadataProvider {
         Ok(tables)
     }
 
-    fn get_table_structure(&self, table_id: i64) -> crate::Result<Vec<DuckLakeTableColumn>> {
+    fn get_table_structure(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+    ) -> crate::Result<Vec<DuckLakeTableColumn>> {
         let conn = self.connection();
         let mut stmt = conn.prepare(SQL_GET_TABLE_COLUMNS)?;
 
         let columns = stmt
-            .query_map([table_id], |row| {
+            .query_map([table_id, snapshot_id, snapshot_id], |row| {
                 let column_id: i64 = row.get(0)?;
                 let column_name: String = row.get(1)?;
                 let column_type: String = row.get(2)?;
@@ -309,7 +313,14 @@ impl MetadataProvider for DuckdbMetadataProvider {
 
         let columns = stmt
             .query_map(
-                params![snapshot_id, snapshot_id, snapshot_id, snapshot_id],
+                params![
+                    snapshot_id,
+                    snapshot_id,
+                    snapshot_id,
+                    snapshot_id,
+                    snapshot_id,
+                    snapshot_id
+                ],
                 |row| {
                     let schema_name: String = row.get(0)?;
                     let table_name: String = row.get(1)?;

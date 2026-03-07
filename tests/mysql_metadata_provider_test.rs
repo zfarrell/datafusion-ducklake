@@ -78,6 +78,8 @@ async fn init_schema(pool: &MySqlPool) -> anyhow::Result<()> {
             column_type VARCHAR(255) NOT NULL,
             column_order INTEGER NOT NULL,
             nulls_allowed BOOLEAN,
+            begin_snapshot BIGINT NOT NULL DEFAULT 1,
+            end_snapshot BIGINT,
             FOREIGN KEY (table_id) REFERENCES ducklake_table(table_id)
         )",
     )
@@ -425,7 +427,8 @@ async fn populate_from_duckdb_catalog(
             .execute(pool)
             .await?;
 
-            let columns = duckdb_provider.get_table_structure(table.table_id)?;
+            let columns = duckdb_provider
+                .get_table_structure(table.table_id, current_snapshot.snapshot_id)?;
 
             for (order, column) in columns.iter().enumerate() {
                 sqlx::query(
@@ -731,7 +734,7 @@ async fn test_get_table_structure() {
         .expect("Failed to populate test data");
 
     let columns = provider
-        .get_table_structure(1)
+        .get_table_structure(1, 1)
         .expect("Should get table structure");
 
     assert_eq!(columns.len(), 3, "users table should have 3 columns");
@@ -873,7 +876,7 @@ async fn test_concurrent_access() {
             let _schemas = provider.list_schemas(1).expect("Should list schemas");
             let _tables = provider.list_tables(1, 1).expect("Should list tables");
             let _columns = provider
-                .get_table_structure(1)
+                .get_table_structure(1, 1)
                 .expect("Should get structure");
         });
         tasks.push(task);
