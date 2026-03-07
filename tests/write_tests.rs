@@ -13,48 +13,10 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
-use datafusion::prelude::*;
-use object_store::local::LocalFileSystem;
-use tempfile::TempDir;
+use datafusion_ducklake::{DuckLakeTableWriter, WriteMode};
 
-use datafusion_ducklake::{
-    DuckLakeCatalog, DuckLakeTableWriter, MetadataWriter, SqliteMetadataProvider,
-    SqliteMetadataWriter, WriteMode,
-};
-
-/// Create a local filesystem object store
-fn create_object_store() -> Arc<dyn object_store::ObjectStore> {
-    Arc::new(LocalFileSystem::new())
-}
-
-/// Helper to create a test environment with writer and data directory
-async fn create_test_env() -> (SqliteMetadataWriter, TempDir) {
-    let temp_dir = TempDir::new().unwrap();
-    let db_path = temp_dir.path().join("test.db");
-    let data_path = temp_dir.path().join("data");
-    std::fs::create_dir_all(&data_path).unwrap();
-
-    let conn_str = format!("sqlite:{}?mode=rwc", db_path.display());
-    let writer = SqliteMetadataWriter::new_with_init(&conn_str)
-        .await
-        .unwrap();
-    writer.set_data_path(data_path.to_str().unwrap()).unwrap();
-
-    (writer, temp_dir)
-}
-
-/// Helper to create a SessionContext with a DuckLakeCatalog
-async fn create_read_context(temp_dir: &TempDir) -> SessionContext {
-    let db_path = temp_dir.path().join("test.db");
-    let conn_str = format!("sqlite:{}", db_path.display());
-
-    let provider = SqliteMetadataProvider::new(&conn_str).await.unwrap();
-    let catalog = DuckLakeCatalog::new(provider).unwrap();
-
-    let ctx = SessionContext::new();
-    ctx.register_catalog("test", Arc::new(catalog));
-    ctx
-}
+mod common;
+use common::{create_object_store, create_test_env};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_write_and_read_basic_types() {
@@ -100,7 +62,7 @@ async fn test_write_and_read_basic_types() {
     assert!(result.schema_id > 0);
 
     // Read back via DuckLakeCatalog
-    let ctx = create_read_context(&temp_dir).await;
+    let ctx = common::create_read_context(&temp_dir, "test").await;
     let df = ctx
         .sql("SELECT * FROM test.main.users ORDER BY id")
         .await
@@ -165,7 +127,7 @@ async fn test_write_temporal_types() {
     assert_eq!(result.records_written, 2);
 
     // Read back
-    let ctx = create_read_context(&temp_dir).await;
+    let ctx = common::create_read_context(&temp_dir, "test").await;
     let df = ctx
         .sql("SELECT COUNT(*) as cnt FROM test.main.events")
         .await
@@ -210,7 +172,7 @@ async fn test_write_multiple_batches() {
     assert_eq!(result.records_written, 4);
 
     // Read back
-    let ctx = create_read_context(&temp_dir).await;
+    let ctx = common::create_read_context(&temp_dir, "test").await;
     let df = ctx
         .sql("SELECT COUNT(*) as cnt FROM test.main.data")
         .await
@@ -268,7 +230,7 @@ async fn test_replace_semantics() {
     assert_eq!(result.records_written, 2);
 
     // Read back - should only have the replacement data
-    let ctx = create_read_context(&temp_dir).await;
+    let ctx = common::create_read_context(&temp_dir, "test").await;
     let df = ctx
         .sql("SELECT id, value FROM test.main.replace_test ORDER BY id")
         .await
@@ -325,7 +287,7 @@ async fn test_append_semantics() {
     assert_eq!(result.records_written, 2);
 
     // Read back - should have all data
-    let ctx = create_read_context(&temp_dir).await;
+    let ctx = common::create_read_context(&temp_dir, "test").await;
     let df = ctx
         .sql("SELECT COUNT(*) as cnt FROM test.main.append_test")
         .await
@@ -374,7 +336,7 @@ async fn test_multiple_tables_same_schema() {
         .unwrap();
 
     // Read back both tables
-    let ctx = create_read_context(&temp_dir).await;
+    let ctx = common::create_read_context(&temp_dir, "test").await;
 
     let df1 = ctx.sql("SELECT name FROM test.main.t1").await.unwrap();
     let batches1 = df1.collect().await.unwrap();
@@ -493,7 +455,7 @@ async fn test_streaming_write_api() {
     assert_eq!(result.files_written, 1);
 
     // Read back via DuckLakeCatalog
-    let ctx = create_read_context(&temp_dir).await;
+    let ctx = common::create_read_context(&temp_dir, "test").await;
     let df = ctx
         .sql("SELECT COUNT(*) as cnt FROM test.main.streaming_test")
         .await
@@ -546,7 +508,7 @@ async fn test_streaming_write_to_custom_path() {
     assert!(custom_dir.join(&file_name).exists());
 
     // Read back via DuckLakeCatalog
-    let ctx = create_read_context(&temp_dir).await;
+    let ctx = common::create_read_context(&temp_dir, "test").await;
     let df = ctx
         .sql("SELECT COUNT(*) as cnt FROM test.main.custom_path_test")
         .await
@@ -579,7 +541,7 @@ async fn test_streaming_empty_write() {
     assert_eq!(result.files_written, 1);
 
     // Read back - should have 0 rows
-    let ctx = create_read_context(&temp_dir).await;
+    let ctx = common::create_read_context(&temp_dir, "test").await;
     let df = ctx
         .sql("SELECT COUNT(*) as cnt FROM test.main.empty_test")
         .await
@@ -649,7 +611,7 @@ async fn test_append_add_nullable_column() {
     assert_eq!(result.unwrap().records_written, 2);
 
     // Read back - should have all 4 rows
-    let ctx = create_read_context(&temp_dir).await;
+    let ctx = common::create_read_context(&temp_dir, "test").await;
     let df = ctx
         .sql("SELECT COUNT(*) as cnt FROM test.main.evolve_add")
         .await
@@ -717,7 +679,7 @@ async fn test_append_remove_column() {
     assert_eq!(result.unwrap().records_written, 2);
 
     // Read back - should have all 4 rows
-    let ctx = create_read_context(&temp_dir).await;
+    let ctx = common::create_read_context(&temp_dir, "test").await;
     let df = ctx
         .sql("SELECT COUNT(*) as cnt FROM test.main.evolve_remove")
         .await
@@ -895,7 +857,7 @@ async fn test_append_reorder_columns() {
     assert_eq!(result.unwrap().records_written, 2);
 
     // Read back - should have all 4 rows
-    let ctx = create_read_context(&temp_dir).await;
+    let ctx = common::create_read_context(&temp_dir, "test").await;
     let df = ctx
         .sql("SELECT COUNT(*) as cnt FROM test.main.evolve_reorder")
         .await

@@ -11,58 +11,14 @@ use arrow::array::{Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion::prelude::*;
-use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 
 use datafusion_ducklake::{
     DuckLakeCatalog, MetadataWriter, SqliteMetadataProvider, SqliteMetadataWriter,
 };
 
-/// Create a local filesystem object store
-fn create_object_store() -> Arc<dyn object_store::ObjectStore> {
-    Arc::new(LocalFileSystem::new())
-}
-
-/// Helper to create a test environment with a writable catalog
-async fn create_writable_catalog() -> (SessionContext, TempDir) {
-    let temp_dir = TempDir::new().unwrap();
-    let db_path = temp_dir.path().join("test.db");
-    let data_path = temp_dir.path().join("data");
-    std::fs::create_dir_all(&data_path).unwrap();
-
-    let conn_str = format!("sqlite:{}?mode=rwc", db_path.display());
-
-    // Create writer and initialize schema
-    let writer = SqliteMetadataWriter::new_with_init(&conn_str)
-        .await
-        .unwrap();
-    writer.set_data_path(data_path.to_str().unwrap()).unwrap();
-
-    // Create a snapshot to initialize the catalog
-    writer.create_snapshot().unwrap();
-
-    // Create provider and catalog with writer
-    let provider = SqliteMetadataProvider::new(&conn_str).await.unwrap();
-    let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer)).unwrap();
-
-    let ctx = SessionContext::new();
-    ctx.register_catalog("ducklake", Arc::new(catalog));
-
-    (ctx, temp_dir)
-}
-
-/// Helper to create a session context for read-only access
-async fn create_read_context(temp_dir: &TempDir) -> SessionContext {
-    let db_path = temp_dir.path().join("test.db");
-    let conn_str = format!("sqlite:{}", db_path.display());
-
-    let provider = SqliteMetadataProvider::new(&conn_str).await.unwrap();
-    let catalog = DuckLakeCatalog::new(provider).unwrap();
-
-    let ctx = SessionContext::new();
-    ctx.register_catalog("ducklake", Arc::new(catalog));
-    ctx
-}
+mod common;
+use common::{create_object_store, create_writable_catalog};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_create_table_as_select() {
@@ -97,7 +53,7 @@ async fn test_create_table_as_select() {
             let _batches = df.collect().await.unwrap();
 
             // Verify table was created by reading it back with fresh context
-            let read_ctx = create_read_context(&temp_dir).await;
+            let read_ctx = common::create_read_context(&temp_dir, "ducklake").await;
             let df = read_ctx
                 .sql("SELECT * FROM ducklake.main.users ORDER BY id")
                 .await
@@ -199,7 +155,7 @@ async fn test_insert_into_existing_table() {
             }
 
             // Verify with fresh read context
-            let read_ctx = create_read_context(&temp_dir).await;
+            let read_ctx = common::create_read_context(&temp_dir, "ducklake").await;
             let df = read_ctx
                 .sql("SELECT COUNT(*) as cnt FROM ducklake.main.values_table")
                 .await
@@ -363,7 +319,7 @@ async fn test_insert_overwrite() {
             let _ = df.collect().await;
 
             // Verify only new data exists
-            let read_ctx = create_read_context(&temp_dir).await;
+            let read_ctx = common::create_read_context(&temp_dir, "ducklake").await;
             let df = read_ctx
                 .sql("SELECT COUNT(*) as cnt FROM ducklake.main.overwrite_test")
                 .await
@@ -434,7 +390,7 @@ async fn test_sql_insert_values() {
             let _ = df.collect().await;
 
             // Verify data
-            let read_ctx = create_read_context(&temp_dir).await;
+            let read_ctx = common::create_read_context(&temp_dir, "ducklake").await;
             let df = read_ctx
                 .sql("SELECT COUNT(*) as cnt FROM ducklake.main.values_test")
                 .await
@@ -529,7 +485,7 @@ async fn test_schema_evolution_via_sql() {
             match exec_result {
                 Ok(_) => {
                     // Verify total rows
-                    let read_ctx = create_read_context(&temp_dir).await;
+                    let read_ctx = common::create_read_context(&temp_dir, "ducklake").await;
                     let df = read_ctx
                         .sql("SELECT COUNT(*) as cnt FROM ducklake.main.evolve_table")
                         .await
@@ -623,7 +579,7 @@ async fn test_insert_from_query_with_filter() {
             match exec_result {
                 Ok(_) => {
                     // Verify filtered results
-                    let read_ctx = create_read_context(&temp_dir).await;
+                    let read_ctx = common::create_read_context(&temp_dir, "ducklake").await;
                     let df = read_ctx
                         .sql("SELECT id, name FROM ducklake.main.filtered_users ORDER BY id")
                         .await
