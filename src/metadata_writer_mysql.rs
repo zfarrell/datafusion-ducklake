@@ -557,8 +557,10 @@ impl MySqlMetadataWriter {
         // F-013: Check if schema is identical — if so, preserve column IDs
         let schema_matches = existing_columns.len() == columns.len()
             && existing_columns.iter().zip(columns.iter()).all(
-                |((name, col_type, _nullable), col)| {
-                    name == &col.name && col_type == &col.ducklake_type
+                |((name, col_type, nullable), col)| {
+                    name == &col.name
+                        && col_type == &col.ducklake_type
+                        && *nullable == col.is_nullable
                 },
             );
 
