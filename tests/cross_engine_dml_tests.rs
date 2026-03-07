@@ -897,6 +897,83 @@ async fn cross_engine_bidirectional_update() {
 }
 
 // ============================================================================
+// DELETE: DuckDB creates + inserts, DF deletes, DuckDB reads (sentinel field_id test)
+// ============================================================================
+
+/// Verify MOR delete files with sentinel field_ids work cross-engine:
+/// DuckDB creates the table and inserts data (with row_id_start),
+/// DataFusion produces a delete file, DuckDB reads and excludes deleted rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn cross_engine_duckdb_insert_df_delete_duckdb_read() {
+    let temp_dir = TempDir::new().unwrap();
+    let catalog_db_path = temp_dir.path().join("catalog.db");
+    let data_path = temp_dir.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+
+    // DuckDB creates table and inserts data via SQLite-backed catalog
+    {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute("INSTALL ducklake;", []).unwrap();
+        conn.execute("LOAD ducklake;", []).unwrap();
+        conn.execute(
+            &format!(
+                "ATTACH 'ducklake:sqlite:{}' AS ducklake (DATA_PATH '{}');",
+                catalog_db_path.display(),
+                data_path.display()
+            ),
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE ducklake.main.items (id INT, name VARCHAR, value DOUBLE)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ducklake.main.items VALUES              (1, 'Alpha', 10.0), (2, 'Beta', 20.0), (3, 'Gamma', 30.0),              (4, 'Delta', 40.0), (5, 'Epsilon', 50.0)",
+            [],
+        )
+        .unwrap();
+    }
+
+    // DataFusion deletes rows via SQLite-backed writable context
+    let ctx = open_writable_df_context(&catalog_db_path).await;
+    let df = ctx
+        .sql("DELETE FROM ducklake.main.items WHERE id >= 4")
+        .await
+        .unwrap();
+    let count = collect_dml_count(df).await;
+    assert_eq!(count, 2, "Should delete id=4 and id=5");
+
+    // DuckDB reads and verifies the DF-produced delete file is compatible
+    let duckdb = DuckDbConn::open(&catalog_db_path);
+    let rows = duckdb.query("SELECT id, name, value FROM ducklake.main.items ORDER BY id");
+    assert_eq!(
+        rows.len(),
+        3,
+        "DuckDB should see 3 remaining rows after DF delete"
+    );
+    assert_eq!(rows[0][0], "1");
+    assert_eq!(rows[0][1], "Alpha");
+    assert_eq!(rows[1][0], "2");
+    assert_eq!(rows[1][1], "Beta");
+    assert_eq!(rows[2][0], "3");
+    assert_eq!(rows[2][1], "Gamma");
+
+    // Also verify via DataFusion read-back
+    drop(duckdb);
+    let df_ctx = open_readonly_df_sqlite(&catalog_db_path).await;
+    let df_rows = df_query(
+        &df_ctx,
+        "SELECT id, name FROM ducklake.main.items ORDER BY id",
+    )
+    .await;
+    assert_eq!(df_rows.len(), 3);
+    assert_eq!(df_rows[0][0], "1");
+    assert_eq!(df_rows[2][0], "3");
+}
+
+// ============================================================================
 // Filesystem helpers for delete file inspection
 // ============================================================================
 
