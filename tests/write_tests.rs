@@ -13,48 +13,12 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
-use datafusion::prelude::*;
-use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 
-use datafusion_ducklake::{
-    DuckLakeCatalog, DuckLakeTableWriter, MetadataWriter, SqliteMetadataProvider,
-    SqliteMetadataWriter, WriteMode,
-};
+use datafusion_ducklake::{DuckLakeTableWriter, WriteMode};
 
-/// Create a local filesystem object store
-fn create_object_store() -> Arc<dyn object_store::ObjectStore> {
-    Arc::new(LocalFileSystem::new())
-}
-
-/// Helper to create a test environment with writer and data directory
-async fn create_test_env() -> (SqliteMetadataWriter, TempDir) {
-    let temp_dir = TempDir::new().unwrap();
-    let db_path = temp_dir.path().join("test.db");
-    let data_path = temp_dir.path().join("data");
-    std::fs::create_dir_all(&data_path).unwrap();
-
-    let conn_str = format!("sqlite:{}?mode=rwc", db_path.display());
-    let writer = SqliteMetadataWriter::new_with_init(&conn_str)
-        .await
-        .unwrap();
-    writer.set_data_path(data_path.to_str().unwrap()).unwrap();
-
-    (writer, temp_dir)
-}
-
-/// Helper to create a SessionContext with a DuckLakeCatalog
-async fn create_read_context(temp_dir: &TempDir) -> SessionContext {
-    let db_path = temp_dir.path().join("test.db");
-    let conn_str = format!("sqlite:{}", db_path.display());
-
-    let provider = SqliteMetadataProvider::new(&conn_str).await.unwrap();
-    let catalog = DuckLakeCatalog::new(provider).unwrap();
-
-    let ctx = SessionContext::new();
-    ctx.register_catalog("test", Arc::new(catalog));
-    ctx
-}
+mod common;
+use common::{create_object_store, create_test_env};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_write_and_read_basic_types() {
@@ -100,7 +64,7 @@ async fn test_write_and_read_basic_types() {
     assert!(result.schema_id > 0);
 
     // Read back via DuckLakeCatalog
-    let ctx = create_read_context(&temp_dir).await;
+    let ctx = common::create_read_context(&temp_dir, "test").await;
     let df = ctx
         .sql("SELECT * FROM test.main.users ORDER BY id")
         .await
@@ -166,7 +130,7 @@ async fn test_write_temporal_types() {
     assert_eq!(result.records_written, 2);
 
     // Read back and verify values
-    let ctx = create_read_context(&temp_dir).await;
+    let ctx = common::create_read_context(&temp_dir, "test").await;
     let df = ctx
         .sql("SELECT id, date FROM test.main.events ORDER BY id")
         .await
@@ -212,7 +176,7 @@ async fn test_write_multiple_batches() {
     assert_eq!(result.records_written, 4);
 
     // Read back and verify values
-    let ctx = create_read_context(&temp_dir).await;
+    let ctx = common::create_read_context(&temp_dir, "test").await;
     let df = ctx
         .sql("SELECT id, value FROM test.main.data ORDER BY id")
         .await
@@ -271,7 +235,7 @@ async fn test_replace_semantics() {
     assert_eq!(result.records_written, 2);
 
     // Read back - should only have the replacement data
-    let ctx = create_read_context(&temp_dir).await;
+    let ctx = common::create_read_context(&temp_dir, "test").await;
     let df = ctx
         .sql("SELECT id, value FROM test.main.replace_test ORDER BY id")
         .await
@@ -328,7 +292,7 @@ async fn test_append_semantics() {
     assert_eq!(result.records_written, 2);
 
     // Read back - should have all data with correct values
-    let ctx = create_read_context(&temp_dir).await;
+    let ctx = common::create_read_context(&temp_dir, "test").await;
     let df = ctx
         .sql("SELECT id, value FROM test.main.append_test ORDER BY id")
         .await
@@ -386,7 +350,7 @@ async fn test_multiple_tables_same_schema() {
         .unwrap();
 
     // Read back both tables
-    let ctx = create_read_context(&temp_dir).await;
+    let ctx = common::create_read_context(&temp_dir, "test").await;
 
     let df1 = ctx.sql("SELECT name FROM test.main.t1").await.unwrap();
     let batches1 = df1.collect().await.unwrap();
@@ -505,7 +469,7 @@ async fn test_streaming_write_api() {
     assert_eq!(result.files_written, 1);
 
     // Read back via DuckLakeCatalog and verify values
-    let ctx = create_read_context(&temp_dir).await;
+    let ctx = common::create_read_context(&temp_dir, "test").await;
     let df = ctx
         .sql("SELECT id, value FROM test.main.streaming_test ORDER BY id")
         .await
@@ -569,7 +533,7 @@ async fn test_streaming_write_to_custom_path() {
     assert!(custom_dir.join(&file_name).exists());
 
     // Read back via DuckLakeCatalog
-    let ctx = create_read_context(&temp_dir).await;
+    let ctx = common::create_read_context(&temp_dir, "test").await;
     let df = ctx
         .sql("SELECT COUNT(*) as cnt FROM test.main.custom_path_test")
         .await
@@ -602,7 +566,7 @@ async fn test_streaming_empty_write() {
     assert_eq!(result.files_written, 1);
 
     // Read back - should have 0 rows
-    let ctx = create_read_context(&temp_dir).await;
+    let ctx = common::create_read_context(&temp_dir, "test").await;
     let df = ctx
         .sql("SELECT COUNT(*) as cnt FROM test.main.empty_test")
         .await
@@ -672,7 +636,7 @@ async fn test_append_add_nullable_column() {
     assert_eq!(result.unwrap().records_written, 2);
 
     // Read back - should have all 4 rows with correct values
-    let ctx = create_read_context(&temp_dir).await;
+    let ctx = common::create_read_context(&temp_dir, "test").await;
     let df = ctx
         .sql("SELECT id, name FROM test.main.evolve_add ORDER BY id")
         .await
@@ -749,7 +713,7 @@ async fn test_append_remove_column() {
     assert_eq!(result.unwrap().records_written, 2);
 
     // Read back - should have all 4 rows
-    let ctx = create_read_context(&temp_dir).await;
+    let ctx = common::create_read_context(&temp_dir, "test").await;
     let df = ctx
         .sql("SELECT COUNT(*) as cnt FROM test.main.evolve_remove")
         .await
@@ -927,7 +891,7 @@ async fn test_append_reorder_columns() {
     assert_eq!(result.unwrap().records_written, 2);
 
     // Read back - should have all 4 rows with correct values
-    let ctx = create_read_context(&temp_dir).await;
+    let ctx = common::create_read_context(&temp_dir, "test").await;
     let df = ctx
         .sql("SELECT id, name, value FROM test.main.evolve_reorder ORDER BY id")
         .await
@@ -1007,4 +971,96 @@ async fn test_zero_column_table_rejected() {
         "Error should mention needing at least one column: {}",
         err
     );
+}
+
+/// Regression test: successive append writes produce correct data and metadata.
+///
+/// Verifies that two separate write operations in Append mode to the same table
+/// produce correct cumulative results: all rows from both writes are readable
+/// and COUNT(*) matches the total number of rows written.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_successive_appends_correct_counts() {
+    let (writer, temp_dir) = create_test_env().await;
+    let object_store = create_object_store();
+
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("value", DataType::Utf8, true),
+    ]);
+
+    // First write: rows 1-3 (Replace mode creates the table)
+    let batch1 = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec!["a", "b", "c"])),
+        ],
+    )
+    .unwrap();
+
+    let table_writer =
+        DuckLakeTableWriter::new(Arc::new(writer.clone()), Arc::clone(&object_store)).unwrap();
+    let result1 = table_writer
+        .write_table("main", "append_test", &[batch1])
+        .await
+        .unwrap();
+    assert_eq!(result1.records_written, 3);
+
+    // Second write: rows 4-6 using Append mode (preserves existing data)
+    let batch2 = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![
+            Arc::new(Int32Array::from(vec![4, 5, 6])),
+            Arc::new(StringArray::from(vec!["d", "e", "f"])),
+        ],
+    )
+    .unwrap();
+
+    let table_writer2 =
+        DuckLakeTableWriter::new(Arc::new(writer.clone()), Arc::clone(&object_store)).unwrap();
+    let mut session = table_writer2
+        .begin_write("main", "append_test", &schema, WriteMode::Append)
+        .unwrap();
+    session.write_batch(&batch2).unwrap();
+    let result2 = session.finish().await.unwrap();
+    assert_eq!(result2.records_written, 3);
+
+    // Read back and verify all 6 rows present
+    let ctx = common::create_read_context(&temp_dir, "test").await;
+    let df = ctx
+        .sql("SELECT id, value FROM test.main.append_test ORDER BY id")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 6, "Expected 6 total rows after two appends");
+
+    // Verify IDs are 1..6 with no duplicates or gaps
+    let mut all_ids: Vec<i32> = Vec::new();
+    for batch in &batches {
+        let id_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        for i in 0..id_col.len() {
+            all_ids.push(id_col.value(i));
+        }
+    }
+    assert_eq!(all_ids, vec![1, 2, 3, 4, 5, 6]);
+
+    // Verify COUNT(*) agrees
+    let df_count = ctx
+        .sql("SELECT COUNT(*) as cnt FROM test.main.append_test")
+        .await
+        .unwrap();
+    let count_batches = df_count.collect().await.unwrap();
+    let count = count_batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(count, 6, "COUNT(*) should be 6 after two appends");
 }

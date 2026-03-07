@@ -8,12 +8,10 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion_ducklake::metadata_writer::MetadataWriter;
 use datafusion_ducklake::{DuckLakeTableWriter, SqliteMetadataWriter, WriteMode};
-use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 
-fn create_object_store() -> Arc<dyn object_store::ObjectStore> {
-    Arc::new(LocalFileSystem::new())
-}
+mod common;
+use common::create_object_store;
 
 async fn create_test_writer(temp_dir: &TempDir) -> (SqliteMetadataWriter, std::path::PathBuf) {
     let db_path = temp_dir.path().join("test.db");

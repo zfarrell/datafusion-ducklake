@@ -1,22 +1,29 @@
-#![cfg(feature = "metadata-duckdb")]
 //! Common test utilities for integration tests
 //!
 //! This module provides helper functions to generate DuckLake catalogs
 //! for testing purposes. Each function creates a persistent DuckDB database
 //! file with DuckLake extension, populates it with test data, and returns
 //! the path for use with DuckdbMetadataProvider.
+//!
+//! Also provides SQLite-based write helpers (behind `write-sqlite` feature)
+//! for write integration tests.
 
 #![allow(dead_code)]
 
 pub mod test_utils;
 
+#[cfg(feature = "metadata-duckdb")]
 use anyhow::Result;
+#[cfg(feature = "metadata-duckdb")]
 use std::path::Path;
+#[cfg(feature = "metadata-duckdb")]
 use std::sync::Once;
 
+#[cfg(feature = "metadata-duckdb")]
 static INSTALL_DUCKLAKE: Once = Once::new();
 
 /// Install the ducklake extension exactly once (thread-safe across parallel tests).
+#[cfg(feature = "metadata-duckdb")]
 fn ensure_ducklake_installed() {
     INSTALL_DUCKLAKE.call_once(|| {
         let conn = duckdb::Connection::open_in_memory().expect("open in-memory duckdb");
@@ -30,15 +37,7 @@ fn ensure_ducklake_installed() {
 /// Table schema:
 /// - users (id INT, name VARCHAR, email VARCHAR)
 /// - 4 rows: Alice, Bob, Charlie, Diana
-///
-/// # Example
-///
-/// ```
-/// use tempfile::TempDir;
-/// let temp_dir = TempDir::new()?;
-/// let catalog_path = temp_dir.path().join("no_deletes.ducklake");
-/// create_catalog_no_deletes(&catalog_path)?;
-/// ```
+#[cfg(feature = "metadata-duckdb")]
 pub fn create_catalog_no_deletes(catalog_path: &Path) -> Result<()> {
     // Use in-memory database to avoid file locking issues
     let conn = duckdb::Connection::open_in_memory()?;
@@ -79,6 +78,7 @@ pub fn create_catalog_no_deletes(catalog_path: &Path) -> Result<()> {
 ///
 /// This catalog demonstrates delete file functionality where some rows
 /// are marked as deleted via DuckLake's delete files.
+#[cfg(feature = "metadata-duckdb")]
 pub fn create_catalog_with_deletes(catalog_path: &Path) -> Result<()> {
     // Use in-memory database to avoid file locking issues
     let conn = duckdb::Connection::open_in_memory()?;
@@ -125,6 +125,7 @@ pub fn create_catalog_with_deletes(catalog_path: &Path) -> Result<()> {
 ///
 /// This demonstrates the MOR (Merge-On-Read) pattern where UPDATEs
 /// create delete files for old row versions.
+#[cfg(feature = "metadata-duckdb")]
 pub fn create_catalog_with_updates(catalog_path: &Path) -> Result<()> {
     // Use in-memory database to avoid file locking issues
     let conn = duckdb::Connection::open_in_memory()?;
@@ -180,6 +181,7 @@ pub fn create_catalog_with_updates(catalog_path: &Path) -> Result<()> {
 ///
 /// This tests that WHERE filters are applied AFTER delete filtering,
 /// ensuring correct query semantics.
+#[cfg(feature = "metadata-duckdb")]
 pub fn create_catalog_filter_pushdown(catalog_path: &Path) -> Result<()> {
     // Use in-memory database to avoid file locking issues
     let conn = duckdb::Connection::open_in_memory()?;
@@ -219,6 +221,7 @@ pub fn create_catalog_filter_pushdown(catalog_path: &Path) -> Result<()> {
 /// Table schema:
 /// - tbl (i INT)
 /// - 0 rows (after inserting and deleting)
+#[cfg(feature = "metadata-duckdb")]
 pub fn create_catalog_empty_table(catalog_path: &Path) -> Result<()> {
     let conn = duckdb::Connection::open_in_memory()?;
 
@@ -249,6 +252,7 @@ pub fn create_catalog_empty_table(catalog_path: &Path) -> Result<()> {
 /// Tables:
 /// - test (i INT, j INT) with 4 rows: (1,2), (NULL,3), (4,5), (6,7)
 /// - test2 (j VARCHAR, date DATE) with 1 row: ('hello world', '1992-01-01')
+#[cfg(feature = "metadata-duckdb")]
 pub fn create_catalog_basic_test(catalog_path: &Path) -> Result<()> {
     let conn = duckdb::Connection::open_in_memory()?;
 
@@ -288,6 +292,7 @@ pub fn create_catalog_basic_test(catalog_path: &Path) -> Result<()> {
 /// Helper to convert anyhow errors to DataFusion errors
 ///
 /// This is useful for converting anyhow::Error to DataFusionError in test code.
+#[cfg(feature = "metadata-duckdb")]
 pub fn to_datafusion_error(e: anyhow::Error) -> datafusion::error::DataFusionError {
     datafusion::error::DataFusionError::External(e.into())
 }
@@ -301,6 +306,7 @@ pub fn to_datafusion_error(e: anyhow::Error) -> datafusion::error::DataFusionErr
 /// - Delete some rows (5, 6)
 ///
 /// Total deletions: 5 rows (1, 2, 3, 5, 6)
+#[cfg(feature = "metadata-duckdb")]
 pub fn create_catalog_complex_deletions(catalog_path: &Path) -> Result<()> {
     let conn = duckdb::Connection::open_in_memory()?;
 
@@ -347,6 +353,7 @@ pub fn create_catalog_complex_deletions(catalog_path: &Path) -> Result<()> {
 /// - Files added between snapshots 0-1 (initial insert)
 /// - Files added between snapshots 1-2 (second insert)
 /// - Files added between snapshots 2-3 (delete file)
+#[cfg(feature = "metadata-duckdb")]
 pub fn create_catalog_multiple_snapshots(catalog_path: &Path) -> Result<()> {
     let conn = duckdb::Connection::open_in_memory()?;
 
@@ -386,4 +393,96 @@ pub fn create_catalog_multiple_snapshots(catalog_path: &Path) -> Result<()> {
     conn.execute("DELETE FROM test_catalog.events WHERE id = 2;", [])?;
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// SQLite write helpers (feature-gated: write-sqlite + metadata-sqlite)
+// ---------------------------------------------------------------------------
+
+#[cfg(all(feature = "write-sqlite", feature = "metadata-sqlite"))]
+use std::sync::Arc;
+
+#[cfg(all(feature = "write-sqlite", feature = "metadata-sqlite"))]
+use datafusion::prelude::*;
+#[cfg(all(feature = "write-sqlite", feature = "metadata-sqlite"))]
+use object_store::local::LocalFileSystem;
+#[cfg(all(feature = "write-sqlite", feature = "metadata-sqlite"))]
+use tempfile::TempDir;
+
+#[cfg(all(feature = "write-sqlite", feature = "metadata-sqlite"))]
+use datafusion_ducklake::{
+    DuckLakeCatalog, MetadataWriter, SqliteMetadataProvider, SqliteMetadataWriter,
+};
+
+/// Create a local filesystem object store for write tests.
+#[cfg(all(feature = "write-sqlite", feature = "metadata-sqlite"))]
+pub fn create_object_store() -> Arc<dyn object_store::ObjectStore> {
+    Arc::new(LocalFileSystem::new())
+}
+
+/// Create a test environment with a SQLite metadata writer and temp directory.
+///
+/// Returns `(writer, temp_dir)`. The writer is initialized with a data directory
+/// inside `temp_dir`.
+#[cfg(all(feature = "write-sqlite", feature = "metadata-sqlite"))]
+pub async fn create_test_env() -> (SqliteMetadataWriter, TempDir) {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test.db");
+    let data_path = temp_dir.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+
+    let conn_str = format!("sqlite:{}?mode=rwc", db_path.display());
+    let writer = SqliteMetadataWriter::new_with_init(&conn_str)
+        .await
+        .unwrap();
+    writer.set_data_path(data_path.to_str().unwrap()).unwrap();
+
+    (writer, temp_dir)
+}
+
+/// Create a read-only SessionContext backed by the SQLite catalog in `temp_dir`.
+///
+/// The catalog is registered under the given `catalog_name`.
+#[cfg(all(feature = "write-sqlite", feature = "metadata-sqlite"))]
+pub async fn create_read_context(temp_dir: &TempDir, catalog_name: &str) -> SessionContext {
+    let db_path = temp_dir.path().join("test.db");
+    let conn_str = format!("sqlite:{}", db_path.display());
+
+    let provider = SqliteMetadataProvider::new(&conn_str).await.unwrap();
+    let catalog = DuckLakeCatalog::new(provider).unwrap();
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog(catalog_name, Arc::new(catalog));
+    ctx
+}
+
+/// Create a writable SessionContext with a DuckLake catalog backed by SQLite.
+///
+/// The catalog is registered as "ducklake". Returns `(ctx, temp_dir)`.
+#[cfg(all(feature = "write-sqlite", feature = "metadata-sqlite"))]
+pub async fn create_writable_catalog() -> (SessionContext, TempDir) {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test.db");
+    let data_path = temp_dir.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+
+    let conn_str = format!("sqlite:{}?mode=rwc", db_path.display());
+
+    // Create writer and initialize schema
+    let writer = SqliteMetadataWriter::new_with_init(&conn_str)
+        .await
+        .unwrap();
+    writer.set_data_path(data_path.to_str().unwrap()).unwrap();
+
+    // Create a snapshot to initialize the catalog
+    writer.create_snapshot().unwrap();
+
+    // Create provider and catalog with writer
+    let provider = SqliteMetadataProvider::new(&conn_str).await.unwrap();
+    let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer)).unwrap();
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog("ducklake", Arc::new(catalog));
+
+    (ctx, temp_dir)
 }
