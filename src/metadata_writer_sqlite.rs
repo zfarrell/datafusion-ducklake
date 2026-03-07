@@ -1334,13 +1334,13 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .column_names
                     .iter()
                     .enumerate()
-                    .map(|(i, name)| (name.as_str(), i))
+                    .map(|(i, name)| (&**name, i))
                     .collect();
 
                 // Bind each column value using precomputed map
                 for col in columns {
                     let value = col_map
-                        .get(col.name().as_ref())
+                        .get(&*col.name())
                         .and_then(|&pos| inlined_row.values.get(pos))
                         .and_then(|v| v.clone());
                     query = query.bind(value);
