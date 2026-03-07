@@ -8,12 +8,7 @@ use std::sync::Arc;
 mod common;
 
 #[tokio::test]
-#[ignore] // Snapshots table requires ducklake_snapshot table which test catalogs don't create
 async fn test_information_schema_snapshots() -> Result<(), Box<dyn std::error::Error>> {
-    // NOTE: This test is ignored because the test helper uses DuckDB's DuckLake extension
-    // which doesn't expose the ducklake_snapshot table directly.
-    // In production catalogs created by other means, this table would exist.
-
     let temp_dir = tempfile::tempdir()?;
     let catalog_path = temp_dir.path().join("test.ducklake");
 
