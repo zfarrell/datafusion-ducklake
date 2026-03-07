@@ -625,7 +625,9 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
     /// List tables for a specific snapshot
     fn list_tables(&self, schema_id: i64, snapshot_id: i64) -> Result<Vec<TableMetadata>>;
 
-    /// Get table structure (columns) for a specific snapshot
+    /// Get table structure (columns) for a specific snapshot.
+    /// Columns are snapshot-versioned: they have begin_snapshot/end_snapshot
+    /// to track schema evolution (ALTER TABLE ADD/DROP/RENAME COLUMN).
     fn get_table_structure(
         &self,
         table_id: i64,

@@ -78,6 +78,8 @@ async fn init_schema(pool: &MySqlPool) -> anyhow::Result<()> {
             column_type VARCHAR(255) NOT NULL,
             column_order INTEGER NOT NULL,
             nulls_allowed BOOLEAN,
+            begin_snapshot BIGINT NOT NULL DEFAULT 1,
+            end_snapshot BIGINT,
             FOREIGN KEY (table_id) REFERENCES ducklake_table(table_id)
         )",
     )

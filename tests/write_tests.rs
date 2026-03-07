@@ -985,3 +985,26 @@ async fn test_orphaned_file_cleanup() {
     // Verify it was deleted
     assert!(!full_path.exists(), "File should be deleted after cleanup");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_zero_column_table_rejected() {
+    let (writer, _temp_dir) = create_test_env().await;
+    let object_store = create_object_store();
+
+    // An empty Arrow schema (zero columns)
+    let schema = Arc::new(Schema::empty());
+
+    let batch = RecordBatch::new_empty(schema.clone());
+
+    let table_writer = DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
+    let result = table_writer
+        .write_table("main", "empty_cols", &[batch])
+        .await;
+    assert!(result.is_err(), "Zero-column table should be rejected");
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("at least one column"),
+        "Error should mention needing at least one column: {}",
+        err
+    );
+}
