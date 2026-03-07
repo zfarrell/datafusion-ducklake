@@ -30,18 +30,11 @@ use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::stream::{self, TryStreamExt};
+use object_store::ObjectStore;
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, PutPayload};
-use parquet::arrow::ArrowWriter;
-use parquet::file::properties::WriterProperties;
-use uuid::Uuid;
 
 use crate::metadata_provider::DuckLakeTableFile;
 use crate::metadata_writer::{DataFileInfo, DeleteFileInfo, MetadataWriter};
-use crate::path_resolver::join_paths;
-use crate::table_writer::{
-    build_schema_with_field_ids, calculate_footer_size_from_bytes, extract_column_stats,
-};
 
 use crate::delete_exec::make_dml_count_schema;
 
@@ -625,72 +618,15 @@ impl ExecutionPlan for DuckLakeMergeExec {
             // Write new data file(s) for updated + inserted rows
             let mut pending_data_files: Vec<DataFileInfo> = Vec::new();
             if !new_data_batches.is_empty() {
-                let data_file_name = format!("ducklake-{}.parquet", Uuid::new_v4());
-
-                // Use the catalog's stored table_path instead of deriving from names,
-                // so writes go to the correct location even after table rename.
-                let object_key = join_paths(table_path.trim_start_matches('/'), &data_file_name)?;
-                let data_object_path = ObjectPath::from(object_key.trim_start_matches('/'));
-
-                let write_schema = Arc::new(
-                    build_schema_with_field_ids(&table_schema, &column_ids)
-                        .map_err(|e| DataFusionError::External(Box::new(e)))?,
-                );
-
-                let props = WriterProperties::builder()
-                    .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
-                    .set_compression(parquet::basic::Compression::SNAPPY)
-                    .build();
-                let mut arrow_writer =
-                    ArrowWriter::try_new(Vec::new(), write_schema.clone(), Some(props))
-                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-                let mut total_records: i64 = 0;
-                for batch in &new_data_batches {
-                    let batch_with_ids =
-                        RecordBatch::try_new(write_schema.clone(), batch.columns().to_vec())?;
-                    let batch_rows = i64::try_from(batch_with_ids.num_rows()).map_err(|e| {
-                        DataFusionError::Execution(format!("Row count overflow: {}", e))
-                    })?;
-                    total_records = total_records.checked_add(batch_rows).ok_or_else(|| {
-                        DataFusionError::Execution(format!(
-                            "Total record count overflow: {} + {} exceeds i64::MAX",
-                            total_records, batch_rows
-                        ))
-                    })?;
-                    arrow_writer
-                        .write(&batch_with_ids)
-                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                }
-
-                // R4-S-005: Extract column stats before consuming the writer
-                arrow_writer
-                    .flush()
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                let column_stats =
-                    extract_column_stats(arrow_writer.flushed_row_groups(), &column_ids);
-
-                let buffer = arrow_writer
-                    .into_inner()
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-                let file_size = i64::try_from(buffer.len()).map_err(|e| {
-                    DataFusionError::Execution(format!("File size overflow: {}", e))
-                })?;
-                let footer_size = calculate_footer_size_from_bytes(&buffer)
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-                // Upload data file (guard cleans up on error)
-                object_store
-                    .put(&data_object_path, PutPayload::from(buffer))
-                    .await
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                upload_guard.push(data_object_path);
-
-                let data_file_info = DataFileInfo::new(&data_file_name, file_size, total_records)
-                    .with_footer_size(footer_size)
-                    .with_column_stats(column_stats);
-
+                let data_file_info = crate::table_writer::write_and_upload_parquet(
+                    &new_data_batches,
+                    &table_schema,
+                    &column_ids,
+                    &table_path,
+                    &*object_store,
+                    &mut upload_guard,
+                )
+                .await?;
                 pending_data_files.push(data_file_info);
             }
 

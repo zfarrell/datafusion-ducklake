@@ -1665,6 +1665,78 @@ impl Drop for UploadCleanupGuard {
     }
 }
 
+/// Write record batches to a Parquet file and upload it to the object store.
+///
+/// Shared by UPDATE and MERGE exec plans to avoid duplicated write boilerplate.
+/// Returns the `DataFileInfo` for metadata registration.
+pub(crate) async fn write_and_upload_parquet(
+    batches: &[RecordBatch],
+    table_schema: &arrow::datatypes::Schema,
+    column_ids: &[i64],
+    table_path: &str,
+    object_store: &dyn ObjectStore,
+    upload_guard: &mut UploadCleanupGuard,
+) -> std::result::Result<DataFileInfo, datafusion::error::DataFusionError> {
+    use datafusion::error::DataFusionError;
+
+    let data_file_name = format!("ducklake-{}.parquet", Uuid::new_v4());
+    let object_key = join_paths(table_path.trim_start_matches('/'), &data_file_name)
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let data_object_path = ObjectPath::from(object_key.trim_start_matches('/'));
+
+    let write_schema = Arc::new(
+        build_schema_with_field_ids(table_schema, column_ids)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?,
+    );
+
+    let props = WriterProperties::builder()
+        .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
+        .set_compression(parquet::basic::Compression::SNAPPY)
+        .build();
+    let mut arrow_writer = ArrowWriter::try_new(Vec::new(), write_schema.clone(), Some(props))
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+    let mut total_records: i64 = 0;
+    for batch in batches {
+        let batch_with_ids = RecordBatch::try_new(write_schema.clone(), batch.columns().to_vec())?;
+        let batch_rows = i64::try_from(batch_with_ids.num_rows())
+            .map_err(|e| DataFusionError::Execution(format!("Row count overflow: {}", e)))?;
+        total_records = total_records.checked_add(batch_rows).ok_or_else(|| {
+            DataFusionError::Execution(format!(
+                "Total record count overflow: {} + {} exceeds i64::MAX",
+                total_records, batch_rows
+            ))
+        })?;
+        arrow_writer
+            .write(&batch_with_ids)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    }
+
+    arrow_writer
+        .flush()
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let column_stats = extract_column_stats(arrow_writer.flushed_row_groups(), column_ids);
+
+    let buffer = arrow_writer
+        .into_inner()
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+    let file_size = i64::try_from(buffer.len())
+        .map_err(|e| DataFusionError::Execution(format!("File size overflow: {}", e)))?;
+    let footer_size = calculate_footer_size_from_bytes(&buffer)
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+    object_store
+        .put(&data_object_path, PutPayload::from(buffer))
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    upload_guard.push(data_object_path);
+
+    Ok(DataFileInfo::new(&data_file_name, file_size, total_records)
+        .with_footer_size(footer_size)
+        .with_column_stats(column_stats))
+}
+
 /// Write a Parquet delete file and upload it to the object store.
 ///
 /// Shared by DELETE, UPDATE, and MERGE exec plans.
