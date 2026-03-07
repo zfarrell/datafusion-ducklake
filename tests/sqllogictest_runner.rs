@@ -276,8 +276,11 @@ fn preprocess_test_file(content: &str, test_dir: &str) -> String {
                 }
                 continue;
             }
-            // For queries with GROUP BY but no ORDER BY, add rowsort since
-            // aggregate grouping order is non-deterministic across engines
+            // For queries with GROUP BY/UNION/EXCEPT/INTERSECT but no ORDER BY,
+            // add rowsort since aggregate/set operation ordering is non-deterministic.
+            // Note: rowsort only sorts actual results, so the expected results in the
+            // test file must also be in sorted order. This works because DuckDB typically
+            // returns GROUP BY results in key order, which matches lexicographic sort.
             if !full_sql_upper.contains("ORDER BY")
                 && (full_sql_upper.contains("GROUP BY")
                     || full_sql_upper.contains("UNION")
