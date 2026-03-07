@@ -196,6 +196,8 @@ WHERE data.table_id = ?
         snapshot_id: i64,
     ) -> Result<Vec<InlinedDataRow>> {
         block_on(async {
+            let mut tx = self.pool.begin().await?;
+
             let table_info = sqlx::query(
                 "SELECT table_name, schema_version FROM ducklake_inlined_data_tables \
                  WHERE table_id = ? \
@@ -204,7 +206,7 @@ WHERE data.table_id = ?
             )
             .bind(table_id)
             .bind(snapshot_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?;
 
             let Some(info_row) = table_info else {
@@ -217,7 +219,7 @@ WHERE data.table_id = ?
                 "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?",
             )
             .bind(&inlined_table_name)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *tx)
             .await?;
             let count: i64 = exists.try_get(0)?;
             if count == 0 {
@@ -228,7 +230,7 @@ WHERE data.table_id = ?
                 "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
             )
             .bind(&inlined_table_name)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *tx)
             .await?;
 
             let user_columns: Vec<String> = columns
@@ -260,7 +262,7 @@ WHERE data.table_id = ?
             let rows = sqlx::query(&select_sql)
                 .bind(snapshot_id)
                 .bind(snapshot_id)
-                .fetch_all(&self.pool)
+                .fetch_all(&mut *tx)
                 .await?;
 
             let num_columns = user_columns.len();
