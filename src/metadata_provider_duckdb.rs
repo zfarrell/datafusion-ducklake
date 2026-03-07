@@ -266,7 +266,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
                     };
 
                     // Parse delete file (columns 6-12) if exists
-                    let delete_file = if let Ok(Some(_)) = row.get::<_, Option<i64>>(6) {
+                    let delete_file = if row.get::<_, Option<i64>>(6)?.is_some() {
                         Some(DuckLakeFileData {
                             path: row.get(7)?,
                             path_is_relative: row.get(8)?,
@@ -458,18 +458,17 @@ impl MetadataProvider for DuckdbMetadataProvider {
                     };
 
                     // Parse optional delete file (column 8: delete_file_id, check if exists but don't store)
-                    let delete_file =
-                        if let Ok(Some(_delete_file_id)) = row.get::<_, Option<i64>>(8) {
-                            Some(DuckLakeFileData {
-                                path: row.get(9)?,
-                                path_is_relative: row.get(10)?,
-                                file_size_bytes: row.get(11)?,
-                                footer_size: row.get(12)?,
-                                encryption_key: row.get(13)?,
-                            })
-                        } else {
-                            None
-                        };
+                    let delete_file = if row.get::<_, Option<i64>>(8)?.is_some() {
+                        Some(DuckLakeFileData {
+                            path: row.get(9)?,
+                            path_is_relative: row.get(10)?,
+                            file_size_bytes: row.get(11)?,
+                            footer_size: row.get(12)?,
+                            encryption_key: row.get(13)?,
+                        })
+                    } else {
+                        None
+                    };
 
                     let max_row_count = row.get::<_, Option<i64>>(14)?;
 
