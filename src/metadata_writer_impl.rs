@@ -310,7 +310,11 @@ macro_rules! impl_writer_query_ops {
                 sqlx::query(&sql)
                     .bind(data_file_id)
                     .bind(table_id)
-                    .bind(partition_key_index as i64)
+                    .bind(i64::try_from(partition_key_index).map_err(|_| {
+                        crate::error::DuckLakeError::Internal(format!(
+                            "partition_key_index {} overflows i64", partition_key_index
+                        ))
+                    })?)
                     .bind(partition_value)
                     .execute(&self.pool)
                     .await?;
@@ -593,14 +597,14 @@ macro_rules! impl_writer_file_ops {
             );
             let insert_file_sql = if d.supports_returning() {
                 format!(
-                    "INSERT INTO ducklake_data_file (table_id, path, path_is_relative, file_size_bytes, footer_size, record_count, row_id_start, begin_snapshot)
-                     VALUES ({}, {}, {}, {}, {}, {}, {}, {}) RETURNING data_file_id",
+                    "INSERT INTO ducklake_data_file (table_id, path, path_is_relative, file_size_bytes, footer_size, record_count, row_id_start, file_format, begin_snapshot)
+                     VALUES ({}, {}, {}, {}, {}, {}, {}, 'parquet', {}) RETURNING data_file_id",
                     d.ph(1), d.ph(2), d.ph(3), d.ph(4), d.ph(5), d.ph(6), d.ph(7), d.ph(8),
                 )
             } else {
                 format!(
-                    "INSERT INTO ducklake_data_file (table_id, path, path_is_relative, file_size_bytes, footer_size, record_count, row_id_start, begin_snapshot)
-                     VALUES ({}, {}, {}, {}, {}, {}, {}, {})",
+                    "INSERT INTO ducklake_data_file (table_id, path, path_is_relative, file_size_bytes, footer_size, record_count, row_id_start, file_format, begin_snapshot)
+                     VALUES ({}, {}, {}, {}, {}, {}, {}, 'parquet', {})",
                     d.ph(1), d.ph(2), d.ph(3), d.ph(4), d.ph(5), d.ph(6), d.ph(7), d.ph(8),
                 )
             };
@@ -774,14 +778,14 @@ macro_rules! impl_writer_file_ops {
             let d = $dialect;
             let insert_file_sql = if d.supports_returning() {
                 format!(
-                    "INSERT INTO ducklake_data_file (table_id, path, path_is_relative, file_size_bytes, footer_size, record_count, row_id_start, begin_snapshot)
-                     VALUES ({}, {}, {}, {}, {}, {}, {}, {}) RETURNING data_file_id",
+                    "INSERT INTO ducklake_data_file (table_id, path, path_is_relative, file_size_bytes, footer_size, record_count, row_id_start, file_format, begin_snapshot)
+                     VALUES ({}, {}, {}, {}, {}, {}, {}, 'parquet', {}) RETURNING data_file_id",
                     d.ph(1), d.ph(2), d.ph(3), d.ph(4), d.ph(5), d.ph(6), d.ph(7), d.ph(8),
                 )
             } else {
                 format!(
-                    "INSERT INTO ducklake_data_file (table_id, path, path_is_relative, file_size_bytes, footer_size, record_count, row_id_start, begin_snapshot)
-                     VALUES ({}, {}, {}, {}, {}, {}, {}, {})",
+                    "INSERT INTO ducklake_data_file (table_id, path, path_is_relative, file_size_bytes, footer_size, record_count, row_id_start, file_format, begin_snapshot)
+                     VALUES ({}, {}, {}, {}, {}, {}, {}, 'parquet', {})",
                     d.ph(1), d.ph(2), d.ph(3), d.ph(4), d.ph(5), d.ph(6), d.ph(7), d.ph(8),
                 )
             };
@@ -792,6 +796,24 @@ macro_rules! impl_writer_file_ops {
             );
             let insert_partition_sql = format!(
                 "INSERT INTO ducklake_file_partition_value (data_file_id, table_id, partition_key_index, partition_value)
+                 VALUES ({}, {}, {}, {})",
+                d.ph(1), d.ph(2), d.ph(3), d.ph(4),
+            );
+            let stats_sql = format!(
+                "SELECT next_row_id FROM ducklake_table_stats WHERE table_id = {}{}",
+                d.ph(1),
+                d.for_update(),
+            );
+            let update_stats_sql = format!(
+                "UPDATE ducklake_table_stats
+                 SET record_count = COALESCE(record_count, 0) + {},
+                     next_row_id = {},
+                     file_size_bytes = COALESCE(file_size_bytes, 0) + {}
+                 WHERE table_id = {}",
+                d.ph(1), d.ph(2), d.ph(3), d.ph(4),
+            );
+            let insert_stats_row_sql = format!(
+                "INSERT INTO ducklake_table_stats (table_id, record_count, next_row_id, file_size_bytes)
                  VALUES ({}, {}, {}, {})",
                 d.ph(1), d.ph(2), d.ph(3), d.ph(4),
             );
@@ -808,8 +830,18 @@ macro_rules! impl_writer_file_ops {
             $block_on(|| async {
                 let mut tx = self.pool.begin().await?;
 
+                // Get current next_row_id from table_stats (locked for update)
+                let stats_row = sqlx::query(&stats_sql)
+                    .bind(table_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                let base_row_id: i64 = match stats_row {
+                    Some(r) => r.try_get::<Option<i64>, _>(0)?.unwrap_or(0),
+                    None => 0,
+                };
+
                 let mut ids = Vec::with_capacity(files.len());
-                let mut cumulative_row_id: i64 = 0;
+                let mut cumulative_row_id: i64 = base_row_id;
                 for entry in files {
                     let path_is_relative = entry.file_info.path_is_relative;
                     let data_file_id: i64 = if d.supports_returning() {
@@ -872,6 +904,42 @@ macro_rules! impl_writer_file_ops {
                     ids.push(data_file_id);
                 }
 
+                // Update ducklake_table_stats
+                let total_record_count: i64 = files.iter().try_fold(0i64, |acc, f| {
+                    acc.checked_add(f.file_info.record_count).ok_or_else(|| {
+                        DuckLakeError::Internal(
+                            "record_count sum overflow in append_table_files".into(),
+                        )
+                    })
+                })?;
+                let total_file_size: i64 = files.iter().try_fold(0i64, |acc, f| {
+                    acc.checked_add(f.file_info.file_size_bytes).ok_or_else(|| {
+                        DuckLakeError::Internal(
+                            "file_size_bytes sum overflow in append_table_files".into(),
+                        )
+                    })
+                })?;
+                let updated = sqlx::query(&update_stats_sql)
+                    .bind(total_record_count)
+                    .bind(cumulative_row_id)
+                    .bind(total_file_size)
+                    .bind(table_id)
+                    .execute(&mut *tx)
+                    .await?;
+
+                if updated.rows_affected() == 0 {
+                    sqlx::query(&insert_stats_row_sql)
+                        .bind(table_id)
+                        .bind(total_record_count)
+                        .bind(cumulative_row_id)
+                        .bind(total_file_size)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+
+                // Recompute table column stats
+                Self::recompute_table_column_stats(&mut tx, table_id).await?;
+
                 // Update snapshot's next_file_id
                 sqlx::query(&next_file_id_sql)
                     .bind(snapshot_id)
@@ -924,14 +992,14 @@ macro_rules! impl_writer_file_ops {
             );
             let insert_data_file_sql = if d.supports_returning() {
                 format!(
-                    "INSERT INTO ducklake_data_file (table_id, path, path_is_relative, file_size_bytes, footer_size, record_count, row_id_start, begin_snapshot)
-                     VALUES ({}, {}, {}, {}, {}, {}, {}, {}) RETURNING data_file_id",
+                    "INSERT INTO ducklake_data_file (table_id, path, path_is_relative, file_size_bytes, footer_size, record_count, row_id_start, file_format, begin_snapshot)
+                     VALUES ({}, {}, {}, {}, {}, {}, {}, 'parquet', {}) RETURNING data_file_id",
                     d.ph(1), d.ph(2), d.ph(3), d.ph(4), d.ph(5), d.ph(6), d.ph(7), d.ph(8),
                 )
             } else {
                 format!(
-                    "INSERT INTO ducklake_data_file (table_id, path, path_is_relative, file_size_bytes, footer_size, record_count, row_id_start, begin_snapshot)
-                     VALUES ({}, {}, {}, {}, {}, {}, {}, {})",
+                    "INSERT INTO ducklake_data_file (table_id, path, path_is_relative, file_size_bytes, footer_size, record_count, row_id_start, file_format, begin_snapshot)
+                     VALUES ({}, {}, {}, {}, {}, {}, {}, 'parquet', {})",
                     d.ph(1), d.ph(2), d.ph(3), d.ph(4), d.ph(5), d.ph(6), d.ph(7), d.ph(8),
                 )
             };
@@ -1211,12 +1279,15 @@ pub(crate) use impl_writer_file_ops;
 macro_rules! create_ddl_snapshot {
     ($tx:expr, $d:expr, $last_id:expr) => {{
         let sv_lock_sql = format!(
-            "SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot{}",
+            "SELECT schema_version FROM ducklake_snapshot ORDER BY snapshot_id DESC LIMIT 1{}",
             $d.for_update()
         );
         let prev_sv_row = sqlx::query(&sv_lock_sql)
-            .fetch_one(&mut *$tx).await?;
-        let new_sv: i64 = prev_sv_row.try_get::<i64, _>(0)? + 1;
+            .fetch_optional(&mut *$tx).await?;
+        let new_sv: i64 = match prev_sv_row {
+            Some(r) => r.try_get::<i64, _>(0)? + 1,
+            None => 1,
+        };
 
         let sid: i64 = if $d.supports_returning() {
             let ins = format!(
@@ -1473,7 +1544,7 @@ macro_rules! impl_writer_ddl_ops {
                                 column_id: r.try_get(0)?,
                                 column_name: r.try_get(1)?,
                                 column_type: r.try_get(2)?,
-                                column_order: r.try_get::<i32, _>(3)? as i64,
+                                column_order: i64::from(r.try_get::<i32, _>(3)?),
                                 is_nullable: r.try_get::<Option<bool>, _>(4)?.unwrap_or(true),
                                 initial_default: r.try_get(5)?,
                                 default_value: r.try_get(6)?,

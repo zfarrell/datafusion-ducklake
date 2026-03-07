@@ -691,16 +691,21 @@ macro_rules! impl_metadata_provider {
                      FROM ducklake_file_column_stats s
                      JOIN ducklake_data_file f ON s.data_file_id = f.data_file_id
                      JOIN ducklake_column c ON s.column_id = c.column_id
-                       AND c.table_id = s.table_id AND c.end_snapshot IS NULL
+                       AND c.table_id = s.table_id
+                       AND c.begin_snapshot <= {} AND (c.end_snapshot IS NULL OR c.end_snapshot > {})
                      WHERE s.table_id = {}
                        AND {} >= f.begin_snapshot
                        AND ({} < f.end_snapshot OR f.end_snapshot IS NULL)",
                     d.ph(1),
                     d.ph(2),
                     d.ph(3),
+                    d.ph(4),
+                    d.ph(5),
                 );
                 block_on(async {
                     sqlx::query(&sql)
+                        .bind(snapshot_id)
+                        .bind(snapshot_id)
                         .bind(table_id)
                         .bind(snapshot_id)
                         .bind(snapshot_id)
@@ -788,7 +793,8 @@ macro_rules! impl_metadata_provider {
                      JOIN ducklake_partition_column pc
                          ON pi.partition_id = pc.partition_id AND pi.table_id = pc.table_id
                      JOIN ducklake_column c ON pc.column_id = c.column_id
-                       AND c.table_id = pi.table_id AND c.end_snapshot IS NULL
+                       AND c.table_id = pi.table_id
+                       AND c.begin_snapshot <= {} AND (c.end_snapshot IS NULL OR c.end_snapshot > {})
                      WHERE pi.table_id = {}
                        AND {} >= pi.begin_snapshot
                        AND ({} < pi.end_snapshot OR pi.end_snapshot IS NULL)
@@ -797,9 +803,13 @@ macro_rules! impl_metadata_provider {
                     d.ph(1),
                     d.ph(2),
                     d.ph(3),
+                    d.ph(4),
+                    d.ph(5),
                 );
                 block_on(async {
                     sqlx::query(&sql)
+                        .bind(snapshot_id)
+                        .bind(snapshot_id)
                         .bind(table_id)
                         .bind(snapshot_id)
                         .bind(snapshot_id)

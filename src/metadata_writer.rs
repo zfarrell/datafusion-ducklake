@@ -465,8 +465,8 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// (DELETE, UPDATE, MERGE) are committed atomically. If any registration
     /// fails, none of them take effect.
     ///
-    /// Default implementation calls individual methods (non-atomic, for backward
-    /// compatibility). Backends should override for true atomicity.
+    /// All backends must override this method to provide atomic transaction
+    /// semantics. The default panics to prevent accidental non-atomic usage.
     fn register_dml_files(
         &self,
         table_id: i64,
@@ -474,13 +474,8 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         delete_files: &[DeleteFileInfo],
         data_files: &[DataFileInfo],
     ) -> Result<()> {
-        for file in delete_files {
-            self.register_delete_file(table_id, snapshot_id, file)?;
-        }
-        for file in data_files {
-            self.register_data_file(table_id, snapshot_id, file)?;
-        }
-        Ok(())
+        let _ = (table_id, snapshot_id, delete_files, data_files);
+        unimplemented!("register_dml_files must be implemented by the backend for atomicity")
     }
 
     /// Atomically replace table files: end existing files and register new ones.
@@ -490,38 +485,16 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     ///
     /// Returns the data_file_id for each registered file.
     ///
-    /// # Warning: Default implementation is NOT atomic
-    ///
-    /// The default implementation calls `end_table_files` followed by individual
-    /// `register_data_file` / `register_column_stats` / `register_file_partition_value`
-    /// calls **without** a wrapping transaction.  If a failure occurs mid-way, the
-    /// table metadata will be left in an inconsistent state (some files ended, some
-    /// new files registered).  Backends **should** override this method to wrap the
-    /// entire operation in a single transaction for true atomicity.
+    /// All backends must override this method to provide atomic transaction
+    /// semantics. The default panics to prevent accidental non-atomic usage.
     fn replace_table_files(
         &self,
         table_id: i64,
         snapshot_id: i64,
         files: &[ReplaceFileEntry],
     ) -> Result<Vec<i64>> {
-        self.end_table_files(table_id, snapshot_id)?;
-        let mut ids = Vec::with_capacity(files.len());
-        for entry in files {
-            let data_file_id = self.register_data_file(table_id, snapshot_id, &entry.file_info)?;
-            if !entry.file_info.column_stats.is_empty() {
-                self.register_column_stats(data_file_id, table_id, &entry.file_info.column_stats)?;
-            }
-            for (key_index, val) in &entry.partition_values {
-                self.register_file_partition_value(
-                    data_file_id,
-                    table_id,
-                    *key_index,
-                    val.as_deref(),
-                )?;
-            }
-            ids.push(data_file_id);
-        }
-        Ok(ids)
+        let _ = (table_id, snapshot_id, files);
+        unimplemented!("replace_table_files must be implemented by the backend for atomicity")
     }
 
     /// Atomically append new files to a table (without ending existing files).
@@ -532,35 +505,16 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     ///
     /// Returns the data_file_id for each registered file.
     ///
-    /// # Warning: Default implementation is NOT atomic
-    ///
-    /// The default implementation calls individual `register_data_file` /
-    /// `register_column_stats` / `register_file_partition_value` calls
-    /// **without** a wrapping transaction. Backends **should** override this
-    /// method to wrap the entire operation in a single transaction.
+    /// All backends must override this method to provide atomic transaction
+    /// semantics. The default panics to prevent accidental non-atomic usage.
     fn append_table_files(
         &self,
         table_id: i64,
         snapshot_id: i64,
         files: &[ReplaceFileEntry],
     ) -> Result<Vec<i64>> {
-        let mut ids = Vec::with_capacity(files.len());
-        for entry in files {
-            let data_file_id = self.register_data_file(table_id, snapshot_id, &entry.file_info)?;
-            if !entry.file_info.column_stats.is_empty() {
-                self.register_column_stats(data_file_id, table_id, &entry.file_info.column_stats)?;
-            }
-            for (key_index, val) in &entry.partition_values {
-                self.register_file_partition_value(
-                    data_file_id,
-                    table_id,
-                    *key_index,
-                    val.as_deref(),
-                )?;
-            }
-            ids.push(data_file_id);
-        }
-        Ok(ids)
+        let _ = (table_id, snapshot_id, files);
+        unimplemented!("append_table_files must be implemented by the backend for atomicity")
     }
 
     /// Drop a table by setting its end_snapshot.
