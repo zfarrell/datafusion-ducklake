@@ -296,6 +296,11 @@ pub fn get_int_column(batch: &RecordBatch, col_idx: usize) -> Vec<i32> {
 ///
 /// Only normalizes values that look like floats (contain '.' or 'e'/'E') to avoid
 /// collapsing distinct integer/float representations or losing large-integer precision.
+///
+/// **Limitation**: This is type-unaware — it cannot distinguish between Float32 "1.0"
+/// and Decimal "1.00" since both normalize to "1.000000". For tests where numeric type
+/// precision matters (e.g., Decimal vs Float32 confusion), use `assert_results_eq_strict`
+/// instead.
 pub fn normalize_value(s: &str) -> String {
     if s == "NULL" {
         return s.to_string();
