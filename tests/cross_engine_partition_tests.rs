@@ -17,7 +17,12 @@ use common::test_utils::{DuckDbConn, batches_to_strings_filtered};
 use datafusion::prelude::*;
 use tempfile::TempDir;
 
-use datafusion_ducklake::{DuckLakeCatalog, DuckdbMetadataProvider, SqliteMetadataProvider};
+use datafusion::execution::session_state::SessionStateBuilder;
+
+use datafusion_ducklake::{
+    DuckLakeCatalog, DuckLakeQueryPlanner, DuckdbMetadataProvider, SqliteMetadataProvider,
+    SqliteMetadataWriter,
+};
 
 // ==================== Setup helpers ====================
 
@@ -252,4 +257,91 @@ async fn test_duckdb_empty_partitioned_table() {
     let batches = df.collect().await.unwrap();
     let rows = batches_to_strings_filtered(&batches);
     assert_eq!(rows.len(), 0);
+}
+
+// ==================== DF-created partitioned data -> DuckDB reads ====================
+
+/// Open a writable DataFusion context with DuckLakeQueryPlanner (SQLite-backed).
+async fn open_writable_df_context(catalog_path: &Path) -> SessionContext {
+    let conn_str = format!("sqlite:{}?mode=rwc", catalog_path.display());
+    let provider = Arc::new(SqliteMetadataProvider::new(&conn_str).await.unwrap());
+    let writer = Arc::new(SqliteMetadataWriter::new(&conn_str).await.unwrap());
+    let catalog = DuckLakeCatalog::with_writer(provider, writer).unwrap();
+
+    let state = SessionStateBuilder::new()
+        .with_default_features()
+        .with_query_planner(Arc::new(DuckLakeQueryPlanner))
+        .build();
+    let ctx = SessionContext::new_with_state(state);
+    ctx.register_catalog("ducklake", Arc::new(catalog));
+    ctx
+}
+
+/// Test: DuckDB creates partitioned table -> DataFusion inserts data -> DuckDB reads
+#[tokio::test(flavor = "multi_thread")]
+async fn test_df_insert_partitioned_duckdb_read() {
+    let temp_dir = TempDir::new().unwrap();
+    let catalog_db_path = temp_dir.path().join("catalog.db");
+    let data_path = temp_dir.path().join("data/");
+    std::fs::create_dir_all(&data_path).unwrap();
+
+    // DuckDB creates partitioned table via SQLite-backed catalog
+    {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute("INSTALL ducklake;", []).unwrap();
+        conn.execute("LOAD ducklake;", []).unwrap();
+        conn.execute(
+            &format!(
+                "ATTACH 'ducklake:sqlite:{}' AS ducklake (DATA_PATH '{}');",
+                catalog_db_path.display(),
+                data_path.display()
+            ),
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE ducklake.main.products (id INTEGER, category VARCHAR, price DOUBLE)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "ALTER TABLE ducklake.main.products SET PARTITIONED BY (category)",
+            [],
+        )
+        .unwrap();
+    }
+
+    // DataFusion inserts partitioned data
+    let ctx = open_writable_df_context(&catalog_db_path).await;
+    ctx.sql(
+        "INSERT INTO ducklake.main.products VALUES          (1, 'Electronics', 99.99), (2, 'Books', 12.50),          (3, 'Electronics', 149.99), (4, 'Clothing', 29.99),          (5, 'Books', 8.99)",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    // DuckDB reads and verifies all data
+    let duckdb = DuckDbConn::open(&catalog_db_path);
+    let rows = duckdb.query("SELECT id, category, price FROM ducklake.main.products ORDER BY id");
+    assert_eq!(rows.len(), 5, "DuckDB should see all 5 DF-inserted rows");
+    assert_eq!(rows[0][0], "1");
+    assert_eq!(rows[0][1], "Electronics");
+    assert_eq!(rows[1][0], "2");
+    assert_eq!(rows[1][1], "Books");
+    assert_eq!(rows[2][0], "3");
+    assert_eq!(rows[2][1], "Electronics");
+    assert_eq!(rows[3][0], "4");
+    assert_eq!(rows[3][1], "Clothing");
+    assert_eq!(rows[4][0], "5");
+    assert_eq!(rows[4][1], "Books");
+
+    // DuckDB: filtered read on partition column
+    let filtered = duckdb.query(
+        "SELECT id, price FROM ducklake.main.products WHERE category = 'Electronics' ORDER BY id",
+    );
+    assert_eq!(filtered.len(), 2);
+    assert_eq!(filtered[0][0], "1");
+    assert_eq!(filtered[1][0], "3");
 }
