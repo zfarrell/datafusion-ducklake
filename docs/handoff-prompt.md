@@ -47,9 +47,9 @@ Also in `/home/zac/`:
 - Views, DDL, Virtual Columns: ~100%
 - Table functions: 14 implemented (incl. `ducklake_flush_inlined_data()`)
 - Multi-backend (SQLite/Postgres/MySQL): ALL methods implemented, Docker tests passing
-- SLT pass rate: 157/254 (61.8%)
-- ~770 total tests, 72+ cross-engine tests, 254 SLT files
-- Code review cycles: 8 complete (R1: 36, R2: 58, R3: 50, R4: 46, R5: 77, R6: 88, R7: 50, R8: 96 — **~335 fixed across R1-R8**)
+- SLT pass rate: 158/254 (62.2%)
+- ~811 total tests, 72+ cross-engine tests, 254 SLT files, 3 pre-existing cross-engine failures
+- Code review cycles: 11 complete (R1: 36, R2: 58, R3: 50, R4: 46, R5: 77, R6: 88, R7: 50, R8: 96, R9: 25, R10: 42, R11: 45 — **~430+ fixed across R1-R11**)
 
 ### What's Been Done (Phases 0-6)
 Everything through Phase 6 is complete. See `docs/project-status.md` for the full verified feature matrix.
@@ -70,12 +70,13 @@ Everything through Phase 6 is complete. See `docs/project-status.md` for the ful
 - T1-5 remainder: SLT result mismatch fixes — Medium, 10-15 more tests fixable
 - T1-3 remainder: CTAS table visibility — Small, 2-3 tests
 
-**Remaining (Review Cycle 2 — 3 deferred):**
-- F-036: INSERT streaming for OOM prevention (L effort — architectural)
-- F-044: Provider/writer code deduplication (L effort — ~1000+ lines near-identical across backends)
-- F-045: Async trait redesign, sync->async (L effort — ~60+ block_on calls)
+**Remaining (Deferred — architectural, L effort):**
+- F-036: INSERT streaming for OOM prevention
+- F-045: Async trait redesign, sync->async (~60+ block_on calls)
+- R4-S-018: PG/MySQL checked write TOCTOU
+- R6-S-017: Concurrent DML lost-delete race
 
-All other Cycle 2 findings (55 of 58) are resolved. See `docs/2026-03-02-review-synthesis.md` for full status.
+**Completed**: F-044 (Provider/writer code deduplication) was completed in R9 — macro + dialect trait approach removed ~4,137 lines (30% reduction).
 
 **Tier 2 — Blocked:**
 - SQL MERGE parsing (DataFusion limitation)
@@ -279,6 +280,86 @@ Eight fix agents resolved **all 43 P1+P2 findings**. 53 P3 findings were not ass
 **Source documents:**
 - `docs/2026-03-05-r8-review-synthesis.md` (consolidated, deduplicated, prioritized, with **[FIXED]**/**[NOT ASSIGNED]** markers)
 - `docs/2026-03-05-r8-review-idiomatic.md`, `docs/2026-03-05-r8-review-correctness.md`, `docs/2026-03-05-r8-review-interop.md`, `docs/2026-03-05-r8-review-test-harness.md`, `docs/2026-03-05-r8-codex-review.md`
+
+### Code Review Cycle 9 (2026-03-06 R9) — F-044 Code Deduplication + 25 FINDINGS
+
+R9 was a focused review of the F-044 code deduplication refactoring (macro + dialect trait approach). F-044 was the #1 recommendation from both prior retrospectives — it eliminated ~4,137 lines (30% reduction) of near-identical code across SQLite/Postgres/MySQL backends by introducing `src/dialect.rs` (SqlDialect trait), `src/metadata_provider_impl.rs` (shared provider macros), and `src/metadata_writer_impl.rs` (shared writer macros).
+
+The review identified **55 raw → 25 after dedup** (0 P0, 2 P1, 12 P2, 11 P3). The correctness review confirmed zero regressions from the macro migration. Codex false positive rate: 46% (6/13).
+
+All 25 findings were fixed. Key fixes: `register_dml_files` unit test coverage, MySQL LAST_INSERT_ID path tests, `replace_table_files` next_file_id update, `#[allow(dead_code)]` cleanup, identifier quoting consolidation, SqlDialect unit tests.
+
+**F-044 is now COMPLETE.** R4-S-036 (map_err boilerplate) and R4-S-040 (monolithic execute blocks) are also resolved by this refactoring.
+
+**Deferred items updated**: F-036, F-045, R4-S-018, R6-S-017 remain deferred.
+
+**Source documents:**
+- `docs/2026-03-06-r9-review-synthesis.md`
+
+### Code Review Cycle 10 (2026-03-06 R10) — 42 FINDINGS, 19 FIXED
+
+A five-part review (idiomatic, correctness, interop, test-harness, codex) of the post-R9 codebase identified **63 raw → 42 after dedup** (0 P0, 6 P1, 17 P2, 14 P3). Zero P0 — extending the P0-free streak to 5 consecutive cycles.
+
+Four fix agents resolved **all 6 P1 + 13 P2** findings (19 total). 14 P3 not assigned.
+
+**Key fixes:**
+- R10-S-002/003: Missing `table_id` join predicates in stats/partition queries (wrong column names on SQLite)
+- R10-S-004: DDL schema-version race on Postgres — added `FOR UPDATE` locking
+- R10-S-005: Parquet writes now use SNAPPY compression (matching DuckDB)
+- R10-S-006: `filter_map` → error on missing partition columns
+- R10-S-008: Checked u64/i64 accumulation in DML row counts (`checked_add` consistency)
+- R10-S-010/011: MERGE source batches + DML table_files wrapped in `Arc` to prevent cloning
+
+**Tests**: 811 pass, 3 pre-existing DuckDB cross-engine failures.
+
+**Source documents:**
+- `docs/2026-03-06-r10-review-synthesis.md`
+- `docs/2026-03-06-r10-review-idiomatic.md`, `docs/2026-03-06-r10-review-correctness.md`, `docs/2026-03-06-r10-review-interop.md`, `docs/2026-03-06-r10-review-test-harness.md`, `docs/2026-03-06-r10-codex-review.md`
+
+### Code Review Cycle 11 (2026-03-06 R11) — 45 FINDINGS, 29 FIXED
+
+A five-part review (idiomatic, correctness, interop, test-harness, codex) of the post-R10 codebase identified **97 raw → 45 after dedup** (0 P0, 11 P1, 22 P2, 9 P3). Zero P0 — P0-free streak now at 6 consecutive cycles. Codex FP rate improved to 6% (3/48).
+
+Four fix agents resolved **29 findings** (11 P1 + 18 P2) across 28 commits. 3 findings skipped/reverted. 9 P3 not assigned.
+
+**Key fixes:**
+- R11-S-001: `append_table_files` now reads `next_row_id` from stats and updates `record_count`/`next_row_id`/`file_size_bytes` (was starting at 0 and never updating stats — affected all partitioned INSERTs to non-empty tables)
+- R11-S-003: MERGE now detects multiple source rows matching same target (SQL standard requirement)
+- R11-S-004: Fixed R10's broken `FOR UPDATE` on aggregate queries (PostgreSQL rejects this) — replaced with `ORDER BY ... LIMIT 1 FOR UPDATE`
+- R11-S-005/006: Snapshot-aware column joins in `get_file_column_stats` and `get_partition_columns` (time travel correctness)
+- R11-S-002: Orphan file cleanup — composite cleanup guard for partitioned INSERT commit failures
+- R11-S-007: DuckDB `delete_file_id` error propagation (was silently swallowing type-conversion errors)
+
+**Tests**: 811 pass, 3 pre-existing cross-engine failures.
+
+**Source documents:**
+- `docs/2026-03-06-r11-review-synthesis.md`
+- `docs/2026-03-06-r11-review-idiomatic.md`, `docs/2026-03-06-r11-review-correctness.md`, `docs/2026-03-06-r11-review-interop.md`, `docs/2026-03-06-r11-review-test-harness.md`, `docs/2026-03-06-r11-codex-review.md`
+
+### Snapshot-Awareness Audit (2026-03-07)
+
+After R11 highlighted snapshot-awareness gaps, a targeted audit examined 52 queries across 8 files for correct temporal predicates. Found and fixed 3 bugs:
+- `get_table_structure` missing snapshot-window predicates on column join (all 4 providers)
+- `list_all_columns` missing snapshot filter
+- PG/MySQL test DDL missing `begin_snapshot`/`end_snapshot` columns
+
+Report: `docs/2026-03-07-snapshot-awareness-audit.md`. Merged at `d2472c0`.
+
+### Test Infrastructure Cleanup (2026-03-07)
+
+- Centralized test helpers
+- Un-ignored `information_schema` snapshot test
+- Added regression test for `append_table_files` successive writes
+- SLT recovered from 131/254 regression to 158/254 (62.2%), +1 above prior baseline of 157
+- 96 remaining SLT failures all require deep implementation work (no quick wins left)
+
+### Retrospective (2026-03-07)
+
+`docs/2026-03-07-retrospective-r9-r11.md` — Key conclusions:
+- Zero P0 findings for 6 consecutive cycles (R6-R11)
+- Full-scope reviews continue finding ~8-12 P1s per cycle with no evidence of convergence
+- F-044 eliminated PG/MySQL parity gap as a systemic theme (zero parity findings in R10-R11)
+- Recommended stopping full-scope review cycles and shipping
 
 ### After Implementation: PR Creation
 Follow `/home/zac/ducklake-pr-strategy.md`:

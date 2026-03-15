@@ -1,8 +1,8 @@
 # Remaining Work Audit: DataFusion-DuckLake Feature Parity
 
-**Date**: 2026-03-02 (updated from 2026-03-01 audit)
+**Date**: 2026-03-07 (updated from 2026-03-02 audit)
 **Auditor**: Comprehensive cross-document reconciliation
-**Branch audited**: `ducklake-features/integration` (updated 2026-03-02 with R3 review findings)
+**Branch audited**: `ducklake-features/integration` (updated through R11 review cycle + snapshot audit)
 **Documents reviewed**: 12+ (see methodology at end)
 
 ---
@@ -217,6 +217,36 @@ Six fix agents resolved **all 22 assigned findings** (8 P1 + 14 P2). 28 P3 findi
 
 Full details in `docs/2026-03-04-r7-review-synthesis.md`.
 
+### Cycle 8 (2026-03-05 R8) — 43 of 43 P1+P2 FINDINGS FIXED
+
+A five-part review identified 125 raw → 96 after dedup (0 P0, 12 P1, 31 P2, 53 P3). Eight fix agents resolved all 43 P1+P2 findings. 53 P3 not assigned.
+
+Full details in `docs/2026-03-05-r8-review-synthesis.md`.
+
+### Cycle 9 (2026-03-06 R9) — F-044 Code Deduplication — 25 FINDINGS FIXED
+
+A focused review of the F-044 code deduplication refactoring identified 55 raw → 25 after dedup (0 P0, 2 P1, 12 P2, 11 P3). F-044 eliminated ~4,137 lines (30% reduction) via macro + dialect trait approach. All 25 findings fixed.
+
+**F-044 is now COMPLETE.** R4-S-036 (map_err boilerplate) and R4-S-040 (monolithic execute blocks) also resolved.
+
+Full details in `docs/2026-03-06-r9-review-synthesis.md`.
+
+### Cycle 10 (2026-03-06 R10) — 19 of 42 FINDINGS FIXED
+
+A five-part review identified 63 raw → 42 after dedup (0 P0, 6 P1, 17 P2, 14 P3). Four fix agents resolved all 6 P1 + 13 P2 (19 total). Key fixes: table_id joins, FOR UPDATE on PG, SNAPPY compression, checked_add, Arc wrapping.
+
+Full details in `docs/2026-03-06-r10-review-synthesis.md`.
+
+### Cycle 11 (2026-03-06 R11) — 29 of 45 FINDINGS FIXED
+
+A five-part review identified 97 raw → 45 after dedup (0 P0, 11 P1, 22 P2, 9 P3). Four fix agents resolved 29 findings (11 P1 + 18 P2). Key fixes: append_table_files stats, FOR UPDATE aggregate fix, snapshot-aware joins, MERGE multi-match detection, orphan file cleanup.
+
+Full details in `docs/2026-03-06-r11-review-synthesis.md`.
+
+### Snapshot-Awareness Audit (2026-03-07) — 3 BUGS FIXED
+
+Audited 52 queries across 8 files. Found and fixed 3 bugs: get_table_structure (all 4 providers), list_all_columns, PG/MySQL test DDL. Report: `docs/2026-03-07-snapshot-awareness-audit.md`.
+
 ---
 
 ## 1. Executive Summary
@@ -249,7 +279,7 @@ Here is a corrected breakdown:
 | Complex types (read/write) | Type parsing done | 50% (evolution missing) |
 | Encrypted writes | Not started | 0% |
 | Multi-backend writers (Postgres/MySQL) | Fully implemented | 90% (cross-engine tests in progress) |
-| SQLLogicTest pass rate | 157/254 (61.8%) | 62% (up from 60.9%) |
+| SQLLogicTest pass rate | 158/254 (62.2%) | 62% (up from 61.8%) |
 | Table functions | 14 of ~16 implemented | 88% |
 
 ### Remaining Items by Effort Level
@@ -501,13 +531,13 @@ The feature-parity-plan has a "Cross-Engine Testing Matrix" at the bottom with A
 | Metric | Value |
 |--------|-------|
 | Total tests | 254 |
-| Passing | 157 |
-| Failing | 97 |
-| Pass rate | 61.8% |
+| Passing | 158 |
+| Failing | 96 |
+| Pass rate | 62.2% |
 | Baseline (pre-Phase 6) | 16 / 248 (6.5%) |
 | Previous milestone | 151 / 248 (60.9%) |
-| Improvement (from baseline) | +141 tests (+55.3 percentage points) |
-| Improvement (from previous) | +6 tests (+0.9 percentage points, but 6 new tests also added) |
+| Improvement (from baseline) | +142 tests (+55.7 percentage points) |
+| Improvement (from previous) | +1 test above R8 baseline of 157, recovered from 131 regression |
 
 ### Realistic Target
 
@@ -521,7 +551,7 @@ With the remaining fixable items completed:
 
 **Hard ceiling** (without upstream changes): ~195 / 254 (~77%) — would require complex type evolution (T3-1) + all fixable result mismatches.
 
-### Breakdown of 97 Remaining Failures by Actionability
+### Breakdown of 96 Remaining Failures by Actionability
 
 | Category | Count | Actionability | Estimated Fixable |
 |----------|-------|---------------|-------------------|
@@ -531,7 +561,7 @@ With the remaining fixable items completed:
 | DuckDB macros not supported | 9 | BLOCKED -- upstream DuckLake | 0 |
 | Query result mismatch (various) | 30 | PARTIALLY FIXABLE (T1-5) | 10-15 |
 | Other (catalog names, DuckDB-specific, transactions) | 15 | MOSTLY BLOCKED -- various limitations | 2-3 (table resolution) |
-| **Total** | **97** | | **15-25 fixable** |
+| **Total** | **96** | | **15-25 fixable** |
 
 ### Which Feature Implementations Would Unlock the Most Tests
 
@@ -560,9 +590,7 @@ Note: Several previously-listed items are now resolved:
 
 **All Tier 1 items are now complete.**
 
-**Code Review Cycle 2**: 55 of 58 findings fixed (see Cycle 2 section above). Only 3 deferred (F-036, F-044, F-045).
-
-**Code Review Cycle 3**: 50 findings, **25 fixed** by 6 agents (all P0 + all P1 + 13/16 P2). 25 remaining are P2/P3 nits. See Cycle 3 section above for details.
+**Code Review Cycles 1-11**: ~430+ findings fixed across 11 cycles. See individual cycle sections above for details. F-044 completed in R9. Snapshot-awareness audit completed 2026-03-07.
 
 **Remaining items (Tier 2+):**
 
@@ -582,8 +610,10 @@ Note: Several previously-listed items are now resolved:
 
 **5. Deferred review findings (architectural)** -- Large effort each
 - F-036: INSERT streaming (prevent OOM on large partitioned inserts)
-- F-044: Provider/writer code dedup (~1000+ lines near-identical across backends)
+- ~~F-044: Provider/writer code dedup~~ — **COMPLETE** (R9, macro + dialect trait, ~4,137 lines removed)
 - F-045: Async trait redesign (~60+ block_on calls)
+- R4-S-018: PG/MySQL checked write TOCTOU
+- R6-S-017: Concurrent DML lost-delete race
 
 ### Items to NOT work on
 

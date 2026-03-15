@@ -227,9 +227,9 @@
 
 | Category | Count |
 |----------|-------|
-| **Total `#[test]` + `#[tokio::test]`** | **~725+** |
+| **Total `#[test]` + `#[tokio::test]`** | **~811+** |
 | SLT test files | 254 |
-| SLT pass rate | 157/254 (61.8%) |
+| SLT pass rate | 158/254 (62.2%) |
 
 **Note (2026-03-02)**: +21 tests added during the R2 review fix cycle: 18 new unit tests (input validation, timestamp precisions, partition safety, SQL identifier quoting, date formatting) + 3 new interop tests (`test_df_write_partitioned_duckdb_read`, `test_df_write_inlined_duckdb_read`, `test_duckdb_partitioned_inlined_data`).
 
@@ -238,6 +238,10 @@
 **Note (2026-03-04)**: Tests added during R6 review fix cycle: 10 new cross-engine tests, 7 partition validation tests, 9 table function tests, and additional unit tests. Total: 725+ tests passing.
 
 **Note (2026-03-04 R7)**: R7 fix cycle added transaction routing e2e test and concurrent write read-back verification. 365 unit tests pass post-R7. 13 pre-existing cross-engine failures remain (DuckDB extension bugs).
+
+**Note (2026-03-05 R8)**: R8 fix cycle brought total to 770 tests passing. 3 pre-existing DuckDB cross-engine failures.
+
+**Note (2026-03-06 R9-R11)**: R9 focused on F-044 code deduplication review. R10 and R11 were full-scope reviews adding fixes for snapshot-aware queries, MERGE multi-match detection, append_table_files stats, orphan file cleanup, and more. Snapshot-awareness audit (2026-03-07) fixed 3 bugs across all providers. Test infrastructure cleanup un-ignored information_schema test, added regression test for successive append writes. Total: **811+ tests passing**, 3 pre-existing cross-engine failures. SLT recovered from 131 regression to **158/254 (62.2%)**, +1 above prior baseline.
 
 ### 2.2 Test Breakdown by File
 
@@ -388,7 +392,7 @@ All Tier 1 items are now complete.
 
 | Item | Effort | Status |
 |------|--------|--------|
-| SLT pass rate improvement | Medium | Partially done. Currently 157/254 (61.8%). Fixable subset: ~10-15 result mismatches, 2-3 CTAS visibility. |
+| SLT pass rate improvement | Medium | Partially done. Currently 158/254 (62.2%). Fixable subset: ~10-15 result mismatches, 2-3 CTAS visibility. |
 | ADD/REMOVE/RENAME FIELD (struct evolution) | Medium | Deferred to Tier 3 (architecture change needed) |
 | Cross-engine Postgres/MySQL tests | Medium | **COMPLETE** — 16 tests (8 Postgres, 8 MySQL) in `tests/cross_engine_postgres_tests.rs` and `tests/cross_engine_mysql_tests.rs`. Patterns: df_write_df_read, df_write_duckdb_read, duckdb_write_df_read, null_handling, sql_create_insert_select, multiple_tables, count_query, bidirectional_roundtrip. DuckDB `ducklake:postgres:` interop confirmed. DuckDB `ducklake:mysql:` has minor DSN issue with empty passwords (tests gracefully skip). Tests use testcontainers, marked `#[ignore]`. |
 
@@ -511,7 +515,7 @@ A comprehensive test harness with three SLT execution modes that validate every 
 
 ### 5.2 Mode 1: Hybrid DuckDB→DataFusion (EXISTING — ~61% pass rate)
 
-**Status**: Operational. 157/254 tests passing.
+**Status**: Operational. 158/254 tests passing.
 
 **Infrastructure**:
 - `tests/sqllogictest_runner.rs`: Auto-discovers 254 `.test` files, preprocesses DuckDB-specific directives

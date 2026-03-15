@@ -62,7 +62,7 @@ cargo run --example basic_query -- <catalog.db> <sql>
 
 ### Module Overview
 
-The codebase follows a layered architecture (~35k lines across 35 source files):
+The codebase follows a layered architecture (~25k lines across 35 source files after F-044 deduplication):
 
 #### Catalog Integration (Read Path Foundation)
 - **`catalog.rs`** — `DuckLakeCatalog` implements `CatalogProvider` with dynamic on-demand schema lookup
@@ -157,14 +157,14 @@ Object stores must be registered with DataFusion's `RuntimeEnv` before querying:
 
 ## Testing
 
-The project includes 787+ tests across 67 test files:
+The project includes 811+ tests across 67 test files:
 - **Cross-engine**: 72+ interoperability tests (DataFusion <-> DuckDB)
 - **DML**: INSERT, DELETE, UPDATE, MERGE tests
 - **DDL**: ALTER TABLE, CREATE SCHEMA, DROP tests
 - **Features**: virtual columns, encryption, time travel, CDC, delete filtering
 - **Concurrency**: thread-safety, concurrent writes, SQLite busy handling
 - **Edge cases**: adversarial inputs, deep edge cases, conflict detection
-- **SQLLogicTest**: 157/254 passing (61.8%)
+- **SQLLogicTest**: 158/254 passing (62.2%)
 - **Test data**: Generated in Rust (no external scripts), temporary directories for isolation
 
 ```bash
