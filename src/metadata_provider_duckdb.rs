@@ -1,5 +1,4 @@
 use crate::DuckLakeError;
-use crate::dialect::{SqlDialect, SqliteDialect};
 use crate::metadata_provider::{
     ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileData, DuckLakeTableColumn,
     DuckLakeTableFile, FileColumnStats, FilePartitionValue, FileWithTable, InlinedDataRow,
@@ -16,6 +15,16 @@ use crate::metadata_provider::{
 use duckdb::AccessMode::ReadOnly;
 use duckdb::{Config, Connection, params};
 use std::sync::{Arc, Mutex, MutexGuard};
+
+/// Double-quote an identifier for DuckDB SQL, escaping any embedded `"`.
+///
+/// DuckDB uses ANSI-style double-quoted identifiers, same as SQLite and
+/// PostgreSQL. We inline this small helper rather than depend on the
+/// sqlx-only `SqlDialect` trait so the `metadata-duckdb` feature does not
+/// require the sqlx-backed dialect layer.
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
 
 /// DuckDB metadata provider
 ///
@@ -115,7 +124,7 @@ impl DuckdbMetadataProvider {
         // Count active inlined rows at this snapshot
         let count_sql = format!(
             "SELECT COUNT(*) FROM {} WHERE ? >= begin_snapshot AND (? < end_snapshot OR end_snapshot IS NULL)",
-            SqliteDialect.quote_id(&inlined_table_name)
+            quote_ident(&inlined_table_name)
         );
         let count: i64 = conn.query_row(&count_sql, params![snapshot_id, snapshot_id], |row| {
             row.get(0)
@@ -637,7 +646,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
         // Get column names from the inlined data table (skip row_id, begin_snapshot, end_snapshot)
         let pragma_sql = format!(
             "PRAGMA table_info({})",
-            SqliteDialect.quote_id(&inlined_table_name)
+            quote_ident(&inlined_table_name)
         );
         let mut pragma_stmt = conn.prepare(&pragma_sql)?;
         let user_columns: Vec<String> = pragma_stmt
@@ -654,12 +663,12 @@ impl MetadataProvider for DuckdbMetadataProvider {
         // Build select query with quoted identifiers to prevent SQL injection
         let col_list: Vec<String> = user_columns
             .iter()
-            .map(|c| format!("CAST({} AS VARCHAR)", SqliteDialect.quote_id(c)))
+            .map(|c| format!("CAST({} AS VARCHAR)", quote_ident(c)))
             .collect();
         let select_sql = format!(
             "SELECT {} FROM {} WHERE begin_snapshot <= ? AND (end_snapshot IS NULL OR ? < end_snapshot)",
             col_list.join(", "),
-            SqliteDialect.quote_id(&inlined_table_name),
+            quote_ident(&inlined_table_name),
         );
 
         let num_columns = user_columns.len();

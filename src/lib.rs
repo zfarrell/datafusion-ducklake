@@ -39,6 +39,11 @@ pub mod catalog;
 pub mod cdc_common;
 pub mod column_rename;
 pub mod delete_filter;
+#[cfg(any(
+    feature = "metadata-sqlite",
+    feature = "metadata-postgres",
+    feature = "metadata-mysql"
+))]
 pub(crate) mod dialect;
 pub mod encryption;
 pub mod error;
