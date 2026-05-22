@@ -688,6 +688,7 @@ impl DuckLakeTable {
             Arc::clone(&self.object_store_url),
             self.table_path.clone(),
             existing_deletes,
+            self.snapshot_id,
         )))
     }
 

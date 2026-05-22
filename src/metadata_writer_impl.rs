@@ -957,6 +957,7 @@ macro_rules! impl_writer_file_ops {
             snapshot_id: i64,
             delete_files: &[crate::metadata_writer::DeleteFileInfo],
             data_files: &[crate::metadata_writer::DataFileInfo],
+            since_snapshot: Option<i64>,
         ) -> crate::Result<()> {
             use crate::dialect::SqlDialect;
             use crate::error::DuckLakeError;
@@ -965,6 +966,24 @@ macro_rules! impl_writer_file_ops {
                 return Ok(());
             }
             let d = $dialect;
+            // Optimistic-concurrency conflict detection for DML.
+            // For each targeted data_file_id, reject if another transaction has
+            // either (a) installed a newer active delete file or (b) ended the
+            // data file itself since `since_snapshot`.
+            let conflict_delete_sql = format!(
+                "SELECT data_file_id, begin_snapshot FROM ducklake_delete_file
+                 WHERE table_id = {} AND data_file_id = {}
+                   AND begin_snapshot > {} AND end_snapshot IS NULL
+                 LIMIT 1",
+                d.ph(1), d.ph(2), d.ph(3),
+            );
+            let conflict_data_sql = format!(
+                "SELECT end_snapshot FROM ducklake_data_file
+                 WHERE table_id = {} AND data_file_id = {}
+                   AND end_snapshot IS NOT NULL AND end_snapshot > {}
+                 LIMIT 1",
+                d.ph(1), d.ph(2), d.ph(3),
+            );
             let old_delete_sql = format!(
                 "SELECT COALESCE(delete_count, 0) FROM ducklake_delete_file
                  WHERE data_file_id = {} AND table_id = {} AND end_snapshot IS NULL",
@@ -1034,6 +1053,53 @@ macro_rules! impl_writer_file_ops {
             let last_id_fn = $last_id;
             $block_on(|| async {
                 let mut tx = self.pool.begin().await?;
+
+                // R10-S-007/R10-S-020: Optimistic-concurrency conflict detection.
+                // Run the check inside the same transaction as the writes so
+                // there is no TOCTOU race between detection and commit.
+                if let Some(since) = since_snapshot {
+                    // Collect every data_file_id this DML touches (from both
+                    // the delete files and from the new data files via the
+                    // implicit "end all existing files" path that UPDATE/MERGE
+                    // use; here we only have an explicit list for deletes).
+                    let mut data_file_ids: std::collections::BTreeSet<i64> =
+                        std::collections::BTreeSet::new();
+                    for f in delete_files {
+                        data_file_ids.insert(f.data_file_id);
+                    }
+
+                    for &dfid in &data_file_ids {
+                        // (a) Newer active delete file on the same data file
+                        let row = sqlx::query(&conflict_delete_sql)
+                            .bind(table_id)
+                            .bind(dfid)
+                            .bind(since)
+                            .fetch_optional(&mut *tx)
+                            .await?;
+                        if let Some(r) = row {
+                            let conflict_snap: i64 = r.try_get(1)?;
+                            return Err(DuckLakeError::TransactionConflict(format!(
+                                "Transaction conflict: data_file_id={} already has a newer delete file from snapshot {} (since_snapshot={})",
+                                dfid, conflict_snap, since
+                            )));
+                        }
+
+                        // (b) Data file itself ended since since_snapshot
+                        let row = sqlx::query(&conflict_data_sql)
+                            .bind(table_id)
+                            .bind(dfid)
+                            .bind(since)
+                            .fetch_optional(&mut *tx)
+                            .await?;
+                        if let Some(r) = row {
+                            let ended_snap: Option<i64> = r.try_get(0)?;
+                            return Err(DuckLakeError::TransactionConflict(format!(
+                                "Transaction conflict: data_file_id={} was ended at snapshot {:?} since_snapshot={}",
+                                dfid, ended_snap, since
+                            )));
+                        }
+                    }
+                }
 
                 // Track net new deletions to decrement record_count
                 let mut total_net_new_deletions: i64 = 0;

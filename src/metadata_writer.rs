@@ -476,6 +476,14 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// (DELETE, UPDATE, MERGE) are committed atomically. If any registration
     /// fails, none of them take effect.
     ///
+    /// `since_snapshot`, when provided, enables optimistic-concurrency conflict
+    /// detection: implementations must reject the registration with a
+    /// `DuckLakeError::TransactionConflict` if any of the targeted
+    /// `data_file_id`s has either (a) an active delete file written by a
+    /// snapshot strictly greater than `since_snapshot`, or (b) been ended
+    /// (replaced or dropped) since `since_snapshot`. `None` skips the check
+    /// for legacy callers.
+    ///
     /// All backends must override this method to provide atomic transaction
     /// semantics. The default panics to prevent accidental non-atomic usage.
     fn register_dml_files(
@@ -484,8 +492,15 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         snapshot_id: i64,
         delete_files: &[DeleteFileInfo],
         data_files: &[DataFileInfo],
+        since_snapshot: Option<i64>,
     ) -> Result<()> {
-        let _ = (table_id, snapshot_id, delete_files, data_files);
+        let _ = (
+            table_id,
+            snapshot_id,
+            delete_files,
+            data_files,
+            since_snapshot,
+        );
         unimplemented!("register_dml_files must be implemented by the backend for atomicity")
     }
 

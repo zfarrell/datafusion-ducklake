@@ -7,8 +7,22 @@
 //! 4. Registering delete files in catalog metadata
 //!
 //! If metadata registration fails after a delete file has been uploaded,
-//! best-effort cleanup removes the orphaned file. See `table_writer.rs`
-//! for full write atomicity guarantees.
+//! best-effort cleanup removes the orphaned file via `UploadCleanupGuard`
+//! (see `table_writer.rs` for full write atomicity guarantees).
+//!
+//! Concurrency: the exec captures the table's `snapshot_id` at plan time
+//! and passes it through `register_dml_files(.., since_snapshot)`. The
+//! metadata writer rejects the commit with `DuckLakeError::TransactionConflict`
+//! if another transaction installed a newer active delete file (or ended
+//! the data file) on any targeted `data_file_id` since that snapshot.
+//!
+//! Memory: each data file is read in streaming Parquet batches; the only
+//! per-file state retained across batches is a `Vec<i64>` of matching row
+//! positions (8 B/row). Filter expressions are evaluated batch-at-a-time
+//! and discarded. A DELETE of N rows in one file therefore peaks at
+//! O(N) memory, not O(file size). Filter pushdown to the Parquet reader
+//! is intentionally NOT used here: we need absolute row positions for the
+//! delete file, and a pushed-down filter would change the row-index space.
 
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
@@ -66,6 +80,8 @@ pub struct DuckLakeDeleteExec {
     table_path: String,
     /// Existing deleted positions per file (pre-loaded)
     existing_deletes: Arc<HashMap<String, HashSet<i64>>>,
+    /// Snapshot id this DELETE was planned against (for optimistic-concurrency conflict detection)
+    since_snapshot: i64,
     /// Cached plan properties
     cache: Arc<PlanProperties>,
 }
@@ -82,6 +98,7 @@ impl DuckLakeDeleteExec {
         object_store_url: Arc<ObjectStoreUrl>,
         table_path: String,
         existing_deletes: HashMap<String, HashSet<i64>>,
+        since_snapshot: i64,
     ) -> Self {
         let cache = Self::compute_properties();
         Self {
@@ -94,6 +111,7 @@ impl DuckLakeDeleteExec {
             object_store_url,
             table_path,
             existing_deletes: Arc::new(existing_deletes),
+            since_snapshot,
             cache,
         }
     }
@@ -186,6 +204,7 @@ impl ExecutionPlan for DuckLakeDeleteExec {
         let object_store_url = Arc::clone(&self.object_store_url);
         let table_path = self.table_path.clone();
         let existing_deletes = Arc::clone(&self.existing_deletes);
+        let since_snapshot = self.since_snapshot;
         let output_schema = make_dml_count_schema();
 
         let stream = stream::once(async move {
@@ -350,9 +369,18 @@ impl ExecutionPlan for DuckLakeDeleteExec {
                 .create_snapshot()
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-            // Atomically register all delete files (guard cleans up on error)
+            // Atomically register all delete files (guard cleans up on error).
+            // Pass `since_snapshot` so a concurrent DELETE/UPDATE/MERGE that
+            // committed on the same data file(s) since we read them produces
+            // a TransactionConflict instead of silently overwriting.
             writer
-                .register_dml_files(table_id, snapshot_id, &pending_delete_files, &[])
+                .register_dml_files(
+                    table_id,
+                    snapshot_id,
+                    &pending_delete_files,
+                    &[],
+                    Some(since_snapshot),
+                )
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
             // Success — disarm the cleanup guard

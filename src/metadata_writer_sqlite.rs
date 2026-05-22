@@ -2546,7 +2546,7 @@ mod tests {
         ]);
 
         writer
-            .register_dml_files(table_id, snap2, &[delete_file], &[insert_file])
+            .register_dml_files(table_id, snap2, &[delete_file], &[insert_file], None)
             .unwrap();
 
         // Verify delete file was created with correct data_file_id linkage

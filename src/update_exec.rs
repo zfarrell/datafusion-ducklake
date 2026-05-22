@@ -442,13 +442,16 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                 .create_snapshot()
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-            // Atomically register all delete files and data files (guard cleans up on error)
+            // Atomically register all delete files and data files (guard cleans up on error).
+            // TODO(#18): plumb `since_snapshot` through UPDATE for optimistic-concurrency
+            // conflict detection (matching the path added for DELETE in #17).
             writer
                 .register_dml_files(
                     table_id,
                     snapshot_id,
                     &pending_delete_files,
                     &pending_data_files,
+                    None,
                 )
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
