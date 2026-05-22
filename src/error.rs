@@ -67,6 +67,10 @@ pub enum DuckLakeError {
     #[error("Parquet error: {0}")]
     Parquet(#[from] parquet::errors::ParquetError),
 
+    /// Transaction conflict (concurrent write detected)
+    #[error("Transaction conflict: {0}")]
+    TransactionConflict(String),
+
     /// Generic error
     #[error("Internal error: {0}")]
     Internal(String),
@@ -77,6 +81,12 @@ impl From<DuckLakeError> for datafusion::error::DataFusionError {
         match err {
             // If it's already a DataFusion error, unwrap it
             DuckLakeError::DataFusion(e) => e,
+            // Preserve Arrow error type information
+            DuckLakeError::Arrow(e) => {
+                datafusion::error::DataFusionError::ArrowError(Box::new(e), None)
+            },
+            // Preserve IO error type information
+            DuckLakeError::Io(e) => datafusion::error::DataFusionError::IoError(e),
             // For all other errors, wrap them as External
             other => datafusion::error::DataFusionError::External(Box::new(other)),
         }

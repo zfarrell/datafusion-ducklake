@@ -1,6 +1,7 @@
 //! Type mapping from DuckLake types to Arrow types
 
 use std::collections::HashMap;
+
 use std::sync::Arc;
 
 use crate::metadata_provider::DuckLakeTableColumn;
@@ -18,9 +19,18 @@ pub fn ducklake_to_arrow_type(ducklake_type: &str) -> Result<DataType> {
         return Ok(decimal_params);
     }
 
-    // Handle list/array types
-    if let Some(list_type) = parse_list_type(&normalized)? {
-        return Ok(list_type);
+    // Handle parameterized string types: VARCHAR(N), CHAR(N), CHARACTER VARYING(N)
+    if normalized.starts_with("varchar(")
+        || normalized.starts_with("character varying(")
+        || normalized.starts_with("char(")
+        || normalized.starts_with("character(")
+        || normalized.starts_with("nchar(")
+        || normalized.starts_with("nvarchar(")
+        || normalized.starts_with("text(")
+    {
+        // Validate closing paren with no trailing content
+        validate_no_trailing_after_paren(&normalized, ducklake_type)?;
+        return Ok(DataType::Utf8);
     }
 
     // Handle basic types
@@ -40,20 +50,35 @@ pub fn ducklake_to_arrow_type(ducklake_type: &str) -> Result<DataType> {
 
         // Floating point
         "float32" | "float" | "real" => Ok(DataType::Float32),
-        "float64" | "double" => Ok(DataType::Float64),
+        "float64" | "double" | "double precision" => Ok(DataType::Float64),
 
         // Temporal types
         "time" => Ok(DataType::Time64(TimeUnit::Microsecond)),
+        "time_s" => Ok(DataType::Time32(TimeUnit::Second)),
+        "time_ms" => Ok(DataType::Time32(TimeUnit::Millisecond)),
+        "time_ns" => Ok(DataType::Time64(TimeUnit::Nanosecond)),
         "date" => Ok(DataType::Date32),
+        "date_ms" => Ok(DataType::Date64),
         "timestamp" => Ok(DataType::Timestamp(TimeUnit::Microsecond, None)),
         "timestamptz" | "timestamp with time zone" => Ok(DataType::Timestamp(
             TimeUnit::Microsecond,
+            Some("UTC".into()),
+        )),
+        "timestamptz_s" => Ok(DataType::Timestamp(TimeUnit::Second, Some("UTC".into()))),
+        "timestamptz_ms" => Ok(DataType::Timestamp(
+            TimeUnit::Millisecond,
+            Some("UTC".into()),
+        )),
+        "timestamptz_ns" => Ok(DataType::Timestamp(
+            TimeUnit::Nanosecond,
             Some("UTC".into()),
         )),
         "timestamp_s" => Ok(DataType::Timestamp(TimeUnit::Second, None)),
         "timestamp_ms" => Ok(DataType::Timestamp(TimeUnit::Millisecond, None)),
         "timestamp_ns" => Ok(DataType::Timestamp(TimeUnit::Nanosecond, None)),
         "interval" => Ok(DataType::Interval(IntervalUnit::MonthDayNano)),
+        "interval_ym" => Ok(DataType::Interval(IntervalUnit::YearMonth)),
+        "interval_dt" => Ok(DataType::Interval(IntervalUnit::DayTime)),
 
         // String types
         "varchar" | "text" | "string" => Ok(DataType::Utf8),
@@ -71,17 +96,9 @@ pub fn ducklake_to_arrow_type(ducklake_type: &str) -> Result<DataType> {
         "timetz" | "time with time zone" => Ok(DataType::Utf8),
 
         _ => {
-            // Check for complex types (struct, map)
-            if normalized.starts_with("struct") {
-                Err(DuckLakeError::UnsupportedType(format!(
-                    "Struct type '{}' not yet supported. Please open an issue at https://github.com/hotdata-dev/datafusion-ducklake if you need this feature.",
-                    ducklake_type
-                )))
-            } else if normalized.starts_with("map") {
-                Err(DuckLakeError::UnsupportedType(format!(
-                    "Map type '{}' not yet supported. Please open an issue at https://github.com/hotdata-dev/datafusion-ducklake if you need this feature.",
-                    ducklake_type
-                )))
+            // Try complex types (preserves case for struct field names)
+            if let Some(result) = parse_complex_type(ducklake_type.trim()) {
+                result
             } else {
                 Err(DuckLakeError::UnsupportedType(ducklake_type.to_string()))
             }
@@ -112,14 +129,32 @@ pub fn arrow_to_ducklake_type(arrow_type: &DataType) -> Result<String> {
         DataType::Float64 => Ok("float64".to_string()),
 
         // Temporal types
-        DataType::Date32 | DataType::Date64 => Ok("date".to_string()),
-        DataType::Time32(_) | DataType::Time64(_) => Ok("time".to_string()),
+        DataType::Date32 => Ok("date".to_string()),
+        DataType::Date64 => Ok("date_ms".to_string()),
+        DataType::Time32(TimeUnit::Second) => Ok("time_s".to_string()),
+        DataType::Time32(TimeUnit::Millisecond) => Ok("time_ms".to_string()),
+        DataType::Time32(_) => Ok("time_s".to_string()),
+        DataType::Time64(TimeUnit::Microsecond) => Ok("time".to_string()),
+        DataType::Time64(TimeUnit::Nanosecond) => Ok("time_ns".to_string()),
+        DataType::Time64(_) => Ok("time".to_string()),
         DataType::Timestamp(TimeUnit::Second, None) => Ok("timestamp_s".to_string()),
         DataType::Timestamp(TimeUnit::Millisecond, None) => Ok("timestamp_ms".to_string()),
         DataType::Timestamp(TimeUnit::Microsecond, None) => Ok("timestamp".to_string()),
         DataType::Timestamp(TimeUnit::Nanosecond, None) => Ok("timestamp_ns".to_string()),
-        DataType::Timestamp(_, Some(_)) => Ok("timestamptz".to_string()),
-        DataType::Interval(_) => Ok("interval".to_string()),
+        // Note: DuckLake normalizes all timezones to UTC on roundtrip,
+        // consistent with DuckDB's behavior. The original timezone is not preserved.
+        DataType::Timestamp(unit, Some(_tz)) => {
+            let base = match unit {
+                TimeUnit::Second => "timestamptz_s",
+                TimeUnit::Millisecond => "timestamptz_ms",
+                TimeUnit::Microsecond => "timestamptz",
+                TimeUnit::Nanosecond => "timestamptz_ns",
+            };
+            Ok(base.to_string())
+        },
+        DataType::Interval(IntervalUnit::YearMonth) => Ok("interval_ym".to_string()),
+        DataType::Interval(IntervalUnit::DayTime) => Ok("interval_dt".to_string()),
+        DataType::Interval(IntervalUnit::MonthDayNano) => Ok("interval".to_string()),
 
         // String types
         DataType::Utf8 | DataType::LargeUtf8 => Ok("varchar".to_string()),
@@ -131,29 +166,58 @@ pub fn arrow_to_ducklake_type(arrow_type: &DataType) -> Result<String> {
 
         // Decimal types
         DataType::Decimal128(precision, scale) | DataType::Decimal256(precision, scale) => {
-            Ok(format!("decimal({}, {})", precision, scale))
+            Ok(format!("decimal({},{})", precision, scale))
         },
 
         // Null type - map to varchar as there's no direct equivalent
         DataType::Null => Ok("varchar".to_string()),
 
-        // List types
+        // Complex types
         DataType::List(field) | DataType::LargeList(field) => {
             let inner = arrow_to_ducklake_type(field.data_type())?;
-            Ok(format!("list<{}>", inner))
+            Ok(format!("list({})", inner))
         },
         DataType::FixedSizeList(field, _) => {
             let inner = arrow_to_ducklake_type(field.data_type())?;
-            Ok(format!("list<{}>", inner))
+            Ok(format!("list({})", inner))
         },
-        DataType::Struct(_) => Err(DuckLakeError::UnsupportedType(format!(
-            "Struct type '{}' not yet supported for writing",
-            arrow_type
-        ))),
-        DataType::Map(_, _) => Err(DuckLakeError::UnsupportedType(format!(
-            "Map type '{}' not yet supported for writing",
-            arrow_type
-        ))),
+        DataType::Struct(fields) => {
+            let field_strs: Result<Vec<String>> = fields
+                .iter()
+                .map(|f| {
+                    let dt = arrow_to_ducklake_type(f.data_type())?;
+                    let name = f.name();
+                    // Quote field names that contain special characters
+                    let needs_quoting = name.contains(|c: char| {
+                        c == ' ' || c == ',' || c == ':' || c == '(' || c == ')' || c == '"'
+                    });
+                    if needs_quoting {
+                        let escaped = name.replace('"', "\"\"");
+                        Ok(format!("\"{}\" {}", escaped, dt))
+                    } else {
+                        Ok(format!("{} {}", name, dt))
+                    }
+                })
+                .collect();
+            Ok(format!("struct({})", field_strs?.join(", ")))
+        },
+        DataType::Map(entries_field, _) => {
+            if let DataType::Struct(fields) = entries_field.data_type() {
+                if fields.len() == 2 {
+                    let key_type = arrow_to_ducklake_type(fields[0].data_type())?;
+                    let value_type = arrow_to_ducklake_type(fields[1].data_type())?;
+                    Ok(format!("map({}, {})", key_type, value_type))
+                } else {
+                    Err(DuckLakeError::UnsupportedType(
+                        "Invalid MAP structure: expected 2 fields".to_string(),
+                    ))
+                }
+            } else {
+                Err(DuckLakeError::UnsupportedType(
+                    "Invalid MAP structure: entries must be a struct".to_string(),
+                ))
+            }
+        },
 
         // Other unsupported types
         other => Err(DuckLakeError::UnsupportedType(format!(
@@ -189,25 +253,65 @@ fn validate_decimal_precision_scale(precision: u8, scale: i8, type_str: &str) ->
     Ok(())
 }
 
+/// Validate that a parameterized type like `varchar(10)` has no trailing content after `)`.
+fn validate_no_trailing_after_paren(normalized: &str, original: &str) -> Result<()> {
+    match normalized.rfind(')') {
+        Some(pos) => {
+            let after = &normalized[pos + 1..];
+            if !after.is_empty() {
+                return Err(DuckLakeError::UnsupportedType(format!(
+                    "Unexpected trailing characters '{}' after closing parenthesis in type '{}'",
+                    after, original
+                )));
+            }
+            Ok(())
+        },
+        None => Err(DuckLakeError::UnsupportedType(format!(
+            "Missing closing parenthesis in type '{}'",
+            original
+        ))),
+    }
+}
+
 /// Parse decimal type with precision and scale
 /// Format: "decimal(precision, scale)" or "decimal(precision)"
 ///
 /// Returns `Ok(None)` if the type string is not a decimal type.
 /// Returns `Err` if it is a decimal type but has invalid precision/scale.
 fn parse_decimal(type_str: &str) -> Result<Option<DataType>> {
-    if !type_str.starts_with("decimal") && !type_str.starts_with("numeric") {
+    if !(type_str == "decimal"
+        || type_str.starts_with("decimal(")
+        || type_str == "numeric"
+        || type_str.starts_with("numeric("))
+    {
         return Ok(None);
     }
 
-    // Extract parameters from parentheses
+    // Handle bare decimal/numeric without parameters — default to Decimal128(18,0)
+    // matching DuckDB's default behavior
     let start = match type_str.find('(') {
         Some(s) => s,
-        None => return Ok(None),
+        None => return Ok(Some(DataType::Decimal128(18, 0))),
     };
     let end = match type_str.find(')') {
         Some(e) => e,
-        None => return Ok(None),
+        None => {
+            return Err(DuckLakeError::UnsupportedType(format!(
+                "Missing closing parenthesis in decimal type '{}'",
+                type_str
+            )));
+        },
     };
+
+    // R3F-029: Reject trailing garbage after closing parenthesis
+    let after_paren = &type_str[end + 1..];
+    if !after_paren.is_empty() {
+        return Err(DuckLakeError::UnsupportedType(format!(
+            "Unexpected trailing characters '{}' after closing parenthesis in type '{}'",
+            after_paren, type_str
+        )));
+    }
+
     let params = &type_str[start + 1..end];
 
     let parts: Vec<&str> = params.split(',').map(|s| s.trim()).collect();
@@ -250,176 +354,202 @@ fn parse_decimal(type_str: &str) -> Result<Option<DataType>> {
     }
 }
 
-/// Parse list/array type syntax and return `DataType::List` if matched.
-///
-/// Supported formats:
-/// - `list<element_type>` / `array<element_type>` (DuckDB style)
-/// - `element_type[]` (Postgres style, e.g. `varchar[]`, `float[]`)
-///
-/// Only simple (non-nested) element types are supported.
-fn parse_list_type(type_str: &str) -> Result<Option<DataType>> {
-    let inner = if type_str.starts_with("list<") || type_str.starts_with("array<") {
-        // list<type> or array<type>
-        let start = type_str.find('<').unwrap();
-        if !type_str.ends_with('>') {
-            return Ok(None);
-        }
-        &type_str[start + 1..type_str.len() - 1]
-    } else if let Some(stripped) = type_str.strip_suffix("[]") {
-        // type[]
-        stripped
-    } else {
-        return Ok(None);
+/// Parse a complex DuckLake type string to an Arrow DataType.
+/// Returns `Some(Ok(DataType))` on success, `Some(Err)` on parse failure,
+/// or `None` if the string is not a complex type.
+fn parse_complex_type(type_str: &str) -> Option<Result<DataType>> {
+    let lower = type_str.to_lowercase();
+
+    // Array suffix notation: TYPE[]
+    if let Some(inner) = type_str.strip_suffix("[]") {
+        return Some(
+            ducklake_to_arrow_type(inner)
+                .map(|dt| DataType::List(Arc::new(Field::new("item", dt, true)))),
+        );
+    }
+
+    // LIST or ARRAY type
+    if lower.starts_with("list")
+        && let Some(inner) = extract_type_params(type_str, 4)
+    {
+        return Some(
+            ducklake_to_arrow_type(inner.trim())
+                .map(|dt| DataType::List(Arc::new(Field::new("item", dt, true)))),
+        );
+    }
+    if lower.starts_with("array")
+        && let Some(inner) = extract_type_params(type_str, 5)
+    {
+        return Some(
+            ducklake_to_arrow_type(inner.trim())
+                .map(|dt| DataType::List(Arc::new(Field::new("item", dt, true)))),
+        );
+    }
+
+    // STRUCT type
+    if lower.starts_with("struct")
+        && let Some(inner) = extract_type_params(type_str, 6)
+    {
+        return Some(parse_struct_fields(inner));
+    }
+
+    // MAP type
+    if lower.starts_with("map")
+        && let Some(inner) = extract_type_params(type_str, 3)
+    {
+        return Some(parse_map_type(inner));
+    }
+
+    None
+}
+
+/// Extract the content inside matching brackets after a type prefix.
+/// Supports both `()` and `<>` notation.
+fn extract_type_params(type_str: &str, prefix_len: usize) -> Option<&str> {
+    if type_str.len() <= prefix_len {
+        return None;
+    }
+    let rest = type_str[prefix_len..].trim();
+    if rest.is_empty() {
+        return None;
+    }
+
+    let first = rest.as_bytes()[0];
+    let (open, close) = match first {
+        b'(' => (b'(', b')'),
+        b'<' => (b'<', b'>'),
+        _ => return None,
     };
 
-    let inner = inner.trim();
-    if inner.is_empty() {
+    let mut depth: i32 = 0;
+    let bytes = rest.as_bytes();
+    for i in 0..bytes.len() {
+        if bytes[i] == open {
+            depth += 1;
+        }
+        if bytes[i] == close {
+            depth -= 1;
+        }
+        if depth == 0 {
+            if i + 1 == bytes.len() {
+                return Some(&rest[1..i]);
+            }
+            return None;
+        }
+    }
+    None
+}
+
+/// Parse struct field definitions.
+/// Handles both `name type` (parentheses notation) and `name:type` (angle bracket notation).
+/// Supports double-quoted field names: `"my field" VARCHAR`.
+fn parse_struct_fields(inner: &str) -> Result<DataType> {
+    let parts = split_top_level(inner, ',');
+    let mut fields = Vec::new();
+
+    for part in parts {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+
+        // Check for double-quoted field name
+        let (name, type_str) = if part.starts_with('"') {
+            // Find closing quote
+            if let Some(close_quote) = part[1..].find('"') {
+                let name = &part[1..close_quote + 1];
+                let rest = part[close_quote + 2..].trim();
+                // Rest should start with ':' or ' ' then the type
+                let type_str = rest.strip_prefix(':').unwrap_or(rest).trim();
+                (name, type_str)
+            } else {
+                return Err(DuckLakeError::UnsupportedType(format!(
+                    "Unterminated quoted field name in struct: '{}'",
+                    part
+                )));
+            }
+        } else if let Some(pos) = find_top_level_char(part, ':') {
+            // Try colon separator first (angle bracket notation), then space
+            (&part[..pos], &part[pos + 1..])
+        } else if let Some(pos) = find_top_level_char(part, ' ') {
+            (&part[..pos], &part[pos + 1..])
+        } else {
+            return Err(DuckLakeError::UnsupportedType(format!(
+                "Invalid struct field definition: '{}'",
+                part
+            )));
+        };
+
+        let field_type = ducklake_to_arrow_type(type_str.trim())?;
+        fields.push(Field::new(name.trim(), field_type, true));
+    }
+
+    if fields.is_empty() {
+        return Err(DuckLakeError::UnsupportedType(
+            "STRUCT type must have at least one field".to_string(),
+        ));
+    }
+
+    Ok(DataType::Struct(fields.into()))
+}
+
+/// Parse MAP type parameters: `key_type, value_type`.
+fn parse_map_type(inner: &str) -> Result<DataType> {
+    let parts = split_top_level(inner, ',');
+    if parts.len() != 2 {
         return Err(DuckLakeError::UnsupportedType(format!(
-            "List type '{}' has empty element type",
-            type_str
+            "MAP type requires exactly 2 type parameters (key, value), got {}",
+            parts.len()
         )));
     }
 
-    // Only support simple (non-nested) element types
-    if inner.contains('<') || inner.contains('[') || inner.contains('{') {
-        return Err(DuckLakeError::UnsupportedType(format!(
-            "Nested complex type '{}' not yet supported",
-            type_str
-        )));
-    }
+    let key_type = ducklake_to_arrow_type(parts[0].trim())?;
+    let value_type = ducklake_to_arrow_type(parts[1].trim())?;
 
-    let element_type = ducklake_to_arrow_type(inner)?;
-    Ok(Some(DataType::List(Arc::new(Field::new(
-        "item",
-        element_type,
-        true,
-    )))))
+    let entries_field = Field::new(
+        "entries",
+        DataType::Struct(
+            vec![Field::new("key", key_type, false), Field::new("value", value_type, true)].into(),
+        ),
+        false,
+    );
+
+    Ok(DataType::Map(Arc::new(entries_field), false))
 }
 
-/// Normalize a DuckLake type string to its canonical form.
-///
-/// Converts aliases and case variants to the canonical DuckLake type string.
-/// For example: "int" -> "int32", "INTEGER" -> "int32", "text" -> "varchar".
-///
-/// Returns the canonical type string, or an error if the type is unrecognized.
-pub fn normalize_ducklake_type(ducklake_type: &str) -> Result<String> {
-    let arrow_type = ducklake_to_arrow_type(ducklake_type)?;
-    arrow_to_ducklake_type(&arrow_type)
-}
+/// Split a string by a separator, respecting nested brackets.
+fn split_top_level(s: &str, sep: char) -> Vec<&str> {
+    let mut result = Vec::new();
+    let mut depth = 0;
+    let mut start = 0;
 
-/// Check if a type can be safely promoted (widened) to another type.
-///
-/// Type promotion allows safe widening of numeric types during schema evolution.
-/// Both type strings are normalized before comparison.
-///
-/// Supported promotions:
-/// - Signed integer widening: int8 -> int16 -> int32 -> int64
-/// - Unsigned integer widening: uint8 -> uint16 -> uint32 -> uint64
-/// - Float widening: float32 -> float64
-/// - Integer to float: any int -> float64
-/// - Timestamp: timestamp -> timestamptz
-/// - Decimal: smaller precision/scale -> larger precision/scale
-pub fn is_promotable(from: &str, to: &str) -> bool {
-    let from_arrow = match ducklake_to_arrow_type(from) {
-        Ok(t) => t,
-        Err(_) => return false,
-    };
-    let to_arrow = match ducklake_to_arrow_type(to) {
-        Ok(t) => t,
-        Err(_) => return false,
-    };
-
-    is_arrow_promotable(&from_arrow, &to_arrow)
-}
-
-/// Check if one Arrow DataType can be safely promoted to another.
-fn is_arrow_promotable(from: &DataType, to: &DataType) -> bool {
-    use DataType::*;
-
-    // Same type is trivially promotable
-    if from == to {
-        return true;
-    }
-
-    fn signed_int_rank(dt: &DataType) -> Option<u8> {
-        match dt {
-            Int8 => Some(0),
-            Int16 => Some(1),
-            Int32 => Some(2),
-            Int64 => Some(3),
-            _ => None,
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' | '<' | '[' => depth += 1,
+            ')' | '>' | ']' => depth -= 1,
+            _ if c == sep && depth == 0 => {
+                result.push(&s[start..i]);
+                start = i + c.len_utf8();
+            },
+            _ => {},
         }
     }
-
-    fn unsigned_int_rank(dt: &DataType) -> Option<u8> {
-        match dt {
-            UInt8 => Some(0),
-            UInt16 => Some(1),
-            UInt32 => Some(2),
-            UInt64 => Some(3),
-            _ => None,
-        }
-    }
-
-    // Signed integer widening
-    if let (Some(from_rank), Some(to_rank)) = (signed_int_rank(from), signed_int_rank(to)) {
-        return from_rank < to_rank;
-    }
-
-    // Unsigned integer widening
-    if let (Some(from_rank), Some(to_rank)) = (unsigned_int_rank(from), unsigned_int_rank(to)) {
-        return from_rank < to_rank;
-    }
-
-    // Float widening
-    if matches!(from, Float32) && matches!(to, Float64) {
-        return true;
-    }
-
-    // Integer to float64 (safe for reasonable values)
-    if signed_int_rank(from).is_some() && matches!(to, Float64) {
-        return true;
-    }
-
-    // Timestamp -> TimestampTZ
-    if matches!(from, Timestamp(_, None)) && matches!(to, Timestamp(_, Some(_))) {
-        return true;
-    }
-
-    // Decimal widening: integer digits don't shrink AND fractional digits don't shrink.
-    // We check (tp - ts >= fp - fs) to ensure the integer part has enough room,
-    // in addition to (ts >= fs) for the fractional part.
-    match (from, to) {
-        (Decimal128(fp, fs) | Decimal256(fp, fs), Decimal128(tp, ts) | Decimal256(tp, ts)) => {
-            let from_int_digits = *fp as i16 - *fs as i16;
-            let to_int_digits = *tp as i16 - *ts as i16;
-            ts >= fs && to_int_digits >= from_int_digits
-        },
-        _ => false,
-    }
+    result.push(&s[start..]);
+    result
 }
 
-/// Check if two DuckLake type strings are compatible for schema evolution.
-///
-/// Types are compatible if they normalize to the same canonical type,
-/// or if the existing type can be safely promoted to the new type.
-pub fn types_compatible(existing_type: &str, new_type: &str) -> bool {
-    // First try normalization: if both normalize to the same canonical form, they match
-    let existing_normalized = match normalize_ducklake_type(existing_type) {
-        Ok(t) => t,
-        Err(_) => return false,
-    };
-    let new_normalized = match normalize_ducklake_type(new_type) {
-        Ok(t) => t,
-        Err(_) => return false,
-    };
-
-    if existing_normalized == new_normalized {
-        return true;
+/// Find the first occurrence of a character at the top level (not inside brackets).
+fn find_top_level_char(s: &str, target: char) -> Option<usize> {
+    let mut depth = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' | '<' | '[' => depth += 1,
+            ')' | '>' | ']' => depth -= 1,
+            _ if c == target && depth == 0 => return Some(i),
+            _ => {},
+        }
     }
-
-    // Then check if promotion is allowed
-    is_promotable(existing_type, new_type)
+    None
 }
 
 /// Build an Arrow schema from a list of DuckLake table columns
@@ -576,6 +706,68 @@ mod tests {
     }
 
     #[test]
+    fn test_build_read_schema_column_id_exceeds_i32() {
+        // column_id > i32::MAX should return an error, not silently wrap
+        let current_columns = vec![DuckLakeTableColumn {
+            column_id: i64::from(i32::MAX) + 1, // 2147483648
+            column_name: "big_id_col".to_string(),
+            column_type: "int32".to_string(),
+            is_nullable: true,
+        }];
+
+        let parquet_field_ids = HashMap::new();
+
+        let result = build_read_schema_with_field_id_mapping(&current_columns, &parquet_field_ids);
+        assert!(result.is_err(), "should reject column_id > i32::MAX");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("2147483648"),
+            "error should mention the out-of-range value: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("big_id_col"),
+            "error should mention the column name: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_build_read_schema_negative_column_id_rejected() {
+        // Negative column_id should also be rejected (cannot fit in Parquet's non-negative field_id space)
+        let current_columns = vec![DuckLakeTableColumn {
+            column_id: -1,
+            column_name: "neg_col".to_string(),
+            column_type: "varchar".to_string(),
+            is_nullable: true,
+        }];
+
+        let parquet_field_ids = HashMap::new();
+
+        // Negative i64 values fit in i32 range (down to i32::MIN), so -1 should succeed
+        let result = build_read_schema_with_field_id_mapping(&current_columns, &parquet_field_ids);
+        assert!(
+            result.is_ok(),
+            "negative i64 within i32 range should succeed"
+        );
+    }
+
+    #[test]
+    fn test_build_read_schema_column_id_at_i32_max() {
+        // column_id == i32::MAX should succeed (boundary)
+        let current_columns = vec![DuckLakeTableColumn {
+            column_id: i64::from(i32::MAX), // 2147483647
+            column_name: "max_col".to_string(),
+            column_type: "int32".to_string(),
+            is_nullable: true,
+        }];
+
+        let mut parquet_field_ids = HashMap::new();
+        parquet_field_ids.insert(i32::MAX, "max_col".to_string());
+
+        let result = build_read_schema_with_field_id_mapping(&current_columns, &parquet_field_ids);
+        assert!(result.is_ok(), "column_id == i32::MAX should succeed");
+    }
+
+    #[test]
     fn test_basic_types() {
         assert_eq!(
             ducklake_to_arrow_type("boolean").unwrap(),
@@ -594,7 +786,7 @@ mod tests {
     #[test]
     fn test_decimal_types() {
         assert_eq!(
-            ducklake_to_arrow_type("decimal(10, 2)").unwrap(),
+            ducklake_to_arrow_type("decimal(10,2)").unwrap(),
             DataType::Decimal128(10, 2)
         );
         assert_eq!(
@@ -612,108 +804,306 @@ mod tests {
         );
     }
 
+    // ==================== LIST type tests ====================
+
     #[test]
-    fn test_list_type_angle_bracket() {
+    fn test_list_angle_bracket_notation() {
         let result = ducklake_to_arrow_type("list<int32>").unwrap();
-        let expected = DataType::List(Arc::new(Field::new("item", DataType::Int32, true)));
-        assert_eq!(result, expected);
+        assert_eq!(
+            result,
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true)))
+        );
     }
 
     #[test]
-    fn test_list_type_various_elements() {
-        let cases = vec![
-            ("list<varchar>", DataType::Utf8),
-            ("list<float64>", DataType::Float64),
-            ("list<boolean>", DataType::Boolean),
-            ("list<date>", DataType::Date32),
-        ];
-        for (type_str, expected_inner) in cases {
-            let result = ducklake_to_arrow_type(type_str).unwrap();
-            let expected =
-                DataType::List(Arc::new(Field::new("item", expected_inner.clone(), true)));
-            assert_eq!(result, expected, "Failed for {}", type_str);
-        }
+    fn test_list_parentheses_notation() {
+        let result = ducklake_to_arrow_type("list(varchar)").unwrap();
+        assert_eq!(
+            result,
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)))
+        );
     }
 
     #[test]
-    fn test_array_type_angle_bracket() {
+    fn test_array_angle_bracket_notation() {
         let result = ducklake_to_arrow_type("array<varchar>").unwrap();
-        let expected = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
+        assert_eq!(
+            result,
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)))
+        );
+    }
+
+    #[test]
+    fn test_array_suffix_notation() {
+        let result = ducklake_to_arrow_type("int32[]").unwrap();
+        assert_eq!(
+            result,
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true)))
+        );
+
+        let result2 = ducklake_to_arrow_type("varchar[]").unwrap();
+        assert_eq!(
+            result2,
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)))
+        );
+    }
+
+    #[test]
+    fn test_list_uppercase() {
+        let result = ducklake_to_arrow_type("LIST(INTEGER)").unwrap();
+        assert_eq!(
+            result,
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true)))
+        );
+    }
+
+    // ==================== STRUCT type tests ====================
+
+    #[test]
+    fn test_struct_angle_bracket_notation() {
+        let result = ducklake_to_arrow_type("struct<a:int32,b:varchar>").unwrap();
+        assert_eq!(
+            result,
+            DataType::Struct(
+                vec![
+                    Field::new("a", DataType::Int32, true),
+                    Field::new("b", DataType::Utf8, true),
+                ]
+                .into()
+            )
+        );
+    }
+
+    #[test]
+    fn test_struct_parentheses_notation() {
+        let result = ducklake_to_arrow_type("struct(a int32, b varchar)").unwrap();
+        assert_eq!(
+            result,
+            DataType::Struct(
+                vec![
+                    Field::new("a", DataType::Int32, true),
+                    Field::new("b", DataType::Utf8, true),
+                ]
+                .into()
+            )
+        );
+    }
+
+    #[test]
+    fn test_struct_preserves_field_names() {
+        let result = ducklake_to_arrow_type("STRUCT(userId INTEGER, userName VARCHAR)").unwrap();
+        if let DataType::Struct(fields) = &result {
+            assert_eq!(fields[0].name(), "userId");
+            assert_eq!(fields[1].name(), "userName");
+        } else {
+            panic!("Expected Struct type");
+        }
+    }
+
+    #[test]
+    fn test_struct_single_field() {
+        let result = ducklake_to_arrow_type("struct(x int64)").unwrap();
+        assert_eq!(
+            result,
+            DataType::Struct(vec![Field::new("x", DataType::Int64, true)].into())
+        );
+    }
+
+    // ==================== MAP type tests ====================
+
+    #[test]
+    fn test_map_angle_bracket_notation() {
+        let result = ducklake_to_arrow_type("map<varchar,int32>").unwrap();
+        let expected = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Field::new("key", DataType::Utf8, false),
+                        Field::new("value", DataType::Int32, true),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        );
         assert_eq!(result, expected);
     }
 
     #[test]
-    fn test_list_type_postgres_bracket_syntax() {
-        let cases = vec![
-            ("varchar[]", DataType::Utf8),
-            ("float64[]", DataType::Float64),
-            ("int32[]", DataType::Int32),
-            ("boolean[]", DataType::Boolean),
-            ("bigint[]", DataType::Int64),
-            ("text[]", DataType::Utf8),
-            ("float[]", DataType::Float32),
-            ("integer[]", DataType::Int32),
-        ];
-        for (type_str, expected_inner) in cases {
-            let result = ducklake_to_arrow_type(type_str).unwrap();
-            let expected =
-                DataType::List(Arc::new(Field::new("item", expected_inner.clone(), true)));
-            assert_eq!(result, expected, "Failed for {}", type_str);
+    fn test_map_parentheses_notation() {
+        let result = ducklake_to_arrow_type("map(varchar, int64)").unwrap();
+        let expected = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Field::new("key", DataType::Utf8, false),
+                        Field::new("value", DataType::Int64, true),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        );
+        assert_eq!(result, expected);
+    }
+
+    // ==================== Nested type tests ====================
+
+    #[test]
+    fn test_nested_list_in_list() {
+        let result = ducklake_to_arrow_type("list(list(int32))").unwrap();
+        let inner_list = DataType::List(Arc::new(Field::new("item", DataType::Int32, true)));
+        assert_eq!(
+            result,
+            DataType::List(Arc::new(Field::new("item", inner_list, true)))
+        );
+    }
+
+    #[test]
+    fn test_nested_struct_in_list() {
+        let result = ducklake_to_arrow_type("list<struct<a:int32,b:varchar>>").unwrap();
+        let inner_struct = DataType::Struct(
+            vec![Field::new("a", DataType::Int32, true), Field::new("b", DataType::Utf8, true)]
+                .into(),
+        );
+        assert_eq!(
+            result,
+            DataType::List(Arc::new(Field::new("item", inner_struct, true)))
+        );
+    }
+
+    #[test]
+    fn test_nested_list_in_map() {
+        let result = ducklake_to_arrow_type("map(varchar, list(int32))").unwrap();
+        let inner_list = DataType::List(Arc::new(Field::new("item", DataType::Int32, true)));
+        let expected = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Field::new("key", DataType::Utf8, false),
+                        Field::new("value", inner_list, true),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        );
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_struct_array_suffix() {
+        // struct(a int32, b varchar)[]
+        let result = ducklake_to_arrow_type("struct(a int32, b varchar)[]").unwrap();
+        let inner_struct = DataType::Struct(
+            vec![Field::new("a", DataType::Int32, true), Field::new("b", DataType::Utf8, true)]
+                .into(),
+        );
+        assert_eq!(
+            result,
+            DataType::List(Arc::new(Field::new("item", inner_struct, true)))
+        );
+    }
+
+    // ==================== VARCHAR(N) / CHAR(N) tests ====================
+
+    #[test]
+    fn test_varchar_with_length() {
+        assert_eq!(
+            ducklake_to_arrow_type("varchar(255)").unwrap(),
+            DataType::Utf8
+        );
+        assert_eq!(
+            ducklake_to_arrow_type("VARCHAR(100)").unwrap(),
+            DataType::Utf8
+        );
+        assert_eq!(
+            ducklake_to_arrow_type("varchar(1)").unwrap(),
+            DataType::Utf8
+        );
+    }
+
+    #[test]
+    fn test_char_with_length() {
+        assert_eq!(ducklake_to_arrow_type("char(10)").unwrap(), DataType::Utf8);
+        assert_eq!(ducklake_to_arrow_type("CHAR(1)").unwrap(), DataType::Utf8);
+        assert_eq!(
+            ducklake_to_arrow_type("character(50)").unwrap(),
+            DataType::Utf8
+        );
+    }
+
+    #[test]
+    fn test_character_varying_with_length() {
+        assert_eq!(
+            ducklake_to_arrow_type("character varying(255)").unwrap(),
+            DataType::Utf8
+        );
+        assert_eq!(
+            ducklake_to_arrow_type("CHARACTER VARYING(100)").unwrap(),
+            DataType::Utf8
+        );
+    }
+
+    #[test]
+    fn test_nvarchar_with_length() {
+        assert_eq!(
+            ducklake_to_arrow_type("nvarchar(255)").unwrap(),
+            DataType::Utf8
+        );
+        assert_eq!(ducklake_to_arrow_type("nchar(10)").unwrap(), DataType::Utf8);
+    }
+
+    // ==================== Struct quoted field names tests ====================
+
+    #[test]
+    fn test_struct_quoted_field_names() {
+        let result =
+            ducklake_to_arrow_type(r#"STRUCT("my field" VARCHAR, "other field" INTEGER)"#).unwrap();
+        if let DataType::Struct(fields) = &result {
+            assert_eq!(fields.len(), 2);
+            assert_eq!(fields[0].name(), "my field");
+            assert_eq!(fields[0].data_type(), &DataType::Utf8);
+            assert_eq!(fields[1].name(), "other field");
+            assert_eq!(fields[1].data_type(), &DataType::Int32);
+        } else {
+            panic!("Expected Struct type");
         }
     }
 
     #[test]
-    fn test_list_type_empty_element_errors() {
-        assert!(ducklake_to_arrow_type("list<>").is_err());
-        assert!(ducklake_to_arrow_type("[]").is_err());
+    fn test_struct_mixed_quoted_and_unquoted() {
+        let result = ducklake_to_arrow_type(r#"STRUCT("my field" VARCHAR, name VARCHAR)"#).unwrap();
+        if let DataType::Struct(fields) = &result {
+            assert_eq!(fields.len(), 2);
+            assert_eq!(fields[0].name(), "my field");
+            assert_eq!(fields[1].name(), "name");
+        } else {
+            panic!("Expected Struct type");
+        }
     }
 
     #[test]
-    fn test_unsupported_struct_type_errors() {
-        // Test struct type returns error
-        let result = ducklake_to_arrow_type("struct<a:int32,b:varchar>");
+    fn test_struct_quoted_field_with_colon_notation() {
+        let result = ducklake_to_arrow_type(r#"struct<"my field":int32>"#).unwrap();
+        if let DataType::Struct(fields) = &result {
+            assert_eq!(fields[0].name(), "my field");
+            assert_eq!(fields[0].data_type(), &DataType::Int32);
+        } else {
+            panic!("Expected Struct type");
+        }
+    }
+
+    #[test]
+    fn test_struct_unterminated_quote_error() {
+        let result = ducklake_to_arrow_type(r#"STRUCT("my field VARCHAR)"#);
         assert!(result.is_err());
-        match result {
-            Err(DuckLakeError::UnsupportedType(msg)) => {
-                assert!(msg.contains("struct<a:int32,b:varchar>"));
-                assert!(msg.contains("not yet supported"));
-                assert!(msg.contains("open an issue"));
-            },
-            _ => panic!("Expected UnsupportedType error for struct type"),
-        }
-    }
-
-    #[test]
-    fn test_unsupported_map_type_errors() {
-        // Test map type returns error
-        let result = ducklake_to_arrow_type("map<varchar,int32>");
-        assert!(result.is_err());
-        match result {
-            Err(DuckLakeError::UnsupportedType(msg)) => {
-                assert!(msg.contains("map<varchar,int32>"));
-                assert!(msg.contains("not yet supported"));
-                assert!(msg.contains("open an issue"));
-            },
-            _ => panic!("Expected UnsupportedType error for map type"),
-        }
-    }
-
-    #[test]
-    fn test_nested_complex_types_error() {
-        // Nested complex types return error
-        let result = ducklake_to_arrow_type("list<struct<a:int32,b:varchar>>");
-        assert!(result.is_err());
-        match result {
-            Err(DuckLakeError::UnsupportedType(msg)) => {
-                assert!(msg.contains("Nested complex type"));
-                assert!(msg.contains("not yet supported"));
-            },
-            _ => panic!("Expected UnsupportedType error for nested complex type"),
-        }
-
-        // Nested list also errors
-        assert!(ducklake_to_arrow_type("list<list<int32>>").is_err());
-        assert!(ducklake_to_arrow_type("int32[][]").is_err());
     }
 
     #[test]
@@ -758,10 +1148,25 @@ mod tests {
     #[test]
     fn test_arrow_to_ducklake_temporal_types() {
         assert_eq!(arrow_to_ducklake_type(&DataType::Date32).unwrap(), "date");
-        assert_eq!(arrow_to_ducklake_type(&DataType::Date64).unwrap(), "date");
+        assert_eq!(
+            arrow_to_ducklake_type(&DataType::Date64).unwrap(),
+            "date_ms"
+        );
         assert_eq!(
             arrow_to_ducklake_type(&DataType::Time64(TimeUnit::Microsecond)).unwrap(),
             "time"
+        );
+        assert_eq!(
+            arrow_to_ducklake_type(&DataType::Time64(TimeUnit::Nanosecond)).unwrap(),
+            "time_ns"
+        );
+        assert_eq!(
+            arrow_to_ducklake_type(&DataType::Time32(TimeUnit::Second)).unwrap(),
+            "time_s"
+        );
+        assert_eq!(
+            arrow_to_ducklake_type(&DataType::Time32(TimeUnit::Millisecond)).unwrap(),
+            "time_ms"
         );
         assert_eq!(
             arrow_to_ducklake_type(&DataType::Timestamp(TimeUnit::Microsecond, None)).unwrap(),
@@ -775,17 +1180,30 @@ mod tests {
             .unwrap(),
             "timestamptz"
         );
+        assert_eq!(
+            arrow_to_ducklake_type(&DataType::Timestamp(TimeUnit::Second, Some("UTC".into())))
+                .unwrap(),
+            "timestamptz_s"
+        );
+        assert_eq!(
+            arrow_to_ducklake_type(&DataType::Timestamp(
+                TimeUnit::Nanosecond,
+                Some("UTC".into())
+            ))
+            .unwrap(),
+            "timestamptz_ns"
+        );
     }
 
     #[test]
     fn test_arrow_to_ducklake_decimal() {
         assert_eq!(
             arrow_to_ducklake_type(&DataType::Decimal128(10, 2)).unwrap(),
-            "decimal(10, 2)"
+            "decimal(10,2)"
         );
         assert_eq!(
             arrow_to_ducklake_type(&DataType::Decimal256(40, 5)).unwrap(),
-            "decimal(40, 5)"
+            "decimal(40,5)"
         );
     }
 
@@ -814,9 +1232,14 @@ mod tests {
             DataType::Binary,
             DataType::Date32,
             DataType::Timestamp(TimeUnit::Microsecond, None),
+            DataType::Timestamp(TimeUnit::Second, None),
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            DataType::Time64(TimeUnit::Microsecond),
+            DataType::Time64(TimeUnit::Nanosecond),
+            DataType::Time32(TimeUnit::Second),
+            DataType::Time32(TimeUnit::Millisecond),
             DataType::Decimal128(10, 2),
-            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
-            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
         ];
 
         for original in test_types {
@@ -827,32 +1250,127 @@ mod tests {
     }
 
     #[test]
+    fn test_timestamptz_roundtrip() {
+        // Timestamptz roundtrip: timezone is normalized to UTC
+        let tz_types = vec![
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            DataType::Timestamp(TimeUnit::Second, Some("UTC".into())),
+            DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+        ];
+
+        for original in tz_types {
+            let ducklake = arrow_to_ducklake_type(&original).unwrap();
+            let back = ducklake_to_arrow_type(&ducklake).unwrap();
+            assert_eq!(
+                original, back,
+                "Timestamptz roundtrip failed for {:?}",
+                original
+            );
+        }
+    }
+
+    #[test]
+    fn test_decimal_prefix_match_strict() {
+        // F-053: "decimalx(10,2)" should NOT match as a decimal type
+        let result = ducklake_to_arrow_type("decimalx(10,2)");
+        assert!(result.is_err(), "decimalx should not be treated as decimal");
+
+        // But "decimal(10,2)" should still work
+        assert_eq!(
+            ducklake_to_arrow_type("decimal(10,2)").unwrap(),
+            DataType::Decimal128(10, 2)
+        );
+
+        // And "numeric(10,2)" should work
+        assert_eq!(
+            ducklake_to_arrow_type("numeric(10, 2)").unwrap(),
+            DataType::Decimal128(10, 2)
+        );
+
+        // "numericx(10,2)" should not match
+        let result = ducklake_to_arrow_type("numericx(10,2)");
+        assert!(result.is_err(), "numericx should not be treated as numeric");
+    }
+
+    #[test]
+    fn test_complex_type_roundtrip() {
+        // List roundtrip
+        let list_type = DataType::List(Arc::new(Field::new("item", DataType::Int32, true)));
+        let ducklake = arrow_to_ducklake_type(&list_type).unwrap();
+        let back = ducklake_to_arrow_type(&ducklake).unwrap();
+        assert_eq!(list_type, back, "List roundtrip failed");
+
+        // Struct roundtrip
+        let struct_type = DataType::Struct(
+            vec![
+                Field::new("x", DataType::Float64, true),
+                Field::new("y", DataType::Float64, true),
+            ]
+            .into(),
+        );
+        let ducklake = arrow_to_ducklake_type(&struct_type).unwrap();
+        let back = ducklake_to_arrow_type(&ducklake).unwrap();
+        assert_eq!(struct_type, back, "Struct roundtrip failed");
+
+        // Map roundtrip
+        let map_type = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Field::new("key", DataType::Utf8, false),
+                        Field::new("value", DataType::Int64, true),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        );
+        let ducklake = arrow_to_ducklake_type(&map_type).unwrap();
+        let back = ducklake_to_arrow_type(&ducklake).unwrap();
+        assert_eq!(map_type, back, "Map roundtrip failed");
+
+        // Nested roundtrip: list of structs
+        let nested = DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Struct(
+                vec![
+                    Field::new("id", DataType::Int32, true),
+                    Field::new("name", DataType::Utf8, true),
+                ]
+                .into(),
+            ),
+            true,
+        )));
+        let ducklake = arrow_to_ducklake_type(&nested).unwrap();
+        let back = ducklake_to_arrow_type(&ducklake).unwrap();
+        assert_eq!(nested, back, "Nested list-of-struct roundtrip failed");
+    }
+
+    #[test]
     fn test_arrow_to_ducklake_list() {
         let list_type = DataType::List(Arc::new(Field::new("item", DataType::Int32, true)));
-        assert_eq!(arrow_to_ducklake_type(&list_type).unwrap(), "list<int32>");
+        assert_eq!(arrow_to_ducklake_type(&list_type).unwrap(), "list(int32)");
 
-        let list_type = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
-        assert_eq!(arrow_to_ducklake_type(&list_type).unwrap(), "list<varchar>");
-
-        let large_list = DataType::LargeList(Arc::new(Field::new("item", DataType::Float64, true)));
+        let large_list = DataType::LargeList(Arc::new(Field::new("item", DataType::Utf8, true)));
         assert_eq!(
             arrow_to_ducklake_type(&large_list).unwrap(),
-            "list<float64>"
+            "list(varchar)"
         );
     }
 
     #[test]
-    fn test_arrow_to_ducklake_unsupported_struct() {
-        let struct_type = DataType::Struct(vec![Field::new("a", DataType::Int32, true)].into());
-        let result = arrow_to_ducklake_type(&struct_type);
-        assert!(result.is_err());
-        match result {
-            Err(DuckLakeError::UnsupportedType(msg)) => {
-                assert!(msg.contains("Struct type"));
-                assert!(msg.contains("not yet supported"));
-            },
-            _ => panic!("Expected UnsupportedType error"),
-        }
+    fn test_arrow_to_ducklake_struct() {
+        let struct_type = DataType::Struct(
+            vec![Field::new("a", DataType::Int32, true), Field::new("b", DataType::Utf8, true)]
+                .into(),
+        );
+        assert_eq!(
+            arrow_to_ducklake_type(&struct_type).unwrap(),
+            "struct(a int32, b varchar)"
+        );
     }
 
     #[test]
@@ -928,6 +1446,28 @@ mod tests {
     }
 
     #[test]
+    fn test_arrow_to_ducklake_map() {
+        let map_type = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Field::new("key", DataType::Utf8, false),
+                        Field::new("value", DataType::Int64, true),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        );
+        assert_eq!(
+            arrow_to_ducklake_type(&map_type).unwrap(),
+            "map(varchar, int64)"
+        );
+    }
+
+    #[test]
     fn test_decimal_negative_precision_rejected() {
         let result = ducklake_to_arrow_type("decimal(-1, 0)");
         assert!(result.is_err());
@@ -965,7 +1505,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_schema_with_list_type() {
+    fn test_build_schema_with_complex_type() {
         let columns = vec![
             DuckLakeTableColumn {
                 column_id: 1,
@@ -975,8 +1515,8 @@ mod tests {
             },
             DuckLakeTableColumn {
                 column_id: 2,
-                column_name: "tags".to_string(),
-                column_type: "list<varchar>".to_string(),
+                column_name: "data".to_string(),
+                column_type: "list<int32>".to_string(),
                 is_nullable: true,
             },
         ];
@@ -985,22 +1525,8 @@ mod tests {
         assert_eq!(schema.fields().len(), 2);
         assert_eq!(
             *schema.field(1).data_type(),
-            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)))
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true)))
         );
-    }
-
-    #[test]
-    fn test_build_schema_with_unsupported_type() {
-        // Test that build_arrow_schema propagates complex type errors
-        let columns = vec![DuckLakeTableColumn {
-            column_id: 1,
-            column_name: "data".to_string(),
-            column_type: "struct<a:int32>".to_string(),
-            is_nullable: true,
-        }];
-
-        let result = build_arrow_schema(&columns);
-        assert!(result.is_err());
     }
 
     #[test]
@@ -1066,236 +1592,5 @@ mod tests {
             result.is_ok(),
             "Negative column_id within i32 range should succeed"
         );
-    }
-
-    // ── normalize_ducklake_type tests ──
-
-    #[test]
-    fn test_normalize_int_aliases() {
-        assert_eq!(normalize_ducklake_type("int").unwrap(), "int32");
-        assert_eq!(normalize_ducklake_type("integer").unwrap(), "int32");
-        assert_eq!(normalize_ducklake_type("INT").unwrap(), "int32");
-        assert_eq!(normalize_ducklake_type("Integer").unwrap(), "int32");
-        assert_eq!(normalize_ducklake_type("int32").unwrap(), "int32");
-    }
-
-    #[test]
-    fn test_normalize_bigint_aliases() {
-        assert_eq!(normalize_ducklake_type("bigint").unwrap(), "int64");
-        assert_eq!(normalize_ducklake_type("long").unwrap(), "int64");
-        assert_eq!(normalize_ducklake_type("BIGINT").unwrap(), "int64");
-        assert_eq!(normalize_ducklake_type("int64").unwrap(), "int64");
-    }
-
-    #[test]
-    fn test_normalize_string_aliases() {
-        assert_eq!(normalize_ducklake_type("text").unwrap(), "varchar");
-        assert_eq!(normalize_ducklake_type("string").unwrap(), "varchar");
-        assert_eq!(normalize_ducklake_type("varchar").unwrap(), "varchar");
-        assert_eq!(normalize_ducklake_type("TEXT").unwrap(), "varchar");
-        assert_eq!(normalize_ducklake_type("STRING").unwrap(), "varchar");
-    }
-
-    #[test]
-    fn test_normalize_float_aliases() {
-        assert_eq!(normalize_ducklake_type("float").unwrap(), "float32");
-        assert_eq!(normalize_ducklake_type("real").unwrap(), "float32");
-        assert_eq!(normalize_ducklake_type("FLOAT").unwrap(), "float32");
-        assert_eq!(normalize_ducklake_type("float32").unwrap(), "float32");
-    }
-
-    #[test]
-    fn test_normalize_double_aliases() {
-        assert_eq!(normalize_ducklake_type("double").unwrap(), "float64");
-        assert_eq!(normalize_ducklake_type("DOUBLE").unwrap(), "float64");
-        assert_eq!(normalize_ducklake_type("float64").unwrap(), "float64");
-    }
-
-    #[test]
-    fn test_normalize_bool_aliases() {
-        assert_eq!(normalize_ducklake_type("bool").unwrap(), "boolean");
-        assert_eq!(normalize_ducklake_type("boolean").unwrap(), "boolean");
-        assert_eq!(normalize_ducklake_type("BOOLEAN").unwrap(), "boolean");
-    }
-
-    #[test]
-    fn test_normalize_smallint_aliases() {
-        assert_eq!(normalize_ducklake_type("smallint").unwrap(), "int16");
-        assert_eq!(normalize_ducklake_type("SMALLINT").unwrap(), "int16");
-        assert_eq!(normalize_ducklake_type("int16").unwrap(), "int16");
-    }
-
-    #[test]
-    fn test_normalize_tinyint_aliases() {
-        assert_eq!(normalize_ducklake_type("tinyint").unwrap(), "int8");
-        assert_eq!(normalize_ducklake_type("TINYINT").unwrap(), "int8");
-        assert_eq!(normalize_ducklake_type("int8").unwrap(), "int8");
-    }
-
-    #[test]
-    fn test_normalize_unknown_type_errors() {
-        assert!(normalize_ducklake_type("foobar").is_err());
-    }
-
-    // ── is_promotable tests ──
-
-    #[test]
-    fn test_promotable_same_type() {
-        assert!(is_promotable("int32", "int32"));
-        assert!(is_promotable("varchar", "varchar"));
-        assert!(is_promotable("float64", "float64"));
-    }
-
-    #[test]
-    fn test_promotable_signed_int_widening() {
-        assert!(is_promotable("int8", "int16"));
-        assert!(is_promotable("int8", "int32"));
-        assert!(is_promotable("int8", "int64"));
-        assert!(is_promotable("int16", "int32"));
-        assert!(is_promotable("int16", "int64"));
-        assert!(is_promotable("int32", "int64"));
-    }
-
-    #[test]
-    fn test_promotable_signed_int_narrowing_rejected() {
-        assert!(!is_promotable("int64", "int32"));
-        assert!(!is_promotable("int32", "int16"));
-        assert!(!is_promotable("int16", "int8"));
-    }
-
-    #[test]
-    fn test_promotable_unsigned_int_widening() {
-        assert!(is_promotable("uint8", "uint16"));
-        assert!(is_promotable("uint8", "uint32"));
-        assert!(is_promotable("uint8", "uint64"));
-        assert!(is_promotable("uint16", "uint32"));
-        assert!(is_promotable("uint32", "uint64"));
-    }
-
-    #[test]
-    fn test_promotable_unsigned_narrowing_rejected() {
-        assert!(!is_promotable("uint64", "uint32"));
-        assert!(!is_promotable("uint32", "uint16"));
-    }
-
-    #[test]
-    fn test_promotable_float_widening() {
-        assert!(is_promotable("float32", "float64"));
-    }
-
-    #[test]
-    fn test_promotable_float_narrowing_rejected() {
-        assert!(!is_promotable("float64", "float32"));
-    }
-
-    #[test]
-    fn test_promotable_int_to_float64() {
-        assert!(is_promotable("int8", "float64"));
-        assert!(is_promotable("int16", "float64"));
-        assert!(is_promotable("int32", "float64"));
-        assert!(is_promotable("int64", "float64"));
-    }
-
-    #[test]
-    fn test_promotable_int_to_float32_rejected() {
-        // We only allow int -> float64, not int -> float32
-        assert!(!is_promotable("int32", "float32"));
-    }
-
-    #[test]
-    fn test_promotable_timestamp_to_timestamptz() {
-        assert!(is_promotable("timestamp", "timestamptz"));
-    }
-
-    #[test]
-    fn test_promotable_timestamptz_to_timestamp_rejected() {
-        assert!(!is_promotable("timestamptz", "timestamp"));
-    }
-
-    #[test]
-    fn test_promotable_decimal_widening() {
-        assert!(is_promotable("decimal(10, 2)", "decimal(18, 4)"));
-        assert!(is_promotable("decimal(10, 2)", "decimal(10, 2)")); // same
-        assert!(is_promotable("decimal(10, 2)", "decimal(20, 2)")); // wider precision
-        assert!(is_promotable("decimal(10, 2)", "decimal(12, 4)")); // wider scale with enough integer digits
-    }
-
-    #[test]
-    fn test_promotable_decimal_narrowing_rejected() {
-        assert!(!is_promotable("decimal(18, 4)", "decimal(10, 2)"));
-        assert!(!is_promotable("decimal(20, 2)", "decimal(10, 2)")); // narrower precision
-        // Scale widening that shrinks integer digits: 10-2=8 integer digits vs 12-8=4
-        assert!(!is_promotable("decimal(10, 2)", "decimal(12, 8)"));
-    }
-
-    #[test]
-    fn test_promotable_incompatible_types() {
-        assert!(!is_promotable("int32", "varchar"));
-        assert!(!is_promotable("varchar", "int32"));
-        assert!(!is_promotable("boolean", "int32"));
-        assert!(!is_promotable("date", "timestamp"));
-    }
-
-    #[test]
-    fn test_promotable_unknown_types() {
-        assert!(!is_promotable("foobar", "int32"));
-        assert!(!is_promotable("int32", "foobar"));
-    }
-
-    #[test]
-    fn test_promotable_with_aliases() {
-        // Uses normalized forms internally
-        assert!(is_promotable("int", "bigint")); // int32 -> int64
-        assert!(is_promotable("tinyint", "integer")); // int8 -> int32
-        assert!(is_promotable("float", "double")); // float32 -> float64
-    }
-
-    // ── types_compatible tests ──
-
-    #[test]
-    fn test_types_compatible_same_canonical() {
-        assert!(types_compatible("int", "int32"));
-        assert!(types_compatible("int32", "int"));
-        assert!(types_compatible("integer", "int"));
-        assert!(types_compatible("text", "varchar"));
-        assert!(types_compatible("string", "text"));
-        assert!(types_compatible("bigint", "int64"));
-        assert!(types_compatible("float", "real"));
-        assert!(types_compatible("double", "float64"));
-        assert!(types_compatible("bool", "boolean"));
-    }
-
-    #[test]
-    fn test_types_compatible_case_insensitive() {
-        assert!(types_compatible("INT", "int32"));
-        assert!(types_compatible("VARCHAR", "text"));
-        assert!(types_compatible("BIGINT", "int64"));
-    }
-
-    #[test]
-    fn test_types_compatible_with_promotion() {
-        assert!(types_compatible("int32", "int64"));
-        assert!(types_compatible("float32", "float64"));
-        assert!(types_compatible("timestamp", "timestamptz"));
-    }
-
-    #[test]
-    fn test_types_compatible_narrowing_rejected() {
-        assert!(!types_compatible("int64", "int32"));
-        assert!(!types_compatible("float64", "float32"));
-    }
-
-    #[test]
-    fn test_types_compatible_incompatible() {
-        assert!(!types_compatible("int32", "varchar"));
-        assert!(!types_compatible("varchar", "int32"));
-        assert!(!types_compatible("boolean", "float64"));
-    }
-
-    #[test]
-    fn test_types_compatible_unknown() {
-        assert!(!types_compatible("foobar", "int32"));
-        assert!(!types_compatible("int32", "foobar"));
-        assert!(!types_compatible("foobar", "bazqux"));
     }
 }

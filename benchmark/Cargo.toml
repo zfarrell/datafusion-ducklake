@@ -17,6 +17,10 @@ path = "src/bin/generate_tpch.rs"
 name = "generate-tpcds"
 path = "src/bin/generate_tpcds.rs"
 
+[[bin]]
+name = "file-pruning-benchmark"
+path = "src/bin/file_pruning_benchmark.rs"
+
 [dependencies]
 # DataFusion-DuckLake: Uncomment ONE of the following options
 
@@ -49,3 +53,4 @@ chrono = "0.4"
 anyhow = "1"
 regex = "1"
 walkdir = "2"
+tempfile = "3.14"

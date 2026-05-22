@@ -13,6 +13,7 @@ use arrow::datatypes::SchemaRef;
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::Stream;
 
@@ -35,7 +36,16 @@ impl DeleteFilterExec {
         file_path: String,
         deleted_positions: Arc<HashSet<i64>>,
     ) -> Self {
-        // Clone properties from input plan
+        // R8-S-014: row_offset tracking requires a single partition per file.
+        // If the input has multiple partitions (e.g. row-group splitting) and
+        // we have deletes, coalesce to a single partition to ensure correct offsets.
+        let input = if !deleted_positions.is_empty()
+            && input.properties().output_partitioning().partition_count() > 1
+        {
+            Arc::new(CoalescePartitionsExec::new(input)) as Arc<dyn ExecutionPlan>
+        } else {
+            input
+        };
         let properties = input.properties().clone();
 
         Self {
@@ -138,7 +148,22 @@ impl Stream for DeleteFilterStream {
                 match self.filter_batch(&batch) {
                     Ok(filtered_batch) => {
                         // Update row offset for next batch
-                        self.row_offset += batch.num_rows() as i64;
+                        let num_rows = match i64::try_from(batch.num_rows()) {
+                            Ok(n) => n,
+                            Err(_) => {
+                                return Poll::Ready(Some(Err(DataFusionError::Internal(format!(
+                                    "batch row count {} exceeds i64::MAX",
+                                    batch.num_rows()
+                                )))));
+                            },
+                        };
+                        self.row_offset =
+                            self.row_offset.checked_add(num_rows).ok_or_else(|| {
+                                DataFusionError::Internal(format!(
+                                    "row_offset overflow: {} + {}",
+                                    self.row_offset, num_rows
+                                ))
+                            })?;
                         Poll::Ready(Some(Ok(filtered_batch)))
                     },
                     Err(e) => Poll::Ready(Some(Err(e))),
@@ -160,10 +185,18 @@ impl DeleteFilterStream {
 
         // Build list of row indices to keep
         let num_rows = batch.num_rows();
-        let mut keep_indices: Vec<usize> = Vec::with_capacity(num_rows);
+        let num_rows_u32 = u32::try_from(num_rows).map_err(|_| {
+            DataFusionError::Internal(format!("batch row count {} exceeds u32::MAX", num_rows))
+        })?;
+        let mut keep_indices: Vec<u32> = Vec::with_capacity(num_rows);
 
-        for i in 0..num_rows {
-            let global_pos = self.row_offset + i as i64;
+        for i in 0..num_rows_u32 {
+            let global_pos = self.row_offset.checked_add(i64::from(i)).ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "global position overflow: {} + {}",
+                    self.row_offset, i
+                ))
+            })?;
             if !self.deleted_positions.contains(&global_pos) {
                 keep_indices.push(i);
             }
@@ -186,7 +219,7 @@ impl DeleteFilterStream {
         use arrow::array::UInt32Array;
         use arrow::compute::take;
 
-        let indices = UInt32Array::from(keep_indices.iter().map(|&i| i as u32).collect::<Vec<_>>());
+        let indices = UInt32Array::from(keep_indices);
 
         let filtered_columns: DataFusionResult<Vec<_>> = batch
             .columns()

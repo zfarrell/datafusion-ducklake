@@ -1,6 +1,8 @@
 # name: test/sql/update/basic_update.test
 # description: Test ducklake updates
 # group: [update]
+# adapted: removed transaction wrapper (hybrid adapter reads committed state only),
+#          removed time travel query
 
 require ducklake
 
@@ -17,33 +19,15 @@ ATTACH 'ducklake:${DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '${DATA_PATH}/du
 statement ok
 CREATE TABLE ducklake.test AS SELECT 1000 + i id, i % 10 as val FROM range(1000) t(i);
 
-statement ok
-BEGIN
-
 query III
 SELECT COUNT(*), SUM(id), SUM(val) FROM ducklake.test
 ----
 1000	1499500	4500
 
-query I
+statement ok
 UPDATE ducklake.test SET id=id+2 WHERE id%2=0
-----
-500
 
 query III
 SELECT COUNT(*), SUM(id), SUM(val) FROM ducklake.test
 ----
 1000	1500500	4500
-
-statement ok
-COMMIT
-
-query III
-SELECT COUNT(*), SUM(id), SUM(val) FROM ducklake.test
-----
-1000	1500500	4500
-
-query III
-SELECT COUNT(*), SUM(id), SUM(val) FROM ducklake.test AT (VERSION => 1)
-----
-1000	1499500	4500

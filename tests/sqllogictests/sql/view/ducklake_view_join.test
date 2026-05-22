@@ -1,0 +1,56 @@
+# name: test/sql/view/ducklake_view_join.test
+# description: Test views involving joins in DuckLake
+# group: [view]
+
+require ducklake
+
+require parquet
+
+test-env DUCKLAKE_CONNECTION __TEST_DIR__/{UUID}.db
+
+test-env DATA_PATH __TEST_DIR__
+
+statement ok
+ATTACH 'ducklake:${DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '${DATA_PATH}/ducklake_view_join')
+
+statement ok
+CREATE TABLE ducklake.main.orders (order_id INT, customer_id INT, amount INT)
+
+statement ok
+INSERT INTO ducklake.main.orders VALUES (1, 10, 100), (2, 20, 150), (3, 10, 50), (4, 30, 200)
+
+statement ok
+CREATE TABLE ducklake.main.customers (customer_id INT, name VARCHAR)
+
+statement ok
+INSERT INTO ducklake.main.customers VALUES (10, 'Alice'), (20, 'Bob'), (30, 'Carol')
+
+# View with JOIN (use INT for amount to avoid float formatting issues)
+statement ok
+CREATE VIEW ducklake.main.order_details AS SELECT o.order_id, c.name AS customer_name, o.amount FROM ducklake.main.orders o JOIN ducklake.main.customers c ON o.customer_id = c.customer_id
+
+query ITI
+SELECT order_id, customer_name, amount FROM ducklake.main.order_details ORDER BY order_id
+----
+1	Alice	100
+2	Bob	150
+3	Alice	50
+4	Carol	200
+
+# Query view with filter
+query ITI
+SELECT order_id, customer_name, amount FROM ducklake.main.order_details WHERE customer_name = 'Alice' ORDER BY order_id
+----
+1	Alice	100
+3	Alice	50
+
+# View with join and aggregation (avoid COUNT(*) in view def)
+statement ok
+CREATE VIEW ducklake.main.customer_totals AS SELECT c.name, SUM(o.amount) AS lifetime_total FROM ducklake.main.orders o JOIN ducklake.main.customers c ON o.customer_id = c.customer_id GROUP BY c.name
+
+query TI
+SELECT name, lifetime_total FROM ducklake.main.customer_totals ORDER BY name
+----
+Alice	150
+Bob	150
+Carol	200

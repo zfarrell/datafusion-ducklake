@@ -36,12 +36,15 @@
 //! ```
 
 pub mod catalog;
+pub mod cdc_common;
 pub mod column_rename;
 pub mod delete_filter;
+pub(crate) mod dialect;
 pub mod encryption;
 pub mod error;
 pub mod information_schema;
 pub mod metadata_provider;
+pub mod parse_values;
 pub mod path_resolver;
 pub mod row_id;
 pub mod schema;
@@ -49,7 +52,13 @@ pub mod table;
 pub mod table_changes;
 pub mod table_deletions;
 pub mod table_functions;
+pub mod table_insertions;
 pub mod types;
+pub mod virtual_column_exec;
+
+// Shared provider macro (used by SQLite, PostgreSQL, MySQL providers)
+#[cfg(any(feature = "metadata-sqlite", feature = "metadata-postgres", feature = "metadata-mysql"))]
+pub(crate) mod metadata_provider_impl;
 
 // Metadata providers (feature-gated)
 #[cfg(feature = "metadata-duckdb")]
@@ -61,15 +70,33 @@ pub mod metadata_provider_postgres;
 #[cfg(feature = "metadata-sqlite")]
 pub mod metadata_provider_sqlite;
 
+// Shared writer macros (used by SQLite, PostgreSQL, MySQL writers)
+#[cfg(any(feature = "write-sqlite", feature = "write-postgres", feature = "write-mysql"))]
+pub(crate) mod metadata_writer_impl;
+
 // Write support (feature-gated)
+#[cfg(feature = "write")]
+pub mod delete_exec;
 #[cfg(feature = "write")]
 pub mod insert_exec;
 #[cfg(feature = "write")]
+pub mod merge_exec;
+#[cfg(feature = "write")]
 pub mod metadata_writer;
+#[cfg(feature = "write-mysql")]
+pub mod metadata_writer_mysql;
+#[cfg(feature = "write-postgres")]
+pub mod metadata_writer_postgres;
 #[cfg(feature = "write-sqlite")]
 pub mod metadata_writer_sqlite;
 #[cfg(feature = "write")]
+pub(crate) mod metadata_writer_validation;
+#[cfg(feature = "write")]
+pub mod query_planner;
+#[cfg(feature = "write")]
 pub mod table_writer;
+#[cfg(feature = "write")]
+pub mod update_exec;
 
 // Result type for DuckLake operations
 pub type Result<T> = std::result::Result<T, DuckLakeError>;
@@ -81,6 +108,10 @@ pub use metadata_provider::MetadataProvider;
 pub use schema::DuckLakeSchema;
 pub use table::DuckLakeTable;
 pub use table_functions::register_ducklake_functions;
+pub use virtual_column_exec::{
+    VIRTUAL_COL_FILE_INDEX, VIRTUAL_COL_FILE_ROW_NUMBER, VIRTUAL_COL_FILENAME, VIRTUAL_COL_ROWID,
+    VIRTUAL_COL_SNAPSHOT_ID, VirtualColumnExec, VirtualColumnFileInfo, VirtualColumnSet,
+};
 
 // Re-export metadata providers (feature-gated)
 #[cfg(feature = "metadata-duckdb")]
@@ -94,12 +125,28 @@ pub use metadata_provider_sqlite::SqliteMetadataProvider;
 
 // Re-export write types (feature-gated)
 #[cfg(feature = "write")]
-pub use insert_exec::DuckLakeInsertExec;
+pub use delete_exec::DuckLakeDeleteExec;
+#[cfg(feature = "write")]
+pub use insert_exec::{DuckLakeInsertExec, PartitionTransform};
+#[cfg(feature = "write")]
+pub use merge_exec::{DuckLakeMergeExec, MergeMatchedAction};
 #[cfg(feature = "write")]
 pub use metadata_writer::{
-    ColumnDef, DataFileInfo, MetadataWriter, WriteMode, WriteResult, WriteSetupResult,
+    ColumnDef, ColumnStatInfo, DataFileInfo, DeleteFileInfo, MetadataWriter, WriteMode,
+    WriteResult, WriteSetupResult,
 };
+#[cfg(feature = "write-mysql")]
+pub use metadata_writer_mysql::MySqlMetadataWriter;
+#[cfg(feature = "write-postgres")]
+pub use metadata_writer_postgres::PostgresMetadataWriter;
 #[cfg(feature = "write-sqlite")]
 pub use metadata_writer_sqlite::SqliteMetadataWriter;
 #[cfg(feature = "write")]
-pub use table_writer::{DuckLakeTableWriter, TableWriteSession};
+pub use query_planner::DuckLakeQueryPlanner;
+#[cfg(feature = "write")]
+pub use table_writer::{
+    DuckLakeTableWriter, DucklakeFlushInlinedDataFunction, TableWriteSession,
+    cleanup_orphaned_files,
+};
+#[cfg(feature = "write")]
+pub use update_exec::{DuckLakeUpdateExec, UpdateAssignment};

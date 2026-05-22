@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::Result;
 
 // SQL queries for DuckLake catalog tables
@@ -5,7 +7,12 @@ use crate::Result;
 pub const SQL_GET_LATEST_SNAPSHOT: &str =
     "SELECT COALESCE(MAX(snapshot_id), 0) FROM ducklake_snapshot";
 
-pub const SQL_LIST_SNAPSHOTS: &str = "SELECT snapshot_id, CAST(snapshot_time AS VARCHAR) as timestamp FROM ducklake_snapshot ORDER BY snapshot_id";
+pub const SQL_LIST_SNAPSHOTS: &str = "
+    SELECT s.snapshot_id, CAST(s.snapshot_time AS VARCHAR) as snapshot_time, s.schema_version,
+           c.changes_made, c.author, c.commit_message, c.commit_extra_info
+    FROM ducklake_snapshot s
+    LEFT JOIN ducklake_snapshot_changes c ON s.snapshot_id = c.snapshot_id
+    ORDER BY s.snapshot_id";
 
 pub const SQL_LIST_SCHEMAS: &str =
     "SELECT schema_id, schema_name, path, path_is_relative FROM ducklake_schema
@@ -17,10 +24,11 @@ pub const SQL_LIST_TABLES: &str =
        AND ? >= begin_snapshot
        AND (? < end_snapshot OR end_snapshot IS NULL)";
 
-pub const SQL_GET_TABLE_COLUMNS: &str =
-    "SELECT column_id, column_name, column_type, nulls_allowed, parent_column
+pub const SQL_GET_TABLE_COLUMNS: &str = "SELECT column_id, column_name, column_type, nulls_allowed
      FROM ducklake_column
-     WHERE table_id = ? AND end_snapshot IS NULL
+     WHERE table_id = ?
+       AND ? >= begin_snapshot
+       AND (? < end_snapshot OR end_snapshot IS NULL)
      ORDER BY column_order";
 
 pub const SQL_GET_DATA_FILES: &str = "
@@ -31,15 +39,16 @@ pub const SQL_GET_DATA_FILES: &str = "
         data.file_size_bytes AS data_file_size,
         data.footer_size AS data_footer_size,
         data.encryption_key AS data_encryption_key,
-        data.row_id_start AS data_row_id_start,
-        data.record_count AS data_record_count,
         del.delete_file_id,
         del.path AS delete_file_path,
         del.path_is_relative AS delete_path_is_relative,
         del.file_size_bytes AS delete_file_size,
         del.footer_size AS delete_footer_size,
         del.encryption_key AS delete_encryption_key,
-        del.delete_count
+        del.delete_count,
+        data.begin_snapshot,
+        data.row_id_start,
+        data.record_count
     FROM ducklake_data_file AS data
     LEFT JOIN ducklake_delete_file AS del
         ON data.data_file_id = del.data_file_id
@@ -74,6 +83,56 @@ pub const SQL_TABLE_EXISTS: &str = "SELECT EXISTS(
          AND (? < end_snapshot OR end_snapshot IS NULL)
      )";
 
+// Column-level statistics query
+// Joins through ducklake_column to get column_name so stats from different
+// column versions (which have different column_ids) can be aggregated correctly.
+pub const SQL_GET_FILE_COLUMN_STATS: &str = "
+    SELECT s.data_file_id, c.column_name, s.null_count, s.min_value, s.max_value
+    FROM ducklake_file_column_stats s
+    JOIN ducklake_data_file f ON s.data_file_id = f.data_file_id
+    JOIN ducklake_column c ON s.column_id = c.column_id
+    WHERE s.table_id = ?
+      AND ? >= f.begin_snapshot
+      AND (? < f.end_snapshot OR f.end_snapshot IS NULL)";
+
+// Row count query: returns exact row count when all files have record_count metadata
+pub const SQL_GET_TABLE_ROW_COUNT: &str = "
+    SELECT
+        CASE WHEN COUNT(*) = COUNT(data.record_count)
+            THEN COALESCE(SUM(data.record_count), 0) - COALESCE(SUM(del.delete_count), 0)
+            ELSE NULL
+        END as row_count
+    FROM ducklake_data_file data
+    LEFT JOIN ducklake_delete_file del
+        ON data.data_file_id = del.data_file_id
+        AND del.table_id = ?
+        AND ? >= del.begin_snapshot
+        AND (? < del.end_snapshot OR del.end_snapshot IS NULL)
+    WHERE data.table_id = ?
+      AND ? >= data.begin_snapshot
+      AND (? < data.end_snapshot OR data.end_snapshot IS NULL)";
+
+// Partition column query: returns partition key columns for a table
+pub const SQL_GET_PARTITION_COLUMNS: &str = "
+    SELECT pc.partition_key_index, c.column_name, pc.transform
+    FROM ducklake_partition_info pi
+    JOIN ducklake_partition_column pc
+        ON pi.partition_id = pc.partition_id AND pi.table_id = pc.table_id
+    JOIN ducklake_column c ON pc.column_id = c.column_id
+    WHERE pi.table_id = ?
+      AND ? >= pi.begin_snapshot
+      AND (? < pi.end_snapshot OR pi.end_snapshot IS NULL)
+    ORDER BY pc.partition_key_index";
+
+// File partition values: returns partition values for each data file
+pub const SQL_GET_FILE_PARTITION_VALUES: &str = "
+    SELECT fpv.data_file_id, fpv.partition_key_index, fpv.partition_value
+    FROM ducklake_file_partition_value fpv
+    JOIN ducklake_data_file df ON fpv.data_file_id = df.data_file_id
+    WHERE fpv.table_id = ?
+      AND ? >= df.begin_snapshot
+      AND (? < df.end_snapshot OR df.end_snapshot IS NULL)";
+
 // Queries for table_changes (CDC) - files added/removed between snapshots
 
 pub const SQL_GET_DATA_FILES_ADDED_BETWEEN_SNAPSHOTS: &str = "
@@ -90,6 +149,8 @@ pub const SQL_GET_DATA_FILES_ADDED_BETWEEN_SNAPSHOTS: &str = "
       AND data.begin_snapshot <= ?
     ORDER BY data.begin_snapshot";
 
+// Note: This query uses LEFT JOIN LATERAL which is supported by DuckDB and PostgreSQL
+// but not SQLite. SQLite-based providers use their own query implementations.
 pub const SQL_GET_DELETE_FILES_ADDED_BETWEEN_SNAPSHOTS: &str = "
 WITH params AS (
     SELECT
@@ -110,7 +171,7 @@ current_delete AS (
     FROM ducklake_delete_file df
     CROSS JOIN params p
     WHERE df.table_id = p.table_identifier
-      AND df.begin_snapshot BETWEEN p.start_snapshot AND p.finish_snapshot
+      AND df.begin_snapshot > p.start_snapshot AND df.begin_snapshot <= p.finish_snapshot
 ),
 
 all_deletes AS (
@@ -146,6 +207,7 @@ SELECT
     pd.file_size_bytes AS previous_delete_file_size_bytes,
     pd.footer_size AS previous_delete_footer_size,
 
+    data.encryption_key AS data_encryption_key,
     cd.begin_snapshot
 FROM current_delete cd
 JOIN ducklake_data_file data
@@ -182,6 +244,7 @@ SELECT
     pd.file_size_bytes,
     pd.footer_size,
 
+    data.encryption_key AS data_encryption_key,
     data.end_snapshot
 FROM ducklake_data_file data
 LEFT JOIN LATERAL (
@@ -194,7 +257,7 @@ LEFT JOIN LATERAL (
 ) pd ON true
 CROSS JOIN params p
 WHERE data.table_id = p.table_identifier
-  AND data.end_snapshot BETWEEN p.start_snapshot AND p.finish_snapshot;
+  AND data.end_snapshot > p.start_snapshot AND data.end_snapshot <= p.finish_snapshot;
 ";
 
 // Bulk queries for information_schema (avoids N+1 query problem)
@@ -202,8 +265,10 @@ WHERE data.table_id = p.table_identifier
 pub const SQL_LIST_ALL_TABLES: &str = "
     SELECT
         s.schema_name,
+        s.schema_id,
         t.table_id,
         t.table_name,
+        CAST(t.table_uuid AS VARCHAR) AS table_uuid,
         t.path,
         t.path_is_relative
     FROM ducklake_schema s
@@ -221,8 +286,7 @@ pub const SQL_LIST_ALL_COLUMNS: &str = "
         c.column_id,
         c.column_name,
         c.column_type,
-        c.nulls_allowed,
-        c.parent_column
+        c.nulls_allowed
     FROM ducklake_schema s
     JOIN ducklake_table t ON s.schema_id = t.schema_id
     JOIN ducklake_column c ON t.table_id = c.table_id
@@ -230,6 +294,8 @@ pub const SQL_LIST_ALL_COLUMNS: &str = "
       AND (? < s.end_snapshot OR s.end_snapshot IS NULL)
       AND ? >= t.begin_snapshot
       AND (? < t.end_snapshot OR t.end_snapshot IS NULL)
+      AND ? >= c.begin_snapshot
+      AND (? < c.end_snapshot OR c.end_snapshot IS NULL)
     ORDER BY s.schema_name, t.table_name, c.column_order";
 
 pub const SQL_LIST_ALL_FILES: &str = "
@@ -248,7 +314,7 @@ pub const SQL_LIST_ALL_FILES: &str = "
         del.file_size_bytes AS delete_file_size,
         del.footer_size AS delete_footer_size,
         del.encryption_key AS delete_encryption_key,
-        del.delete_count
+        data.record_count
     FROM ducklake_schema s
     JOIN ducklake_table t ON s.schema_id = t.schema_id
     JOIN ducklake_data_file data ON t.table_id = data.table_id
@@ -265,13 +331,32 @@ pub const SQL_LIST_ALL_FILES: &str = "
       AND (? < data.end_snapshot OR data.end_snapshot IS NULL)
     ORDER BY s.schema_name, t.table_name, data.path";
 
+// View queries
+
+pub const SQL_LIST_VIEWS: &str = "SELECT view_id, view_name, sql FROM ducklake_view WHERE schema_id = ? AND ? >= begin_snapshot AND (? < end_snapshot OR end_snapshot IS NULL)";
+
+pub const SQL_GET_VIEW_BY_NAME: &str = "SELECT view_id, view_name, sql FROM ducklake_view WHERE schema_id = ? AND view_name = ? AND ? >= begin_snapshot AND (? < end_snapshot OR end_snapshot IS NULL)";
+
+pub const SQL_VIEW_EXISTS: &str = "SELECT EXISTS(
+    SELECT 1 FROM ducklake_view WHERE schema_id = ? AND view_name = ? AND ? >= begin_snapshot AND (? < end_snapshot OR end_snapshot IS NULL))";
+
 /// Metadata for a snapshot in the DuckLake catalog
 #[derive(Debug, Clone)]
 pub struct SnapshotMetadata {
     /// Unique identifier for this snapshot
     pub snapshot_id: i64,
     /// Timestamp when the snapshot was created (optional)
-    pub timestamp: Option<String>,
+    pub snapshot_time: Option<String>,
+    /// Schema version at this snapshot
+    pub schema_version: Option<i64>,
+    /// Description of changes made in this snapshot
+    pub changes: Option<String>,
+    /// Author of this snapshot
+    pub author: Option<String>,
+    /// Commit message for this snapshot
+    pub commit_message: Option<String>,
+    /// Extra commit info for this snapshot
+    pub commit_extra_info: Option<String>,
 }
 
 /// Metadata for a schema in the DuckLake catalog
@@ -300,11 +385,41 @@ pub struct TableMetadata {
     pub path_is_relative: bool,
 }
 
+/// Metadata for a view in the DuckLake catalog
+#[derive(Debug, Clone)]
+pub struct ViewMetadata {
+    /// Unique identifier for this view in the catalog
+    pub view_id: i64,
+    /// Name of the view as it appears in SQL queries
+    pub view_name: String,
+    /// SQL query that defines the view
+    pub sql: String,
+}
+
+/// Per-column statistics for a single data file
+#[derive(Debug, Clone)]
+pub struct FileColumnStats {
+    /// ID of the data file
+    pub data_file_id: i64,
+    /// Column name in the catalog
+    pub column_name: String,
+    /// Number of null values
+    pub null_count: Option<i64>,
+    /// Minimum value as a string
+    pub min_value: Option<String>,
+    /// Maximum value as a string
+    pub max_value: Option<String>,
+}
+
 /// Table metadata with its schema name (for bulk queries)
 #[derive(Debug, Clone)]
 pub struct TableWithSchema {
     /// Name of the schema this table belongs to
     pub schema_name: String,
+    /// ID of the schema this table belongs to
+    pub schema_id: i64,
+    /// UUID of the table (optional, for table_info output)
+    pub table_uuid: Option<String>,
     /// Table metadata
     pub table: TableMetadata,
 }
@@ -329,6 +444,41 @@ pub struct FileWithTable {
     pub table_name: String,
     /// File metadata
     pub file: DuckLakeTableFile,
+}
+
+/// Partition column definition for a DuckLake table
+#[derive(Debug, Clone)]
+pub struct PartitionColumn {
+    /// Index of this partition key (0-based ordering)
+    pub partition_key_index: i32,
+    /// Name of the column used for partitioning
+    pub column_name: String,
+    /// Transform applied to the column (e.g., "identity", "year", "month")
+    pub transform: Option<String>,
+}
+
+/// A row of inlined data stored directly in the catalog database.
+///
+/// DuckLake can store small amounts of data directly in the catalog database
+/// rather than writing Parquet files. This is controlled by the
+/// `data_inlining_row_limit` option.
+#[derive(Debug, Clone)]
+pub struct InlinedDataRow {
+    /// Column names for this row (shared across all rows in a batch to avoid redundant allocations)
+    pub column_names: Arc<Vec<String>>,
+    /// Values as optional strings (None = NULL)
+    pub values: Vec<Option<String>>,
+}
+
+/// Partition value for a specific data file
+#[derive(Debug, Clone)]
+pub struct FilePartitionValue {
+    /// ID of the data file
+    pub data_file_id: i64,
+    /// Index of the partition key
+    pub partition_key_index: i32,
+    /// Partition value as a string
+    pub partition_value: Option<String>,
 }
 
 /// Column definition for a DuckLake table
@@ -358,96 +508,6 @@ impl DuckLakeTableColumn {
             is_nullable,
         }
     }
-}
-
-/// Reconstruct list types from parent-child column rows.
-///
-/// DuckLake stores list columns as two rows in `ducklake_column`:
-/// - Parent row: `column_type = "list"`, `parent_column = NULL`
-/// - Child row:  `column_type = "<element_type>"`, `parent_column = <parent_column_id>`
-///
-/// This function rewrites the parent's `column_type` to `list<element_type>`
-/// and removes child rows from the result.
-///
-/// Only handles `list` parent types. Struct, map, etc. are left unchanged.
-pub fn reconstruct_list_columns(
-    rows: Vec<(DuckLakeTableColumn, Option<i64>)>,
-) -> Vec<DuckLakeTableColumn> {
-    use std::collections::HashMap;
-
-    // Index: column_id -> position in rows
-    let id_to_index: HashMap<i64, usize> = rows
-        .iter()
-        .enumerate()
-        .map(|(i, (col, _))| (col.column_id, i))
-        .collect();
-
-    // Separate into columns and parent_column arrays
-    let mut columns: Vec<DuckLakeTableColumn> = Vec::with_capacity(rows.len());
-    let mut parent_columns: Vec<Option<i64>> = Vec::with_capacity(rows.len());
-    for (col, parent) in rows {
-        columns.push(col);
-        parent_columns.push(parent);
-    }
-
-    // Find children of list parents and rewrite parent types
-    let mut skip: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    for (i, parent_id) in parent_columns.iter().enumerate() {
-        if let Some(pid) = parent_id
-            && let Some(&parent_idx) = id_to_index.get(pid)
-            && columns[parent_idx].column_type == "list"
-        {
-            columns[parent_idx].column_type = format!("list<{}>", columns[i].column_type);
-            skip.insert(i);
-        }
-    }
-
-    // Return only top-level columns (not children)
-    columns
-        .into_iter()
-        .enumerate()
-        .filter(|(i, _)| !skip.contains(i))
-        .map(|(_, col)| col)
-        .collect()
-}
-
-/// Same as [`reconstruct_list_columns`] but for [`ColumnWithTable`] rows.
-pub fn reconstruct_list_columns_with_table(
-    rows: Vec<(ColumnWithTable, Option<i64>)>,
-) -> Vec<ColumnWithTable> {
-    use std::collections::HashMap;
-
-    let id_to_index: HashMap<i64, usize> = rows
-        .iter()
-        .enumerate()
-        .map(|(i, (cwt, _))| (cwt.column.column_id, i))
-        .collect();
-
-    let mut entries: Vec<ColumnWithTable> = Vec::with_capacity(rows.len());
-    let mut parent_columns: Vec<Option<i64>> = Vec::with_capacity(rows.len());
-    for (cwt, parent) in rows {
-        entries.push(cwt);
-        parent_columns.push(parent);
-    }
-
-    let mut skip: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    for (i, parent_id) in parent_columns.iter().enumerate() {
-        if let Some(pid) = parent_id
-            && let Some(&parent_idx) = id_to_index.get(pid)
-            && entries[parent_idx].column.column_type == "list"
-        {
-            entries[parent_idx].column.column_type =
-                format!("list<{}>", entries[i].column.column_type);
-            skip.insert(i);
-        }
-    }
-
-    entries
-        .into_iter()
-        .enumerate()
-        .filter(|(i, _)| !skip.contains(i))
-        .map(|(_, e)| e)
-        .collect()
 }
 
 /// Metadata for a data file or delete file in DuckLake
@@ -480,24 +540,24 @@ impl DuckLakeFileData {
 /// Represents a data file and its associated delete file (if any) for a DuckLake table
 #[derive(Debug, Clone)]
 pub struct DuckLakeTableFile {
+    /// ID of the data file in the catalog (needed for delete file registration)
+    pub data_file_id: Option<i64>,
     /// Metadata for the data file
     pub file: DuckLakeFileData,
     /// Optional associated delete file containing deleted row positions
     pub delete_file: Option<DuckLakeFileData>,
-    /// Starting row ID for this file. Combined with each row's position in the
-    /// file, this gives a globally unique `rowid` (DuckLake row lineage).
-    /// `None` for files where the metadata column is unset (e.g. older catalogs).
+    /// Starting row ID for this file (reserved for future use)
     pub row_id_start: Option<i64>,
     /// Snapshot ID when this file was created (reserved for future use)
     pub snapshot_id: Option<i64>,
-    /// Total rows in this file (`record_count` from the catalog), before any
-    /// delete files are applied. Used for synthetic `rowid` generation.
+    /// Maximum number of rows in this file (reserved for future use)
     pub max_row_count: Option<i64>,
 }
 
 impl DuckLakeTableFile {
     pub fn new(file: DuckLakeFileData) -> Self {
         Self {
+            data_file_id: None,
             file,
             delete_file: None,
             row_id_start: None,
@@ -525,7 +585,7 @@ pub struct DeleteFileChange {
     pub data_file_path: String,
     pub data_file_path_is_relative: bool,
     pub data_file_size_bytes: i64,
-    pub data_file_footer_size: i64,
+    pub data_file_footer_size: Option<i64>,
     pub data_row_id_start: i64,
     pub data_record_count: i64,
     pub data_mapping_id: Option<i64>,
@@ -541,6 +601,9 @@ pub struct DeleteFileChange {
     pub previous_delete_path_is_relative: Option<bool>,
     pub previous_delete_file_size_bytes: Option<i64>,
     pub previous_delete_footer_size: Option<i64>,
+
+    /* -------- Data file encryption (R6-S-012) -------- */
+    pub data_encryption_key: Option<String>,
 
     /* -------- Snapshot where change occurred -------- */
     pub snapshot_id: i64,
@@ -562,8 +625,14 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
     /// List tables for a specific snapshot
     fn list_tables(&self, schema_id: i64, snapshot_id: i64) -> Result<Vec<TableMetadata>>;
 
-    /// Get table structure (columns) - not snapshot-dependent as column definitions don't change
-    fn get_table_structure(&self, table_id: i64) -> Result<Vec<DuckLakeTableColumn>>;
+    /// Get table structure (columns) for a specific snapshot.
+    /// Columns are snapshot-versioned: they have begin_snapshot/end_snapshot
+    /// to track schema evolution (ALTER TABLE ADD/DROP/RENAME COLUMN).
+    fn get_table_structure(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+    ) -> Result<Vec<DuckLakeTableColumn>>;
 
     /// Get table files for a specific snapshot
     fn get_table_files_for_select(
@@ -612,6 +681,91 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         end_snapshot: i64,
     ) -> Result<Vec<DataFileChange>>;
 
+    // Column statistics methods
+
+    /// Get per-file column statistics for a table at a given snapshot.
+    ///
+    /// Returns statistics only for active data files (those visible at this snapshot).
+    /// Default implementation returns empty (no stats available).
+    fn get_file_column_stats(
+        &self,
+        _table_id: i64,
+        _snapshot_id: i64,
+    ) -> Result<Vec<FileColumnStats>> {
+        Ok(Vec::new())
+    }
+
+    // Row count optimization
+
+    /// Get exact row count for a table at a given snapshot.
+    ///
+    /// Returns Some(count) if all data files have record_count metadata.
+    /// Returns None if any file is missing record_count (cannot compute exact count).
+    /// The count accounts for deleted rows via delete_count in delete files.
+    fn get_table_row_count(&self, _table_id: i64, _snapshot_id: i64) -> Result<Option<i64>> {
+        Ok(None)
+    }
+
+    // Partition pruning methods
+
+    /// Get partition columns for a table at a given snapshot.
+    ///
+    /// Returns the list of columns used for partitioning, ordered by partition_key_index.
+    /// Returns empty vec if the table is not partitioned.
+    fn get_partition_columns(
+        &self,
+        _table_id: i64,
+        _snapshot_id: i64,
+    ) -> Result<Vec<PartitionColumn>> {
+        Ok(Vec::new())
+    }
+
+    /// Get partition values for all data files in a table at a given snapshot.
+    ///
+    /// Returns partition values for each (data_file_id, partition_key_index) pair.
+    /// Only includes values for files that are active at the given snapshot.
+    fn get_file_partition_values(
+        &self,
+        _table_id: i64,
+        _snapshot_id: i64,
+    ) -> Result<Vec<FilePartitionValue>> {
+        Ok(Vec::new())
+    }
+
+    // View methods (with default implementations for backward compatibility)
+
+    /// List views for a specific schema and snapshot
+    fn list_views(&self, _schema_id: i64, _snapshot_id: i64) -> Result<Vec<ViewMetadata>> {
+        Ok(Vec::new())
+    }
+
+    /// Get a view by name for a specific schema and snapshot
+    fn get_view_by_name(
+        &self,
+        _schema_id: i64,
+        _name: &str,
+        _snapshot_id: i64,
+    ) -> Result<Option<ViewMetadata>> {
+        Ok(None)
+    }
+
+    /// Check if a view exists for a specific schema and snapshot
+    fn view_exists(&self, _schema_id: i64, _name: &str, _snapshot_id: i64) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Get inlined data rows for a table at a given snapshot.
+    ///
+    /// DuckLake can store small amounts of data directly in the catalog database
+    /// instead of writing Parquet files. This method returns any such inlined rows
+    /// that are active at the given snapshot (begin_snapshot <= snapshot_id and
+    /// end_snapshot is NULL or > snapshot_id).
+    ///
+    /// Returns empty vec if the table has no inlined data.
+    fn get_inlined_data(&self, _table_id: i64, _snapshot_id: i64) -> Result<Vec<InlinedDataRow>> {
+        Ok(Vec::new())
+    }
+
     /// Get delete files added between two snapshots (exclusive start, inclusive end)
     /// Returns delete files where begin_snapshot > start_snapshot AND begin_snapshot <= end_snapshot
     /// These represent DELETE changes - rows removed from the table
@@ -632,123 +786,17 @@ where
     tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_reconstruct_list_columns_basic() {
-        let rows = vec![
-            (
-                DuckLakeTableColumn::new(1, "id".into(), "int64".into(), false),
-                None,
-            ),
-            (
-                DuckLakeTableColumn::new(6, "vector".into(), "list".into(), true),
-                None,
-            ),
-            (
-                DuckLakeTableColumn::new(7, "element".into(), "float64".into(), true),
-                Some(6),
-            ),
-        ];
-
-        let result = reconstruct_list_columns(rows);
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].column_name, "id");
-        assert_eq!(result[0].column_type, "int64");
-        assert_eq!(result[1].column_name, "vector");
-        assert_eq!(result[1].column_type, "list<float64>");
-    }
-
-    #[test]
-    fn test_reconstruct_list_columns_no_lists() {
-        let rows = vec![
-            (
-                DuckLakeTableColumn::new(1, "id".into(), "int64".into(), false),
-                None,
-            ),
-            (
-                DuckLakeTableColumn::new(2, "name".into(), "varchar".into(), true),
-                None,
-            ),
-        ];
-
-        let result = reconstruct_list_columns(rows);
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].column_type, "int64");
-        assert_eq!(result[1].column_type, "varchar");
-    }
-
-    #[test]
-    fn test_reconstruct_list_columns_struct_parent_unchanged() {
-        // Struct parents should NOT be rewritten — child stays in result
-        let rows = vec![
-            (
-                DuckLakeTableColumn::new(1, "data".into(), "struct".into(), true),
-                None,
-            ),
-            (
-                DuckLakeTableColumn::new(2, "field_a".into(), "int32".into(), true),
-                Some(1),
-            ),
-        ];
-
-        let result = reconstruct_list_columns(rows);
-        assert_eq!(result.len(), 2); // both remain
-        assert_eq!(result[0].column_type, "struct"); // unchanged
-    }
-
-    #[test]
-    fn test_reconstruct_list_columns_multiple_lists() {
-        let rows = vec![
-            (
-                DuckLakeTableColumn::new(1, "tags".into(), "list".into(), true),
-                None,
-            ),
-            (
-                DuckLakeTableColumn::new(2, "element".into(), "varchar".into(), true),
-                Some(1),
-            ),
-            (
-                DuckLakeTableColumn::new(3, "scores".into(), "list".into(), true),
-                None,
-            ),
-            (
-                DuckLakeTableColumn::new(4, "element".into(), "float64".into(), true),
-                Some(3),
-            ),
-        ];
-
-        let result = reconstruct_list_columns(rows);
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].column_type, "list<varchar>");
-        assert_eq!(result[1].column_type, "list<float64>");
-    }
-
-    #[test]
-    fn test_reconstruct_list_columns_with_table_basic() {
-        let rows = vec![
-            (
-                ColumnWithTable {
-                    schema_name: "main".into(),
-                    table_name: "t".into(),
-                    column: DuckLakeTableColumn::new(6, "vector".into(), "list".into(), true),
-                },
-                None,
-            ),
-            (
-                ColumnWithTable {
-                    schema_name: "main".into(),
-                    table_name: "t".into(),
-                    column: DuckLakeTableColumn::new(7, "element".into(), "float64".into(), true),
-                },
-                Some(6),
-            ),
-        ];
-
-        let result = reconstruct_list_columns_with_table(rows);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].column.column_type, "list<float64>");
-    }
+#[cfg(any(feature = "write-postgres", feature = "write-mysql"))]
+/// Single-attempt blocking executor (no retry on transient errors).
+///
+/// Matches the closure interface of [`block_on_with_retry`] so that writer
+/// macros can use a uniform `$block_on(|| async { ... })` call pattern.
+/// Unlike SQLite's `block_on_with_retry`, this does not retry on failure —
+/// PostgreSQL and MySQL handle contention at the database level.
+pub(crate) fn block_on_no_retry<F, Fut, T>(mut f: F) -> crate::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = crate::Result<T>>,
+{
+    block_on(f())
 }

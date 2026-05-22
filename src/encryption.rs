@@ -77,7 +77,6 @@ use parquet::encryption::encrypt::FileEncryptionProperties;
 ///
 /// This factory maintains a mapping of file paths to their encryption keys,
 /// populated from the DuckLake catalog metadata.
-#[derive(Clone)]
 pub struct DuckLakeEncryptionFactory {
     /// Map of file paths to their encryption keys (base64 or hex encoded)
     file_keys: Arc<HashMap<String, String>>,
@@ -119,28 +118,65 @@ impl DuckLakeEncryptionFactory {
     /// Decode an encryption key from its stored format.
     ///
     /// DuckLake stores keys as strings - this function handles decoding.
-    /// Supports: base64, hex, or raw 16/24/32-byte keys.
+    /// Supports: explicit prefix (`hex:`/`base64:`), hex, base64, or raw 16/24/32-byte keys.
     ///
     /// Decoding priority:
-    /// 1. Base64 (if decodes to valid AES length)
-    /// 2. Hex (if decodes to valid AES length)
-    /// 3. Raw bytes (if exactly 16, 24, or 32 chars)
+    /// 1. Explicit prefix (`hex:` or `base64:`) — unambiguous, always preferred
+    /// 2. Hex (if all chars are hex digits AND decoded length is valid AES: 16/24/32 bytes)
+    /// 3. Base64 (if decodes to valid AES length)
+    /// 4. Raw bytes (if exactly 16, 24, or 32 chars)
+    ///
+    /// Hex is tried before base64 because a 32-char hex key (common AES-128) is also
+    /// valid base64 that decodes to 24 bytes (AES-192), which would silently use the
+    /// wrong key material.
     #[cfg(feature = "encryption")]
     pub fn decode_key(key: &str) -> Result<Vec<u8>> {
         use base64::Engine;
         use datafusion::error::DataFusionError;
 
-        // Try base64 first (most common for DuckLake)
-        // Falls through to hex if base64 decode fails or produces invalid AES length
-        if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(key)
-            && Self::is_valid_aes_length(decoded.len())
-        {
+        // Explicit prefix takes priority — unambiguous encoding
+        if let Some(hex_key) = key.strip_prefix("hex:") {
+            let decoded = hex::decode(hex_key).map_err(|e| {
+                DataFusionError::Execution(format!("Invalid hex-encoded encryption key: {e}"))
+            })?;
+            if !Self::is_valid_aes_length(decoded.len()) {
+                return Err(DataFusionError::Execution(format!(
+                    "Hex-decoded key length {} bytes is not a valid AES key size (16, 24, or 32)",
+                    decoded.len()
+                )));
+            }
+            return Ok(decoded);
+        }
+        if let Some(b64_key) = key.strip_prefix("base64:") {
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(b64_key)
+                .map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "Invalid base64-encoded encryption key: {e}"
+                    ))
+                })?;
+            if !Self::is_valid_aes_length(decoded.len()) {
+                return Err(DataFusionError::Execution(format!(
+                    "Base64-decoded key length {} bytes is not a valid AES key size (16, 24, or 32)",
+                    decoded.len()
+                )));
+            }
             return Ok(decoded);
         }
 
-        // Try hex encoding as fallback
-        // Falls through to raw bytes if hex decode fails or produces invalid AES length
-        if let Ok(decoded) = hex::decode(key)
+        // Try hex first: a 32-char hex string (AES-128) is valid base64 that decodes
+        // to 24 bytes (AES-192), so hex must be checked before base64 to avoid ambiguity.
+        if key.len() % 2 == 0
+            && key.chars().all(|c| c.is_ascii_hexdigit())
+            && Self::is_valid_aes_length(key.len() / 2)
+        {
+            if let Ok(decoded) = hex::decode(key) {
+                return Ok(decoded);
+            }
+        }
+
+        // Try base64 encoding
+        if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(key)
             && Self::is_valid_aes_length(decoded.len())
         {
             return Ok(decoded);
@@ -154,9 +190,10 @@ impl DuckLakeEncryptionFactory {
 
         // Provide specific error message (without exposing the key value)
         Err(DataFusionError::Execution(format!(
-            "Invalid encryption key format. Expected: base64-encoded (recommended), \
-             hex-encoded, or raw 16/24/32-byte string. Provided key length: {} chars. \
-             Hint: Use base64 encoding, e.g., 'MDEyMzQ1Njc4OWFiY2RlZg==' for a 16-byte key.",
+            "Invalid encryption key format. Expected: 'hex:<hex_string>', 'base64:<b64_string>', \
+             hex-encoded, base64-encoded, or raw 16/24/32-byte string. Provided key length: {} chars. \
+             Hint: Use explicit prefix for clarity, e.g., 'hex:0123456789abcdef0123456789abcdef' \
+             or 'base64:MDEyMzQ1Njc4OWFiY2RlZg=='.",
             key.len()
         )))
     }
@@ -207,29 +244,18 @@ impl EncryptionFactory for DuckLakeEncryptionFactory {
         let path_str = file_path.to_string();
 
         // Try to find the key for this file path
-        // The path might be stored with or without leading slash, so try multiple formats:
-        // 1. Exact match
-        // 2. With leading slash added
-        // 3. With leading slash removed
-        // 4. Normalized comparison (both without leading slash)
-        let key = self
-            .file_keys
-            .get(&path_str)
-            .or_else(|| self.file_keys.get(&format!("/{}", path_str)))
-            .or_else(|| self.file_keys.get(path_str.trim_start_matches('/')))
-            .or_else(|| {
-                // Try matching by normalized paths - useful when absolute paths differ
-                // e.g., stored as "/Users/x/data/file.parquet" but received as "Users/x/data/file.parquet"
-                self.file_keys.iter().find_map(|(stored_path, key)| {
-                    let stored_normalized = stored_path.trim_start_matches('/');
-                    let path_normalized = path_str.trim_start_matches('/');
-                    if stored_normalized == path_normalized {
-                        Some(key)
-                    } else {
-                        None
-                    }
-                })
-            });
+        // Normalize path by stripping leading slashes, then look up by both
+        // exact match and normalized comparison to handle storage format differences.
+        let path_normalized = path_str.trim_start_matches('/');
+        let key = self.file_keys.get(&path_str).or_else(|| {
+            self.file_keys.iter().find_map(|(stored_path, key)| {
+                if stored_path.trim_start_matches('/') == path_normalized {
+                    Some(key)
+                } else {
+                    None
+                }
+            })
+        });
 
         match key {
             Some(encoded_key) => {

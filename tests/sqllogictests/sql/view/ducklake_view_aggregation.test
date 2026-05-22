@@ -1,0 +1,62 @@
+# name: test/sql/view/ducklake_view_aggregation.test
+# description: Test views with aggregation queries in DuckLake
+# group: [view]
+
+require ducklake
+
+require parquet
+
+test-env DUCKLAKE_CONNECTION __TEST_DIR__/{UUID}.db
+
+test-env DATA_PATH __TEST_DIR__
+
+statement ok
+ATTACH 'ducklake:${DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '${DATA_PATH}/ducklake_view_aggregation')
+
+statement ok
+CREATE TABLE ducklake.main.sales (id INT, product VARCHAR, amount DOUBLE, region VARCHAR)
+
+statement ok
+INSERT INTO ducklake.main.sales VALUES (1, 'Widget', 10.50, 'East'), (2, 'Gadget', 25.00, 'West'), (3, 'Widget', 15.75, 'East'), (4, 'Gadget', 30.00, 'East'), (5, 'Widget', 8.25, 'West'), (6, 'Gadget', 20.00, 'West')
+
+# View with GROUP BY aggregation (avoid COUNT(*) in view def — DuckDB rewrites to count_star())
+statement ok
+CREATE VIEW ducklake.main.sales_by_product AS SELECT product, SUM(amount) AS total_amount FROM ducklake.main.sales GROUP BY product
+
+query TR
+SELECT product, total_amount FROM ducklake.main.sales_by_product ORDER BY product
+----
+Gadget	75.0
+Widget	34.5
+
+# View with aggregation and filter
+statement ok
+CREATE VIEW ducklake.main.east_sales_summary AS SELECT product, SUM(amount) AS total FROM ducklake.main.sales WHERE region = 'East' GROUP BY product
+
+query TR
+SELECT product, total FROM ducklake.main.east_sales_summary ORDER BY product
+----
+Gadget	30.0
+Widget	26.25
+
+# Query aggregation view with additional WHERE filter on top
+query TR
+SELECT product, total_amount FROM ducklake.main.sales_by_product WHERE total_amount > 50.0
+----
+Gadget	75.0
+
+# COUNT(*) at the query level (not inside view) works fine
+query I
+SELECT COUNT(*) FROM ducklake.main.sales_by_product
+----
+2
+
+# MIN/MAX in view
+statement ok
+CREATE VIEW ducklake.main.sales_range AS SELECT product, MIN(amount) AS min_sale, MAX(amount) AS max_sale FROM ducklake.main.sales GROUP BY product
+
+query TRR
+SELECT product, min_sale, max_sale FROM ducklake.main.sales_range ORDER BY product
+----
+Gadget	20.0	30.0
+Widget	8.25	15.75

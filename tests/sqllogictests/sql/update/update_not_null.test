@@ -1,6 +1,7 @@
 # name: test/sql/update/update_not_null.test
 # description: test updating a table with a NOT NULL constraint
 # group: [update]
+# adapted: FROM table → SELECT * FROM table, statement error format
 
 require ducklake
 
@@ -23,20 +24,16 @@ INSERT INTO ducklake.test VALUES (42, NULL);
 statement ok
 BEGIN
 
-statement error
+statement error NOT NULL constraint failed
 UPDATE ducklake.test SET i=NULL
-----
-NOT NULL constraint failed
 
-statement error
+statement error Current transaction is aborted
 UPDATE ducklake.test SET i=100
-----
-Current transaction is aborted
 
 statement ok
 ROLLBACK
 
 query II
-FROM ducklake.test
+SELECT * FROM ducklake.test
 ----
 42	NULL

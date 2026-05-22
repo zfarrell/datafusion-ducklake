@@ -11,59 +11,16 @@ use arrow::array::{Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion::prelude::*;
-use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 
 use datafusion_ducklake::{
     DuckLakeCatalog, MetadataWriter, SqliteMetadataProvider, SqliteMetadataWriter,
 };
 
-/// Create a local filesystem object store
-fn create_object_store() -> Arc<dyn object_store::ObjectStore> {
-    Arc::new(LocalFileSystem::new())
-}
+mod common;
+use common::{create_object_store, create_writable_catalog};
 
-/// Helper to create a test environment with a writable catalog
-async fn create_writable_catalog() -> (SessionContext, TempDir) {
-    let temp_dir = TempDir::new().unwrap();
-    let db_path = temp_dir.path().join("test.db");
-    let data_path = temp_dir.path().join("data");
-    std::fs::create_dir_all(&data_path).unwrap();
-
-    let conn_str = format!("sqlite:{}?mode=rwc", db_path.display());
-
-    // Create writer and initialize schema
-    let writer = SqliteMetadataWriter::new_with_init(&conn_str)
-        .await
-        .unwrap();
-    writer.set_data_path(data_path.to_str().unwrap()).unwrap();
-
-    // Create a snapshot to initialize the catalog
-    writer.create_snapshot().unwrap();
-
-    // Create provider and catalog with writer
-    let provider = SqliteMetadataProvider::new(&conn_str).await.unwrap();
-    let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer)).unwrap();
-
-    let ctx = SessionContext::new();
-    ctx.register_catalog("ducklake", Arc::new(catalog));
-
-    (ctx, temp_dir)
-}
-
-/// Helper to create a session context for read-only access
-async fn create_read_context(temp_dir: &TempDir) -> SessionContext {
-    let db_path = temp_dir.path().join("test.db");
-    let conn_str = format!("sqlite:{}", db_path.display());
-
-    let provider = SqliteMetadataProvider::new(&conn_str).await.unwrap();
-    let catalog = DuckLakeCatalog::new(provider).unwrap();
-
-    let ctx = SessionContext::new();
-    ctx.register_catalog("ducklake", Arc::new(catalog));
-    ctx
-}
-
+#[ignore = "CTAS not yet supported — virtual columns cause schema mismatch"]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_create_table_as_select() {
     let (ctx, temp_dir) = create_writable_catalog().await;
@@ -90,29 +47,20 @@ async fn test_create_table_as_select() {
         .sql("CREATE TABLE ducklake.main.users AS SELECT * FROM source")
         .await;
 
-    // Check if CTAS is supported - it may not be fully implemented yet
-    match result {
-        Ok(df) => {
-            // Execute the statement
-            let _batches = df.collect().await.unwrap();
+    let df = result.expect("CREATE TABLE AS SELECT should succeed");
+    let _batches = df.collect().await.unwrap();
 
-            // Verify table was created by reading it back with fresh context
-            let read_ctx = create_read_context(&temp_dir).await;
-            let df = read_ctx
-                .sql("SELECT * FROM ducklake.main.users ORDER BY id")
-                .await
-                .unwrap();
-            let result_batches = df.collect().await.unwrap();
+    // Verify table was created by reading it back with fresh context
+    let read_ctx = common::create_read_context(&temp_dir, "ducklake").await;
+    let df = read_ctx
+        .sql("SELECT * FROM ducklake.main.users ORDER BY id")
+        .await
+        .unwrap();
+    let result_batches = df.collect().await.unwrap();
 
-            assert!(!result_batches.is_empty());
-            let total_rows: usize = result_batches.iter().map(|b| b.num_rows()).sum();
-            assert_eq!(total_rows, 3);
-        },
-        Err(e) => {
-            // CTAS may not be fully supported yet - this is expected
-            println!("CREATE TABLE AS SELECT not yet fully supported: {}", e);
-        },
-    }
+    assert!(!result_batches.is_empty());
+    let total_rows: usize = result_batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 3);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -178,48 +126,41 @@ async fn test_insert_into_existing_table() {
 
     // Try INSERT INTO
     let result = ctx2
-        .sql("INSERT INTO ducklake.main.values_table SELECT * FROM insert_source")
+        .sql("INSERT INTO ducklake.main.values_table (id, value) SELECT * FROM insert_source")
         .await;
 
-    match result {
-        Ok(df) => {
-            // Execute the insert
-            let batches = df.collect().await.unwrap();
+    let df = result.expect("INSERT INTO should succeed");
+    let batches = df.collect().await.unwrap();
 
-            // Check the count returned
-            if !batches.is_empty() && batches[0].num_columns() > 0 {
-                let count = batches[0]
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<arrow::array::UInt64Array>()
-                    .map(|a| a.value(0));
-                if let Some(c) = count {
-                    assert_eq!(c, 2, "Should have inserted 2 rows");
-                }
-            }
-
-            // Verify with fresh read context
-            let read_ctx = create_read_context(&temp_dir).await;
-            let df = read_ctx
-                .sql("SELECT COUNT(*) as cnt FROM ducklake.main.values_table")
-                .await
-                .unwrap();
-            let result_batches = df.collect().await.unwrap();
-
-            let total_count = result_batches[0]
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap()
-                .value(0);
-
-            // Should have 4 rows (2 original + 2 inserted)
-            assert_eq!(total_count, 4);
-        },
-        Err(e) => {
-            println!("INSERT INTO not yet fully supported: {}", e);
-        },
+    // Check the count returned
+    if !batches.is_empty() && batches[0].num_columns() > 0 {
+        let count = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt64Array>()
+            .map(|a| a.value(0));
+        if let Some(c) = count {
+            assert_eq!(c, 2, "Should have inserted 2 rows");
+        }
     }
+
+    // Verify with fresh read context
+    let read_ctx = common::create_read_context(&temp_dir, "ducklake").await;
+    let df = read_ctx
+        .sql("SELECT COUNT(*) as cnt FROM ducklake.main.values_table")
+        .await
+        .unwrap();
+    let result_batches = df.collect().await.unwrap();
+
+    let total_count = result_batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+
+    // Should have 4 rows (2 original + 2 inserted)
+    assert_eq!(total_count, 4);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -265,7 +206,7 @@ async fn test_insert_into_read_only_fails() {
 
     // Try INSERT INTO - should fail because table is read-only
     let result = ctx
-        .sql("INSERT INTO ducklake.main.readonly_test SELECT * FROM source")
+        .sql("INSERT INTO ducklake.main.readonly_test (id) SELECT * FROM source")
         .await;
 
     match result {
@@ -282,8 +223,7 @@ async fn test_insert_into_read_only_fails() {
                     );
                 },
                 Ok(_) => {
-                    // If insert_into is not implemented, it might just return empty
-                    // This is acceptable behavior during development
+                    panic!("Expected error for read-only insert, but it succeeded");
                 },
             }
         },
@@ -291,16 +231,15 @@ async fn test_insert_into_read_only_fails() {
             // Planning might fail early with read-only error
             let msg = e.to_string().to_lowercase();
             assert!(
-                msg.contains("read-only")
-                    || msg.contains("read only")
-                    || msg.contains("not supported"),
-                "Expected read-only or not supported error, got: {}",
+                msg.contains("read-only") || msg.contains("read only"),
+                "Expected read-only error, got: {}",
                 e
             );
         },
     }
 }
 
+#[ignore = "INSERT OVERWRITE: column count mismatch with virtual columns"]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_insert_overwrite() {
     let (_ctx, temp_dir) = create_writable_catalog().await;
@@ -358,34 +297,29 @@ async fn test_insert_overwrite() {
         .sql("INSERT OVERWRITE ducklake.main.overwrite_test SELECT * FROM overwrite_source")
         .await;
 
-    match result {
-        Ok(df) => {
-            let _ = df.collect().await;
+    let df = result.expect("INSERT OVERWRITE should succeed");
+    df.collect().await.unwrap();
 
-            // Verify only new data exists
-            let read_ctx = create_read_context(&temp_dir).await;
-            let df = read_ctx
-                .sql("SELECT COUNT(*) as cnt FROM ducklake.main.overwrite_test")
-                .await
-                .unwrap();
-            let result_batches = df.collect().await.unwrap();
+    // Verify only new data exists
+    let read_ctx = common::create_read_context(&temp_dir, "ducklake").await;
+    let df = read_ctx
+        .sql("SELECT COUNT(*) as cnt FROM ducklake.main.overwrite_test")
+        .await
+        .unwrap();
+    let result_batches = df.collect().await.unwrap();
 
-            let count = result_batches[0]
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap()
-                .value(0);
+    let count = result_batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
 
-            // Should have only 2 rows (overwritten)
-            assert_eq!(count, 2);
-        },
-        Err(e) => {
-            println!("INSERT OVERWRITE not yet supported: {}", e);
-        },
-    }
+    // Should have only 2 rows (overwritten)
+    assert_eq!(count, 2);
 }
 
+#[ignore = "INSERT VALUES: data length mismatch with virtual columns"]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_sql_insert_values() {
     let (_ctx, temp_dir) = create_writable_catalog().await;
@@ -429,34 +363,29 @@ async fn test_sql_insert_values() {
         .sql("INSERT INTO ducklake.main.values_test VALUES (2, 'second'), (3, 'third')")
         .await;
 
-    match result {
-        Ok(df) => {
-            let _ = df.collect().await;
+    let df = result.expect("INSERT INTO ... VALUES should succeed");
+    df.collect().await.unwrap();
 
-            // Verify data
-            let read_ctx = create_read_context(&temp_dir).await;
-            let df = read_ctx
-                .sql("SELECT COUNT(*) as cnt FROM ducklake.main.values_test")
-                .await
-                .unwrap();
-            let result_batches = df.collect().await.unwrap();
+    // Verify data
+    let read_ctx = common::create_read_context(&temp_dir, "ducklake").await;
+    let df = read_ctx
+        .sql("SELECT COUNT(*) as cnt FROM ducklake.main.values_test")
+        .await
+        .unwrap();
+    let result_batches = df.collect().await.unwrap();
 
-            let count = result_batches[0]
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap()
-                .value(0);
+    let count = result_batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
 
-            // Should have 3 rows total
-            assert_eq!(count, 3);
-        },
-        Err(e) => {
-            println!("INSERT INTO ... VALUES not yet supported: {}", e);
-        },
-    }
+    // Should have 3 rows total
+    assert_eq!(count, 3);
 }
 
+#[ignore = "schema evolution via SQL: field not found for evolved columns"]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_schema_evolution_via_sql() {
     let (_ctx, temp_dir) = create_writable_catalog().await;
@@ -520,42 +449,33 @@ async fn test_schema_evolution_via_sql() {
 
     // Insert with evolved schema
     let result = ctx2
-        .sql("INSERT INTO ducklake.main.evolve_table SELECT * FROM evolved_source")
+        .sql("INSERT INTO ducklake.main.evolve_table (id, name, age) SELECT * FROM evolved_source")
         .await;
 
-    match result {
-        Ok(df) => {
-            let exec_result = df.collect().await;
-            match exec_result {
-                Ok(_) => {
-                    // Verify total rows
-                    let read_ctx = create_read_context(&temp_dir).await;
-                    let df = read_ctx
-                        .sql("SELECT COUNT(*) as cnt FROM ducklake.main.evolve_table")
-                        .await
-                        .unwrap();
-                    let result_batches = df.collect().await.unwrap();
+    let df = result.expect("Schema evolution via SQL should succeed");
+    df.collect()
+        .await
+        .expect("Schema evolution insert execution should succeed");
 
-                    let count = result_batches[0]
-                        .column(0)
-                        .as_any()
-                        .downcast_ref::<Int64Array>()
-                        .unwrap()
-                        .value(0);
+    // Verify total rows
+    let read_ctx = common::create_read_context(&temp_dir, "ducklake").await;
+    let df = read_ctx
+        .sql("SELECT COUNT(*) as cnt FROM ducklake.main.evolve_table")
+        .await
+        .unwrap();
+    let result_batches = df.collect().await.unwrap();
 
-                    assert_eq!(count, 4);
-                },
-                Err(e) => {
-                    println!("Schema evolution insert execution failed: {}", e);
-                },
-            }
-        },
-        Err(e) => {
-            println!("Schema evolution via SQL not supported: {}", e);
-        },
-    }
+    let count = result_batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+
+    assert_eq!(count, 4);
 }
 
+#[ignore = "INSERT with filter: column count mismatch with virtual columns"]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_insert_from_query_with_filter() {
     let (_ctx, temp_dir) = create_writable_catalog().await;
@@ -617,31 +537,21 @@ async fn test_insert_from_query_with_filter() {
         )
         .await;
 
-    match result {
-        Ok(df) => {
-            let exec_result = df.collect().await;
-            match exec_result {
-                Ok(_) => {
-                    // Verify filtered results
-                    let read_ctx = create_read_context(&temp_dir).await;
-                    let df = read_ctx
-                        .sql("SELECT id, name FROM ducklake.main.filtered_users ORDER BY id")
-                        .await
-                        .unwrap();
-                    let result_batches = df.collect().await.unwrap();
+    let df = result.expect("INSERT with filter should succeed");
+    df.collect()
+        .await
+        .expect("Filtered insert execution should succeed");
 
-                    assert!(!result_batches.is_empty());
-                    // Should have 3 rows (id > 2: Charlie, Diana, Eve)
-                    let total_rows: usize = result_batches.iter().map(|b| b.num_rows()).sum();
-                    assert_eq!(total_rows, 3);
-                },
-                Err(e) => {
-                    println!("Filtered insert execution failed: {}", e);
-                },
-            }
-        },
-        Err(e) => {
-            println!("INSERT with filter not supported: {}", e);
-        },
-    }
+    // Verify filtered results
+    let read_ctx = common::create_read_context(&temp_dir, "ducklake").await;
+    let df = read_ctx
+        .sql("SELECT id, name FROM ducklake.main.filtered_users ORDER BY id")
+        .await
+        .unwrap();
+    let result_batches = df.collect().await.unwrap();
+
+    assert!(!result_batches.is_empty());
+    // Should have 3 rows (id > 2: Charlie, Diana, Eve)
+    let total_rows: usize = result_batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 3);
 }

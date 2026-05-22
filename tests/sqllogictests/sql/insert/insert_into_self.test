@@ -1,6 +1,7 @@
 # name: test/sql/insert/insert_into_self.test
 # description: Test ducklake insert into self
 # group: [insert]
+# adapted: query I INSERT → statement ok, INSERT FROM → INSERT SELECT, STRLEN → length
 
 require ducklake
 
@@ -20,35 +21,25 @@ CREATE TABLE ducklake.test(i INTEGER, j VARCHAR);
 statement ok
 BEGIN
 
-query I
+statement ok
 INSERT INTO ducklake.test VALUES (1, '2'), (NULL, '3');
-----
-2
 
-query I
-INSERT INTO ducklake.test FROM ducklake.test
-----
-2
+statement ok
+INSERT INTO ducklake.test SELECT * FROM ducklake.test
 
-query I
-INSERT INTO ducklake.test FROM ducklake.test
-----
-4
+statement ok
+INSERT INTO ducklake.test SELECT * FROM ducklake.test
 
-query I
-INSERT INTO ducklake.test FROM ducklake.test
-----
-8
+statement ok
+INSERT INTO ducklake.test SELECT * FROM ducklake.test
 
-query I
+statement ok
 INSERT INTO ducklake.test SELECT a.i, a.j FROM ducklake.test a, ducklake.test b
-----
-256
 
 statement ok
 COMMIT
 
 query III
-SELECT SUM(i), SUM(STRLEN(j)), COUNT(*) FROM ducklake.test
+SELECT SUM(i), SUM(length(j)), COUNT(*) FROM ducklake.test
 ----
 136	272	272

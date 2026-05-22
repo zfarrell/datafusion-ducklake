@@ -39,6 +39,39 @@ use datafusion::physical_plan::ExecutionPlan;
 
 use crate::metadata_provider::MetadataProvider;
 
+/// Macro to implement the repetitive TableProvider boilerplate for information_schema
+/// tables that query metadata on every scan and delegate to MemTable (R5-S-047).
+macro_rules! impl_info_schema_table_provider {
+    ($table_type:ty, $query_method:ident) => {
+        #[async_trait::async_trait]
+        impl TableProvider for $table_type {
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+
+            fn schema(&self) -> SchemaRef {
+                Arc::clone(&self.schema)
+            }
+
+            fn table_type(&self) -> TableType {
+                TableType::View
+            }
+
+            async fn scan(
+                &self,
+                state: &dyn Session,
+                projection: Option<&Vec<usize>>,
+                filters: &[datafusion::prelude::Expr],
+                limit: Option<usize>,
+            ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+                let batch = self.$query_method()?;
+                let mem_table = MemTable::try_new(Arc::clone(&self.schema), vec![vec![batch]])?;
+                mem_table.scan(state, projection, filters, limit).await
+            }
+        }
+    };
+}
+
 /// Live table provider for snapshots - queries metadata on every scan
 #[derive(Debug)]
 pub struct SnapshotsTable {
@@ -50,7 +83,12 @@ impl SnapshotsTable {
     pub fn new(provider: Arc<dyn MetadataProvider>) -> Self {
         let schema = Arc::new(Schema::new(vec![
             Field::new("snapshot_id", DataType::Int64, false),
-            Field::new("timestamp", DataType::Utf8, true),
+            Field::new("snapshot_time", DataType::Utf8, true),
+            Field::new("schema_version", DataType::Int64, true),
+            Field::new("changes", DataType::Utf8, true),
+            Field::new("author", DataType::Utf8, true),
+            Field::new("commit_message", DataType::Utf8, true),
+            Field::new("commit_extra_info", DataType::Utf8, true),
         ]));
         Self {
             provider,
@@ -67,58 +105,71 @@ impl SnapshotsTable {
         let snapshot_ids: ArrayRef = Arc::new(Int64Array::from(
             snapshots.iter().map(|s| s.snapshot_id).collect::<Vec<_>>(),
         ));
-
-        let timestamps: ArrayRef = Arc::new(StringArray::from(
+        let snapshot_times: ArrayRef = Arc::new(StringArray::from(
             snapshots
                 .iter()
-                .map(|s| s.timestamp.as_deref())
+                .map(|s| s.snapshot_time.as_deref())
+                .collect::<Vec<_>>(),
+        ));
+        let schema_versions: ArrayRef = Arc::new(Int64Array::from(
+            snapshots
+                .iter()
+                .map(|s| s.schema_version)
+                .collect::<Vec<_>>(),
+        ));
+        let changes: ArrayRef = Arc::new(StringArray::from(
+            snapshots
+                .iter()
+                .map(|s| s.changes.as_deref())
+                .collect::<Vec<_>>(),
+        ));
+        let authors: ArrayRef = Arc::new(StringArray::from(
+            snapshots
+                .iter()
+                .map(|s| s.author.as_deref())
+                .collect::<Vec<_>>(),
+        ));
+        let commit_messages: ArrayRef = Arc::new(StringArray::from(
+            snapshots
+                .iter()
+                .map(|s| s.commit_message.as_deref())
+                .collect::<Vec<_>>(),
+        ));
+        let commit_extra_infos: ArrayRef = Arc::new(StringArray::from(
+            snapshots
+                .iter()
+                .map(|s| s.commit_extra_info.as_deref())
                 .collect::<Vec<_>>(),
         ));
 
-        RecordBatch::try_new(self.schema.clone(), vec![snapshot_ids, timestamps])
-            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+        RecordBatch::try_new(
+            Arc::clone(&self.schema),
+            vec![
+                snapshot_ids,
+                snapshot_times,
+                schema_versions,
+                changes,
+                authors,
+                commit_messages,
+                commit_extra_infos,
+            ],
+        )
+        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
     }
 }
 
-#[async_trait::async_trait]
-impl TableProvider for SnapshotsTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
-    }
-
-    fn table_type(&self) -> TableType {
-        TableType::View
-    }
-
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[datafusion::prelude::Expr],
-        limit: Option<usize>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        // Query catalog database live
-        let batch = self.query_snapshots()?;
-
-        // Use MemTable for execution (MemTable handles projection/filters/limit)
-        let mem_table = MemTable::try_new(self.schema.clone(), vec![vec![batch]])?;
-        mem_table.scan(state, projection, filters, limit).await
-    }
-}
+impl_info_schema_table_provider!(SnapshotsTable, query_snapshots);
 
 /// Live table provider for schemata - queries metadata on every scan
 #[derive(Debug)]
 pub struct SchemataTable {
     provider: Arc<dyn MetadataProvider>,
+    snapshot_id: i64,
     schema: SchemaRef,
 }
 
 impl SchemataTable {
-    pub fn new(provider: Arc<dyn MetadataProvider>) -> Self {
+    pub fn new(provider: Arc<dyn MetadataProvider>, snapshot_id: i64) -> Self {
         let schema = Arc::new(Schema::new(vec![
             Field::new("snapshot_id", DataType::Int64, false),
             Field::new("schema_id", DataType::Int64, false),
@@ -128,15 +179,13 @@ impl SchemataTable {
         ]));
         Self {
             provider,
+            snapshot_id,
             schema,
         }
     }
 
     fn query_schemata(&self) -> DataFusionResult<RecordBatch> {
-        let snapshot_id = self
-            .provider
-            .get_current_snapshot()
-            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        let snapshot_id = self.snapshot_id;
 
         let schemas = self
             .provider
@@ -168,52 +217,25 @@ impl SchemataTable {
         ));
 
         RecordBatch::try_new(
-            self.schema.clone(),
+            Arc::clone(&self.schema),
             vec![snapshot_ids, schema_ids, schema_names, paths, path_is_relative],
         )
         .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
     }
 }
 
-#[async_trait::async_trait]
-impl TableProvider for SchemataTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
-    }
-
-    fn table_type(&self) -> TableType {
-        TableType::View
-    }
-
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[datafusion::prelude::Expr],
-        limit: Option<usize>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        // Query catalog database live
-        let batch = self.query_schemata()?;
-
-        // Use MemTable for execution
-        let mem_table = MemTable::try_new(self.schema.clone(), vec![vec![batch]])?;
-        mem_table.scan(state, projection, filters, limit).await
-    }
-}
+impl_info_schema_table_provider!(SchemataTable, query_schemata);
 
 /// Live table provider for tables - queries metadata on every scan
 #[derive(Debug)]
 pub struct TablesTable {
     provider: Arc<dyn MetadataProvider>,
+    snapshot_id: i64,
     schema: SchemaRef,
 }
 
 impl TablesTable {
-    pub fn new(provider: Arc<dyn MetadataProvider>) -> Self {
+    pub fn new(provider: Arc<dyn MetadataProvider>, snapshot_id: i64) -> Self {
         let schema = Arc::new(Schema::new(vec![
             Field::new("snapshot_id", DataType::Int64, false),
             Field::new("schema_name", DataType::Utf8, false),
@@ -224,15 +246,13 @@ impl TablesTable {
         ]));
         Self {
             provider,
+            snapshot_id,
             schema,
         }
     }
 
     fn query_tables(&self) -> DataFusionResult<RecordBatch> {
-        let snapshot_id = self
-            .provider
-            .get_current_snapshot()
-            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        let snapshot_id = self.snapshot_id;
 
         // Single bulk query instead of N+1 queries
         let all_tables = self
@@ -279,52 +299,25 @@ impl TablesTable {
         ));
 
         RecordBatch::try_new(
-            self.schema.clone(),
+            Arc::clone(&self.schema),
             vec![snapshot_ids, schema_names, table_ids, table_names, paths, path_is_relative],
         )
         .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
     }
 }
 
-#[async_trait::async_trait]
-impl TableProvider for TablesTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
-    }
-
-    fn table_type(&self) -> TableType {
-        TableType::View
-    }
-
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[datafusion::prelude::Expr],
-        limit: Option<usize>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        // Query catalog database live
-        let batch = self.query_tables()?;
-
-        // Use MemTable for execution
-        let mem_table = MemTable::try_new(self.schema.clone(), vec![vec![batch]])?;
-        mem_table.scan(state, projection, filters, limit).await
-    }
-}
+impl_info_schema_table_provider!(TablesTable, query_tables);
 
 /// Live table provider for columns - queries metadata on every scan
 #[derive(Debug)]
 pub struct ColumnsTable {
     provider: Arc<dyn MetadataProvider>,
+    snapshot_id: i64,
     schema: SchemaRef,
 }
 
 impl ColumnsTable {
-    pub fn new(provider: Arc<dyn MetadataProvider>) -> Self {
+    pub fn new(provider: Arc<dyn MetadataProvider>, snapshot_id: i64) -> Self {
         let schema = Arc::new(Schema::new(vec![
             Field::new("schema_name", DataType::Utf8, false),
             Field::new("table_name", DataType::Utf8, false),
@@ -334,15 +327,13 @@ impl ColumnsTable {
         ]));
         Self {
             provider,
+            snapshot_id,
             schema,
         }
     }
 
     fn query_columns(&self) -> DataFusionResult<RecordBatch> {
-        let snapshot_id = self
-            .provider
-            .get_current_snapshot()
-            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        let snapshot_id = self.snapshot_id;
 
         // Single bulk query instead of N*M queries
         let all_columns_data = self
@@ -386,56 +377,30 @@ impl ColumnsTable {
         ));
 
         RecordBatch::try_new(
-            self.schema.clone(),
+            Arc::clone(&self.schema),
             vec![schema_names, table_names, column_ids, column_names, column_types],
         )
         .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
     }
 }
 
-#[async_trait::async_trait]
-impl TableProvider for ColumnsTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
-    }
-
-    fn table_type(&self) -> TableType {
-        TableType::View
-    }
-
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[datafusion::prelude::Expr],
-        limit: Option<usize>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        // Query catalog database live
-        let batch = self.query_columns()?;
-
-        // Use MemTable for execution
-        let mem_table = MemTable::try_new(self.schema.clone(), vec![vec![batch]])?;
-        mem_table.scan(state, projection, filters, limit).await
-    }
-}
+impl_info_schema_table_provider!(ColumnsTable, query_columns);
 
 /// Live table provider for table_info - aggregates file information per table
 #[derive(Debug)]
 pub struct TableInfoTable {
     provider: Arc<dyn MetadataProvider>,
+    snapshot_id: i64,
     schema: SchemaRef,
 }
 
 impl TableInfoTable {
-    pub fn new(provider: Arc<dyn MetadataProvider>) -> Self {
+    pub fn new(provider: Arc<dyn MetadataProvider>, snapshot_id: i64) -> Self {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("schema_name", DataType::Utf8, false),
             Field::new("table_name", DataType::Utf8, false),
+            Field::new("schema_id", DataType::Int64, false),
             Field::new("table_id", DataType::Int64, false),
+            Field::new("table_uuid", DataType::Utf8, true),
             Field::new("file_count", DataType::Int64, false),
             Field::new("file_size_bytes", DataType::Int64, false),
             Field::new("delete_file_count", DataType::Int64, false),
@@ -443,15 +408,13 @@ impl TableInfoTable {
         ]));
         Self {
             provider,
+            snapshot_id,
             schema,
         }
     }
 
     fn query_table_info(&self) -> DataFusionResult<RecordBatch> {
-        let snapshot_id = self
-            .provider
-            .get_current_snapshot()
-            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        let snapshot_id = self.snapshot_id;
 
         // Single bulk query instead of N*M queries
         let all_files = self
@@ -470,7 +433,9 @@ impl TableInfoTable {
 
         #[derive(Default, Debug)]
         struct TableStats {
+            schema_id: i64,
             table_id: i64,
+            table_uuid: Option<String>,
             file_count: i64,
             file_size: i64,
             delete_count: i64,
@@ -486,7 +451,9 @@ impl TableInfoTable {
             table_stats.insert(
                 (t.schema_name.clone(), t.table.table_name.clone()),
                 TableStats {
+                    schema_id: t.schema_id,
                     table_id: t.table.table_id,
+                    table_uuid: t.table_uuid.clone(),
                     file_count: 0,
                     file_size: 0,
                     delete_count: 0,
@@ -508,50 +475,51 @@ impl TableInfoTable {
                     .delete_file
                     .as_ref()
                     .map(|d| d.file_size_bytes)
-                    .unwrap_or(0); // delete_file_size_bytes
+                    .unwrap_or(0);
             }
         }
 
         // Convert to vector and sort for deterministic output
         let mut all_table_info: Vec<_> = table_stats.into_iter().collect();
-        all_table_info.sort_by(|a, b| {
-            // Sort by schema_name, then table_name
-            a.0.0.cmp(&b.0.0).then_with(|| a.0.1.cmp(&b.0.1))
-        });
+        all_table_info.sort_by(|a, b| a.0.0.cmp(&b.0.0).then_with(|| a.0.1.cmp(&b.0.1)));
 
         // Build arrays in a single pass
         let mut table_names = Vec::with_capacity(all_table_info.len());
-        let mut schema_names = Vec::with_capacity(all_table_info.len());
+        let mut schema_ids = Vec::with_capacity(all_table_info.len());
         let mut table_ids = Vec::with_capacity(all_table_info.len());
+        let mut table_uuids: Vec<Option<String>> = Vec::with_capacity(all_table_info.len());
         let mut file_counts = Vec::with_capacity(all_table_info.len());
         let mut file_sizes = Vec::with_capacity(all_table_info.len());
         let mut delete_file_counts = Vec::with_capacity(all_table_info.len());
         let mut delete_file_sizes = Vec::with_capacity(all_table_info.len());
 
-        for ((schema_name, table_name), stats) in all_table_info {
-            schema_names.push(schema_name);
+        for ((_schema_name, table_name), stats) in all_table_info {
             table_names.push(table_name);
+            schema_ids.push(stats.schema_id);
             table_ids.push(stats.table_id);
+            table_uuids.push(stats.table_uuid);
             file_counts.push(stats.file_count);
             file_sizes.push(stats.file_size);
             delete_file_counts.push(stats.delete_count);
             delete_file_sizes.push(stats.delete_size);
         }
 
-        let schema_names: ArrayRef = Arc::new(StringArray::from(schema_names));
         let table_names: ArrayRef = Arc::new(StringArray::from(table_names));
+        let schema_ids: ArrayRef = Arc::new(Int64Array::from(schema_ids));
         let table_ids: ArrayRef = Arc::new(Int64Array::from(table_ids));
+        let table_uuids: ArrayRef = Arc::new(StringArray::from(table_uuids));
         let file_counts: ArrayRef = Arc::new(Int64Array::from(file_counts));
         let file_sizes: ArrayRef = Arc::new(Int64Array::from(file_sizes));
         let delete_file_counts: ArrayRef = Arc::new(Int64Array::from(delete_file_counts));
         let delete_file_sizes: ArrayRef = Arc::new(Int64Array::from(delete_file_sizes));
 
         RecordBatch::try_new(
-            self.schema.clone(),
+            Arc::clone(&self.schema),
             vec![
-                schema_names,
                 table_names,
+                schema_ids,
                 table_ids,
+                table_uuids,
                 file_counts,
                 file_sizes,
                 delete_file_counts,
@@ -562,42 +530,18 @@ impl TableInfoTable {
     }
 }
 
-#[async_trait::async_trait]
-impl TableProvider for TableInfoTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
-    }
-
-    fn table_type(&self) -> TableType {
-        TableType::View
-    }
-
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[datafusion::prelude::Expr],
-        limit: Option<usize>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let batch = self.query_table_info()?;
-        let mem_table = MemTable::try_new(self.schema.clone(), vec![vec![batch]])?;
-        mem_table.scan(state, projection, filters, limit).await
-    }
-}
+impl_info_schema_table_provider!(TableInfoTable, query_table_info);
 
 /// Live table provider for files - queries metadata on every scan
 #[derive(Debug)]
 pub struct FilesTable {
     provider: Arc<dyn MetadataProvider>,
+    snapshot_id: i64,
     schema: SchemaRef,
 }
 
 impl FilesTable {
-    pub fn new(provider: Arc<dyn MetadataProvider>) -> Self {
+    pub fn new(provider: Arc<dyn MetadataProvider>, snapshot_id: i64) -> Self {
         let schema = Arc::new(Schema::new(vec![
             Field::new("schema_name", DataType::Utf8, false),
             Field::new("table_name", DataType::Utf8, false),
@@ -608,15 +552,13 @@ impl FilesTable {
         ]));
         Self {
             provider,
+            snapshot_id,
             schema,
         }
     }
 
     fn query_files(&self) -> DataFusionResult<RecordBatch> {
-        let snapshot_id = self
-            .provider
-            .get_current_snapshot()
-            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        let snapshot_id = self.snapshot_id;
 
         // Single bulk query instead of N*M queries
         let all_files_data = self
@@ -668,42 +610,14 @@ impl FilesTable {
         ));
 
         RecordBatch::try_new(
-            self.schema.clone(),
+            Arc::clone(&self.schema),
             vec![schema_names, table_names, file_paths, file_sizes, record_counts, has_delete_file],
         )
         .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
     }
 }
 
-#[async_trait::async_trait]
-impl TableProvider for FilesTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
-    }
-
-    fn table_type(&self) -> TableType {
-        TableType::View
-    }
-
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[datafusion::prelude::Expr],
-        limit: Option<usize>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        // Query catalog database live
-        let batch = self.query_files()?;
-
-        // Use MemTable for execution
-        let mem_table = MemTable::try_new(self.schema.clone(), vec![vec![batch]])?;
-        mem_table.scan(state, projection, filters, limit).await
-    }
-}
+impl_info_schema_table_provider!(FilesTable, query_files);
 
 /// Schema provider for information_schema
 ///
@@ -712,12 +626,15 @@ impl TableProvider for FilesTable {
 #[derive(Debug)]
 pub(crate) struct InformationSchemaProvider {
     provider: Arc<dyn MetadataProvider>,
+    /// Pinned snapshot_id from the catalog for consistency across tables
+    snapshot_id: i64,
 }
 
 impl InformationSchemaProvider {
-    pub fn new(provider: Arc<dyn MetadataProvider>) -> Self {
+    pub fn new(provider: Arc<dyn MetadataProvider>, snapshot_id: i64) -> Self {
         Self {
             provider,
+            snapshot_id,
         }
     }
 }
@@ -742,18 +659,36 @@ impl SchemaProvider for InformationSchemaProvider {
     async fn table(&self, name: &str) -> DataFusionResult<Option<Arc<dyn TableProvider>>> {
         // Create table provider on-demand - queries will be live
         let provider: Option<Arc<dyn TableProvider>> = match name {
-            "snapshots" => Some(Arc::new(SnapshotsTable::new(self.provider.clone()))),
-            "schemata" => Some(Arc::new(SchemataTable::new(self.provider.clone()))),
-            "tables" => Some(Arc::new(TablesTable::new(self.provider.clone()))),
-            "table_info" => Some(Arc::new(TableInfoTable::new(self.provider.clone()))),
-            "columns" => Some(Arc::new(ColumnsTable::new(self.provider.clone()))),
-            "files" => Some(Arc::new(FilesTable::new(self.provider.clone()))),
+            "snapshots" => Some(Arc::new(SnapshotsTable::new(Arc::clone(&self.provider)))),
+            "schemata" => Some(Arc::new(SchemataTable::new(
+                Arc::clone(&self.provider),
+                self.snapshot_id,
+            ))),
+            "tables" => Some(Arc::new(TablesTable::new(
+                Arc::clone(&self.provider),
+                self.snapshot_id,
+            ))),
+            "table_info" => Some(Arc::new(TableInfoTable::new(
+                Arc::clone(&self.provider),
+                self.snapshot_id,
+            ))),
+            "columns" => Some(Arc::new(ColumnsTable::new(
+                Arc::clone(&self.provider),
+                self.snapshot_id,
+            ))),
+            "files" => Some(Arc::new(FilesTable::new(
+                Arc::clone(&self.provider),
+                self.snapshot_id,
+            ))),
             _ => None,
         };
         Ok(provider)
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        self.table_names().iter().any(|t| t == name)
+        matches!(
+            name,
+            "snapshots" | "schemata" | "tables" | "table_info" | "columns" | "files"
+        )
     }
 }

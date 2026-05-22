@@ -11,6 +11,7 @@
 
 use std::any::Any;
 use std::collections::HashSet;
+use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -31,22 +32,17 @@ use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::union::UnionExec;
-use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
-};
+use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::Stream;
 
+use crate::cdc_common::{CdcProjectionAnalysis, analyze_cdc_projection};
+#[cfg(feature = "encryption")]
+use crate::encryption::EncryptionFactoryBuilder;
 use crate::metadata_provider::{DeleteFileChange, MetadataProvider};
 use crate::path_resolver::resolve_path;
-use crate::table::{validated_file_size, validated_record_count};
-
-/// Delete file schema: (file_path: VARCHAR, pos: INT64)
-fn delete_file_schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![
-        Field::new("file_path", DataType::Utf8, false),
-        Field::new("pos", DataType::Int64, false),
-    ]))
-}
+use crate::table::{delete_file_schema, validated_file_size};
+#[cfg(feature = "encryption")]
+use datafusion::execution::parquet_encryption::EncryptionFactory;
 
 /// TableProvider that exposes deleted rows between snapshots
 ///
@@ -101,10 +97,20 @@ impl TableDeletionsTable {
         }
     }
 
+    /// Analyze projection and split into table columns and CDC columns
+    fn analyze_projection(
+        &self,
+        projection: Option<&Vec<usize>>,
+    ) -> DataFusionResult<CdcProjectionAnalysis> {
+        analyze_cdc_projection(projection, &self.table_schema, &self.output_schema)
+    }
+
     /// Build execution plan for a single delete file entry
     fn build_exec_for_delete_entry(
         &self,
         delete_file: &DeleteFileChange,
+        proj_info: &CdcProjectionAnalysis,
+        parquet_source: ParquetSource,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         // Resolve data file path
         let data_file_path = resolve_path(
@@ -116,10 +122,19 @@ impl TableDeletionsTable {
 
         // Create scan for current delete file (if exists - None means full file delete)
         let current_delete_exec = if let Some(ref current_path) = delete_file.current_delete_path {
+            let size_bytes = delete_file
+                .current_delete_file_size_bytes
+                .unwrap_or_else(|| {
+                    tracing::warn!(
+                        path = current_path,
+                        "Delete file metadata missing size_bytes, defaulting to 0"
+                    );
+                    0
+                });
             Some(self.build_delete_file_scan(
                 current_path,
                 delete_file.current_delete_path_is_relative.unwrap_or(true),
-                delete_file.current_delete_file_size_bytes.unwrap_or(0),
+                size_bytes,
                 delete_file.current_delete_footer_size.unwrap_or(0),
             )?)
         } else {
@@ -128,26 +143,46 @@ impl TableDeletionsTable {
 
         // Create scan for previous delete file (if exists)
         let previous_delete_exec = if let Some(ref prev_path) = delete_file.previous_delete_path {
+            let size_bytes = delete_file
+                .previous_delete_file_size_bytes
+                .unwrap_or_else(|| {
+                    tracing::warn!(
+                        path = prev_path,
+                        "Previous delete file metadata missing size_bytes, defaulting to 0"
+                    );
+                    0
+                });
             Some(self.build_delete_file_scan(
                 prev_path,
                 delete_file.previous_delete_path_is_relative.unwrap_or(true),
-                delete_file.previous_delete_file_size_bytes.unwrap_or(0),
+                size_bytes,
                 delete_file.previous_delete_footer_size.unwrap_or(0),
             )?)
         } else {
             None
         };
 
-        // Create scan for data file
+        // Push table column projection to data file scan
         let data_file_exec = self.build_data_file_scan(
             &data_file_path,
             delete_file.data_file_size_bytes,
             delete_file.data_file_footer_size,
+            {
+                let is_natural_order = proj_info.table_indices.len()
+                    == self.table_schema.fields().len()
+                    && proj_info
+                        .table_indices
+                        .iter()
+                        .enumerate()
+                        .all(|(i, &idx)| i == idx);
+                if is_natural_order {
+                    None
+                } else {
+                    Some(&proj_info.table_indices)
+                }
+            },
+            parquet_source,
         )?;
-
-        // Validate record_count before use — a negative value from corrupt metadata
-        // would cause incorrect behavior (e.g., empty ranges in full-file deletes).
-        validated_record_count(delete_file.data_record_count, &delete_file.data_file_path)?;
 
         Ok(Arc::new(DeletedRowsExec::new(
             current_delete_exec,
@@ -155,7 +190,10 @@ impl TableDeletionsTable {
             data_file_exec,
             delete_file.data_record_count,
             delete_file.snapshot_id,
-            self.output_schema.clone(),
+            proj_info.output_schema.clone(),
+            proj_info.need_snapshot_id,
+            proj_info.need_change_type,
+            proj_info.reorder_indices.clone(),
         )))
     }
 
@@ -189,25 +227,32 @@ impl TableDeletionsTable {
         Ok(DataSourceExec::from_data_source(builder.build()))
     }
 
-    /// Build a ParquetExec for a data file
+    /// Build a ParquetExec for a data file with optional projection
     fn build_data_file_scan(
         &self,
         path: &str,
         size_bytes: i64,
-        footer_size: i64,
+        footer_size: Option<i64>,
+        projection: Option<&[usize]>,
+        parquet_source: ParquetSource,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let mut pf = PartitionedFile::new(path, validated_file_size(size_bytes, path)?);
-        if footer_size > 0
-            && let Ok(hint) = usize::try_from(footer_size)
+        if let Some(fs) = footer_size
+            && fs > 0
+            && let Ok(hint) = usize::try_from(fs)
         {
             pf = pf.with_metadata_size_hint(hint);
         }
 
-        let builder = FileScanConfigBuilder::new(
+        let mut builder = FileScanConfigBuilder::new(
             self.object_store_url.as_ref().clone(),
-            Arc::new(ParquetSource::new(self.table_schema.clone())),
+            Arc::new(parquet_source),
         )
         .with_file_group(FileGroup::new(vec![pf]));
+
+        if let Some(proj) = projection {
+            builder = builder.with_projection_indices(Some(proj.to_vec()))?;
+        }
 
         Ok(DataSourceExec::from_data_source(builder.build()))
     }
@@ -234,6 +279,9 @@ impl TableProvider for TableDeletionsTable {
         _filters: &[datafusion::prelude::Expr],
         _limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        // Analyze projection to determine what to read
+        let proj_info = self.analyze_projection(projection)?;
+
         // Get delete files added between snapshots
         let delete_files = self
             .provider
@@ -247,29 +295,58 @@ impl TableProvider for TableDeletionsTable {
         // Handle empty case
         if delete_files.is_empty() {
             use datafusion::physical_plan::empty::EmptyExec;
-            let output_schema = match projection {
-                Some(indices) => {
-                    let fields: Vec<Field> = indices
-                        .iter()
-                        .map(|&i| self.output_schema.field(i).clone())
-                        .collect();
-                    Arc::new(Schema::new(fields))
-                },
-                None => self.output_schema.clone(),
-            };
-            return Ok(Arc::new(EmptyExec::new(output_schema)));
+            return Ok(Arc::new(EmptyExec::new(proj_info.output_schema)));
         }
 
-        // Build execution plan for each delete entry
+        // Build execution plan for each delete entry with projection pushdown (R6-S-012)
         let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(delete_files.len());
+        #[cfg(feature = "encryption")]
+        {
+            let mut builder = EncryptionFactoryBuilder::new();
+            for delete_file in &delete_files {
+                let resolved_path = resolve_path(
+                    &self.table_path,
+                    &delete_file.data_file_path,
+                    delete_file.data_file_path_is_relative,
+                )
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                builder.add_file(&resolved_path, delete_file.data_encryption_key.as_deref());
+            }
+            let del_factory = builder.build();
+            let del_encryption_factory: Option<Arc<dyn EncryptionFactory>> =
+                if del_factory.has_encrypted_files() {
+                    Some(Arc::new(del_factory) as Arc<dyn EncryptionFactory>)
+                } else {
+                    None
+                };
+            for delete_file in &delete_files {
+                let parquet_source = if let Some(ref factory) = del_encryption_factory {
+                    ParquetSource::new(delete_file_schema())
+                        .with_encryption_factory(Arc::clone(factory))
+                } else {
+                    ParquetSource::new(delete_file_schema())
+                };
+                let exec =
+                    self.build_exec_for_delete_entry(delete_file, &proj_info, parquet_source)?;
+                execs.push(exec);
+            }
+        }
+        #[cfg(not(feature = "encryption"))]
         for delete_file in &delete_files {
-            let exec = self.build_exec_for_delete_entry(delete_file)?;
+            let exec = self.build_exec_for_delete_entry(
+                delete_file,
+                &proj_info,
+                ParquetSource::new(delete_file_schema()),
+            )?;
             execs.push(exec);
         }
 
         // Combine with UnionExec if multiple
         if execs.len() == 1 {
-            Ok(execs.into_iter().next().unwrap())
+            Ok(execs
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| panic!("expected exactly 1 exec, got {}", 0)))
         } else {
             UnionExec::try_new(execs)
         }
@@ -295,8 +372,14 @@ pub struct DeletedRowsExec {
     record_count: i64,
     /// Snapshot ID for CDC column
     snapshot_id: i64,
-    /// Output schema (table columns + snapshot_id + change_type)
+    /// Output schema (projected table columns + requested CDC columns)
     output_schema: SchemaRef,
+    /// Whether to include snapshot_id in output
+    include_snapshot_id: bool,
+    /// Whether to include change_type in output
+    include_change_type: bool,
+    /// Reorder mapping: output_pos -> natural_pos. None if no reordering needed.
+    reorder_indices: Option<Vec<usize>>,
     /// Cached plan properties
     properties: Arc<PlanProperties>,
 }
@@ -309,13 +392,17 @@ impl DeletedRowsExec {
         record_count: i64,
         snapshot_id: i64,
         output_schema: SchemaRef,
+        include_snapshot_id: bool,
+        include_change_type: bool,
+        reorder_indices: Option<Vec<usize>>,
     ) -> Self {
         let eq_properties = EquivalenceProperties::new(output_schema.clone());
+        let data_props = data_file_scan.properties();
         let properties = Arc::new(PlanProperties::new(
             eq_properties,
-            data_file_scan.output_partitioning().clone(),
-            data_file_scan.pipeline_behavior(),
-            data_file_scan.boundedness(),
+            data_props.output_partitioning().clone(),
+            data_props.emission_type,
+            data_props.boundedness,
         ));
 
         Self {
@@ -325,6 +412,9 @@ impl DeletedRowsExec {
             record_count,
             snapshot_id,
             output_schema,
+            include_snapshot_id,
+            include_change_type,
+            reorder_indices,
             properties,
         }
     }
@@ -362,7 +452,7 @@ impl ExecutionPlan for DeletedRowsExec {
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        let mut children = Vec::new();
+        let mut children = Vec::with_capacity(3);
         if let Some(ref curr) = self.current_delete_scan {
             children.push(curr);
         }
@@ -413,6 +503,9 @@ impl ExecutionPlan for DeletedRowsExec {
             self.record_count,
             self.snapshot_id,
             self.output_schema.clone(),
+            self.include_snapshot_id,
+            self.include_change_type,
+            self.reorder_indices.clone(),
         )))
     }
 
@@ -440,6 +533,9 @@ impl ExecutionPlan for DeletedRowsExec {
             self.record_count,
             self.snapshot_id,
             self.output_schema.clone(),
+            self.include_snapshot_id,
+            self.include_change_type,
+            self.reorder_indices.clone(),
         )))
     }
 
@@ -461,8 +557,31 @@ enum StreamState {
     Done,
 }
 
+/// Represents current delete positions, avoiding large allocations for full-file deletes
+enum CurrentDeletePositions {
+    /// All rows in the file are deleted (full-file delete)
+    All {
+        record_count: i64,
+    },
+    /// Only specific positions are deleted
+    Partial(HashSet<i64>),
+}
+
+/// Represents computed delta positions (newly deleted rows)
+enum DeltaPositions {
+    /// All rows in the file are newly deleted
+    All,
+    /// Specific sorted positions are newly deleted
+    Specific(Vec<i64>),
+}
+
 /// Stream that reads deleted rows from a data file
+///
+/// Uses a state machine to read delete files, compute delta positions,
+/// then filter data file rows to only include deleted rows.
 struct DeletedRowsStream {
+    // Note: manual Debug is not derived because SendableRecordBatchStream
+    // does not implement Debug. Use the struct name for debug output.
     /// Current delete file stream (None for full file delete)
     current_delete_stream: Option<SendableRecordBatchStream>,
     /// Previous delete file stream (if exists)
@@ -473,16 +592,34 @@ struct DeletedRowsStream {
     snapshot_id: i64,
     /// Output schema
     output_schema: SchemaRef,
-    /// Collected current positions (or all positions for full delete)
-    current_positions: HashSet<i64>,
+    /// Whether to include snapshot_id in output
+    include_snapshot_id: bool,
+    /// Whether to include change_type in output
+    include_change_type: bool,
+    /// Reorder mapping: output_pos -> natural_pos. None if no reordering needed.
+    reorder_indices: Option<Vec<usize>>,
+    /// Collected current positions (or All for full delete)
+    current_positions: CurrentDeletePositions,
     /// Collected previous positions
     previous_positions: HashSet<i64>,
     /// Computed delta positions (sorted)
-    deleted_positions: Option<Vec<i64>>,
+    deleted_positions: Option<DeltaPositions>,
     /// Current row offset in data file
     row_offset: i64,
     /// State machine
     state: StreamState,
+}
+
+impl fmt::Debug for DeletedRowsStream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeletedRowsStream")
+            .field("snapshot_id", &self.snapshot_id)
+            .field("include_snapshot_id", &self.include_snapshot_id)
+            .field("include_change_type", &self.include_change_type)
+            .field("row_offset", &self.row_offset)
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
 }
 
 impl DeletedRowsStream {
@@ -493,22 +630,35 @@ impl DeletedRowsStream {
         record_count: i64,
         snapshot_id: i64,
         output_schema: SchemaRef,
+        include_snapshot_id: bool,
+        include_change_type: bool,
+        reorder_indices: Option<Vec<usize>>,
     ) -> Self {
         // Determine initial state and compute positions if needed
         let (initial_state, current_positions, deleted_positions) =
             if current_delete_stream.is_some() {
-                (StreamState::ReadingCurrentDelete, HashSet::new(), None)
+                (
+                    StreamState::ReadingCurrentDelete,
+                    CurrentDeletePositions::Partial(HashSet::new()),
+                    None,
+                )
             } else if previous_delete_stream.is_some() {
                 // Full file delete but has previous - need to subtract previous positions
-                let current: HashSet<i64> = (0..record_count).collect();
-                (StreamState::ReadingPreviousDelete, current, None)
+                (
+                    StreamState::ReadingPreviousDelete,
+                    CurrentDeletePositions::All {
+                        record_count,
+                    },
+                    None,
+                )
             } else {
                 // Full file delete with no previous - all positions are deleted
-                let positions: Vec<i64> = (0..record_count).collect();
                 (
                     StreamState::ReadingData,
-                    HashSet::new(),
-                    Some(positions), // Pre-computed sorted positions
+                    CurrentDeletePositions::All {
+                        record_count,
+                    },
+                    Some(DeltaPositions::All),
                 )
             };
 
@@ -518,6 +668,9 @@ impl DeletedRowsStream {
             data_stream,
             snapshot_id,
             output_schema,
+            include_snapshot_id,
+            include_change_type,
+            reorder_indices,
             current_positions,
             previous_positions: HashSet::new(),
             deleted_positions,
@@ -527,48 +680,80 @@ impl DeletedRowsStream {
     }
 
     /// Extract positions from a delete file batch
-    fn extract_positions(batch: &RecordBatch) -> HashSet<i64> {
+    fn extract_positions(batch: &RecordBatch) -> DataFusionResult<HashSet<i64>> {
         if batch.num_columns() < 2 {
-            return HashSet::new();
+            return Ok(HashSet::new());
         }
 
         let pos_array = batch
             .column(1)
             .as_any()
             .downcast_ref::<Int64Array>()
-            .expect("pos column should be Int64");
+            .ok_or_else(|| {
+                DataFusionError::Internal("delete file pos column is not Int64".to_string())
+            })?;
 
-        pos_array.values().iter().copied().collect()
+        // Use .iter() to respect null bitmap; skip null entries
+        Ok(pos_array.iter().flatten().collect())
     }
 
     /// Compute the delta and sort it
     fn compute_deleted_positions(&mut self) {
-        let mut delta: Vec<i64> = self
-            .current_positions
-            .iter()
-            .filter(|pos| !self.previous_positions.contains(pos))
-            .copied()
-            .collect();
-        delta.sort_unstable();
-        self.deleted_positions = Some(delta);
+        match &self.current_positions {
+            CurrentDeletePositions::All {
+                record_count,
+            } => {
+                if self.previous_positions.is_empty() {
+                    self.deleted_positions = Some(DeltaPositions::All);
+                } else {
+                    let mut delta: Vec<i64> = (0..*record_count)
+                        .filter(|pos| !self.previous_positions.contains(pos))
+                        .collect();
+                    delta.sort_unstable();
+                    self.deleted_positions = Some(DeltaPositions::Specific(delta));
+                }
+            },
+            CurrentDeletePositions::Partial(current) => {
+                let mut delta: Vec<i64> = current
+                    .iter()
+                    .filter(|pos| !self.previous_positions.contains(pos))
+                    .copied()
+                    .collect();
+                delta.sort_unstable();
+                self.deleted_positions = Some(DeltaPositions::Specific(delta));
+            },
+        }
     }
 
     /// Filter batch to only include deleted rows and append CDC columns
     fn filter_batch(&mut self, batch: &RecordBatch) -> DataFusionResult<Option<RecordBatch>> {
-        let deleted_positions = self.deleted_positions.as_ref().unwrap();
         let num_rows = batch.num_rows();
+        let num_rows_i64 = i64::try_from(num_rows).map_err(|_| {
+            DataFusionError::Internal(format!("batch row count {} exceeds i64::MAX", num_rows))
+        })?;
 
-        // Find which rows in this batch are deleted
-        let mut keep_indices: Vec<u32> = Vec::new();
-        for i in 0..num_rows {
-            let global_pos = self.row_offset + i as i64;
-            if deleted_positions.binary_search(&global_pos).is_ok() {
-                keep_indices.push(i as u32);
-            }
-        }
+        let num_rows_u32 = u32::try_from(num_rows).map_err(|_| {
+            DataFusionError::Internal(format!("batch row count {} exceeds u32::MAX", num_rows))
+        })?;
+        let keep_indices: Vec<u32> = match self.deleted_positions.as_ref().unwrap() {
+            DeltaPositions::All => {
+                // All rows are deleted — keep all rows in this batch
+                (0..num_rows_u32).collect()
+            },
+            DeltaPositions::Specific(deleted_positions) => {
+                let mut indices = Vec::new();
+                for i in 0..num_rows_u32 {
+                    let global_pos = self.row_offset + i64::from(i);
+                    if deleted_positions.binary_search(&global_pos).is_ok() {
+                        indices.push(i);
+                    }
+                }
+                indices
+            },
+        };
 
         // Update row offset for next batch
-        self.row_offset += num_rows as i64;
+        self.row_offset += num_rows_i64;
 
         // If no deleted rows in this batch, return None
         if keep_indices.is_empty() {
@@ -576,7 +761,8 @@ impl DeletedRowsStream {
         }
 
         // Use Arrow's take kernel to select rows
-        let indices = UInt32Array::from(keep_indices.clone());
+        let num_output_rows = keep_indices.len();
+        let indices = UInt32Array::from(keep_indices);
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns() + 2);
 
         for col in batch.columns() {
@@ -584,14 +770,22 @@ impl DeletedRowsStream {
                 .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
             columns.push(filtered);
         }
+        if self.include_snapshot_id {
+            columns.push(Arc::new(Int64Array::from(vec![
+                self.snapshot_id;
+                num_output_rows
+            ])));
+        }
+        if self.include_change_type {
+            columns.push(Arc::new(StringArray::from(vec!["delete"; num_output_rows])));
+        }
 
-        // Append CDC columns
-        let num_output_rows = keep_indices.len();
-        columns.push(Arc::new(Int64Array::from(vec![
-            self.snapshot_id;
-            num_output_rows
-        ])));
-        columns.push(Arc::new(StringArray::from(vec!["delete"; num_output_rows])));
+        // Apply reorder if projection requested non-natural column order
+        let columns = if let Some(ref reorder) = self.reorder_indices {
+            reorder.iter().map(|&i| columns[i].clone()).collect()
+        } else {
+            columns
+        };
 
         RecordBatch::try_new(self.output_schema.clone(), columns)
             .map(Some)
@@ -609,8 +803,15 @@ impl Stream for DeletedRowsStream {
                     let current = self.current_delete_stream.as_mut().unwrap();
                     match Pin::new(current).poll_next(cx) {
                         Poll::Ready(Some(Ok(batch))) => {
-                            let positions = Self::extract_positions(&batch);
-                            self.current_positions.extend(positions);
+                            let positions = match Self::extract_positions(&batch) {
+                                Ok(p) => p,
+                                Err(e) => return Poll::Ready(Some(Err(e))),
+                            };
+                            if let CurrentDeletePositions::Partial(ref mut set) =
+                                self.current_positions
+                            {
+                                set.extend(positions);
+                            }
                         },
                         Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
                         Poll::Ready(None) => {
@@ -628,7 +829,10 @@ impl Stream for DeletedRowsStream {
                     let prev = self.previous_delete_stream.as_mut().unwrap();
                     match Pin::new(prev).poll_next(cx) {
                         Poll::Ready(Some(Ok(batch))) => {
-                            let positions = Self::extract_positions(&batch);
+                            let positions = match Self::extract_positions(&batch) {
+                                Ok(p) => p,
+                                Err(e) => return Poll::Ready(Some(Err(e))),
+                            };
                             self.previous_positions.extend(positions);
                         },
                         Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),

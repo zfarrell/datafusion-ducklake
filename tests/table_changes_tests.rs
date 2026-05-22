@@ -90,7 +90,8 @@ mod integration_tests {
         ctx.register_catalog("ducklake", Arc::new(catalog));
 
         // Register the table functions including ducklake_table_changes
-        register_ducklake_functions(&ctx, provider_arc);
+        let snapshot_id = provider_arc.get_current_snapshot()?;
+        register_ducklake_functions(&ctx, provider_arc, snapshot_id);
 
         Ok(ctx)
     }
@@ -130,16 +131,18 @@ mod integration_tests {
 
         let ctx = create_context_with_functions(catalog_path.to_str().unwrap()).await?;
 
-        // Query all columns including table data + CDC metadata
+        // Query only INSERT changes (filter out deletes)
         let df = ctx
             .sql(
-                "SELECT id, event_type, value, snapshot_id, change_type FROM ducklake_table_changes('main.events', 0, 10) ORDER BY id",
+                "SELECT id, event_type, value, snapshot_id, change_type \
+                 FROM ducklake_table_changes('main.events', 0, 10) \
+                 WHERE change_type = 'insert' ORDER BY id",
             )
             .await?;
 
         let batches: Vec<RecordBatch> = df.collect().await?;
 
-        // Should have rows from both inserts (5 total rows inserted)
+        // Should have 5 inserted rows (3 from snapshot 1 + 2 from snapshot 2)
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 5, "Should have 5 inserted rows");
 
@@ -154,22 +157,18 @@ mod integration_tests {
         // All rows should have ids 1-5
         assert_eq!(all_ids, vec![1, 2, 3, 4, 5], "Should have ids 1-5");
 
-        // All changes should be inserts (Phase 2 INSERT-only)
+        // All filtered changes should be inserts
         for change_type in all_change_types {
-            assert_eq!(
-                change_type, "insert",
-                "All changes should be 'insert' in Phase 2"
-            );
+            assert_eq!(change_type, "insert", "All changes should be 'insert'");
         }
 
         Ok(())
     }
 
-    /// Test that ducklake_table_changes returns delete changes (delete files added)
+    /// Test that ducklake_table_changes returns delete changes (R5-S-039)
     ///
-    /// NOTE: DELETE changes are NOT supported in Phase 2 INSERT-only.
-    /// This test verifies that no delete changes are returned (expected behavior for this phase).
-    /// Future phases will add DELETE support.
+    /// The multi-snapshot catalog includes a DELETE at snapshot 3.
+    /// table_changes should now return these as 'delete' change_type rows.
     #[tokio::test]
     async fn test_table_changes_deletes() -> DataFusionResult<()> {
         let temp_dir = TempDir::new().unwrap();
@@ -180,7 +179,7 @@ mod integration_tests {
 
         let ctx = create_context_with_functions(catalog_path.to_str().unwrap()).await?;
 
-        // Query only delete changes - in Phase 2, there should be none
+        // Query only delete changes — should now return the deleted row
         let df = ctx
             .sql("SELECT snapshot_id, change_type FROM ducklake_table_changes('main.events', 0, 100) WHERE change_type = 'delete'")
             .await?;
@@ -188,11 +187,10 @@ mod integration_tests {
         let batches: Vec<RecordBatch> = df.collect().await?;
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
-        // Phase 2 INSERT-only: no delete changes expected
-        assert_eq!(
-            total_rows, 0,
-            "Phase 2 INSERT-only: no delete changes expected, got {}",
-            total_rows
+        // R5-S-039: delete changes should now be returned
+        assert!(
+            total_rows > 0,
+            "Should have delete changes after R5-S-039 fix, got 0"
         );
 
         Ok(())
@@ -319,6 +317,45 @@ mod integration_tests {
         Ok(())
     }
 
+    /// Test that ducklake_table_changes returns both insert AND delete changes (R5-S-039)
+    ///
+    /// The multi-snapshot catalog has: snapshot 1 (insert 3 rows), snapshot 2 (insert 2 rows),
+    /// snapshot 3 (delete row id=2). table_changes should now return both inserts and deletes.
+    #[tokio::test]
+    async fn test_table_changes_includes_deletes() -> DataFusionResult<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let catalog_path = temp_dir.path().join("multi_snapshot.ducklake");
+
+        common::create_catalog_multiple_snapshots(&catalog_path)
+            .map_err(common::to_datafusion_error)?;
+
+        let ctx = create_context_with_functions(catalog_path.to_str().unwrap()).await?;
+
+        // Query all changes including both inserts and deletes across all snapshots
+        let df = ctx
+            .sql("SELECT change_type FROM ducklake_table_changes('main.events', 0, 100)")
+            .await?;
+
+        let batches: Vec<RecordBatch> = df.collect().await?;
+        let mut all_change_types: Vec<String> = Vec::new();
+        for batch in &batches {
+            all_change_types.extend(get_string_column(batch, 0));
+        }
+
+        // Should have both insert and delete changes
+        let insert_count = all_change_types.iter().filter(|t| *t == "insert").count();
+        let delete_count = all_change_types.iter().filter(|t| *t == "delete").count();
+
+        assert!(insert_count > 0, "Should have insert changes, got 0");
+        assert!(
+            delete_count > 0,
+            "Should have delete changes (R5-S-039), got 0. All change types: {:?}",
+            all_change_types
+        );
+
+        Ok(())
+    }
+
     /// Test error handling for invalid snapshot range (start > end)
     #[tokio::test]
     async fn test_table_changes_invalid_snapshot_range() -> DataFusionResult<()> {
@@ -367,7 +404,8 @@ mod table_deletions_tests {
         ctx.register_catalog("ducklake", Arc::new(catalog));
 
         // Register the table functions including ducklake_table_deletions
-        register_ducklake_functions(&ctx, provider_arc);
+        let snapshot_id = provider_arc.get_current_snapshot()?;
+        register_ducklake_functions(&ctx, provider_arc, snapshot_id);
 
         Ok(ctx)
     }

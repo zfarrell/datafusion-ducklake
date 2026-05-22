@@ -13,44 +13,10 @@ use arrow::record_batch::RecordBatch;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::prelude::*;
 use datafusion_ducklake::{DuckLakeCatalog, DuckdbMetadataProvider};
+use parquet::file::reader::FileReader;
 use tempfile::TempDir;
 
-/// Test helper to extract integer values from a RecordBatch column
-/// Supports both Int32 and Int64
-fn get_int_column(batch: &RecordBatch, col_idx: usize) -> Vec<i32> {
-    let column = batch.column(col_idx);
-
-    // Try Int32 first
-    if let Some(array) = column.as_any().downcast_ref::<arrow::array::Int32Array>() {
-        return (0..array.len())
-            .filter_map(|i| {
-                if array.is_null(i) {
-                    None
-                } else {
-                    Some(array.value(i))
-                }
-            })
-            .collect();
-    }
-
-    // Try Int64
-    if let Some(array) = column.as_any().downcast_ref::<arrow::array::Int64Array>() {
-        return (0..array.len())
-            .filter_map(|i| {
-                if array.is_null(i) {
-                    None
-                } else {
-                    Some(array.value(i) as i32)
-                }
-            })
-            .collect();
-    }
-
-    panic!(
-        "Column should be Int32Array or Int64Array, got {:?}",
-        column.data_type()
-    );
-}
+use common::test_utils::get_int_column;
 
 #[cfg(test)]
 mod integration_tests {
@@ -464,4 +430,148 @@ mod integration_tests {
 
         Ok(())
     }
+
+    /// Test that querying fails with a clear error when a delete file is missing from storage
+    ///
+    /// This is the bug scenario from issue #52:
+    /// When a delete file referenced in catalog metadata is physically missing from storage,
+    /// the query should fail with a clear error rather than silently returning rows that
+    /// should have been deleted (data corruption).
+    ///
+    /// Repro:
+    /// 1. Write data, then delete some rows (creates delete file in metadata)
+    /// 2. Remove the delete file from disk
+    /// 3. Query the table — should error, NOT silently return deleted rows
+    #[tokio::test]
+    async fn test_missing_delete_file_returns_error() -> DataFusionResult<()> {
+        let temp_dir = TempDir::new()
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        let catalog_path = temp_dir.path().join("missing_delete.ducklake");
+
+        // Generate test data with deletes (products table: 5 rows, 2 deleted)
+        common::create_catalog_with_deletes(&catalog_path).map_err(common::to_datafusion_error)?;
+
+        // Find and remove delete files from the filesystem
+        let removed_count = find_and_remove_delete_files(temp_dir.path());
+        assert!(
+            removed_count > 0,
+            "Should have found and removed at least one delete file"
+        );
+
+        // Create catalog and session
+        let catalog = create_catalog(&catalog_path.to_string_lossy())?;
+
+        let ctx = SessionContext::new();
+        ctx.register_catalog("test", catalog);
+
+        // Query should fail because delete files are missing
+        let result = ctx
+            .sql("SELECT * FROM test.main.products")
+            .await?
+            .collect()
+            .await;
+
+        assert!(
+            result.is_err(),
+            "Query should fail when delete file is missing from storage, \
+             but it succeeded (silent data corruption). Got {} rows.",
+            result
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|b| b.num_rows())
+                .sum::<usize>()
+        );
+
+        // Verify the error message mentions the missing delete file
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Delete file") || err_msg.contains("delete file"),
+            "Error message should mention the missing delete file, got: {}",
+            err_msg
+        );
+
+        Ok(())
+    }
+
+    /// Test that COUNT(*) also fails when delete file is missing
+    ///
+    /// Even aggregate queries must not silently return wrong results
+    /// when delete files are missing from storage.
+    #[tokio::test]
+    async fn test_missing_delete_file_count_also_errors() -> DataFusionResult<()> {
+        let temp_dir = TempDir::new()
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        let catalog_path = temp_dir.path().join("missing_delete_count.ducklake");
+
+        // Generate test data with deletes
+        common::create_catalog_with_deletes(&catalog_path).map_err(common::to_datafusion_error)?;
+
+        // Remove delete files
+        let removed_count = find_and_remove_delete_files(temp_dir.path());
+        assert!(removed_count > 0);
+
+        let catalog = create_catalog(&catalog_path.to_string_lossy())?;
+        let ctx = SessionContext::new();
+        ctx.register_catalog("test", catalog);
+
+        // COUNT(*) should also fail, not return a wrong count
+        let result = ctx
+            .sql("SELECT COUNT(*) FROM test.main.products")
+            .await?
+            .collect()
+            .await;
+
+        assert!(
+            result.is_err(),
+            "COUNT(*) should fail when delete file is missing, not return wrong count"
+        );
+
+        Ok(())
+    }
+}
+
+/// Recursively find all parquet files in a directory
+fn find_parquet_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut result = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                result.extend(find_parquet_files(&path));
+            } else if path.extension().map_or(false, |e| e == "parquet") {
+                result.push(path);
+            }
+        }
+    }
+    result
+}
+
+/// Check if a parquet file is a DuckLake delete file by examining its schema.
+/// Delete files have schema: (file_path: BYTE_ARRAY/UTF8, pos: INT64)
+fn is_delete_file(path: &std::path::Path) -> bool {
+    if let Ok(file) = std::fs::File::open(path) {
+        if let Ok(reader) = parquet::file::serialized_reader::SerializedFileReader::new(file) {
+            let schema = reader.metadata().file_metadata().schema();
+            let fields = schema.get_fields();
+            return fields.len() == 2
+                && fields[0].name() == "file_path"
+                && fields[1].name() == "pos";
+        }
+    }
+    false
+}
+
+/// Find and remove delete files (identified by their Parquet schema) from a directory tree.
+/// Returns the number of files removed.
+fn find_and_remove_delete_files(dir: &std::path::Path) -> usize {
+    let parquet_files = find_parquet_files(dir);
+    let mut removed = 0;
+    for file_path in parquet_files {
+        if is_delete_file(&file_path) {
+            std::fs::remove_file(&file_path).unwrap();
+            removed += 1;
+        }
+    }
+    removed
 }

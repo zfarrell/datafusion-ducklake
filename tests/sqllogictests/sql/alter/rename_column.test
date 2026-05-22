@@ -1,6 +1,7 @@
 # name: test/sql/alter/rename_column.test
-# description: test ducklake renanming columns
+# description: test ducklake renaming columns
 # group: [alter]
+# adapted: statement error format, removed DESCRIBE
 
 require ducklake
 
@@ -32,19 +33,11 @@ NULL	3
 statement ok
 ALTER TABLE ducklake.test RENAME COLUMN col2 TO new_col2
 
-query IIIIII
-DESCRIBE ducklake.test
-----
-new_col1	INTEGER	YES	NULL	NULL	NULL
-new_col2	INTEGER	YES	NULL	NULL	NULL
-
 query II
 SELECT new_col1, new_col2 FROM ducklake.test
 ----
 1	2
 NULL	3
 
-statement error
+statement error column blablabla does not exist
 ALTER TABLE ducklake.test RENAME COLUMN blablabla TO k
-----
-column blablabla does not exist

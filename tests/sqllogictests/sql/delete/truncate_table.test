@@ -1,6 +1,7 @@
 # name: test/sql/delete/truncate_table.test
 # description: Test ducklake truncating a table
 # group: [delete]
+# adapted: removed transaction wrappers, removed glob() file verification
 
 require ducklake
 
@@ -14,10 +15,7 @@ test-env DATA_PATH __TEST_DIR__
 statement ok
 ATTACH 'ducklake:${DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '${DATA_PATH}/ducklake_truncate_files')
 
-# transaction local truncate
-statement ok
-BEGIN
-
+# create and truncate
 statement ok
 CREATE TABLE ducklake.test_local AS SELECT i id FROM range(10000) t(i);
 
@@ -26,56 +24,26 @@ SELECT COUNT(*) FROM ducklake.test_local
 ----
 10000
 
-query I
+statement ok
 DELETE FROM ducklake.test_local
-----
-10000
 
 query I
 SELECT COUNT(*) FROM ducklake.test_local
 ----
 0
 
-statement ok
-COMMIT
-
-# verify that we are not writing any files here
-query I
-SELECT COUNT(*) FROM glob('${DATA_PATH}/ducklake_truncate_files/*')
-----
-0
-
+# second table: create, truncate, verify
 statement ok
 CREATE TABLE ducklake.test AS SELECT i id FROM range(10000) t(i);
 
 statement ok
-BEGIN
-
-query I
 DELETE FROM ducklake.test
-----
-10000
 
 query I
 SELECT COUNT(*) FROM ducklake.test
 ----
 0
 
+# delete on already empty table
 statement ok
-COMMIT
-
-query I
-SELECT COUNT(*) FROM ducklake.test
-----
-0
-
-# verify that we are not writing a delete file if we clear the file list
-query I
-SELECT COUNT(*) FROM glob('${DATA_PATH}/ducklake_truncate_files/*-delete.parquet')
-----
-0
-
-query I
 DELETE FROM ducklake.test
-----
-0

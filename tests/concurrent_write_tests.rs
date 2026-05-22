@@ -9,12 +9,10 @@ use arrow::record_batch::RecordBatch;
 use datafusion_ducklake::metadata_writer::MetadataWriter;
 use datafusion_ducklake::{DuckLakeTableWriter, SqliteMetadataWriter, WriteMode};
 use object_store::ObjectStoreExt;
-use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 
-fn create_object_store() -> Arc<dyn object_store::ObjectStore> {
-    Arc::new(LocalFileSystem::new())
-}
+mod common;
+use common::create_object_store;
 
 async fn create_test_writer(temp_dir: &TempDir) -> (SqliteMetadataWriter, std::path::PathBuf) {
     let db_path = temp_dir.path().join("test.db");
@@ -152,6 +150,39 @@ async fn test_concurrent_writes_same_table_append() {
         let result = task.await.expect("Task panicked");
         assert_eq!(result.unwrap().records_written, 1);
     }
+
+    // Read back all rows and verify count: 1 initial + 10 appended = 11
+    let db_path = temp_dir.path().join("test.db");
+    let conn_str = format!("sqlite:{}?mode=rwc", db_path.display());
+    let data_path = temp_dir.path().join("data");
+
+    let provider = datafusion_ducklake::SqliteMetadataProvider::new(&conn_str)
+        .await
+        .unwrap();
+    let catalog = Arc::new(datafusion_ducklake::DuckLakeCatalog::new(provider).unwrap());
+
+    let ctx = datafusion::prelude::SessionContext::new();
+    let local_fs: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::local::LocalFileSystem::new());
+    let data_url = url::Url::from_directory_path(&data_path).unwrap();
+    ctx.runtime_env().register_object_store(&data_url, local_fs);
+    ctx.register_catalog("ducklake", catalog);
+
+    let df = ctx
+        .sql("SELECT COUNT(*) AS cnt FROM ducklake.main.shared_table")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    let count_array = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap();
+    assert_eq!(
+        count_array.value(0),
+        11,
+        "Expected 1 initial + 10 appended = 11 rows"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

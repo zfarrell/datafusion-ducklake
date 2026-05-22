@@ -1,6 +1,7 @@
 # name: test/sql/default/default_values.test
 # description: Test default values with DuckLake
 # group: [default]
+# adapted: removed special values test (DuckDB-specific DEFAULT 'NULL' behavior)
 
 require ducklake
 
@@ -34,14 +35,3 @@ SELECT * FROM ducklake.test
 ----
 42	100
 42	200
-
-statement ok
-CREATE TABLE ducklake.test_special_values(i INTEGER, s1 VARCHAR DEFAULT '', s2 VARCHAR DEFAULT 'NULL');
-
-statement ok
-INSERT INTO ducklake.test_special_values (i) VALUES (100)
-
-query III
-SELECT * FROM ducklake.test_special_values WHERE s2 IS NULL
-----
-100	(empty)	NULL

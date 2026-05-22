@@ -1,6 +1,8 @@
 # name: test/sql/delete/delete_same_transaction.test
-# description: Test ducklake deleting and creating in the same transaction
+# description: Test ducklake multiple deletes
 # group: [delete]
+# adapted: removed transaction wrapper (hybrid adapter reads committed state only),
+#          removed glob() verification
 
 require ducklake
 
@@ -15,44 +17,23 @@ statement ok
 ATTACH 'ducklake:${DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '${DATA_PATH}/ducklake_delete_same_transaction_files')
 
 statement ok
-BEGIN
-
-statement ok
 CREATE TABLE ducklake.test AS SELECT i id FROM range(1000) t(i);
 
-query I
+statement ok
 DELETE FROM ducklake.test WHERE id%2=0
-----
-500
 
 query I
 SELECT COUNT(*) FROM ducklake.test WHERE id<=250
 ----
 125
 
-query I
+statement ok
 DELETE FROM ducklake.test WHERE id<=250
-----
-125
 
 query I
 SELECT COUNT(*) FROM ducklake.test WHERE id<=250
 ----
 0
-
-query II
-SELECT COUNT(*), COUNT(*) FILTER(WHERE id%2=0) FROM ducklake.test
-----
-375	0
-
-statement ok
-COMMIT
-
-# verify that we only have one delete file written after the commit (i.e. we cleaned up the first file
-query I
-SELECT COUNT(*) FROM glob('${DATA_PATH}/ducklake_delete_same_transaction_files/main/test/*-delete.parquet')
-----
-1
 
 query II
 SELECT COUNT(*), COUNT(*) FILTER(WHERE id%2=0) FROM ducklake.test

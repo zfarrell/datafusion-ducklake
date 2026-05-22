@@ -34,7 +34,21 @@ async fn init_schema(pool: &SqlitePool) -> anyhow::Result<()> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS ducklake_snapshot (
             snapshot_id INTEGER PRIMARY KEY,
-            snapshot_time TEXT
+            snapshot_time TEXT,
+            schema_version INTEGER
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS ducklake_snapshot_changes (
+            snapshot_id INTEGER PRIMARY KEY,
+            changes_made TEXT,
+            author TEXT,
+            commit_message TEXT,
+            commit_extra_info TEXT,
+            FOREIGN KEY (snapshot_id) REFERENCES ducklake_snapshot(snapshot_id)
         )",
     )
     .execute(pool)
@@ -58,6 +72,7 @@ async fn init_schema(pool: &SqlitePool) -> anyhow::Result<()> {
             table_id INTEGER PRIMARY KEY,
             schema_id INTEGER NOT NULL,
             table_name TEXT NOT NULL,
+            table_uuid TEXT,
             path TEXT NOT NULL,
             path_is_relative INTEGER NOT NULL,
             begin_snapshot INTEGER NOT NULL,
@@ -68,7 +83,6 @@ async fn init_schema(pool: &SqlitePool) -> anyhow::Result<()> {
     .execute(pool)
     .await?;
 
-    // Schema must match SQL_CREATE_SCHEMA in metadata_writer_sqlite.rs.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS ducklake_column (
             column_id INTEGER PRIMARY KEY,
@@ -77,11 +91,6 @@ async fn init_schema(pool: &SqlitePool) -> anyhow::Result<()> {
             column_type TEXT NOT NULL,
             column_order INTEGER NOT NULL,
             nulls_allowed INTEGER,
-            initial_default TEXT,
-            default_value TEXT,
-            parent_column INTEGER,
-            default_value_type TEXT,
-            default_value_dialect TEXT,
             begin_snapshot INTEGER NOT NULL DEFAULT 1,
             end_snapshot INTEGER,
             FOREIGN KEY (table_id) REFERENCES ducklake_table(table_id)
@@ -101,7 +110,6 @@ async fn init_schema(pool: &SqlitePool) -> anyhow::Result<()> {
             encryption_key TEXT,
             record_count INTEGER,
             row_id_start INTEGER,
-            mapping_id INTEGER,
             begin_snapshot INTEGER NOT NULL DEFAULT 1,
             end_snapshot INTEGER,
             FOREIGN KEY (table_id) REFERENCES ducklake_table(table_id)
@@ -167,14 +175,14 @@ async fn create_sqlite_provider() -> anyhow::Result<SqliteMetadataProvider> {
     let provider = SqliteMetadataProvider::new("sqlite::memory:")
         .await
         .expect("Failed to create provider");
-    init_schema(&provider.pool).await?;
+    init_schema(provider.pool()).await?;
 
     Ok(provider)
 }
 
 /// Helper to populate test data in SQLite
 async fn populate_test_data(provider: &SqliteMetadataProvider) -> anyhow::Result<()> {
-    let pool = &provider.pool;
+    let pool = provider.pool();
 
     // Insert snapshots
     sqlx::query(
@@ -260,8 +268,8 @@ async fn populate_test_data(provider: &SqliteMetadataProvider) -> anyhow::Result
 
     // Insert columns for users table
     sqlx::query(
-        "INSERT INTO ducklake_column (column_id, table_id, column_name, column_type, column_order, nulls_allowed)
-         VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO ducklake_column (column_id, table_id, column_name, column_type, column_order, nulls_allowed, begin_snapshot)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(1i64)
     .bind(1i64)
@@ -269,12 +277,13 @@ async fn populate_test_data(provider: &SqliteMetadataProvider) -> anyhow::Result
     .bind("INT")
     .bind(0i32)
     .bind(0i32) // false
+    .bind(1i64)
     .execute(pool)
     .await?;
 
     sqlx::query(
-        "INSERT INTO ducklake_column (column_id, table_id, column_name, column_type, column_order, nulls_allowed)
-         VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO ducklake_column (column_id, table_id, column_name, column_type, column_order, nulls_allowed, begin_snapshot)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(2i64)
     .bind(1i64)
@@ -282,12 +291,13 @@ async fn populate_test_data(provider: &SqliteMetadataProvider) -> anyhow::Result
     .bind("VARCHAR")
     .bind(1i32)
     .bind(1i32) // true
+    .bind(1i64)
     .execute(pool)
     .await?;
 
     sqlx::query(
-        "INSERT INTO ducklake_column (column_id, table_id, column_name, column_type, column_order, nulls_allowed)
-         VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO ducklake_column (column_id, table_id, column_name, column_type, column_order, nulls_allowed, begin_snapshot)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(3i64)
     .bind(1i64)
@@ -295,6 +305,7 @@ async fn populate_test_data(provider: &SqliteMetadataProvider) -> anyhow::Result
     .bind("VARCHAR")
     .bind(2i32)
     .bind(1i32) // true
+    .bind(1i64)
     .execute(pool)
     .await?;
 
@@ -370,13 +381,13 @@ async fn populate_from_duckdb_catalog(
     let schemas = duckdb_provider.list_schemas(current_snapshot.snapshot_id)?;
 
     // Step 3: Populate SQLite with metadata from DuckDB
-    let pool = &provider.pool;
+    let pool = provider.pool();
 
     // Insert snapshots
     for snapshot in &snapshots {
         sqlx::query("INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time) VALUES (?, ?)")
             .bind(snapshot.snapshot_id)
-            .bind(&snapshot.timestamp)
+            .bind(&snapshot.snapshot_time)
             .execute(pool)
             .await?;
     }
@@ -422,7 +433,8 @@ async fn populate_from_duckdb_catalog(
             .execute(pool)
             .await?;
 
-            let columns = duckdb_provider.get_table_structure(table.table_id)?;
+            let columns = duckdb_provider
+                .get_table_structure(table.table_id, current_snapshot.snapshot_id)?;
 
             for (order, column) in columns.iter().enumerate() {
                 sqlx::query(
@@ -492,7 +504,7 @@ async fn test_schema_initialization_idempotent() {
     let provider = create_sqlite_provider().await.unwrap();
 
     // Initialize schema again - should be idempotent
-    init_schema(&provider.pool)
+    init_schema(provider.pool())
         .await
         .expect("Schema initialization should be idempotent");
 
@@ -718,7 +730,7 @@ async fn test_get_table_structure() {
         .expect("Failed to populate test data");
 
     let columns = provider
-        .get_table_structure(1)
+        .get_table_structure(1, 1)
         .expect("Should get table structure");
 
     assert_eq!(columns.len(), 3, "users table should have 3 columns");
@@ -858,7 +870,7 @@ async fn test_concurrent_access() {
             let _schemas = provider.list_schemas(1).expect("Should list schemas");
             let _tables = provider.list_tables(1, 1).expect("Should list tables");
             let _columns = provider
-                .get_table_structure(1)
+                .get_table_structure(1, 1)
                 .expect("Should get structure");
         });
         tasks.push(task);
@@ -918,7 +930,12 @@ async fn test_query_real_parquet_files() {
     assert_eq!(batch.num_rows(), 4, "Should have 4 rows");
 
     // Verify schema
-    assert_eq!(batch.num_columns(), 3, "Should have 3 columns");
+    // 3 real columns + 5 virtual columns (filename, file_row_number, rowid, snapshot_id, file_index)
+    assert_eq!(
+        batch.num_columns(),
+        8,
+        "Should have 8 columns (3 real + 5 virtual)"
+    );
     let schema = batch.schema();
     assert_eq!(schema.field(0).name(), "id");
     assert_eq!(schema.field(1).name(), "name");

@@ -2,18 +2,15 @@
 //! Integration tests for information_schema virtual tables and table functions
 
 use datafusion::prelude::*;
-use datafusion_ducklake::{DuckLakeCatalog, DuckdbMetadataProvider, register_ducklake_functions};
+use datafusion_ducklake::{
+    DuckLakeCatalog, DuckdbMetadataProvider, MetadataProvider, register_ducklake_functions,
+};
 use std::sync::Arc;
 
 mod common;
 
 #[tokio::test]
-#[ignore] // Snapshots table requires ducklake_snapshot table which test catalogs don't create
 async fn test_information_schema_snapshots() -> Result<(), Box<dyn std::error::Error>> {
-    // NOTE: This test is ignored because the test helper uses DuckDB's DuckLake extension
-    // which doesn't expose the ducklake_snapshot table directly.
-    // In production catalogs created by other means, this table would exist.
-
     let temp_dir = tempfile::tempdir()?;
     let catalog_path = temp_dir.path().join("test.ducklake");
 
@@ -349,7 +346,8 @@ async fn test_ducklake_snapshots_function() -> Result<(), Box<dyn std::error::Er
     let ctx = SessionContext::new();
 
     // Register table functions
-    register_ducklake_functions(&ctx, Arc::new(provider));
+    let snapshot_id = provider.get_current_snapshot().unwrap();
+    register_ducklake_functions(&ctx, Arc::new(provider), snapshot_id);
 
     // Query using function syntax
     let df = ctx.sql("SELECT * FROM ducklake_snapshots()").await?;
@@ -370,7 +368,8 @@ async fn test_ducklake_table_info_function() -> Result<(), Box<dyn std::error::E
     let provider = DuckdbMetadataProvider::new(catalog_path.to_str().unwrap())?;
     let ctx = SessionContext::new();
 
-    register_ducklake_functions(&ctx, Arc::new(provider));
+    let snapshot_id = provider.get_current_snapshot().unwrap();
+    register_ducklake_functions(&ctx, Arc::new(provider), snapshot_id);
 
     let df = ctx
         .sql("SELECT table_name, file_count, file_size_bytes FROM ducklake_table_info()")
@@ -392,10 +391,11 @@ async fn test_ducklake_list_files_function() -> Result<(), Box<dyn std::error::E
     let provider = DuckdbMetadataProvider::new(catalog_path.to_str().unwrap())?;
     let ctx = SessionContext::new();
 
-    register_ducklake_functions(&ctx, Arc::new(provider));
+    let snapshot_id = provider.get_current_snapshot().unwrap();
+    register_ducklake_functions(&ctx, Arc::new(provider), snapshot_id);
 
     let df = ctx
-        .sql("SELECT file_path, file_size_bytes FROM ducklake_list_files()")
+        .sql("SELECT data_file, data_file_size_bytes FROM ducklake_list_files('users')")
         .await?;
     let results = df.collect().await?;
 
@@ -414,7 +414,8 @@ async fn test_table_info_aggregation() -> Result<(), Box<dyn std::error::Error>>
     let provider = DuckdbMetadataProvider::new(catalog_path.to_str().unwrap())?;
     let ctx = SessionContext::new();
 
-    register_ducklake_functions(&ctx, Arc::new(provider));
+    let snapshot_id = provider.get_current_snapshot().unwrap();
+    register_ducklake_functions(&ctx, Arc::new(provider), snapshot_id);
 
     // Get total storage
     let df = ctx
@@ -437,7 +438,8 @@ async fn test_function_rejects_arguments() -> Result<(), Box<dyn std::error::Err
     let provider = DuckdbMetadataProvider::new(catalog_path.to_str().unwrap())?;
     let ctx = SessionContext::new();
 
-    register_ducklake_functions(&ctx, Arc::new(provider));
+    let snapshot_id = provider.get_current_snapshot().unwrap();
+    register_ducklake_functions(&ctx, Arc::new(provider), snapshot_id);
 
     // These functions should reject arguments
     let result = ctx.sql("SELECT * FROM ducklake_snapshots('arg')").await;

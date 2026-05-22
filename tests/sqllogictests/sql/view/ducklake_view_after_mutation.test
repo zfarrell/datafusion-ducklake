@@ -1,0 +1,68 @@
+# name: test/sql/view/ducklake_view_after_mutation.test
+# description: Test that views reflect data mutations (INSERT/DELETE/UPDATE) in DuckLake
+# group: [view]
+
+require ducklake
+
+require parquet
+
+test-env DUCKLAKE_CONNECTION __TEST_DIR__/{UUID}.db
+
+test-env DATA_PATH __TEST_DIR__
+
+statement ok
+ATTACH 'ducklake:${DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '${DATA_PATH}/ducklake_view_after_mutation')
+
+statement ok
+CREATE TABLE ducklake.main.items (id INT, name VARCHAR, qty INT)
+
+statement ok
+INSERT INTO ducklake.main.items VALUES (1, 'apple', 10), (2, 'banana', 20)
+
+# Create view
+statement ok
+CREATE VIEW ducklake.main.item_view AS SELECT id, name, qty FROM ducklake.main.items
+
+# Verify initial state
+query ITI
+SELECT id, name, qty FROM ducklake.main.item_view ORDER BY id
+----
+1	apple	10
+2	banana	20
+
+# Insert more data — view should reflect new rows
+statement ok
+INSERT INTO ducklake.main.items VALUES (3, 'cherry', 30)
+
+query ITI
+SELECT id, name, qty FROM ducklake.main.item_view ORDER BY id
+----
+1	apple	10
+2	banana	20
+3	cherry	30
+
+# Delete a row — view should reflect deletion
+statement ok
+DELETE FROM ducklake.main.items WHERE id = 2
+
+query ITI
+SELECT id, name, qty FROM ducklake.main.item_view ORDER BY id
+----
+1	apple	10
+3	cherry	30
+
+# Update a row — view should reflect update
+statement ok
+UPDATE ducklake.main.items SET qty = 100 WHERE id = 1
+
+query ITI
+SELECT id, name, qty FROM ducklake.main.item_view ORDER BY id
+----
+1	apple	100
+3	cherry	30
+
+# Count on view after mutations
+query I
+SELECT COUNT(*) FROM ducklake.main.item_view
+----
+2
