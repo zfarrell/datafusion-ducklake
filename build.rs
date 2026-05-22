@@ -61,8 +61,6 @@ fn find_test_files(dir: &Path, files: &mut Vec<std::path::PathBuf>) {
 fn path_to_test_name(rel_path: &str) -> String {
     rel_path
         .trim_end_matches(".test")
-        .replace(['/', '\\'], "_")
-        .replace('-', "_")
-        .replace('.', "_")
+        .replace(['/', '\\', '-', '.'], "_")
         .to_lowercase()
 }

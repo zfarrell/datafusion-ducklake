@@ -101,7 +101,7 @@ pub(crate) fn validate_schema_evolution(
     // R8-S-012: Check that all existing columns are present in the new schema.
     // Append mode must not silently drop columns.
     let new_names: std::collections::HashSet<&str> = new.iter().map(|c| c.name.as_str()).collect();
-    for (existing_name, _) in &existing_map {
+    for existing_name in existing_map.keys() {
         if !new_names.contains(existing_name) {
             return Err(DuckLakeError::InvalidConfig(format!(
                 "Schema evolution error: existing column '{}' is missing from the new schema. Removing columns is not allowed in append mode.",

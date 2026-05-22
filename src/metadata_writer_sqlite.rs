@@ -34,10 +34,10 @@ const BUSY_RETRY_INITIAL_DELAY_MS: u64 = 10;
 /// database was modified after the transaction started).
 fn is_sqlite_busy(err: &DuckLakeError) -> bool {
     if let DuckLakeError::Sqlx(sqlx::Error::Database(db_err)) = err {
-        if let Some(code) = db_err.code() {
-            if code.as_ref() == "5" || code.as_ref() == "517" {
-                return true;
-            }
+        if let Some(code) = db_err.code()
+            && (code.as_ref() == "5" || code.as_ref() == "517")
+        {
+            return true;
         }
         // Fallback to error message check
         return db_err.message().contains("database is locked");
@@ -1340,7 +1340,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 // Bind each column value using precomputed map
                 for col in columns {
                     let value = col_map
-                        .get(&*col.name())
+                        .get(col.name())
                         .and_then(|&pos| inlined_row.values.get(pos))
                         .and_then(|v| v.clone());
                     query = query.bind(value);
