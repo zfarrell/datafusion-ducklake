@@ -87,8 +87,14 @@ pub fn delete_file_schema() -> SchemaRef {
     let mut pos_metadata = HashMap::new();
     pos_metadata.insert("PARQUET:field_id".to_string(), "2147483645".to_string()); // 0x7FFFFFFD
 
+    // file_path is "Iceberg-compatibility metadata" per the DuckLake spec; it
+    // is OPTIONAL in delete parquet files. Some writers (notably DuckDB's
+    // DuckLake extension) emit delete files with only `pos`. We therefore
+    // declare it nullable here so the Parquet reader does not reject those
+    // files with "Non-nullable column 'file_path' is missing from the
+    // physical schema".
     Arc::new(Schema::new(vec![
-        Field::new(DELETE_FILE_PATH_COL, DataType::Utf8, false).with_metadata(file_path_metadata),
+        Field::new(DELETE_FILE_PATH_COL, DataType::Utf8, true).with_metadata(file_path_metadata),
         Field::new(DELETE_POS_COL, DataType::Int64, false).with_metadata(pos_metadata),
     ]))
 }

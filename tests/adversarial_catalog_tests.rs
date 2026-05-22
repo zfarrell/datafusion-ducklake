@@ -1055,16 +1055,16 @@ async fn test_boundary_record_count_values() {
     );
     assert!(result.is_ok(), "Zero record count should be accepted");
 
-    // Negative record count
-    let result = writer.register_data_file(
-        setup.table_id,
-        setup.snapshot_id,
-        &DataFileInfo::new("neg.parquet", 100, -1),
-    );
-    // No validation - negative count accepted
+    // Negative record count is rejected at construction time by the
+    // `DataFileInfo::new` guard (cherry-picked from PR #9). See
+    // `metadata_writer::tests::test_data_file_info_negative_record_count_panics`.
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        DataFileInfo::new("neg.parquet", 100, -1);
+    }))
+    .is_err();
     assert!(
-        result.is_ok(),
-        "Negative record count accepted (no validation)"
+        panicked,
+        "DataFileInfo::new should panic on negative record_count"
     );
 
     // MAX i64

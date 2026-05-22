@@ -260,6 +260,7 @@ async fn test_list_files_requires_table_arg() -> Result<(), Box<dyn std::error::
 // ==================== ducklake_options tests ====================
 
 #[tokio::test]
+#[ignore = "TODO(#12): ducklake_options() lived in the dropped compaction_functions DuckDB pass-through; reintroduce alongside native compaction"]
 async fn test_options_returns_catalog_options() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = TempDir::new()?;
     let catalog_path = temp_dir.path().join("test.ducklake");
