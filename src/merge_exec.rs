@@ -13,6 +13,74 @@
 //! - Matched+updated rows → delete file for old positions + new data file with updated values
 //! - Matched+deleted rows → delete file for old positions
 //! - Unmatched rows → new data file with inserted values
+//!
+//! ## Concurrency
+//!
+//! Like DELETE (#17) and UPDATE (#18), MERGE captures the table's
+//! `snapshot_id` at plan time and threads it through
+//! [`MetadataWriter::register_dml_files`] as `since_snapshot`. Inside the
+//! writer's transaction, any data file that this MERGE targets and that was
+//! ended (or had a newer active delete file installed on it) since
+//! `since_snapshot` causes the commit to fail with `TransactionConflict` and
+//! the `UploadCleanupGuard` removes any uploaded files.
+//!
+//! **Granularity:** the writer's conflict check is file-level — two MERGEs
+//! planned at the same snapshot that target the same `data_file_id` will
+//! conflict even when they touch disjoint row positions. This is conservative
+//! but correct; refining it to be row-position-aware is tracked as a
+//! follow-up (the same deferral applies to DELETE and UPDATE).
+//!
+//! ## Memory bounds
+//!
+//! MERGE buffers updated/inserted rows in memory before writing them as a
+//! single new data file. The cap is read at execute time from
+//! [`crate::config::DuckLakeConfig::max_buffered_rows_per_dml`] (default
+//! 10M). Raise it via session config for legitimate large MERGEs.
+//!
+//! ## Write atomicity / NOT NULL pre-validation
+//!
+//! MERGE executes in three phases so that a NOT NULL violation can never
+//! leave orphan files on the object store:
+//!
+//! 1. **Build phase (in-memory):** scan target files, hash-join against
+//!    source, apply UPDATE SET to matched rows, collect INSERT rows, and
+//!    validate NOT NULL on the buffered batches. No object-store I/O yet.
+//! 2. **Delete-file upload:** only runs if phase 1 completes without error.
+//! 3. **New data-file upload:** writes the combined updated + inserted batches.
+//!
+//! Any failure after phase 1 still triggers `UploadCleanupGuard`-based
+//! removal of any uploaded files.
+//!
+//! ## Hash-key signed / unsigned collation
+//!
+//! The hash key extractor coerces every signed-integer width
+//! (`Int8`/`Int16`/`Int32`/`Int64`, plus the temporal types stored as `i64`)
+//! into a single [`HashableKeyValue::Int64`] slot, and every unsigned-integer
+//! width into a single [`HashableKeyValue::UInt64`] slot, via lossy `as`
+//! casts. This means:
+//!
+//! - **Two keys of the same Arrow signedness** always compare correctly:
+//!   `Int8(-1)` and `Int64(-1)` hash equal and compare equal, which is the
+//!   intended SQL semantics for an equi-join across promoted integer widths.
+//! - **Cross-signedness equality is NOT defined by this exec.** Joining a
+//!   target `Int64` column against a source `UInt64` column means the two
+//!   values inhabit *different* [`HashableKeyValue`] discriminants. They will
+//!   hash to different buckets and `PartialEq` will return false — which is
+//!   correct: a signed/unsigned compare in SQL needs a type promotion at the
+//!   planner level (to a wider common type) before MERGE sees the data. The
+//!   audit verdict on this code flagged that "large `UInt64` keys can
+//!   collide with negative `Int64`s when mixed types share a hash slot" —
+//!   that scenario would require both source and target to be cast to the
+//!   same signedness before reaching this exec, which the planner enforces.
+//!   If a future code path delivers mismatched-signedness columns into this
+//!   exec, they will *not* falsely match, but they also will *not* be
+//!   detected and rejected here; the keys simply sort into disjoint hash
+//!   slots. Documented as a deliberate design choice (the discriminant
+//!   prefix in `Hash` for `HashableKeyValue` is what enforces this) — see
+//!   the `test_hash_key_signed_unsigned_disjoint` test below.
+//!
+//! No DuckLake-side coercion is attempted; the planner is responsible for
+//! aligning the source and target join-key types before invoking MERGE.
 
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
@@ -84,6 +152,14 @@ pub struct DuckLakeMergeExec {
     table_path: String,
     /// Existing deleted positions per file
     existing_deletes: Arc<HashMap<String, HashSet<i64>>>,
+    /// Snapshot id this MERGE was planned against. Threaded through to
+    /// `MetadataWriter::register_dml_files` for optimistic-concurrency
+    /// conflict detection — a concurrent DML that ended any of this MERGE's
+    /// target data files (or installed a newer active delete file on them)
+    /// after `since_snapshot` will cause the commit to fail with
+    /// `TransactionConflict` (matching the path #17 added for DELETE and
+    /// #18 for UPDATE).
+    since_snapshot: i64,
     /// Cached plan properties
     cache: Arc<PlanProperties>,
 }
@@ -104,6 +180,7 @@ impl DuckLakeMergeExec {
         object_store_url: Arc<ObjectStoreUrl>,
         table_path: String,
         existing_deletes: HashMap<String, HashSet<i64>>,
+        since_snapshot: i64,
     ) -> Self {
         let cache = Self::compute_properties();
         Self {
@@ -120,6 +197,7 @@ impl DuckLakeMergeExec {
             object_store_url,
             table_path,
             existing_deletes: Arc::new(existing_deletes),
+            since_snapshot,
             cache,
         }
     }
@@ -371,7 +449,20 @@ impl ExecutionPlan for DuckLakeMergeExec {
         let object_store_url = self.object_store_url.clone();
         let table_path = self.table_path.clone();
         let existing_deletes = Arc::clone(&self.existing_deletes);
+        let since_snapshot = self.since_snapshot;
         let output_schema = make_dml_count_schema();
+
+        // Honour the session-config override for `max_buffered_rows_per_dml`
+        // if present; otherwise fall back to the default. Shared with UPDATE
+        // (#18); MERGE opts into the same safety valve since both buffer
+        // arbitrary numbers of source/matched/insert rows before writing.
+        let max_buffered_rows = context
+            .session_config()
+            .options()
+            .extensions
+            .get::<crate::config::DuckLakeConfig>()
+            .map(|c| c.max_buffered_rows_per_dml)
+            .unwrap_or_else(|| crate::config::DuckLakeConfig::default().max_buffered_rows_per_dml);
 
         let stream = stream::once(async move {
             let object_store = context
@@ -382,9 +473,14 @@ impl ExecutionPlan for DuckLakeMergeExec {
 
             let mut total_affected: u64 = 0;
             let mut new_data_batches: Vec<RecordBatch> = Vec::new();
+            // Buffered-row counter (matched-source + unmatched-insert combined).
+            // Bounds the in-memory write set against the configurable cap.
+            let mut buffered_rows: usize = 0;
             // Collect file metadata for atomic registration
             let mut pending_delete_files: Vec<DeleteFileInfo> = Vec::new();
-            // Cleanup guard ensures orphan files are removed on any error path
+            // Cleanup guard ensures orphan files are removed on any error path.
+            // Initialised early so subsequent uploads register their `ObjectPath`
+            // with the guard and are removed on any `?`-propagated error.
             let mut upload_guard =
                 crate::table_writer::UploadCleanupGuard::new(Arc::clone(&object_store));
 
@@ -411,7 +507,19 @@ impl ExecutionPlan for DuckLakeMergeExec {
             // For UPDATE: collect matched source rows to write as replacement data
             let mut matched_source_rows: Vec<RecordBatch> = Vec::new();
 
-            // Process each target data file
+            // Phase 1 (in-memory build): per target file, hash-join, compute
+            // positions to delete and matched-source row masks, but DO NOT
+            // upload any files yet. After this loop completes, NOT NULL
+            // validation runs on the buffered data set. Only then does phase
+            // 2 perform the disk I/O.
+            struct PerFileWork {
+                resolved_path: String,
+                data_file_id: i64,
+                positions_to_delete: Vec<i64>,
+                existing_positions: Option<HashSet<i64>>,
+            }
+            let mut per_file_work: Vec<PerFileWork> = Vec::new();
+
             for table_file in &*table_files {
                 let data_file_id = table_file.data_file_id.ok_or_else(|| {
                     DataFusionError::Internal(
@@ -551,33 +659,33 @@ impl ExecutionPlan for DuckLakeMergeExec {
                         if mask.true_count() > 0 {
                             let filtered = compute::filter_record_batch(src_batch, &mask)
                                 .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+                            buffered_rows =
+                                buffered_rows.checked_add(filtered.num_rows()).ok_or_else(
+                                    || {
+                                        DataFusionError::Execution(
+                                            "MERGE buffered_rows overflow".to_string(),
+                                        )
+                                    },
+                                )?;
+                            if buffered_rows > max_buffered_rows {
+                                return Err(DataFusionError::ResourcesExhausted(format!(
+                                    "MERGE affects too many rows ({} rows buffered, limit is {}). \
+                                     Raise `ducklake.max_buffered_rows_per_dml` in the session \
+                                     config or use a more selective ON / source filter.",
+                                    buffered_rows, max_buffered_rows
+                                )));
+                            }
                             matched_source_rows.push(filtered);
                         }
                     }
                 }
 
-                // Merge with existing deletes
-                let mut all_positions = positions_to_delete;
-                if let Some(existing) = existing_positions {
-                    for pos in existing {
-                        all_positions.push(*pos);
-                    }
-                    all_positions.sort_unstable();
-                    all_positions.dedup();
-                }
-
-                // Write and upload delete file using shared helper
-                let delete_file_info = crate::table_writer::write_delete_file(
-                    &*object_store,
-                    &table_path,
-                    &resolved_path,
+                per_file_work.push(PerFileWork {
+                    resolved_path,
                     data_file_id,
-                    all_positions,
-                    &mut upload_guard,
-                )
-                .await?;
-
-                pending_delete_files.push(delete_file_info);
+                    positions_to_delete,
+                    existing_positions: existing_positions.cloned(),
+                });
             }
 
             // Add matched source rows as replacement data (for UPDATE)
@@ -607,16 +715,70 @@ impl ExecutionPlan for DuckLakeMergeExec {
                                     total_affected, unmatched_count
                                 ))
                             })?;
+                        buffered_rows =
+                            buffered_rows.checked_add(filtered.num_rows()).ok_or_else(|| {
+                                DataFusionError::Execution(
+                                    "MERGE buffered_rows overflow".to_string(),
+                                )
+                            })?;
+                        if buffered_rows > max_buffered_rows {
+                            return Err(DataFusionError::ResourcesExhausted(format!(
+                                "MERGE affects too many rows ({} rows buffered, limit is {}). \
+                                 Raise `ducklake.max_buffered_rows_per_dml` in the session \
+                                 config or use a more selective ON / source filter.",
+                                buffered_rows, max_buffered_rows
+                            )));
+                        }
                         new_data_batches.push(filtered);
                     }
                     source_global_idx += src_batch.num_rows();
                 }
             }
 
-            // Enforce NOT NULL constraints on data to be written
+            // Enforce NOT NULL constraints on data to be written — BEFORE
+            // any disk I/O. Mirrors the reorder #18 applied to UPDATE: a
+            // failing constraint must never leave orphan files on the
+            // object store, so we validate in memory before phase 2
+            // uploads any delete file or new data file.
             crate::table_writer::validate_not_null_constraints(&table_schema, &new_data_batches)?;
 
-            // Write new data file(s) for updated + inserted rows
+            // Phase 2: now that all in-memory work has passed (including
+            // NOT NULL validation), upload the per-file delete files. Any
+            // error from this point on cleans up via `upload_guard`.
+            for work in per_file_work {
+                let PerFileWork {
+                    resolved_path,
+                    data_file_id,
+                    positions_to_delete,
+                    existing_positions,
+                } = work;
+
+                let mut all_positions = positions_to_delete;
+                if let Some(existing) = existing_positions {
+                    for pos in &existing {
+                        all_positions.push(*pos);
+                    }
+                    all_positions.sort_unstable();
+                    all_positions.dedup();
+                }
+
+                let delete_file_info = crate::table_writer::write_delete_file(
+                    &*object_store,
+                    &table_path,
+                    &resolved_path,
+                    data_file_id,
+                    all_positions,
+                    &mut upload_guard,
+                )
+                .await?;
+
+                pending_delete_files.push(delete_file_info);
+            }
+
+            // Phase 3: write new data file(s) for updated + inserted rows.
+            // NOT NULL was already validated above, but the helper re-runs
+            // the check as a safety net in case future refactors reorder
+            // phases.
             let mut pending_data_files: Vec<DataFileInfo> = Vec::new();
             if !new_data_batches.is_empty() {
                 let data_file_info = crate::table_writer::write_and_upload_parquet(
@@ -642,16 +804,27 @@ impl ExecutionPlan for DuckLakeMergeExec {
                 .create_snapshot()
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-            // Atomically register all delete files and data files (guard cleans up on error).
-            // TODO(#19): plumb `since_snapshot` through MERGE for optimistic-concurrency
-            // conflict detection (matching the path added for DELETE in #17).
+            // Atomically register all delete files and data files (guard
+            // cleans up on error). Passing `since_snapshot` opts MERGE into
+            // the optimistic-concurrency conflict detection DELETE got in
+            // #17 and UPDATE in #18: any concurrent DML that ended one of
+            // this MERGE's target data files (or installed a newer active
+            // delete file on it) since this MERGE was planned will cause
+            // `register_dml_files` to fail with `TransactionConflict`, and
+            // `upload_guard` will remove the orphan files this MERGE
+            // uploaded.
+            //
+            // Granularity: file-level (keyed on `data_file_id`). Two MERGEs
+            // that target the same file conflict even if they touch
+            // disjoint row positions; refining this to be row-position-aware
+            // is tracked as a follow-up (same deferral as #17/#18).
             writer
                 .register_dml_files(
                     table_id,
                     snapshot_id,
                     &pending_delete_files,
                     &pending_data_files,
-                    None,
+                    Some(since_snapshot),
                 )
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
