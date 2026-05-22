@@ -996,6 +996,65 @@ mod tests {
         assert_eq!(index.len(), 3);
     }
 
+    /// Mixed-signedness collation: a target keyed `Int64(-1)` and a source
+    /// keyed `UInt64(u64::MAX)` MUST NOT collide in the hash index. Both
+    /// values would `as i64` to `-1` in the extractor's lossy cast, but the
+    /// `HashableKeyValue` discriminant prefix in `Hash` (and the enum
+    /// `PartialEq`) keeps them in disjoint slots.
+    ///
+    /// This is the unit-level expression of the documented behavior at the
+    /// top of this module; an end-to-end MERGE test lives in
+    /// `tests/merge_tests.rs::test_merge_mixed_signedness_keys_do_not_match`.
+    #[test]
+    fn test_hash_key_signed_unsigned_disjoint() {
+        // Build a source hash index over a UInt64 batch containing
+        // `u64::MAX`. Probe with an Int64(-1) key — must miss.
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "k",
+            DataType::UInt64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(UInt64Array::from(vec![u64::MAX])) as ArrayRef],
+        )
+        .unwrap();
+        let idx = build_source_hash_index(&[batch], &[(0, 0)]).unwrap();
+
+        let signed_probe = vec![HashableKeyValue::Int64(-1)];
+        assert!(
+            !idx.contains_key(&signed_probe),
+            "Int64(-1) probe must not collide with UInt64(u64::MAX) source key"
+        );
+
+        // The matching unsigned probe is present.
+        let unsigned_probe = vec![HashableKeyValue::UInt64(u64::MAX)];
+        let hit = idx.get(&unsigned_probe).expect("UInt64 key should be present");
+        assert_eq!(hit.len(), 1);
+
+        // Symmetric direction: hash over an Int64(-1) batch, probe with
+        // UInt64(u64::MAX) — must miss.
+        let schema2 = Arc::new(Schema::new(vec![Field::new(
+            "k",
+            DataType::Int64,
+            false,
+        )]));
+        let batch2 = RecordBatch::try_new(
+            schema2,
+            vec![Arc::new(Int64Array::from(vec![-1i64])) as ArrayRef],
+        )
+        .unwrap();
+        let idx2 = build_source_hash_index(&[batch2], &[(0, 0)]).unwrap();
+        let cross_probe = vec![HashableKeyValue::UInt64(u64::MAX)];
+        assert!(
+            !idx2.contains_key(&cross_probe),
+            "UInt64(u64::MAX) probe must not collide with Int64(-1) source key"
+        );
+
+        // Direct PartialEq sanity: the discriminants make these unequal.
+        assert_ne!(HashableKeyValue::Int64(-1), HashableKeyValue::UInt64(u64::MAX));
+    }
+
     #[test]
     fn test_dml_count_schema() {
         // R5-S-045: Shared schema function
