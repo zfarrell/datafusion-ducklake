@@ -1,0 +1,100 @@
+diff --git a/src/types.rs b/src/types.rs
+index f3fc0f8..cb3bfdf 100644
+--- a/src/types.rs
++++ b/src/types.rs
+@@ -41,7 +41,11 @@ pub fn ducklake_to_arrow_type(ducklake_type: &str) -> Result<DataType> {
+ 
+         // Temporal types
+         "time" => Ok(DataType::Time64(TimeUnit::Microsecond)),
++        "time_s" => Ok(DataType::Time32(TimeUnit::Second)),
++        "time_ms" => Ok(DataType::Time32(TimeUnit::Millisecond)),
++        "time_ns" => Ok(DataType::Time64(TimeUnit::Nanosecond)),
+         "date" => Ok(DataType::Date32),
++        "date64" => Ok(DataType::Date64),
+         "timestamp" => Ok(DataType::Timestamp(TimeUnit::Microsecond, None)),
+         "timestamptz" | "timestamp with time zone" => Ok(DataType::Timestamp(
+             TimeUnit::Microsecond,
+@@ -54,10 +58,12 @@ pub fn ducklake_to_arrow_type(ducklake_type: &str) -> Result<DataType> {
+ 
+         // String types
+         "varchar" | "text" | "string" => Ok(DataType::Utf8),
++        "large_varchar" => Ok(DataType::LargeUtf8),
+         "json" => Ok(DataType::Utf8), // JSON stored as UTF8 string
+ 
+         // Binary types
+         "blob" | "binary" | "bytea" => Ok(DataType::Binary),
++        "large_blob" => Ok(DataType::LargeBinary),
+         "uuid" => Ok(DataType::FixedSizeBinary(16)),
+ 
+         // Geometry types (stored as binary WKB format)
+@@ -114,7 +120,12 @@ pub fn arrow_to_ducklake_type(arrow_type: &DataType) -> Result<String> {
+         DataType::Float64 => Ok("float64".to_string()),
+ 
+         // Temporal types
+-        DataType::Date32 | DataType::Date64 => Ok("date".to_string()),
++        DataType::Date32 => Ok("date".to_string()),
++        DataType::Date64 => Ok("date64".to_string()),
++        DataType::Time32(TimeUnit::Second) => Ok("time_s".to_string()),
++        DataType::Time32(TimeUnit::Millisecond) => Ok("time_ms".to_string()),
++        DataType::Time64(TimeUnit::Microsecond) => Ok("time".to_string()),
++        DataType::Time64(TimeUnit::Nanosecond) => Ok("time_ns".to_string()),
+         DataType::Time32(_) | DataType::Time64(_) => Ok("time".to_string()),
+         DataType::Timestamp(TimeUnit::Second, None) => Ok("timestamp_s".to_string()),
+         DataType::Timestamp(TimeUnit::Millisecond, None) => Ok("timestamp_ms".to_string()),
+@@ -124,10 +135,12 @@ pub fn arrow_to_ducklake_type(arrow_type: &DataType) -> Result<String> {
+         DataType::Interval(_) => Ok("interval".to_string()),
+ 
+         // String types
+-        DataType::Utf8 | DataType::LargeUtf8 => Ok("varchar".to_string()),
++        DataType::Utf8 => Ok("varchar".to_string()),
++        DataType::LargeUtf8 => Ok("large_varchar".to_string()),
+ 
+         // Binary types
+-        DataType::Binary | DataType::LargeBinary => Ok("blob".to_string()),
++        DataType::Binary => Ok("blob".to_string()),
++        DataType::LargeBinary => Ok("large_blob".to_string()),
+         DataType::FixedSizeBinary(16) => Ok("uuid".to_string()),
+         DataType::FixedSizeBinary(_) => Ok("blob".to_string()),
+ 
+@@ -493,17 +506,40 @@ mod tests {
+             "float64"
+         );
+         assert_eq!(arrow_to_ducklake_type(&DataType::Utf8).unwrap(), "varchar");
++        assert_eq!(
++            arrow_to_ducklake_type(&DataType::LargeUtf8).unwrap(),
++            "large_varchar"
++        );
+         assert_eq!(arrow_to_ducklake_type(&DataType::Binary).unwrap(), "blob");
++        assert_eq!(
++            arrow_to_ducklake_type(&DataType::LargeBinary).unwrap(),
++            "large_blob"
++        );
+     }
+ 
+     #[test]
+     fn test_arrow_to_ducklake_temporal_types() {
+         assert_eq!(arrow_to_ducklake_type(&DataType::Date32).unwrap(), "date");
+-        assert_eq!(arrow_to_ducklake_type(&DataType::Date64).unwrap(), "date");
++        assert_eq!(
++            arrow_to_ducklake_type(&DataType::Date64).unwrap(),
++            "date64"
++        );
++        assert_eq!(
++            arrow_to_ducklake_type(&DataType::Time32(TimeUnit::Second)).unwrap(),
++            "time_s"
++        );
++        assert_eq!(
++            arrow_to_ducklake_type(&DataType::Time32(TimeUnit::Millisecond)).unwrap(),
++            "time_ms"
++        );
+         assert_eq!(
+             arrow_to_ducklake_type(&DataType::Time64(TimeUnit::Microsecond)).unwrap(),
+             "time"
+         );
++        assert_eq!(
++            arrow_to_ducklake_type(&DataType::Time64(TimeUnit::Nanosecond)).unwrap(),
++            "time_ns"
++        );
+         assert_eq!(
+             arrow_to_ducklake_type(&DataType::Timestamp(TimeUnit::Microsecond, None)).unwrap(),
+             "timestamp"

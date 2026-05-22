@@ -1,0 +1,1240 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index bf37bc5..327d711 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -43,6 +43,7 @@ pub mod encryption;
+ pub mod error;
+ pub mod information_schema;
+ pub mod metadata_provider;
++pub mod parse_values;
+ pub mod path_resolver;
+ pub mod schema;
+ pub mod table;
+@@ -124,7 +125,7 @@ pub use metadata_provider_sqlite::SqliteMetadataProvider;
+ #[cfg(feature = "write")]
+ pub use delete_exec::DuckLakeDeleteExec;
+ #[cfg(feature = "write")]
+-pub use insert_exec::DuckLakeInsertExec;
++pub use insert_exec::{DuckLakeInsertExec, PartitionTransform};
+ #[cfg(feature = "write")]
+ pub use merge_exec::{DuckLakeMergeExec, MergeMatchedAction};
+ #[cfg(feature = "write")]
+diff --git a/src/metadata_writer_validation.rs b/src/metadata_writer_validation.rs
+index 30c26a3..770d76c 100644
+--- a/src/metadata_writer_validation.rs
++++ b/src/metadata_writer_validation.rs
+@@ -349,6 +349,11 @@ fn validate_drop_column_default(
+     })
+ }
+ 
++// Known limitation: SET NOT NULL only updates catalog metadata without scanning
++// existing data for nulls. If the column already contains NULL values, the
++// constraint will be recorded but not enforced retroactively. This matches
++// DuckDB's DuckLake behavior where the catalog is the source of truth for
++// constraints, but a full table scan would be needed to truly validate.
+ fn validate_set_not_null(
+     columns: &[ActiveColumnInfo],
+     column_name: &str,
+@@ -362,6 +367,11 @@ fn validate_set_not_null(
+         )));
+     };
+ 
++    tracing::warn!(
++        column = %column_name,
++        "SET NOT NULL does not validate existing data — constraint may be violated if column already contains nulls"
++    );
++
+     Ok(AlterTableAction::ReplaceColumn {
+         end_column_id: target_col.column_id,
+         column_name: target_col.column_name.clone(),
+@@ -403,6 +413,9 @@ fn validate_drop_not_null(
+     })
+ }
+ 
++/// Allowed partition transform values. Empty/None maps to identity.
++const ALLOWED_PARTITION_TRANSFORMS: &[&str] = &["identity", "year", "month", "day", "hour"];
++
+ fn validate_set_partitioned_by(
+     columns: &[ActiveColumnInfo],
+     partition_columns: &[PartitionColumnDef],
+@@ -413,8 +426,32 @@ fn validate_set_partitioned_by(
+         ));
+     }
+ 
++    // Check for duplicate partition columns
++    let mut seen_columns = std::collections::HashSet::new();
++    for pc in partition_columns {
++        if !seen_columns.insert(&pc.column_name) {
++            return Err(DuckLakeError::InvalidConfig(format!(
++                "Duplicate partition column '{}'",
++                pc.column_name
++            )));
++        }
++    }
++
+     let mut validated = Vec::with_capacity(partition_columns.len());
+     for pc in partition_columns {
++        // Validate transform value against allowlist
++        if let Some(ref transform) = pc.transform {
++            let t = transform.to_lowercase();
++            if !t.is_empty() && !ALLOWED_PARTITION_TRANSFORMS.contains(&t.as_str()) {
++                return Err(DuckLakeError::InvalidConfig(format!(
++                    "Invalid partition transform '{}' for column '{}'. Allowed transforms: {}",
++                    transform,
++                    pc.column_name,
++                    ALLOWED_PARTITION_TRANSFORMS.join(", ")
++                )));
++            }
++        }
++
+         let target = columns.iter().find(|c| c.column_name == pc.column_name);
+         let Some(target_col) = target else {
+             return Err(DuckLakeError::InvalidConfig(format!(
+@@ -841,6 +878,103 @@ mod tests {
+         assert!(validate_alter_table(&columns, &op).is_err());
+     }
+ 
++    // --- validate_set_partitioned_by tests ---
++
++    #[test]
++    fn test_partition_valid_transforms() {
++        let columns = make_columns(&[("id", "int64", 0, false), ("ts", "timestamp", 1, true)]);
++        for transform in &["identity", "year", "month", "day", "hour"] {
++            let op = AlterTableOp::SetPartitionedBy {
++                partition_columns: vec![PartitionColumnDef {
++                    column_name: "ts".into(),
++                    transform: Some(transform.to_string()),
++                }],
++            };
++            assert!(
++                validate_alter_table(&columns, &op).is_ok(),
++                "transform '{}' should be allowed",
++                transform
++            );
++        }
++    }
++
++    #[test]
++    fn test_partition_none_transform_ok() {
++        let columns = make_columns(&[("id", "int64", 0, false)]);
++        let op = AlterTableOp::SetPartitionedBy {
++            partition_columns: vec![PartitionColumnDef {
++                column_name: "id".into(),
++                transform: None,
++            }],
++        };
++        assert!(validate_alter_table(&columns, &op).is_ok());
++    }
++
++    #[test]
++    fn test_partition_empty_transform_ok() {
++        let columns = make_columns(&[("id", "int64", 0, false)]);
++        let op = AlterTableOp::SetPartitionedBy {
++            partition_columns: vec![PartitionColumnDef {
++                column_name: "id".into(),
++                transform: Some("".into()),
++            }],
++        };
++        assert!(validate_alter_table(&columns, &op).is_ok());
++    }
++
++    #[test]
++    fn test_partition_invalid_transform_rejected() {
++        let columns = make_columns(&[("id", "int64", 0, false)]);
++        let op = AlterTableOp::SetPartitionedBy {
++            partition_columns: vec![PartitionColumnDef {
++                column_name: "id".into(),
++                transform: Some("bucket".into()),
++            }],
++        };
++        let err = validate_alter_table(&columns, &op).unwrap_err();
++        assert!(err.to_string().contains("Invalid partition transform"));
++    }
++
++    #[test]
++    fn test_partition_duplicate_column_rejected() {
++        let columns = make_columns(&[("id", "int64", 0, false), ("ts", "timestamp", 1, true)]);
++        let op = AlterTableOp::SetPartitionedBy {
++            partition_columns: vec![
++                PartitionColumnDef {
++                    column_name: "id".into(),
++                    transform: None,
++                },
++                PartitionColumnDef {
++                    column_name: "id".into(),
++                    transform: Some("year".into()),
++                },
++            ],
++        };
++        let err = validate_alter_table(&columns, &op).unwrap_err();
++        assert!(err.to_string().contains("Duplicate partition column"));
++    }
++
++    #[test]
++    fn test_partition_nonexistent_column_rejected() {
++        let columns = make_columns(&[("id", "int64", 0, false)]);
++        let op = AlterTableOp::SetPartitionedBy {
++            partition_columns: vec![PartitionColumnDef {
++                column_name: "missing".into(),
++                transform: None,
++            }],
++        };
++        assert!(validate_alter_table(&columns, &op).is_err());
++    }
++
++    #[test]
++    fn test_partition_empty_list_rejected() {
++        let columns = make_columns(&[("id", "int64", 0, false)]);
++        let op = AlterTableOp::SetPartitionedBy {
++            partition_columns: vec![],
++        };
++        assert!(validate_alter_table(&columns, &op).is_err());
++    }
++
+     // --- quote_identifier tests ---
+ 
+     #[test]
+diff --git a/src/table.rs b/src/table.rs
+index 67e6903..402fd38 100644
+--- a/src/table.rs
++++ b/src/table.rs
+@@ -362,7 +362,11 @@ impl DuckLakeTable {
+             }
+ 
+             // Parse string values into the appropriate Arrow array type
+-            let array = parse_inlined_column(&string_values, data_type)?;
++            let array = crate::parse_values::parse_string_values_to_array(
++                &string_values,
++                data_type,
++                crate::parse_values::ParseMode::Lenient,
++            )?;
+             column_arrays.push(array);
+         }
+ 
+@@ -1576,7 +1580,9 @@ impl TableProvider for DuckLakeTable {
+                 self.build_exec_for_file_with_deletes(state, table_file, real_proj_ref, None)
+                     .await?
+             } else {
+-                self.build_exec_for_single_file(state, table_file, real_proj_ref, limit)
++                // Don't push limit to individual file scans — the combined plan
++                // handles the overall limit, pushing it here would read limit*N rows
++                self.build_exec_for_single_file(state, table_file, real_proj_ref, None)
+                     .await?
+             };
+             execs.push(Arc::new(VirtualColumnExec::new(
+@@ -1747,6 +1753,9 @@ impl TableProvider for DuckLakeTable {
+                 Some(crate::insert_exec::WritePartitionColumn {
+                     column_name: pc.column_name.clone(),
+                     column_index: col_idx,
++                    resolved_transform: crate::insert_exec::PartitionTransform::from_str_opt(
++                        pc.transform.as_deref(),
++                    ),
+                     transform: pc.transform.clone(),
+                 })
+             })
+@@ -1842,191 +1851,6 @@ fn extract_deleted_positions_from_batch(
+     Ok(())
+ }
+ 
+-/// Parse a column of string values into an Arrow array of the given data type.
+-///
+-/// Used for converting inlined data (stored as strings in the catalog) back into
+-/// typed Arrow arrays for query execution.
+-fn parse_inlined_column(
+-    values: &[Option<String>],
+-    data_type: &DataType,
+-) -> DataFusionResult<Arc<dyn Array>> {
+-    use arrow::array::*;
+-
+-    macro_rules! parse_primitive {
+-        ($builder_ty:ty, $values:expr) => {{
+-            let mut builder = <$builder_ty>::with_capacity($values.len());
+-            for val in $values {
+-                match val {
+-                    Some(s) => match s.parse() {
+-                        Ok(v) => builder.append_value(v),
+-                        Err(_) => builder.append_null(),
+-                    },
+-                    None => builder.append_null(),
+-                }
+-            }
+-            Arc::new(builder.finish()) as Arc<dyn Array>
+-        }};
+-    }
+-
+-    let array: Arc<dyn Array> = match data_type {
+-        DataType::Boolean => {
+-            let mut builder = BooleanBuilder::with_capacity(values.len());
+-            for val in values {
+-                match val {
+-                    Some(s) => match s.to_lowercase().as_str() {
+-                        "true" | "1" | "t" => builder.append_value(true),
+-                        "false" | "0" | "f" => builder.append_value(false),
+-                        _ => builder.append_null(),
+-                    },
+-                    None => builder.append_null(),
+-                }
+-            }
+-            Arc::new(builder.finish())
+-        },
+-        DataType::Int8 => parse_primitive!(Int8Builder, values),
+-        DataType::Int16 => parse_primitive!(Int16Builder, values),
+-        DataType::Int32 => parse_primitive!(Int32Builder, values),
+-        DataType::Int64 => parse_primitive!(Int64Builder, values),
+-        DataType::UInt8 => parse_primitive!(UInt8Builder, values),
+-        DataType::UInt16 => parse_primitive!(UInt16Builder, values),
+-        DataType::UInt32 => parse_primitive!(UInt32Builder, values),
+-        DataType::UInt64 => parse_primitive!(UInt64Builder, values),
+-        DataType::Float32 => parse_primitive!(Float32Builder, values),
+-        DataType::Float64 => parse_primitive!(Float64Builder, values),
+-        DataType::Utf8 => {
+-            let mut builder = StringBuilder::new();
+-            for val in values {
+-                match val {
+-                    Some(s) => builder.append_value(s),
+-                    None => builder.append_null(),
+-                }
+-            }
+-            Arc::new(builder.finish())
+-        },
+-        DataType::LargeUtf8 => {
+-            let mut builder = LargeStringBuilder::new();
+-            for val in values {
+-                match val {
+-                    Some(s) => builder.append_value(s),
+-                    None => builder.append_null(),
+-                }
+-            }
+-            Arc::new(builder.finish())
+-        },
+-        DataType::Date32 => {
+-            let mut builder = Date32Builder::with_capacity(values.len());
+-            for val in values {
+-                match val {
+-                    Some(s) => {
+-                        // Try ISO date string ("2024-06-15"), then epoch days
+-                        let epoch_days =
+-                            if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+-                                let epoch: chrono::NaiveDate =
+-                                    chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+-                                date.signed_duration_since(epoch).num_days() as i32
+-                            } else if let Ok(v) = s.parse::<i32>() {
+-                                v
+-                            } else {
+-                                builder.append_null();
+-                                continue;
+-                            };
+-                        builder.append_value(epoch_days);
+-                    },
+-                    None => builder.append_null(),
+-                }
+-            }
+-            Arc::new(builder.finish()) as Arc<dyn Array>
+-        },
+-        DataType::Date64 => {
+-            let mut builder = Date64Builder::with_capacity(values.len());
+-            for val in values {
+-                match val {
+-                    Some(s) => {
+-                        let epoch_ms =
+-                            if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+-                                let epoch: chrono::NaiveDate =
+-                                    chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+-                                date.signed_duration_since(epoch).num_days() as i64 * 86_400_000
+-                            } else if let Ok(v) = s.parse::<i64>() {
+-                                v
+-                            } else {
+-                                builder.append_null();
+-                                continue;
+-                            };
+-                        builder.append_value(epoch_ms);
+-                    },
+-                    None => builder.append_null(),
+-                }
+-            }
+-            Arc::new(builder.finish()) as Arc<dyn Array>
+-        },
+-        DataType::Timestamp(unit, tz) => {
+-            use arrow::datatypes::TimeUnit;
+-
+-            /// Parse a timestamp string (ISO or epoch integer) to epoch microseconds.
+-            fn parse_ts_to_us(s: &str) -> Option<i64> {
+-                if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+-                    let dt: chrono::NaiveDateTime = dt;
+-                    return Some(dt.and_utc().timestamp_micros());
+-                }
+-                if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
+-                    let dt: chrono::NaiveDateTime = dt;
+-                    return Some(dt.and_utc().timestamp_micros());
+-                }
+-                s.parse::<i64>().ok()
+-            }
+-
+-            macro_rules! build_timestamp {
+-                ($builder_ty:ty, $convert:expr) => {{
+-                    let mut builder = <$builder_ty>::with_capacity(values.len());
+-                    let convert_fn: fn(i64) -> i64 = $convert;
+-                    for val in values {
+-                        match val {
+-                            Some(s) => match parse_ts_to_us(s) {
+-                                Some(us) => builder.append_value(convert_fn(us)),
+-                                None => builder.append_null(),
+-                            },
+-                            None => builder.append_null(),
+-                        }
+-                    }
+-                    let arr = builder.finish();
+-                    match tz {
+-                        Some(tz) => Arc::new(arr.with_timezone(tz.as_ref())) as Arc<dyn Array>,
+-                        None => Arc::new(arr) as Arc<dyn Array>,
+-                    }
+-                }};
+-            }
+-
+-            match unit {
+-                TimeUnit::Second => {
+-                    build_timestamp!(TimestampSecondBuilder, |us: i64| us / 1_000_000)
+-                },
+-                TimeUnit::Millisecond => {
+-                    build_timestamp!(TimestampMillisecondBuilder, |us: i64| us / 1_000)
+-                },
+-                TimeUnit::Microsecond => {
+-                    build_timestamp!(TimestampMicrosecondBuilder, |us: i64| us)
+-                },
+-                TimeUnit::Nanosecond => {
+-                    build_timestamp!(TimestampNanosecondBuilder, |us: i64| us * 1_000)
+-                },
+-            }
+-        },
+-        _ => {
+-            // Fallback: store as strings
+-            let mut builder = StringBuilder::new();
+-            for val in values {
+-                match val {
+-                    Some(s) => builder.append_value(s),
+-                    None => builder.append_null(),
+-                }
+-            }
+-            Arc::new(builder.finish())
+-        },
+-    };
+-
+-    Ok(array)
+-}
+ 
+ /// Check if a DataFusion error is caused by an object store NotFound error.
+ fn is_object_store_not_found(err: &DataFusionError) -> bool {
+diff --git a/src/table_writer.rs b/src/table_writer.rs
+index 9e7740c..50bfa0d 100644
+--- a/src/table_writer.rs
++++ b/src/table_writer.rs
+@@ -1200,7 +1200,11 @@ pub(crate) fn inlined_rows_to_batch(
+         }
+ 
+         // Parse string values into the appropriate Arrow array type
+-        let array = parse_string_to_array(&string_values, data_type)?;
++        let array = crate::parse_values::parse_string_values_to_array(
++            &string_values,
++            data_type,
++            crate::parse_values::ParseMode::Strict,
++        )?;
+         column_arrays.push(array);
+     }
+ 
+@@ -1210,308 +1214,6 @@ pub(crate) fn inlined_rows_to_batch(
+     )?)
+ }
+ 
+-/// Parse a decimal string (e.g. "123.45") to an i128 value scaled by 10^scale.
+-fn parse_decimal_string(s: &str, scale: i8) -> Result<i128> {
+-    let negative = s.starts_with('-');
+-    let s = if negative {
+-        &s[1..]
+-    } else {
+-        s
+-    };
+-
+-    let (integer_part, frac_part) = if let Some(dot_pos) = s.find('.') {
+-        (&s[..dot_pos], &s[dot_pos + 1..])
+-    } else {
+-        (s, "")
+-    };
+-
+-    let integer: i128 = if integer_part.is_empty() {
+-        0
+-    } else {
+-        integer_part.parse::<i128>().map_err(|_| {
+-            crate::error::DuckLakeError::Internal(format!(
+-                "Failed to parse decimal integer part '{}'",
+-                integer_part
+-            ))
+-        })?
+-    };
+-
+-    let scale_u = scale.max(0) as u32;
+-    let frac_len = frac_part.len() as u32;
+-    let frac: i128 = if frac_part.is_empty() {
+-        0
+-    } else if frac_len <= scale_u {
+-        let frac_val: i128 = frac_part.parse::<i128>().map_err(|_| {
+-            crate::error::DuckLakeError::Internal(format!(
+-                "Failed to parse decimal fraction part '{}'",
+-                frac_part
+-            ))
+-        })?;
+-        frac_val * 10i128.pow(scale_u - frac_len)
+-    } else {
+-        // Truncate extra digits
+-        let truncated = &frac_part[..scale_u as usize];
+-        truncated.parse::<i128>().map_err(|_| {
+-            crate::error::DuckLakeError::Internal(format!(
+-                "Failed to parse decimal fraction part '{}'",
+-                truncated
+-            ))
+-        })?
+-    };
+-
+-    let unscaled = integer * 10i128.pow(scale_u) + frac;
+-    Ok(if negative {
+-        -unscaled
+-    } else {
+-        unscaled
+-    })
+-}
+-
+-/// Parse string values into an Arrow array of the given data type.
+-fn parse_string_to_array(
+-    values: &[Option<String>],
+-    data_type: &arrow::datatypes::DataType,
+-) -> Result<Arc<dyn arrow::array::Array>> {
+-    use arrow::array::*;
+-    use arrow::datatypes::DataType;
+-
+-    macro_rules! parse_primitive {
+-        ($builder_ty:ty, $values:expr) => {{
+-            let mut builder = <$builder_ty>::with_capacity($values.len());
+-            for val in $values {
+-                match val {
+-                    Some(s) => match s.parse() {
+-                        Ok(v) => builder.append_value(v),
+-                        Err(_) => {
+-                            return Err(crate::error::DuckLakeError::Internal(format!(
+-                                "Failed to parse inlined value '{}' as {}",
+-                                s,
+-                                std::any::type_name::<$builder_ty>()
+-                            )));
+-                        },
+-                    },
+-                    None => builder.append_null(),
+-                }
+-            }
+-            Arc::new(builder.finish()) as Arc<dyn Array>
+-        }};
+-    }
+-
+-    let array: Arc<dyn arrow::array::Array> = match data_type {
+-        DataType::Boolean => {
+-            let mut builder = BooleanBuilder::with_capacity(values.len());
+-            for val in values {
+-                match val {
+-                    Some(s) => match s.to_lowercase().as_str() {
+-                        "true" | "1" | "t" => builder.append_value(true),
+-                        "false" | "0" | "f" => builder.append_value(false),
+-                        _ => {
+-                            return Err(crate::error::DuckLakeError::Internal(format!(
+-                                "Failed to parse inlined value '{}' as Boolean",
+-                                s
+-                            )));
+-                        },
+-                    },
+-                    None => builder.append_null(),
+-                }
+-            }
+-            Arc::new(builder.finish())
+-        },
+-        DataType::Int8 => parse_primitive!(Int8Builder, values),
+-        DataType::Int16 => parse_primitive!(Int16Builder, values),
+-        DataType::Int32 => parse_primitive!(Int32Builder, values),
+-        DataType::Int64 => parse_primitive!(Int64Builder, values),
+-        DataType::UInt8 => parse_primitive!(UInt8Builder, values),
+-        DataType::UInt16 => parse_primitive!(UInt16Builder, values),
+-        DataType::UInt32 => parse_primitive!(UInt32Builder, values),
+-        DataType::UInt64 => parse_primitive!(UInt64Builder, values),
+-        DataType::Float32 => parse_primitive!(Float32Builder, values),
+-        DataType::Float64 => parse_primitive!(Float64Builder, values),
+-        DataType::Utf8 => {
+-            let mut builder = StringBuilder::new();
+-            for val in values {
+-                match val {
+-                    Some(s) => builder.append_value(s),
+-                    None => builder.append_null(),
+-                }
+-            }
+-            Arc::new(builder.finish())
+-        },
+-        DataType::LargeUtf8 => {
+-            let mut builder = LargeStringBuilder::new();
+-            for val in values {
+-                match val {
+-                    Some(s) => builder.append_value(s),
+-                    None => builder.append_null(),
+-                }
+-            }
+-            Arc::new(builder.finish())
+-        },
+-        DataType::Date32 => {
+-            let mut builder = Date32Builder::with_capacity(values.len());
+-            for val in values {
+-                match val {
+-                    Some(s) => {
+-                        // Try ISO date string first ("2024-06-15"), then epoch days
+-                        let epoch_days =
+-                            if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+-                                let epoch: chrono::NaiveDate =
+-                                    chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+-                                date.signed_duration_since(epoch).num_days() as i32
+-                            } else if let Ok(v) = s.parse::<i32>() {
+-                                v
+-                            } else {
+-                                return Err(crate::error::DuckLakeError::Internal(format!(
+-                                    "Failed to parse inlined value '{}' as Date32",
+-                                    s
+-                                )));
+-                            };
+-                        builder.append_value(epoch_days);
+-                    },
+-                    None => builder.append_null(),
+-                }
+-            }
+-            Arc::new(builder.finish()) as Arc<dyn Array>
+-        },
+-        DataType::Date64 => {
+-            let mut builder = Date64Builder::with_capacity(values.len());
+-            for val in values {
+-                match val {
+-                    Some(s) => {
+-                        let epoch_ms =
+-                            if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+-                                let epoch: chrono::NaiveDate =
+-                                    chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+-                                date.signed_duration_since(epoch).num_days() as i64 * 86_400_000
+-                            } else if let Ok(v) = s.parse::<i64>() {
+-                                v
+-                            } else {
+-                                return Err(crate::error::DuckLakeError::Internal(format!(
+-                                    "Failed to parse inlined value '{}' as Date64",
+-                                    s
+-                                )));
+-                            };
+-                        builder.append_value(epoch_ms);
+-                    },
+-                    None => builder.append_null(),
+-                }
+-            }
+-            Arc::new(builder.finish()) as Arc<dyn Array>
+-        },
+-        DataType::Timestamp(unit, tz) => {
+-            use arrow::datatypes::TimeUnit;
+-
+-            /// Parse a timestamp string (ISO or epoch integer) to epoch microseconds.
+-            fn parse_timestamp_to_us(s: &str) -> std::result::Result<i64, String> {
+-                // Try ISO format first: "2024-06-15 12:30:00"
+-                if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+-                    let utc: chrono::DateTime<chrono::Utc> = dt.and_utc();
+-                    return Ok(utc.timestamp_micros());
+-                }
+-                // Try with fractional seconds: "2024-06-15 12:30:00.123456"
+-                if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
+-                    let utc: chrono::DateTime<chrono::Utc> = dt.and_utc();
+-                    return Ok(utc.timestamp_micros());
+-                }
+-                // Fallback: raw integer (epoch microseconds)
+-                s.parse::<i64>()
+-                    .map_err(|_| format!("Failed to parse '{}' as Timestamp", s))
+-            }
+-
+-            macro_rules! build_timestamp {
+-                ($builder_ty:ty, $convert:expr) => {{
+-                    let mut builder = <$builder_ty>::with_capacity(values.len());
+-                    let convert_fn: fn(i64) -> i64 = $convert;
+-                    for val in values {
+-                        match val {
+-                            Some(s) => match parse_timestamp_to_us(s) {
+-                                Ok(us) => builder.append_value(convert_fn(us)),
+-                                Err(msg) => {
+-                                    return Err(crate::error::DuckLakeError::Internal(msg));
+-                                },
+-                            },
+-                            None => builder.append_null(),
+-                        }
+-                    }
+-                    let arr = builder.finish();
+-                    match tz {
+-                        Some(tz) => Arc::new(arr.with_timezone(tz.as_ref())) as Arc<dyn Array>,
+-                        None => Arc::new(arr) as Arc<dyn Array>,
+-                    }
+-                }};
+-            }
+-
+-            match unit {
+-                TimeUnit::Second => {
+-                    build_timestamp!(TimestampSecondBuilder, |us: i64| us / 1_000_000)
+-                },
+-                TimeUnit::Millisecond => {
+-                    build_timestamp!(TimestampMillisecondBuilder, |us: i64| us / 1_000)
+-                },
+-                TimeUnit::Microsecond => {
+-                    build_timestamp!(TimestampMicrosecondBuilder, |us: i64| us)
+-                },
+-                TimeUnit::Nanosecond => {
+-                    build_timestamp!(TimestampNanosecondBuilder, |us: i64| us * 1_000)
+-                },
+-            }
+-        },
+-        DataType::Decimal128(precision, scale) => {
+-            let mut builder = Decimal128Builder::with_capacity(values.len());
+-            for val in values {
+-                match val {
+-                    Some(s) => {
+-                        let i128_val = parse_decimal_string(s, *scale)?;
+-                        builder.append_value(i128_val);
+-                    },
+-                    None => builder.append_null(),
+-                }
+-            }
+-            Arc::new(
+-                builder
+-                    .finish()
+-                    .with_precision_and_scale(*precision, *scale)
+-                    .map_err(|e| {
+-                        crate::error::DuckLakeError::Internal(format!(
+-                            "Invalid Decimal128 precision/scale: {}",
+-                            e
+-                        ))
+-                    })?,
+-            ) as Arc<dyn Array>
+-        },
+-        DataType::Decimal256(precision, scale) => {
+-            let mut builder = Decimal256Builder::with_capacity(values.len());
+-            for val in values {
+-                match val {
+-                    Some(s) => {
+-                        let i128_val = parse_decimal_string(s, *scale)?;
+-                        builder.append_value(arrow::datatypes::i256::from_i128(i128_val));
+-                    },
+-                    None => builder.append_null(),
+-                }
+-            }
+-            Arc::new(
+-                builder
+-                    .finish()
+-                    .with_precision_and_scale(*precision, *scale)
+-                    .map_err(|e| {
+-                        crate::error::DuckLakeError::Internal(format!(
+-                            "Invalid Decimal256 precision/scale: {}",
+-                            e
+-                        ))
+-                    })?,
+-            ) as Arc<dyn Array>
+-        },
+-        other => {
+-            return Err(crate::error::DuckLakeError::UnsupportedType(format!(
+-                "Unsupported data type {:?} in parse_string_to_array",
+-                other
+-            )));
+-        },
+-    };
+-
+-    Ok(array)
+-}
+ 
+ pub(crate) fn arrow_schema_to_column_defs(schema: &Schema) -> Result<Vec<ColumnDef>> {
+     schema
+diff --git a/tests/hybrid_asyncdb.rs b/tests/hybrid_asyncdb.rs
+index 9082658..dbe525f 100644
+--- a/tests/hybrid_asyncdb.rs
++++ b/tests/hybrid_asyncdb.rs
+@@ -116,6 +116,12 @@ impl HybridDuckLakeDB {
+     /// Includes WRITE operations, catalog management, and DuckDB-specific statements
+     fn is_write_statement(sql: &str) -> bool {
+         let trimmed = sql.trim().trim_end_matches(';').trim().to_uppercase();
++
++        // Check for CTE-wrapped DML: WITH ... INSERT/UPDATE/DELETE/MERGE
++        if trimmed.starts_with("WITH ") {
++            return Self::cte_wraps_dml(&trimmed);
++        }
++
+         trimmed.starts_with("CREATE ")
+             || trimmed.starts_with("INSERT ")
+             || trimmed.starts_with("UPDATE ")
+@@ -142,6 +148,53 @@ impl HybridDuckLakeDB {
+             || trimmed.starts_with("ROLLBACK ")
+     }
+ 
++    /// Check if a CTE-prefixed statement wraps a DML keyword (INSERT/UPDATE/DELETE/MERGE).
++    /// Scans past balanced parentheses in the CTE definitions to find the main statement.
++    fn cte_wraps_dml(upper_sql: &str) -> bool {
++        let dml_keywords = ["INSERT ", "UPDATE ", "DELETE ", "MERGE "];
++        let mut depth: i32 = 0;
++        let mut in_quote = false;
++        let bytes = upper_sql.as_bytes();
++        let len = bytes.len();
++        let mut i = 0;
++        let mut last_close_at_zero = None;
++        while i < len {
++            let b = bytes[i];
++            if in_quote {
++                if b == b'\'' {
++                    if i + 1 < len && bytes[i + 1] == b'\'' {
++                        i += 2;
++                        continue;
++                    }
++                    in_quote = false;
++                }
++                i += 1;
++                continue;
++            }
++            match b {
++                b'\'' => in_quote = true,
++                b'(' => depth += 1,
++                b')' => {
++                    depth -= 1;
++                    if depth == 0 {
++                        last_close_at_zero = Some(i);
++                    }
++                },
++                _ => {},
++            }
++            i += 1;
++        }
++        if let Some(pos) = last_close_at_zero {
++            let remainder = upper_sql[pos + 1..].trim_start();
++            for kw in &dml_keywords {
++                if remainder.starts_with(kw) {
++                    return true;
++                }
++            }
++        }
++        false
++    }
++
+     /// Rewrite table references from 2-part to 3-part names
+     /// ducklake.table → ducklake.main.table
+     /// ducklake.schema.table → unchanged (already 3-part)
+@@ -153,17 +206,18 @@ impl HybridDuckLakeDB {
+         let mut last_pos = 0;
+ 
+         while let Some(&(i, ch)) = chars.peek() {
+-            if ch == '\'' {
+-                // Inside a single-quoted string literal — copy verbatim until closing quote
++            if ch == '\'' || ch == '"' {
++                // Inside a quoted region — copy verbatim until closing quote
++                let quote_char = ch;
+                 result.push_str(&sql[last_pos..i]);
+                 last_pos = i;
+                 chars.next(); // consume opening quote
+                 while let Some(&(_, c)) = chars.peek() {
+                     chars.next();
+-                    if c == '\'' {
+-                        // Check for escaped quote ('')
++                    if c == quote_char {
++                        // Check for escaped quote (doubled)
+                         if let Some(&(_, next_c)) = chars.peek() {
+-                            if next_c == '\'' {
++                            if next_c == quote_char {
+                                 chars.next(); // skip escaped quote
+                                 continue;
+                             }
+@@ -171,7 +225,7 @@ impl HybridDuckLakeDB {
+                         break;
+                     }
+                 }
+-                // Copy the entire string literal as-is
++                // Copy the entire quoted region as-is
+                 let end = chars.peek().map(|&(idx, _)| idx).unwrap_or(sql.len());
+                 result.push_str(&sql[last_pos..end]);
+                 last_pos = end;
+@@ -567,6 +621,50 @@ fn format_float(v: f64) -> String {
+     }
+ }
+ 
++/// Convert an Arrow array value to string for the SLT adapter.
++///
++/// Delegates to `test_utils::arrow_value_to_string` for shared types,
++/// adding SLT-specific handling for floats (NaN/Inf) and Binary.
++fn slt_arrow_value_to_string(
++    column: &dyn datafusion::arrow::array::Array,
++    row_idx: usize,
++    col_idx: usize,
++) -> String {
++    use super::common::test_utils::arrow_value_to_string;
++
++    match column.data_type() {
++        // SLT adapter needs DuckDB float conventions (NaN→"nan", Inf→"inf")
++        DataType::Float32 => {
++            let arr = column.as_any().downcast_ref::<Float32Array>().unwrap();
++            format_float(arr.value(row_idx) as f64)
++        },
++        DataType::Float64 => {
++            let arr = column.as_any().downcast_ref::<Float64Array>().unwrap();
++            format_float(arr.value(row_idx))
++        },
++        // Binary is SLT-specific (not needed in cross-engine tests)
++        DataType::Binary => {
++            let arr = column.as_any().downcast_ref::<BinaryArray>().unwrap();
++            let bytes = arr.value(row_idx);
++            bytes
++                .iter()
++                .map(|b| format!("{:02X}", b))
++                .collect::<String>()
++        },
++        // All other types: delegate to shared converter
++        other => {
++            let result = arrow_value_to_string(column, row_idx);
++            if result.starts_with("<unsupported:") {
++                panic!(
++                    "convert_batch_to_strings: unsupported Arrow type {:?} at col {} row {}",
++                    other, col_idx, row_idx
++                );
++            }
++            result
++        },
++    }
++}
++
+ /// Convert RecordBatch to string rows for sqllogictest
+ fn convert_batch_to_strings(batch: &RecordBatch) -> Result<Vec<Vec<String>>, HybridError> {
+     let mut rows = Vec::new();
+@@ -578,153 +676,7 @@ fn convert_batch_to_strings(batch: &RecordBatch) -> Result<Vec<Vec<String>>, Hyb
+             let value = if column.is_null(row_idx) {
+                 "NULL".to_string()
+             } else {
+-                match column.data_type() {
+-                    DataType::Int8 => {
+-                        let arr = column.as_any().downcast_ref::<Int8Array>().unwrap();
+-                        arr.value(row_idx).to_string()
+-                    },
+-                    DataType::Int16 => {
+-                        let arr = column.as_any().downcast_ref::<Int16Array>().unwrap();
+-                        arr.value(row_idx).to_string()
+-                    },
+-                    DataType::Int32 => {
+-                        let arr = column.as_any().downcast_ref::<Int32Array>().unwrap();
+-                        arr.value(row_idx).to_string()
+-                    },
+-                    DataType::Int64 => {
+-                        let arr = column.as_any().downcast_ref::<Int64Array>().unwrap();
+-                        arr.value(row_idx).to_string()
+-                    },
+-                    DataType::UInt8 => {
+-                        let arr = column.as_any().downcast_ref::<UInt8Array>().unwrap();
+-                        arr.value(row_idx).to_string()
+-                    },
+-                    DataType::UInt16 => {
+-                        let arr = column.as_any().downcast_ref::<UInt16Array>().unwrap();
+-                        arr.value(row_idx).to_string()
+-                    },
+-                    DataType::UInt32 => {
+-                        let arr = column.as_any().downcast_ref::<UInt32Array>().unwrap();
+-                        arr.value(row_idx).to_string()
+-                    },
+-                    DataType::UInt64 => {
+-                        let arr = column.as_any().downcast_ref::<UInt64Array>().unwrap();
+-                        arr.value(row_idx).to_string()
+-                    },
+-                    DataType::Float32 => {
+-                        let arr = column.as_any().downcast_ref::<Float32Array>().unwrap();
+-                        format_float(arr.value(row_idx) as f64)
+-                    },
+-                    DataType::Float64 => {
+-                        let arr = column.as_any().downcast_ref::<Float64Array>().unwrap();
+-                        format_float(arr.value(row_idx))
+-                    },
+-                    DataType::Utf8 => {
+-                        let arr = column.as_any().downcast_ref::<StringArray>().unwrap();
+-                        arr.value(row_idx).to_string()
+-                    },
+-                    DataType::LargeUtf8 => {
+-                        let arr = column.as_any().downcast_ref::<LargeStringArray>().unwrap();
+-                        arr.value(row_idx).to_string()
+-                    },
+-                    DataType::Boolean => {
+-                        let arr = column.as_any().downcast_ref::<BooleanArray>().unwrap();
+-                        arr.value(row_idx).to_string()
+-                    },
+-                    DataType::Date32 => {
+-                        let arr = column
+-                            .as_any()
+-                            .downcast_ref::<Date32Array>()
+-                            .expect("Date32 downcast");
+-                        arr.value_as_date(row_idx)
+-                            .expect("Date32 value_as_date")
+-                            .to_string()
+-                    },
+-                    DataType::Timestamp(unit, _) => {
+-                        use datafusion::arrow::datatypes::TimeUnit;
+-                        // Use consistent format with test_utils.rs: %Y-%m-%d %H:%M:%S
+-                        // (truncates sub-seconds to match DuckDB display format)
+-                        match unit {
+-                            TimeUnit::Second => {
+-                                let arr = column
+-                                    .as_any()
+-                                    .downcast_ref::<TimestampSecondArray>()
+-                                    .unwrap();
+-                                let s = arr.value(row_idx);
+-                                let dt = chrono::DateTime::from_timestamp(s, 0).unwrap();
+-                                dt.format("%Y-%m-%d %H:%M:%S").to_string()
+-                            },
+-                            TimeUnit::Millisecond => {
+-                                let arr = column
+-                                    .as_any()
+-                                    .downcast_ref::<TimestampMillisecondArray>()
+-                                    .unwrap();
+-                                let ms = arr.value(row_idx);
+-                                let secs = ms.div_euclid(1_000);
+-                                let subsec_ms = ms.rem_euclid(1_000) as u32;
+-                                let dt =
+-                                    chrono::DateTime::from_timestamp(secs, subsec_ms * 1_000_000)
+-                                        .unwrap();
+-                                dt.format("%Y-%m-%d %H:%M:%S").to_string()
+-                            },
+-                            TimeUnit::Microsecond => {
+-                                let arr = column
+-                                    .as_any()
+-                                    .downcast_ref::<TimestampMicrosecondArray>()
+-                                    .unwrap();
+-                                let us = arr.value(row_idx);
+-                                let secs = us.div_euclid(1_000_000);
+-                                let subsec_us = us.rem_euclid(1_000_000) as u32;
+-                                let dt = chrono::DateTime::from_timestamp(secs, subsec_us * 1_000)
+-                                    .unwrap();
+-                                dt.format("%Y-%m-%d %H:%M:%S").to_string()
+-                            },
+-                            TimeUnit::Nanosecond => {
+-                                let arr = column
+-                                    .as_any()
+-                                    .downcast_ref::<TimestampNanosecondArray>()
+-                                    .unwrap();
+-                                let ns = arr.value(row_idx);
+-                                let secs = ns.div_euclid(1_000_000_000);
+-                                let subsec_ns = ns.rem_euclid(1_000_000_000) as u32;
+-                                let dt = chrono::DateTime::from_timestamp(secs, subsec_ns).unwrap();
+-                                dt.format("%Y-%m-%d %H:%M:%S").to_string()
+-                            },
+-                        }
+-                    },
+-                    DataType::Decimal128(_, scale) => {
+-                        let arr = column
+-                            .as_any()
+-                            .downcast_ref::<Decimal128Array>()
+-                            .expect("Decimal128 downcast");
+-                        let raw = arr.value(row_idx);
+-                        let scale = *scale as u32;
+-                        let divisor = 10i128.pow(scale);
+-                        let whole = raw / divisor;
+-                        let frac = (raw % divisor).unsigned_abs();
+-                        let sign = if raw < 0 && whole == 0 {
+-                            "-"
+-                        } else {
+-                            ""
+-                        };
+-                        format!("{sign}{whole}.{frac:0>width$}", width = scale as usize)
+-                    },
+-                    DataType::Binary => {
+-                        let arr = column.as_any().downcast_ref::<BinaryArray>().unwrap();
+-                        let bytes = arr.value(row_idx);
+-                        // Format as hex string
+-                        bytes
+-                            .iter()
+-                            .map(|b| format!("{:02X}", b))
+-                            .collect::<String>()
+-                    },
+-                    other => {
+-                        panic!(
+-                            "convert_batch_to_strings: unsupported Arrow type {:?} at col {} row {}",
+-                            other, col_idx, row_idx
+-                        );
+-                    },
+-                }
++                slt_arrow_value_to_string(column.as_ref(), row_idx, col_idx)
+             };
+             row.push(value);
+         }
+@@ -968,17 +920,55 @@ mod tests {
+         assert!(HybridDuckLakeDB::is_write_statement("EXECUTE stmt"));
+     }
+ 
+-    #[test]
+-    fn test_transaction_state_tracking() {
+-        // Verify that in_transaction flag is toggled by BEGIN/COMMIT/ROLLBACK
++    #[tokio::test]
++    async fn test_transaction_state_tracking() {
++        use sqllogictest::AsyncDB;
++
+         let temp_dir = tempfile::TempDir::new().unwrap();
+         let catalog_path = temp_dir.path().join("test_tx.ducklake");
+-        let db = HybridDuckLakeDB::new(catalog_path).unwrap();
++        let mut db = HybridDuckLakeDB::new(catalog_path).unwrap();
+ 
+         assert!(
+-            !db.in_transaction.load(std::sync::atomic::Ordering::Relaxed),
++            !db.in_transaction
++                .load(std::sync::atomic::Ordering::Relaxed),
+             "Should not be in transaction initially"
+         );
++
++        // BEGIN should set in_transaction to true
++        db.run("CREATE TABLE ducklake.test_tx (id INTEGER)")
++            .await
++            .unwrap();
++        db.run("BEGIN").await.unwrap();
++        assert!(
++            db.in_transaction
++                .load(std::sync::atomic::Ordering::Relaxed),
++            "Should be in transaction after BEGIN"
++        );
++
++        // COMMIT should set in_transaction back to false
++        db.run("INSERT INTO ducklake.test_tx VALUES (1)")
++            .await
++            .unwrap();
++        db.run("COMMIT").await.unwrap();
++        assert!(
++            !db.in_transaction
++                .load(std::sync::atomic::Ordering::Relaxed),
++            "Should not be in transaction after COMMIT"
++        );
++
++        // BEGIN + ROLLBACK should also set in_transaction back to false
++        db.run("BEGIN").await.unwrap();
++        assert!(
++            db.in_transaction
++                .load(std::sync::atomic::Ordering::Relaxed),
++            "Should be in transaction after second BEGIN"
++        );
++        db.run("ROLLBACK").await.unwrap();
++        assert!(
++            !db.in_transaction
++                .load(std::sync::atomic::Ordering::Relaxed),
++            "Should not be in transaction after ROLLBACK"
++        );
+     }
+ 
+     #[test]
+@@ -1049,4 +1039,70 @@ mod tests {
+         );
+         assert_eq!(rows[3][0], "0.00", "Zero should not have negative sign");
+     }
++
++    #[test]
++    fn test_rewrite_order_by_all_basic() {
++        assert_eq!(
++            HybridDuckLakeDB::rewrite_order_by_all("SELECT * FROM t ORDER BY ALL"),
++            "SELECT * FROM t"
++        );
++    }
++
++    #[test]
++    fn test_rewrite_order_by_all_with_limit() {
++        assert_eq!(
++            HybridDuckLakeDB::rewrite_order_by_all("SELECT * FROM t ORDER BY ALL LIMIT 10"),
++            "SELECT * FROM t LIMIT 10"
++        );
++    }
++
++    #[test]
++    fn test_rewrite_order_by_all_not_present() {
++        let sql = "SELECT * FROM t ORDER BY id";
++        assert_eq!(HybridDuckLakeDB::rewrite_order_by_all(sql), sql);
++    }
++
++    #[test]
++    fn test_rewrite_order_by_all_inside_string() {
++        let sql = "SELECT 'ORDER BY ALL' FROM t";
++        let result = HybridDuckLakeDB::rewrite_order_by_all(sql);
++        assert!(
++            result.contains("SELECT") && result.contains("FROM t"),
++            "Should still be a valid query: {result}"
++        );
++    }
++
++    #[test]
++    fn test_is_write_statement_cte_wrapped_dml() {
++        assert!(HybridDuckLakeDB::is_write_statement(
++            "WITH cte AS (SELECT 1 AS id) INSERT INTO t SELECT * FROM cte"
++        ));
++        assert!(HybridDuckLakeDB::is_write_statement(
++            "WITH cte AS (SELECT 1 AS id) UPDATE t SET x = 1"
++        ));
++        assert!(HybridDuckLakeDB::is_write_statement(
++            "WITH cte AS (SELECT 1 AS id) DELETE FROM t WHERE id IN (SELECT id FROM cte)"
++        ));
++        assert!(HybridDuckLakeDB::is_write_statement(
++            "WITH cte AS (SELECT 1 AS id) MERGE INTO t USING cte ON t.id = cte.id WHEN MATCHED THEN DELETE"
++        ));
++        assert!(!HybridDuckLakeDB::is_write_statement(
++            "WITH cte AS (SELECT 1) SELECT * FROM cte"
++        ));
++    }
++
++    #[test]
++    fn test_rewrite_preserves_double_quoted_identifiers() {
++        let result = HybridDuckLakeDB::rewrite_table_references(
++            "SELECT * FROM ducklake.t WHERE \"ducklake.col\" = 1",
++        );
++        assert!(
++            result.contains("ducklake.main.t"),
++            "Table reference should be rewritten: {result}"
++        );
++        assert!(
++            result.contains("\"ducklake.col\""),
++            "Double-quoted identifier should NOT be rewritten: {result}"
++        );
++    }
+ }
+diff --git a/tests/sqllogictest_runner.rs b/tests/sqllogictest_runner.rs
+index a323345..9d309bc 100644
+--- a/tests/sqllogictest_runner.rs
++++ b/tests/sqllogictest_runner.rs
+@@ -660,8 +660,9 @@ fn contains_unsupported_function(sql_upper: &str) -> bool {
+         || sql_upper.contains("DUCKLAKE_METADATA.")
+         || sql_upper.contains("DUCKLAKE_META.")
+         || sql_upper.contains("METADATA.DUCKLAKE_")
+-        // DuckDB functions not available
+-        || sql_upper.contains("COLUMNS(")
++        // DuckDB COLUMNS(*) table function (not a standard SQL function)
++        || sql_upper.contains(" COLUMNS(")
++        || sql_upper.starts_with("COLUMNS(")
+         // Infinity timestamp literals (DataFusion optimizer can't handle)
+         || sql_upper.contains("'INFINITY'")
+         || sql_upper.contains("'-INFINITY'")
+@@ -781,8 +782,14 @@ async fn run_hybrid_test(test_file: &str) -> Result<(), Box<dyn std::error::Erro
+     let test_dir_str = temp_dir.path().to_string_lossy().to_string();
+     let processed_content = preprocess_test_file(&original_content, &test_dir_str);
+ 
+-    // Verify that preprocessing didn't eliminate all meaningful statements.
+-    // Count actual test directives (not just "halt" which stops the test early).
++    // Count original vs preprocessed test directives to detect excessive filtering
++    let original_count = original_content
++        .lines()
++        .filter(|line| {
++            let t = line.trim();
++            t.starts_with("statement") || t.starts_with("query")
++        })
++        .count();
+     let meaningful_count = processed_content
+         .lines()
+         .filter(|line| {
+@@ -790,6 +797,12 @@ async fn run_hybrid_test(test_file: &str) -> Result<(), Box<dyn std::error::Erro
+             t.starts_with("statement") || t.starts_with("query")
+         })
+         .count();
++    let filtered_count = original_count.saturating_sub(meaningful_count);
++    if filtered_count > 0 {
++        eprintln!(
++            "SLT preprocessing: {test_file}: {meaningful_count}/{original_count} directives kept ({filtered_count} filtered)"
++        );
++    }
+     assert!(
+         meaningful_count > 0,
+         "Preprocessed test file has zero statements/queries — test would pass vacuously: {test_file}"

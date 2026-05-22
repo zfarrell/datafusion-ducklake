@@ -1,0 +1,130 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 44ba1a3..61f8400 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -22,6 +22,7 @@ arrow = "57"
+ parquet = "57"
+ object_store = { version = "0.12.4", features = ["aws"] }
+ url = "2.5"
++percent-encoding = "2"
+ async-trait = "0.1"
+ tokio = { version = "1", features = ["full"] }
+ futures = "0.3"
+diff --git a/src/path_resolver.rs b/src/path_resolver.rs
+index 389e906..f66e965 100644
+--- a/src/path_resolver.rs
++++ b/src/path_resolver.rs
+@@ -5,6 +5,7 @@
+ 
+ use crate::{DuckLakeError, Result};
+ use datafusion::datasource::object_store::ObjectStoreUrl;
++use percent_encoding::percent_decode_str;
+ use std::sync::Arc;
+ 
+ /// Validate that a path does not contain null bytes (literal or URL-encoded)
+@@ -58,6 +59,10 @@ fn validate_no_path_traversal(path: &str) -> Result<()> {
+             path
+         )));
+     }
++    // Fast path: skip allocation if no percent-encoded characters
++    if !path.contains('%') {
++        return Ok(());
++    }
+     // Also check the percent-decoded path to catch encoded variants
+     // (e.g., %2e%2e%2f, ..%2f, %2e%2e%2F, ..%2F, etc.)
+     let decoded = percent_decode_path(path);
+@@ -110,9 +115,11 @@ fn validate_path(path: &str) -> Result<()> {
+ pub fn parse_object_store_url(data_path: &str) -> Result<(ObjectStoreUrl, String)> {
+     validate_path(data_path)?;
+ 
+-    if data_path.starts_with("s3://") {
++    // Use case-insensitive scheme matching per RFC 3986
++    let lower = data_path.to_ascii_lowercase();
++    if lower.starts_with("s3://") {
+         parse_s3_url(data_path)
+-    } else if data_path.starts_with("file://") {
++    } else if lower.starts_with("file://") {
+         parse_file_url(data_path)
+     } else {
+         parse_local_path(data_path)
+@@ -146,7 +153,20 @@ fn parse_file_url(data_path: &str) -> Result<(ObjectStoreUrl, String)> {
+         DuckLakeError::InvalidConfig(format!("Failed to create ObjectStoreUrl: {}", e))
+     })?;
+ 
+-    Ok((object_store_url, url.path().to_owned()))
++    // Decode percent-encoded characters to preserve non-ASCII in local filesystem paths (#60).
++    // url::Url::parse() percent-encodes UTF-8 characters, but the local filesystem expects
++    // raw UTF-8 paths.
++    let decoded_path = percent_decode_str(url.path())
++        .decode_utf8()
++        .map_err(|e| {
++            DuckLakeError::InvalidConfig(format!(
++                "Invalid UTF-8 in file path '{}': {}",
++                data_path, e
++            ))
++        })?
++        .to_string();
++
++    Ok((object_store_url, decoded_path))
+ }
+ 
+ /// Parse a local filesystem path into ObjectStoreUrl and key path
+@@ -753,8 +773,10 @@ mod tests {
+ 
+     #[test]
+     fn test_s3_url_uppercase_scheme() {
+-        let result = parse_object_store_url("S3://bucket/path");
+-        assert!(result.is_err());
++        // URL schemes are case-insensitive per RFC 3986
++        let (url, path) = parse_object_store_url("S3://bucket/path").unwrap();
++        assert_eq!(url, ObjectStoreUrl::parse("s3://bucket/").unwrap());
++        assert_eq!(path, "/path");
+     }
+ 
+     #[test]
+diff --git a/src/table.rs b/src/table.rs
+index 66aa8b8..d8700ba 100644
+--- a/src/table.rs
++++ b/src/table.rs
+@@ -287,8 +287,11 @@ impl DuckLakeTable {
+         // Create PartitionedFile with footer size hint if available
+         let mut pf =
+             PartitionedFile::new(&resolved_delete_path, delete_file.file_size_bytes as u64);
+-        if let Some(footer_size) = delete_file.footer_size {
+-            pf = pf.with_metadata_size_hint(footer_size as usize);
++        if let Some(footer_size) = delete_file.footer_size
++            && footer_size > 0
++            && let Ok(hint) = usize::try_from(footer_size)
++        {
++            pf = pf.with_metadata_size_hint(hint);
+         }
+ 
+         // Create file scan config for the delete file
+@@ -344,8 +347,11 @@ impl DuckLakeTable {
+ 
+                 // Apply footer size hint if available from DuckLake metadata
+                 // This reduces I/O from 2 reads to 1 read per file (especially beneficial for S3/MinIO)
+-                if let Some(footer_size) = table_file.file.footer_size {
+-                    pf = pf.with_metadata_size_hint(footer_size as usize);
++                if let Some(footer_size) = table_file.file.footer_size
++                    && footer_size > 0
++                    && let Ok(hint) = usize::try_from(footer_size)
++                {
++                    pf = pf.with_metadata_size_hint(hint);
+                 }
+ 
+                 Ok(pf)
+@@ -419,8 +425,11 @@ impl DuckLakeTable {
+ 
+         // Create PartitionedFile with footer size hint if available
+         let mut pf = PartitionedFile::new(&resolved_path, table_file.file.file_size_bytes as u64);
+-        if let Some(footer_size) = table_file.file.footer_size {
+-            pf = pf.with_metadata_size_hint(footer_size as usize);
++        if let Some(footer_size) = table_file.file.footer_size
++            && footer_size > 0
++            && let Ok(hint) = usize::try_from(footer_size)
++        {
++            pf = pf.with_metadata_size_hint(hint);
+         }
+ 
+         // Use read_schema (with original Parquet names) for reading

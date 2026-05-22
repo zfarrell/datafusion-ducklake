@@ -1,0 +1,16 @@
+diff --git a/src/types.rs b/src/types.rs
+index b06e566..8dff5b7 100644
+--- a/src/types.rs
++++ b/src/types.rs
+@@ -243,7 +243,10 @@ fn parse_decimal(type_str: &str) -> Result<Option<DataType>> {
+                 Ok(Some(DataType::Decimal128(precision, scale)))
+             }
+         },
+-        _ => Ok(None),
++        n => Err(DuckLakeError::UnsupportedType(format!(
++            "Invalid decimal type: expected at most 2 parameters (precision, scale), got {} in type '{}'",
++            n, type_str
++        ))),
+     }
+ }
+ 

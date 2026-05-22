@@ -1,0 +1,85 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index fe7986d..a116dd6 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1863,6 +1863,7 @@ dependencies = [
+  "hex",
+  "object_store",
+  "parquet",
++ "percent-encoding",
+  "sqllogictest",
+  "sqlx",
+  "tempfile",
+diff --git a/src/table.rs b/src/table.rs
+index 643deda..888b3b5 100644
+--- a/src/table.rs
++++ b/src/table.rs
+@@ -282,8 +282,11 @@ impl DuckLakeTable {
+         // Create PartitionedFile with footer size hint if available
+         let mut pf =
+             PartitionedFile::new(&resolved_delete_path, delete_file.file_size_bytes as u64);
+-        if let Some(footer_size) = delete_file.footer_size {
+-            pf = pf.with_metadata_size_hint(footer_size as usize);
++        if let Some(footer_size) = delete_file.footer_size
++            && footer_size > 0
++            && let Ok(hint) = usize::try_from(footer_size)
++        {
++            pf = pf.with_metadata_size_hint(hint);
+         }
+ 
+         // Create file scan config for the delete file
+@@ -310,7 +313,7 @@ impl DuckLakeTable {
+             .map_err(|e| {
+                 if is_object_store_not_found(&e) {
+                     DataFusionError::Execution(format!(
+-                        "Delete file '{}' referenced in catalog metadata was not found.                          This may indicate catalog corruption or that the file was                          deleted outside of DuckLake.",
++                        "Delete file '{}' referenced in catalog metadata was not found. This may indicate catalog corruption or that the file was deleted outside of DuckLake.",
+                         resolved_delete_path
+                     ))
+                 } else {
+@@ -349,8 +352,11 @@ impl DuckLakeTable {
+ 
+                 // Apply footer size hint if available from DuckLake metadata
+                 // This reduces I/O from 2 reads to 1 read per file (especially beneficial for S3/MinIO)
+-                if let Some(footer_size) = table_file.file.footer_size {
+-                    pf = pf.with_metadata_size_hint(footer_size as usize);
++                if let Some(footer_size) = table_file.file.footer_size
++                    && footer_size > 0
++                    && let Ok(hint) = usize::try_from(footer_size)
++                {
++                    pf = pf.with_metadata_size_hint(hint);
+                 }
+ 
+                 pf
+@@ -424,8 +430,11 @@ impl DuckLakeTable {
+ 
+         // Create PartitionedFile with footer size hint if available
+         let mut pf = PartitionedFile::new(&resolved_path, table_file.file.file_size_bytes as u64);
+-        if let Some(footer_size) = table_file.file.footer_size {
+-            pf = pf.with_metadata_size_hint(footer_size as usize);
++        if let Some(footer_size) = table_file.file.footer_size
++            && footer_size > 0
++            && let Ok(hint) = usize::try_from(footer_size)
++        {
++            pf = pf.with_metadata_size_hint(hint);
+         }
+ 
+         // Use read_schema (with original Parquet names) for reading
+diff --git a/src/table_changes.rs b/src/table_changes.rs
+index d436a2e..297cc09 100644
+--- a/src/table_changes.rs
++++ b/src/table_changes.rs
+@@ -443,8 +443,11 @@ impl TableChangesTable {
+ 
+         // Create PartitionedFile with footer size hint if available
+         let mut pf = PartitionedFile::new(&resolved_path, data_file.file_size_bytes as u64);
+-        if let Some(footer_size) = data_file.footer_size {
+-            pf = pf.with_metadata_size_hint(footer_size as usize);
++        if let Some(footer_size) = data_file.footer_size
++            && footer_size > 0
++            && let Ok(hint) = usize::try_from(footer_size)
++        {
++            pf = pf.with_metadata_size_hint(hint);
+         }
+ 
+         // Determine what to read from Parquet

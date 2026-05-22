@@ -1,0 +1,34 @@
+diff --git a/src/metadata_writer_sqlite.rs b/src/metadata_writer_sqlite.rs
+index f19a2d5..d5aebdb 100644
+--- a/src/metadata_writer_sqlite.rs
++++ b/src/metadata_writer_sqlite.rs
+@@ -577,8 +577,10 @@ mod tests {
+             .get_or_create_table(schema_id, "users", None, snapshot_id)
+             .unwrap();
+ 
+-        let columns =
+-            vec![ColumnDef::new("id", "int64", false).unwrap(), ColumnDef::new("name", "varchar", true).unwrap()];
++        let columns = vec![
++            ColumnDef::new("id", "int64", false).unwrap(),
++            ColumnDef::new("name", "varchar", true).unwrap(),
++        ];
+ 
+         let column_ids = writer.set_columns(table_id, &columns, snapshot_id).unwrap();
+         assert_eq!(column_ids.len(), 2);
+diff --git a/src/table_writer.rs b/src/table_writer.rs
+index a3a2ebb..bd3dbc0 100644
+--- a/src/table_writer.rs
++++ b/src/table_writer.rs
+@@ -299,11 +299,7 @@ fn arrow_schema_to_column_defs(schema: &Schema) -> Result<Vec<ColumnDef>> {
+         .iter()
+         .map(|field| {
+             let ducklake_type = arrow_to_ducklake_type(field.data_type())?;
+-            ColumnDef::new(
+-                field.name().clone(),
+-                ducklake_type,
+-                field.is_nullable(),
+-            )
++            ColumnDef::new(field.name().clone(), ducklake_type, field.is_nullable())
+         })
+         .collect()
+ }

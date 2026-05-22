@@ -1,0 +1,1774 @@
+diff --git a/src/catalog.rs b/src/catalog.rs
+index 54f60c0..d6d3c05 100644
+--- a/src/catalog.rs
++++ b/src/catalog.rs
+@@ -255,7 +255,7 @@ impl CatalogProvider for DuckLakeCatalog {
+             .map_err(|e| DataFusionError::External(Box::new(e)))?;
+ 
+         // Update snapshot so subsequent lookups see the change
+-        self.snapshot_id.store(new_snapshot, Ordering::Release);
++        self.snapshot_id.fetch_max(new_snapshot, Ordering::Release);
+ 
+         // Return the schema provider that was dropped
+         let schema_path = resolve_path(&self.catalog_path, &meta.path, meta.path_is_relative)
+@@ -312,7 +312,7 @@ impl CatalogProvider for DuckLakeCatalog {
+             .map_err(|e| DataFusionError::External(Box::new(e)))?;
+ 
+         // Update snapshot so subsequent lookups see the new schema
+-        self.snapshot_id.store(new_snapshot, Ordering::Release);
++        self.snapshot_id.fetch_max(new_snapshot, Ordering::Release);
+ 
+         // Build the schema provider
+         let schema_path = resolve_path(&self.catalog_path, name, true)
+@@ -325,7 +325,8 @@ impl CatalogProvider for DuckLakeCatalog {
+             self.object_store_url.clone(),
+             schema_path,
+         )
+-        .with_writer(Arc::clone(&config.writer));
++        .with_writer(Arc::clone(&config.writer))
++        .with_catalog_snapshot_id(Arc::clone(&self.snapshot_id));
+ 
+         if let Some(ref store) = config.object_store {
+             schema = schema.with_object_store(Arc::clone(store));
+diff --git a/src/compaction_functions.rs b/src/compaction_functions.rs
+index e3cdc81..5ec7c2a 100644
+--- a/src/compaction_functions.rs
++++ b/src/compaction_functions.rs
+@@ -17,7 +17,7 @@
+ 
+ #![cfg(feature = "metadata-duckdb")]
+ 
+-use std::sync::{Arc, OnceLock};
++use std::sync::{Arc, Mutex};
+ 
+ use arrow::array::{ArrayRef, BooleanArray, Int64Array, RecordBatch, StringArray};
+ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+@@ -32,8 +32,10 @@ use datafusion::logical_expr::Expr;
+ /// Used as default when no explicit `older_than` is provided (R6-S-052).
+ const DEFAULT_OLDER_THAN: &str = "2099-01-01";
+ 
+-/// Global flag to ensure `INSTALL ducklake` is only executed once per process (R6-S-026).
+-static DUCKLAKE_INSTALLED: OnceLock<()> = OnceLock::new();
++/// Global flag to track whether `INSTALL ducklake` has succeeded (R6-S-026, R7-S-001).
++/// Uses `Mutex<bool>` instead of `OnceLock<()>` so that a failed INSTALL can be retried
++/// on the next call rather than permanently caching the failure.
++static DUCKLAKE_INSTALLED: Mutex<bool> = Mutex::new(false);
+ 
+ // ==================== Schemas ====================
+ 
+@@ -78,9 +80,17 @@ fn open_compaction_connection(catalog_path: &str) -> DataFusionResult<duckdb::Co
+         .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+     // Only INSTALL once per process — the extension is cached on disk (R6-S-026).
+     // INSTALL is idempotent but has overhead; LOAD is still needed per-connection.
+-    DUCKLAKE_INSTALLED.get_or_init(|| {
+-        let _ = conn.execute("INSTALL ducklake;", []);
+-    });
++    // Uses Mutex<bool> so failures can be retried on subsequent calls (R7-S-001).
++    {
++        let mut installed = DUCKLAKE_INSTALLED
++            .lock()
++            .unwrap_or_else(|e| e.into_inner());
++        if !*installed {
++            conn.execute("INSTALL ducklake;", [])
++                .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
++            *installed = true;
++        }
++    }
+     conn.execute("LOAD ducklake;", [])
+         .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+     let attach_sql = format!(
+diff --git a/src/insert_exec.rs b/src/insert_exec.rs
+index e1a7a58..0e27f6e 100644
+--- a/src/insert_exec.rs
++++ b/src/insert_exec.rs
+@@ -51,14 +51,18 @@ pub enum PartitionTransform {
+ impl PartitionTransform {
+     /// Parse an optional transform string into a [`PartitionTransform`].
+     /// `None`, empty, or `"identity"` all map to [`PartitionTransform::Identity`].
+-    pub fn from_str_opt(s: Option<&str>) -> Self {
++    /// Returns an error for unrecognized transform strings (R7-S-003).
++    pub fn from_str_opt(s: Option<&str>) -> crate::Result<Self> {
+         match s.map(|t| t.to_lowercase()).as_deref() {
+-            None | Some("") | Some("identity") => Self::Identity,
+-            Some("year") => Self::Year,
+-            Some("month") => Self::Month,
+-            Some("day") => Self::Day,
+-            Some("hour") => Self::Hour,
+-            Some(_) => Self::Identity,
++            None | Some("") | Some("identity") => Ok(Self::Identity),
++            Some("year") => Ok(Self::Year),
++            Some("month") => Ok(Self::Month),
++            Some("day") => Ok(Self::Day),
++            Some("hour") => Ok(Self::Hour),
++            Some(other) => Err(DuckLakeError::InvalidConfig(format!(
++                "Unknown partition transform: {}",
++                other
++            ))),
+         }
+     }
+ }
+@@ -917,46 +921,48 @@ mod tests {
+     #[test]
+     fn test_partition_transform_from_str_opt() {
+         assert_eq!(
+-            PartitionTransform::from_str_opt(None),
++            PartitionTransform::from_str_opt(None).unwrap(),
+             PartitionTransform::Identity
+         );
+         assert_eq!(
+-            PartitionTransform::from_str_opt(Some("")),
++            PartitionTransform::from_str_opt(Some("")).unwrap(),
+             PartitionTransform::Identity
+         );
+         assert_eq!(
+-            PartitionTransform::from_str_opt(Some("identity")),
++            PartitionTransform::from_str_opt(Some("identity")).unwrap(),
+             PartitionTransform::Identity
+         );
+         assert_eq!(
+-            PartitionTransform::from_str_opt(Some("IDENTITY")),
++            PartitionTransform::from_str_opt(Some("IDENTITY")).unwrap(),
+             PartitionTransform::Identity
+         );
+         assert_eq!(
+-            PartitionTransform::from_str_opt(Some("year")),
++            PartitionTransform::from_str_opt(Some("year")).unwrap(),
+             PartitionTransform::Year
+         );
+         assert_eq!(
+-            PartitionTransform::from_str_opt(Some("Year")),
++            PartitionTransform::from_str_opt(Some("Year")).unwrap(),
+             PartitionTransform::Year
+         );
+         assert_eq!(
+-            PartitionTransform::from_str_opt(Some("month")),
++            PartitionTransform::from_str_opt(Some("month")).unwrap(),
+             PartitionTransform::Month
+         );
+         assert_eq!(
+-            PartitionTransform::from_str_opt(Some("day")),
++            PartitionTransform::from_str_opt(Some("day")).unwrap(),
+             PartitionTransform::Day
+         );
+         assert_eq!(
+-            PartitionTransform::from_str_opt(Some("hour")),
++            PartitionTransform::from_str_opt(Some("hour")).unwrap(),
+             PartitionTransform::Hour
+         );
+-        // Unknown transforms default to Identity
+-        assert_eq!(
+-            PartitionTransform::from_str_opt(Some("yer")),
+-            PartitionTransform::Identity
+-        );
++        // Unknown transforms return an error (R7-S-003)
++        let err = PartitionTransform::from_str_opt(Some("yer"));
++        assert!(err.is_err());
++        assert!(err
++            .unwrap_err()
++            .to_string()
++            .contains("Unknown partition transform: yer"));
+     }
+ 
+     #[test]
+diff --git a/src/metadata_writer.rs b/src/metadata_writer.rs
+index 6588e3c..41cb7c2 100644
+--- a/src/metadata_writer.rs
++++ b/src/metadata_writer.rs
+@@ -691,14 +691,18 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
+     /// Returns the same format as `MetadataProvider::get_inlined_data`.
+     /// Used when flushing inlined data to Parquet.
+     fn read_inlined_data(&self, _table_id: i64) -> Result<Vec<InlinedDataRow>> {
+-        Ok(Vec::new())
++        Err(crate::DuckLakeError::Unsupported(
++            "Inlined data read not supported by this backend".into(),
++        ))
+     }
+ 
+     /// Remove all active inlined data for a table (set end_snapshot).
+     ///
+     /// Called after flushing inlined data to Parquet.
+     fn clear_inlined_data(&self, _table_id: i64, _snapshot_id: i64) -> Result<()> {
+-        Ok(())
++        Err(crate::DuckLakeError::Unsupported(
++            "Inlined data clear not supported by this backend".into(),
++        ))
+     }
+ }
+ 
+diff --git a/src/metadata_writer_mysql.rs b/src/metadata_writer_mysql.rs
+index 37c4139..d536726 100644
+--- a/src/metadata_writer_mysql.rs
++++ b/src/metadata_writer_mysql.rs
+@@ -10,8 +10,9 @@ use crate::metadata_writer::{
+     ReplaceFileEntry, WriteMode, WriteSetupResult,
+ };
+ use crate::metadata_writer_validation::{
+-    ActiveColumnInfo, AlterTableAction, validate_alter_table, validate_no_duplicate_columns,
+-    validate_schema_evolution, validate_table_has_columns,
++    ActiveColumnInfo, AlterTableAction, is_numeric_type, stat_value_less_than,
++    validate_alter_table, validate_no_duplicate_columns, validate_schema_evolution,
++    validate_table_has_columns,
+ };
+ use sqlx::Row;
+ use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
+@@ -867,6 +868,111 @@ impl MySqlMetadataWriter {
+         tx.commit().await?;
+         Ok(snapshot_id)
+     }
++
++    /// Recompute `ducklake_table_column_stats` from per-file stats using
++    /// type-aware min/max comparison (R7-S-011, R7-S-022 — parity with SQLite).
++    async fn recompute_table_column_stats(
++        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
++        table_id: i64,
++    ) -> Result<()> {
++        use std::collections::HashMap;
++
++        sqlx::query("DELETE FROM ducklake_table_column_stats WHERE table_id = ?")
++            .bind(table_id)
++            .execute(&mut **tx)
++            .await?;
++
++        let rows = sqlx::query(
++            "SELECT fcs.column_id, fcs.null_count, fcs.min_value, fcs.max_value, c.column_type
++             FROM ducklake_file_column_stats fcs
++             INNER JOIN ducklake_data_file df
++                 ON fcs.data_file_id = df.data_file_id
++                 AND df.table_id = fcs.table_id
++                 AND df.end_snapshot IS NULL
++             INNER JOIN ducklake_column c ON fcs.column_id = c.column_id
++             WHERE fcs.table_id = ?",
++        )
++        .bind(table_id)
++        .fetch_all(&mut **tx)
++        .await?;
++
++        if rows.is_empty() {
++            return Ok(());
++        }
++
++        struct ColumnAgg {
++            contains_null: bool,
++            min_value: Option<String>,
++            max_value: Option<String>,
++            is_numeric: bool,
++        }
++
++        let mut aggs: HashMap<i64, ColumnAgg> = HashMap::new();
++
++        for row in &rows {
++            let column_id: i64 = row.try_get(0)?;
++            let null_count: Option<i64> = row.try_get(1)?;
++            let min_value: Option<String> = row.try_get(2)?;
++            let max_value: Option<String> = row.try_get(3)?;
++            let column_type: String = row.try_get(4)?;
++
++            let is_numeric = is_numeric_type(&column_type);
++
++            let entry = aggs.entry(column_id).or_insert(ColumnAgg {
++                contains_null: false,
++                min_value: None,
++                max_value: None,
++                is_numeric,
++            });
++
++            if null_count.unwrap_or(0) > 0 {
++                entry.contains_null = true;
++            }
++
++            if let Some(ref new_min) = min_value {
++                entry.min_value = Some(match &entry.min_value {
++                    None => new_min.clone(),
++                    Some(current) => {
++                        if stat_value_less_than(new_min, current, entry.is_numeric) {
++                            new_min.clone()
++                        } else {
++                            current.clone()
++                        }
++                    },
++                });
++            }
++
++            if let Some(ref new_max) = max_value {
++                entry.max_value = Some(match &entry.max_value {
++                    None => new_max.clone(),
++                    Some(current) => {
++                        if stat_value_less_than(current, new_max, entry.is_numeric) {
++                            new_max.clone()
++                        } else {
++                            current.clone()
++                        }
++                    },
++                });
++            }
++        }
++
++        for (column_id, agg) in &aggs {
++            sqlx::query(
++                "INSERT INTO ducklake_table_column_stats
++                 (table_id, column_id, contains_null, min_value, max_value)
++                 VALUES (?, ?, ?, ?, ?)",
++            )
++            .bind(table_id)
++            .bind(column_id)
++            .bind(agg.contains_null)
++            .bind(&agg.min_value)
++            .bind(&agg.max_value)
++            .execute(&mut **tx)
++            .await?;
++        }
++
++        Ok(())
++    }
+ }
+ 
+ impl MetadataWriter for MySqlMetadataWriter {
+@@ -1057,6 +1163,10 @@ impl MetadataWriter for MySqlMetadataWriter {
+                 .execute(&mut *tx)
+                 .await?;
+             }
++
++            // R7-S-011: Recompute table-level column stats (parity with SQLite)
++            Self::recompute_table_column_stats(&mut tx, table_id).await?;
++
+             tx.commit().await?;
+             Ok(())
+         })
+@@ -1356,11 +1466,11 @@ impl MetadataWriter for MySqlMetadataWriter {
+                 total_net_new_deletions += file.delete_count - old_delete_count;
+             }
+ 
+-            // R6-S-003: Decrement record_count by net new deletions
++            // R6-S-003 + R7-S-010: Decrement record_count by net new deletions (clamped to 0)
+             if total_net_new_deletions > 0 {
+                 sqlx::query(
+                     "UPDATE ducklake_table_stats
+-                     SET record_count = COALESCE(record_count, 0) - ?
++                     SET record_count = GREATEST(0, COALESCE(record_count, 0) - ?)
+                      WHERE table_id = ?",
+                 )
+                 .bind(total_net_new_deletions)
+@@ -1370,6 +1480,7 @@ impl MetadataWriter for MySqlMetadataWriter {
+             }
+ 
+             // R3F-002: For each new data file, set row_id_start and update table_stats
++            let mut has_column_stats = false;
+             for file in data_files {
+                 // Get current next_row_id from table_stats
+                 // R6-S-033: Use FOR UPDATE to prevent concurrent row_id allocation races
+@@ -1399,6 +1510,12 @@ impl MetadataWriter for MySqlMetadataWriter {
+                 .execute(&mut *tx)
+                 .await?;
+ 
++                // R7-S-011: Get data_file_id for column stats
++                let id_row = sqlx::query("SELECT LAST_INSERT_ID()")
++                    .fetch_one(&mut *tx)
++                    .await?;
++                let data_file_id: i64 = id_row.try_get(0)?;
++
+                 // Update ducklake_table_stats
+                 let new_next_row_id = row_id_start
+                     .checked_add(file.record_count)
+@@ -1429,6 +1546,31 @@ impl MetadataWriter for MySqlMetadataWriter {
+                     .execute(&mut *tx)
+                     .await?;
+                 }
++
++                // R7-S-011: Register per-file column stats (parity with SQLite)
++                if !file.column_stats.is_empty() {
++                    has_column_stats = true;
++                    for stat in &file.column_stats {
++                        sqlx::query(
++                            "INSERT INTO ducklake_file_column_stats
++                             (data_file_id, table_id, column_id, null_count, min_value, max_value)
++                             VALUES (?, ?, ?, ?, ?, ?)",
++                        )
++                        .bind(data_file_id)
++                        .bind(table_id)
++                        .bind(stat.column_id)
++                        .bind(stat.null_count)
++                        .bind(&stat.min_value)
++                        .bind(&stat.max_value)
++                        .execute(&mut *tx)
++                        .await?;
++                    }
++                }
++            }
++
++            // R7-S-011: Recompute table-level column stats with type-aware min/max
++            if has_column_stats {
++                Self::recompute_table_column_stats(&mut tx, table_id).await?;
+             }
+ 
+             // R4-S-004: Update snapshot's next_file_id
+diff --git a/src/metadata_writer_postgres.rs b/src/metadata_writer_postgres.rs
+index 7a05e2b..b14098c 100644
+--- a/src/metadata_writer_postgres.rs
++++ b/src/metadata_writer_postgres.rs
+@@ -10,8 +10,9 @@ use crate::metadata_writer::{
+     ReplaceFileEntry, WriteMode, WriteSetupResult,
+ };
+ use crate::metadata_writer_validation::{
+-    ActiveColumnInfo, AlterTableAction, validate_alter_table, validate_no_duplicate_columns,
+-    validate_schema_evolution, validate_table_has_columns,
++    ActiveColumnInfo, AlterTableAction, is_numeric_type, stat_value_less_than,
++    validate_alter_table, validate_no_duplicate_columns, validate_schema_evolution,
++    validate_table_has_columns,
+ };
+ use sqlx::Row;
+ use sqlx::postgres::{PgPool, PgPoolOptions};
+@@ -742,6 +743,111 @@ impl PostgresMetadataWriter {
+         tx.commit().await?;
+         Ok(snapshot_id)
+     }
++
++    /// Recompute `ducklake_table_column_stats` from per-file stats using
++    /// type-aware min/max comparison (R7-S-011, R7-S-022 — parity with SQLite).
++    async fn recompute_table_column_stats(
++        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
++        table_id: i64,
++    ) -> Result<()> {
++        use std::collections::HashMap;
++
++        sqlx::query("DELETE FROM ducklake_table_column_stats WHERE table_id = $1")
++            .bind(table_id)
++            .execute(&mut **tx)
++            .await?;
++
++        let rows = sqlx::query(
++            "SELECT fcs.column_id, fcs.null_count, fcs.min_value, fcs.max_value, c.column_type
++             FROM ducklake_file_column_stats fcs
++             INNER JOIN ducklake_data_file df
++                 ON fcs.data_file_id = df.data_file_id
++                 AND df.table_id = fcs.table_id
++                 AND df.end_snapshot IS NULL
++             INNER JOIN ducklake_column c ON fcs.column_id = c.column_id
++             WHERE fcs.table_id = $1",
++        )
++        .bind(table_id)
++        .fetch_all(&mut **tx)
++        .await?;
++
++        if rows.is_empty() {
++            return Ok(());
++        }
++
++        struct ColumnAgg {
++            contains_null: bool,
++            min_value: Option<String>,
++            max_value: Option<String>,
++            is_numeric: bool,
++        }
++
++        let mut aggs: HashMap<i64, ColumnAgg> = HashMap::new();
++
++        for row in &rows {
++            let column_id: i64 = row.try_get(0)?;
++            let null_count: Option<i64> = row.try_get(1)?;
++            let min_value: Option<String> = row.try_get(2)?;
++            let max_value: Option<String> = row.try_get(3)?;
++            let column_type: String = row.try_get(4)?;
++
++            let is_numeric = is_numeric_type(&column_type);
++
++            let entry = aggs.entry(column_id).or_insert(ColumnAgg {
++                contains_null: false,
++                min_value: None,
++                max_value: None,
++                is_numeric,
++            });
++
++            if null_count.unwrap_or(0) > 0 {
++                entry.contains_null = true;
++            }
++
++            if let Some(ref new_min) = min_value {
++                entry.min_value = Some(match &entry.min_value {
++                    None => new_min.clone(),
++                    Some(current) => {
++                        if stat_value_less_than(new_min, current, entry.is_numeric) {
++                            new_min.clone()
++                        } else {
++                            current.clone()
++                        }
++                    },
++                });
++            }
++
++            if let Some(ref new_max) = max_value {
++                entry.max_value = Some(match &entry.max_value {
++                    None => new_max.clone(),
++                    Some(current) => {
++                        if stat_value_less_than(current, new_max, entry.is_numeric) {
++                            new_max.clone()
++                        } else {
++                            current.clone()
++                        }
++                    },
++                });
++            }
++        }
++
++        for (column_id, agg) in &aggs {
++            sqlx::query(
++                "INSERT INTO ducklake_table_column_stats
++                 (table_id, column_id, contains_null, min_value, max_value)
++                 VALUES ($1, $2, $3, $4, $5)",
++            )
++            .bind(table_id)
++            .bind(column_id)
++            .bind(agg.contains_null)
++            .bind(&agg.min_value)
++            .bind(&agg.max_value)
++            .execute(&mut **tx)
++            .await?;
++        }
++
++        Ok(())
++    }
+ }
+ 
+ impl MetadataWriter for PostgresMetadataWriter {
+@@ -931,6 +1037,10 @@ impl MetadataWriter for PostgresMetadataWriter {
+                 .execute(&mut *tx)
+                 .await?;
+             }
++
++            // R7-S-011: Recompute table-level column stats (parity with SQLite)
++            Self::recompute_table_column_stats(&mut tx, table_id).await?;
++
+             tx.commit().await?;
+             Ok(())
+         })
+@@ -1221,11 +1331,11 @@ impl MetadataWriter for PostgresMetadataWriter {
+                 total_net_new_deletions += file.delete_count - old_delete_count;
+             }
+ 
+-            // R6-S-003: Decrement record_count by net new deletions
++            // R6-S-003 + R7-S-010: Decrement record_count by net new deletions (clamped to 0)
+             if total_net_new_deletions > 0 {
+                 sqlx::query(
+                     "UPDATE ducklake_table_stats
+-                     SET record_count = COALESCE(record_count, 0) - $1
++                     SET record_count = GREATEST(0, COALESCE(record_count, 0) - $1)
+                      WHERE table_id = $2",
+                 )
+                 .bind(total_net_new_deletions)
+@@ -1235,6 +1345,7 @@ impl MetadataWriter for PostgresMetadataWriter {
+             }
+ 
+             // R3F-002: For each new data file, set row_id_start and update table_stats
++            let mut has_column_stats = false;
+             for file in data_files {
+                 // Get current next_row_id from table_stats
+                 // R6-S-033: Use FOR UPDATE to prevent concurrent row_id allocation races
+@@ -1249,9 +1360,10 @@ impl MetadataWriter for PostgresMetadataWriter {
+                     None => 0,
+                 };
+ 
+-                sqlx::query(
++                // R7-S-011: Use RETURNING to get data_file_id for column stats
++                let row = sqlx::query(
+                     "INSERT INTO ducklake_data_file (table_id, path, path_is_relative, file_size_bytes, footer_size, record_count, row_id_start, begin_snapshot)
+-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
++                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING data_file_id",
+                 )
+                 .bind(table_id)
+                 .bind(&file.path)
+@@ -1261,8 +1373,9 @@ impl MetadataWriter for PostgresMetadataWriter {
+                 .bind(file.record_count)
+                 .bind(row_id_start)
+                 .bind(snapshot_id)
+-                .execute(&mut *tx)
++                .fetch_one(&mut *tx)
+                 .await?;
++                let data_file_id: i64 = row.try_get(0)?;
+ 
+                 // Update ducklake_table_stats
+                 let new_next_row_id = row_id_start
+@@ -1294,6 +1407,31 @@ impl MetadataWriter for PostgresMetadataWriter {
+                     .execute(&mut *tx)
+                     .await?;
+                 }
++
++                // R7-S-011: Register per-file column stats (parity with SQLite)
++                if !file.column_stats.is_empty() {
++                    has_column_stats = true;
++                    for stat in &file.column_stats {
++                        sqlx::query(
++                            "INSERT INTO ducklake_file_column_stats
++                             (data_file_id, table_id, column_id, null_count, min_value, max_value)
++                             VALUES ($1, $2, $3, $4, $5, $6)",
++                        )
++                        .bind(data_file_id)
++                        .bind(table_id)
++                        .bind(stat.column_id)
++                        .bind(stat.null_count)
++                        .bind(&stat.min_value)
++                        .bind(&stat.max_value)
++                        .execute(&mut *tx)
++                        .await?;
++                    }
++                }
++            }
++
++            // R7-S-011: Recompute table-level column stats with type-aware min/max
++            if has_column_stats {
++                Self::recompute_table_column_stats(&mut tx, table_id).await?;
+             }
+ 
+             // R4-S-004: Update snapshot's next_file_id
+diff --git a/src/metadata_writer_sqlite.rs b/src/metadata_writer_sqlite.rs
+index 1307435..0ad1dde 100644
+--- a/src/metadata_writer_sqlite.rs
++++ b/src/metadata_writer_sqlite.rs
+@@ -12,8 +12,9 @@ use crate::metadata_writer::{
+     ReplaceFileEntry, WriteMode, WriteSetupResult,
+ };
+ use crate::metadata_writer_validation::{
+-    ActiveColumnInfo, AlterTableAction, quote_identifier, validate_alter_table,
+-    validate_no_duplicate_columns, validate_schema_evolution, validate_table_has_columns,
++    ActiveColumnInfo, AlterTableAction, is_numeric_type, quote_identifier, stat_value_less_than,
++    validate_alter_table, validate_ducklake_type_for_ddl, validate_no_duplicate_columns,
++    validate_schema_evolution, validate_table_has_columns,
+ };
+ use sqlx::Row;
+ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
+@@ -1023,156 +1024,8 @@ impl SqliteMetadataWriter {
+     }
+ }
+ 
+-/// Check if a DuckLake column type string represents a numeric type.
+-fn is_numeric_type(column_type: &str) -> bool {
+-    let t = column_type.to_uppercase();
+-    let base = t.split('(').next().unwrap_or(&t).trim();
+-    matches!(
+-        base,
+-        "TINYINT"
+-            | "SMALLINT"
+-            | "INTEGER"
+-            | "INT"
+-            | "BIGINT"
+-            | "HUGEINT"
+-            | "UTINYINT"
+-            | "USMALLINT"
+-            | "UINTEGER"
+-            | "UBIGINT"
+-            | "FLOAT"
+-            | "REAL"
+-            | "DOUBLE"
+-            | "DECIMAL"
+-            | "NUMERIC"
+-            | "INT8"
+-            | "INT16"
+-            | "INT32"
+-            | "INT64"
+-            | "UINT8"
+-            | "UINT16"
+-            | "UINT32"
+-            | "UINT64"
+-            | "FLOAT4"
+-            | "FLOAT8"
+-    )
+-}
+-
+-/// R6-S-029: Validate a DuckLake type string for safe use in DDL.
+-/// Rejects types containing characters that could enable SQL injection.
+-/// Only allows alphanumeric, parentheses, commas, spaces, underscores, and dots (for decimal precision).
+-fn validate_ducklake_type_for_ddl(type_str: &str) -> crate::Result<()> {
+-    if type_str.is_empty() {
+-        return Err(DuckLakeError::InvalidConfig(
+-            "empty DuckLake type in DDL".into(),
+-        ));
+-    }
+-    for ch in type_str.chars() {
+-        if !ch.is_alphanumeric() && !matches!(ch, '(' | ')' | ',' | ' ' | '_' | '.') {
+-            return Err(DuckLakeError::InvalidConfig(format!(
+-                "invalid character '{}' in DuckLake type '{}' for DDL",
+-                ch, type_str
+-            )));
+-        }
+-    }
+-    Ok(())
+-}
+-
+-/// Compare two stat value strings: returns true if `a < b`.
+-/// For numeric types, attempts numeric parsing; falls back to lexicographic.
+-fn stat_value_less_than(a: &str, b: &str, is_numeric: bool) -> bool {
+-    if is_numeric {
+-        // Try i128 first (handles all integer types without precision loss)
+-        if let (Ok(ia), Ok(ib)) = (a.parse::<i128>(), b.parse::<i128>()) {
+-            return ia < ib;
+-        }
+-        // R6-S-019: Use string-based decimal comparison to avoid f64 precision loss
+-        if let Some(ord) = cmp_decimal_strings(a, b) {
+-            return ord == std::cmp::Ordering::Less;
+-        }
+-    }
+-    // Lexicographic comparison for strings, dates, etc.
+-    a < b
+-}
+-
+-/// Compare two decimal number strings without f64 conversion (R6-S-019).
+-fn cmp_decimal_strings(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+-    fn parse_parts(s: &str) -> Option<(bool, &str, &str)> {
+-        let s = s.trim();
+-        let (neg, s) = if let Some(rest) = s.strip_prefix('-') {
+-            (true, rest)
+-        } else if let Some(rest) = s.strip_prefix('+') {
+-            (false, rest)
+-        } else {
+-            (false, s)
+-        };
+-        if s.is_empty() || s.chars().any(|c| !c.is_ascii_digit() && c != '.') {
+-            return None;
+-        }
+-        if s.matches('.').count() > 1 {
+-            return None;
+-        }
+-        let (int_part, frac_part) = match s.split_once('.') {
+-            Some((i, f)) => (i, f),
+-            None => (s, ""),
+-        };
+-        Some((neg, int_part, frac_part))
+-    }
+-
+-    fn cmp_magnitude(a_int: &str, a_frac: &str, b_int: &str, b_frac: &str) -> std::cmp::Ordering {
+-        let ai = a_int.trim_start_matches('0');
+-        let bi = b_int.trim_start_matches('0');
+-        match ai.len().cmp(&bi.len()) {
+-            std::cmp::Ordering::Equal => {},
+-            ord => return ord,
+-        }
+-        match ai.cmp(bi) {
+-            std::cmp::Ordering::Equal => {},
+-            ord => return ord,
+-        }
+-        let a_bytes = a_frac.as_bytes();
+-        let b_bytes = b_frac.as_bytes();
+-        let max_len = a_bytes.len().max(b_bytes.len());
+-        for i in 0..max_len {
+-            let ac = a_bytes.get(i).copied().unwrap_or(b'0');
+-            let bc = b_bytes.get(i).copied().unwrap_or(b'0');
+-            match ac.cmp(&bc) {
+-                std::cmp::Ordering::Equal => continue,
+-                ord => return ord,
+-            }
+-        }
+-        std::cmp::Ordering::Equal
+-    }
+-
+-    let (a_neg, a_int, a_frac) = parse_parts(a)?;
+-    let (b_neg, b_int, b_frac) = parse_parts(b)?;
+-
+-    match (a_neg, b_neg) {
+-        (true, false) => {
+-            let a_zero =
+-                a_int.trim_start_matches('0').is_empty() && a_frac.trim_end_matches('0').is_empty();
+-            let b_zero =
+-                b_int.trim_start_matches('0').is_empty() && b_frac.trim_end_matches('0').is_empty();
+-            if a_zero && b_zero {
+-                Some(std::cmp::Ordering::Equal)
+-            } else {
+-                Some(std::cmp::Ordering::Less)
+-            }
+-        },
+-        (false, true) => {
+-            let a_zero =
+-                a_int.trim_start_matches('0').is_empty() && a_frac.trim_end_matches('0').is_empty();
+-            let b_zero =
+-                b_int.trim_start_matches('0').is_empty() && b_frac.trim_end_matches('0').is_empty();
+-            if a_zero && b_zero {
+-                Some(std::cmp::Ordering::Equal)
+-            } else {
+-                Some(std::cmp::Ordering::Greater)
+-            }
+-        },
+-        (false, false) => Some(cmp_magnitude(a_int, a_frac, b_int, b_frac)),
+-        (true, true) => Some(cmp_magnitude(b_int, b_frac, a_int, a_frac)),
+-    }
+-}
++// R7-S-009: validate_ducklake_type_for_ddl moved to metadata_writer_validation.rs
++// R7-S-022: is_numeric_type, stat_value_less_than, cmp_decimal_strings moved to metadata_writer_validation.rs
+ 
+ impl MetadataWriter for SqliteMetadataWriter {
+     fn create_snapshot(&self) -> Result<i64> {
+@@ -1702,11 +1555,11 @@ impl MetadataWriter for SqliteMetadataWriter {
+                 total_net_new_deletions += file.delete_count - old_delete_count;
+             }
+ 
+-            // R4-S-013: Decrement record_count by net new deletions
++            // R4-S-013 + R7-S-010: Decrement record_count by net new deletions (clamped to 0)
+             if total_net_new_deletions > 0 {
+                 sqlx::query(
+                     "UPDATE ducklake_table_stats
+-                     SET record_count = COALESCE(record_count, 0) - ?
++                     SET record_count = MAX(0, COALESCE(record_count, 0) - ?)
+                      WHERE table_id = ?",
+                 )
+                 .bind(total_net_new_deletions)
+@@ -4417,13 +4270,5 @@ mod tests {
+         assert_eq!(r2.try_get::<i64, _>(0).unwrap(), 50);
+     }
+ 
+-    #[test]
+-    fn test_validate_ducklake_type_for_ddl() {
+-        assert!(validate_ducklake_type_for_ddl("int64").is_ok());
+-        assert!(validate_ducklake_type_for_ddl("varchar").is_ok());
+-        assert!(validate_ducklake_type_for_ddl("decimal(10, 2)").is_ok());
+-        assert!(validate_ducklake_type_for_ddl("int64; DROP TABLE users").is_err());
+-        assert!(validate_ducklake_type_for_ddl("int64\'--").is_err());
+-        assert!(validate_ducklake_type_for_ddl("").is_err());
+-    }
++    // R7-S-009: validate_ducklake_type_for_ddl tests moved to metadata_writer_validation.rs
+ }
+diff --git a/src/metadata_writer_validation.rs b/src/metadata_writer_validation.rs
+index 770d76c..7e6dcda 100644
+--- a/src/metadata_writer_validation.rs
++++ b/src/metadata_writer_validation.rs
+@@ -413,6 +413,157 @@ fn validate_drop_not_null(
+     })
+ }
+ 
++/// Validate a DuckLake type string for safe use in DDL (R6-S-029, R7-S-009).
++/// Rejects types containing characters that could enable SQL injection.
++/// Only allows alphanumeric, parentheses, commas, spaces, underscores, and dots.
++/// Shared across all backends so any backend doing DDL interpolation is protected.
++pub(crate) fn validate_ducklake_type_for_ddl(type_str: &str) -> Result<()> {
++    if type_str.is_empty() {
++        return Err(DuckLakeError::InvalidConfig(
++            "empty DuckLake type in DDL".into(),
++        ));
++    }
++    for ch in type_str.chars() {
++        if !ch.is_alphanumeric() && !matches!(ch, '(' | ')' | ',' | ' ' | '_' | '.') {
++            return Err(DuckLakeError::InvalidConfig(format!(
++                "invalid character '{}' in DuckLake type '{}' for DDL",
++                ch, type_str
++            )));
++        }
++    }
++    Ok(())
++}
++
++/// Check if a DuckLake column type string represents a numeric type (R7-S-022).
++/// Shared across all backends for consistent type-aware stats comparison.
++pub(crate) fn is_numeric_type(column_type: &str) -> bool {
++    let t = column_type.to_uppercase();
++    let base = t.split('(').next().unwrap_or(&t).trim();
++    matches!(
++        base,
++        "TINYINT"
++            | "SMALLINT"
++            | "INTEGER"
++            | "INT"
++            | "BIGINT"
++            | "HUGEINT"
++            | "UTINYINT"
++            | "USMALLINT"
++            | "UINTEGER"
++            | "UBIGINT"
++            | "FLOAT"
++            | "REAL"
++            | "DOUBLE"
++            | "DECIMAL"
++            | "NUMERIC"
++            | "INT8"
++            | "INT16"
++            | "INT32"
++            | "INT64"
++            | "UINT8"
++            | "UINT16"
++            | "UINT32"
++            | "UINT64"
++            | "FLOAT4"
++            | "FLOAT8"
++    )
++}
++
++/// Compare two stat value strings: returns true if `a < b` (R7-S-022).
++/// For numeric types, attempts numeric parsing; falls back to lexicographic.
++/// Shared across all backends for consistent column stats aggregation.
++pub(crate) fn stat_value_less_than(a: &str, b: &str, is_numeric: bool) -> bool {
++    if is_numeric {
++        if let (Ok(ia), Ok(ib)) = (a.parse::<i128>(), b.parse::<i128>()) {
++            return ia < ib;
++        }
++        if let Some(ord) = cmp_decimal_strings(a, b) {
++            return ord == std::cmp::Ordering::Less;
++        }
++    }
++    a < b
++}
++
++/// Compare two decimal number strings without f64 conversion (R6-S-019, R7-S-022).
++pub(crate) fn cmp_decimal_strings(a: &str, b: &str) -> Option<std::cmp::Ordering> {
++    fn parse_parts(s: &str) -> Option<(bool, &str, &str)> {
++        let s = s.trim();
++        let (neg, s) = if let Some(rest) = s.strip_prefix('-') {
++            (true, rest)
++        } else if let Some(rest) = s.strip_prefix('+') {
++            (false, rest)
++        } else {
++            (false, s)
++        };
++        if s.is_empty() || s.chars().any(|c| !c.is_ascii_digit() && c != '.') {
++            return None;
++        }
++        if s.matches('.').count() > 1 {
++            return None;
++        }
++        let (int_part, frac_part) = match s.split_once('.') {
++            Some((i, f)) => (i, f),
++            None => (s, ""),
++        };
++        Some((neg, int_part, frac_part))
++    }
++
++    fn cmp_magnitude(a_int: &str, a_frac: &str, b_int: &str, b_frac: &str) -> std::cmp::Ordering {
++        let ai = a_int.trim_start_matches('0');
++        let bi = b_int.trim_start_matches('0');
++        match ai.len().cmp(&bi.len()) {
++            std::cmp::Ordering::Equal => {},
++            ord => return ord,
++        }
++        match ai.cmp(bi) {
++            std::cmp::Ordering::Equal => {},
++            ord => return ord,
++        }
++        let a_bytes = a_frac.as_bytes();
++        let b_bytes = b_frac.as_bytes();
++        let max_len = a_bytes.len().max(b_bytes.len());
++        for i in 0..max_len {
++            let ac = a_bytes.get(i).copied().unwrap_or(b'0');
++            let bc = b_bytes.get(i).copied().unwrap_or(b'0');
++            match ac.cmp(&bc) {
++                std::cmp::Ordering::Equal => continue,
++                ord => return ord,
++            }
++        }
++        std::cmp::Ordering::Equal
++    }
++
++    let (a_neg, a_int, a_frac) = parse_parts(a)?;
++    let (b_neg, b_int, b_frac) = parse_parts(b)?;
++
++    match (a_neg, b_neg) {
++        (true, false) => {
++            let a_zero = a_int.trim_start_matches('0').is_empty()
++                && a_frac.trim_end_matches('0').is_empty();
++            let b_zero = b_int.trim_start_matches('0').is_empty()
++                && b_frac.trim_end_matches('0').is_empty();
++            if a_zero && b_zero {
++                Some(std::cmp::Ordering::Equal)
++            } else {
++                Some(std::cmp::Ordering::Less)
++            }
++        },
++        (false, true) => {
++            let a_zero = a_int.trim_start_matches('0').is_empty()
++                && a_frac.trim_end_matches('0').is_empty();
++            let b_zero = b_int.trim_start_matches('0').is_empty()
++                && b_frac.trim_end_matches('0').is_empty();
++            if a_zero && b_zero {
++                Some(std::cmp::Ordering::Equal)
++            } else {
++                Some(std::cmp::Ordering::Greater)
++            }
++        },
++        (false, false) => Some(cmp_magnitude(a_int, a_frac, b_int, b_frac)),
++        (true, true) => Some(cmp_magnitude(b_int, b_frac, a_int, a_frac)),
++    }
++}
++
+ /// Allowed partition transform values. Empty/None maps to identity.
+ const ALLOWED_PARTITION_TRANSFORMS: &[&str] = &["identity", "year", "month", "day", "hour"];
+ 
+@@ -1001,4 +1152,46 @@ mod tests {
+         let quoted = quote_identifier(malicious);
+         assert_eq!(quoted, r#""x"" TEXT); DROP TABLE foo; --""#);
+     }
++
++    // --- validate_ducklake_type_for_ddl tests (R7-S-009) ---
++
++    #[test]
++    fn test_validate_ducklake_type_for_ddl() {
++        assert!(validate_ducklake_type_for_ddl("int64").is_ok());
++        assert!(validate_ducklake_type_for_ddl("varchar").is_ok());
++        assert!(validate_ducklake_type_for_ddl("decimal(10, 2)").is_ok());
++        assert!(validate_ducklake_type_for_ddl("int64; DROP TABLE users").is_err());
++        assert!(validate_ducklake_type_for_ddl("int64\'--").is_err());
++        assert!(validate_ducklake_type_for_ddl("").is_err());
++    }
++
++    // --- is_numeric_type tests (R7-S-022) ---
++
++    #[test]
++    fn test_is_numeric_type() {
++        assert!(is_numeric_type("int64"));
++        assert!(is_numeric_type("DECIMAL(10, 2)"));
++        assert!(is_numeric_type("float"));
++        assert!(!is_numeric_type("varchar"));
++        assert!(!is_numeric_type("timestamp"));
++        assert!(!is_numeric_type("boolean"));
++    }
++
++    // --- stat_value_less_than tests (R7-S-022) ---
++
++    #[test]
++    fn test_stat_value_less_than_numeric() {
++        assert!(stat_value_less_than("1", "2", true));
++        assert!(!stat_value_less_than("2", "1", true));
++        assert!(!stat_value_less_than("1", "1", true));
++        // Large numbers
++        assert!(stat_value_less_than("-100", "100", true));
++        assert!(stat_value_less_than("1.5", "2.5", true));
++    }
++
++    #[test]
++    fn test_stat_value_less_than_string() {
++        assert!(stat_value_less_than("abc", "def", false));
++        assert!(!stat_value_less_than("def", "abc", false));
++    }
+ }
+diff --git a/src/parse_values.rs b/src/parse_values.rs
+index 6f5a3ef..f40b18b 100644
+--- a/src/parse_values.rs
++++ b/src/parse_values.rs
+@@ -245,9 +245,10 @@ pub fn parse_string_values_to_array(
+             let mut builder = Decimal128Builder::with_capacity(values.len());
+             for val in values {
+                 match val {
+-                    Some(s) => {
+-                        let i128_val = parse_decimal_string(s, *scale)?;
+-                        builder.append_value(i128_val);
++                    Some(s) => match parse_decimal_string(s, *scale) {
++                        Ok(i128_val) => builder.append_value(i128_val),
++                        Err(_) if mode == ParseMode::Lenient => builder.append_null(),
++                        Err(e) => return Err(e),
+                     },
+                     None => builder.append_null(),
+                 }
+@@ -268,9 +269,12 @@ pub fn parse_string_values_to_array(
+             let mut builder = Decimal256Builder::with_capacity(values.len());
+             for val in values {
+                 match val {
+-                    Some(s) => {
+-                        let i128_val = parse_decimal_string(s, *scale)?;
+-                        builder.append_value(arrow::datatypes::i256::from_i128(i128_val));
++                    Some(s) => match parse_decimal_string(s, *scale) {
++                        Ok(i128_val) => {
++                            builder.append_value(arrow::datatypes::i256::from_i128(i128_val));
++                        },
++                        Err(_) if mode == ParseMode::Lenient => builder.append_null(),
++                        Err(e) => return Err(e),
+                     },
+                     None => builder.append_null(),
+                 }
+diff --git a/src/schema.rs b/src/schema.rs
+index ff778a4..8d5d9e6 100644
+--- a/src/schema.rs
++++ b/src/schema.rs
+@@ -376,7 +376,7 @@ impl SchemaProvider for DuckLakeSchema {
+ 
+         // Propagate new snapshot to parent catalog so subsequent lookups see the change
+         if let Some(ref catalog_sid) = self.catalog_snapshot_id {
+-            catalog_sid.store(new_snapshot, Ordering::Release);
++            catalog_sid.fetch_max(new_snapshot, Ordering::Release);
+         }
+ 
+         Ok(Some(Arc::new(table) as Arc<dyn TableProvider>))
+@@ -442,7 +442,7 @@ impl SchemaProvider for DuckLakeSchema {
+                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
+             // Propagate new snapshot to parent catalog
+             if let Some(ref catalog_sid) = self.catalog_snapshot_id {
+-                catalog_sid.store(result.snapshot_id, Ordering::Release);
++                catalog_sid.fetch_max(result.snapshot_id, Ordering::Release);
+             }
+         } else {
+             // CTAS with data — write to Parquet and create metadata in one operation.
+@@ -461,7 +461,7 @@ impl SchemaProvider for DuckLakeSchema {
+                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
+             // Propagate new snapshot to parent catalog
+             if let Some(ref catalog_sid) = self.catalog_snapshot_id {
+-                catalog_sid.store(result.snapshot_id, Ordering::Release);
++                catalog_sid.fetch_max(result.snapshot_id, Ordering::Release);
+             }
+         }
+ 
+diff --git a/src/table.rs b/src/table.rs
+index 1165754..0bc90d4 100644
+--- a/src/table.rs
++++ b/src/table.rs
+@@ -362,7 +362,11 @@ impl DuckLakeTable {
+             }
+ 
+             // Parse string values into the appropriate Arrow array type
+-            let array = crate::table_writer::parse_string_to_array(&string_values, data_type)?;
++            let array = crate::parse_values::parse_string_values_to_array(
++                &string_values,
++                data_type,
++                crate::parse_values::ParseMode::Lenient,
++            )?;
+             column_arrays.push(array);
+         }
+ 
+@@ -954,7 +958,13 @@ impl DuckLakeTable {
+                     let file_value = values.iter().find(|(ki, _)| ki == key_index);
+                     match file_value {
+                         Some((_, actual_value)) => {
+-                            if actual_value.as_deref() != Some(expected_value.as_str()) {
++                            let matches = match actual_value.as_deref() {
++                                Some(actual) => {
++                                    partition_values_equal(actual, expected_value)
++                                },
++                                None => false,
++                            };
++                            if !matches {
+                                 return false; // Partition value doesn't match
+                             }
+                         },
+@@ -1288,6 +1298,23 @@ fn scalar_value_to_partition_string(value: &datafusion::common::ScalarValue) ->
+     }
+ }
+ 
++/// Type-aware comparison of partition values (R7-S-005).
++///
++/// Tries numeric (f64) comparison first so that "10" and "10.0" are considered
++/// equal and ordering is numeric rather than lexicographic. Falls back to
++/// exact string comparison for non-numeric values.
++fn partition_values_equal(actual: &str, expected: &str) -> bool {
++    // Fast path: exact string match
++    if actual == expected {
++        return true;
++    }
++    // Try numeric comparison for values that parse as numbers
++    if let (Ok(a), Ok(b)) = (actual.parse::<f64>(), expected.parse::<f64>()) {
++        return a == b;
++    }
++    false
++}
++
+ #[async_trait]
+ impl TableProvider for DuckLakeTable {
+     fn as_any(&self) -> &dyn Any {
+@@ -1746,16 +1773,19 @@ impl TableProvider for DuckLakeTable {
+                     .fields()
+                     .iter()
+                     .position(|f| f.name() == &pc.column_name)?;
+-                Some(crate::insert_exec::WritePartitionColumn {
++                let resolved_transform =
++                    crate::insert_exec::PartitionTransform::from_str_opt(
++                        pc.transform.as_deref(),
++                    )
++                    .map_err(|e| DataFusionError::External(Box::new(e)));
++                Some(resolved_transform.map(|rt| crate::insert_exec::WritePartitionColumn {
+                     column_name: pc.column_name.clone(),
+                     column_index: col_idx,
+-                    resolved_transform: crate::insert_exec::PartitionTransform::from_str_opt(
+-                        pc.transform.as_deref(),
+-                    ),
++                    resolved_transform: rt,
+                     transform: pc.transform.clone(),
+-                })
++                }))
+             })
+-            .collect();
++            .collect::<DataFusionResult<Vec<_>>>()?;
+ 
+         let exec = DuckLakeInsertExec::new(
+             actual_input,
+diff --git a/src/table_writer.rs b/src/table_writer.rs
+index cbf516d..99af306 100644
+--- a/src/table_writer.rs
++++ b/src/table_writer.rs
+@@ -1006,8 +1006,8 @@ pub(crate) fn batches_to_inlined_rows(
+ 
+ /// Convert an Arrow array value at a given index to a string representation.
+ ///
+-/// This produces strings compatible with the `parse_inlined_column` function
+-/// in `table.rs` for round-tripping through the catalog database.
++/// This produces strings compatible with `parse_values::parse_string_values_to_array`
++/// for round-tripping through the catalog database.
+ fn arrow_array_value_to_string(
+     array: &dyn arrow::array::Array,
+     idx: usize,
+@@ -1178,7 +1178,7 @@ fn arrow_array_value_to_string(
+ /// Convert InlinedDataRow values back to a RecordBatch.
+ ///
+ /// Used when flushing inlined data to Parquet. Re-uses the same parsing
+-/// logic as the read-side `parse_inlined_column` in `table.rs`.
++/// logic as `parse_values::parse_string_values_to_array`.
+ pub(crate) fn inlined_rows_to_batch(
+     rows: &[InlinedDataRow],
+     schema: &Schema,
+@@ -1203,7 +1203,11 @@ pub(crate) fn inlined_rows_to_batch(
+         }
+ 
+         // Parse string values into the appropriate Arrow array type
+-        let array = parse_string_to_array(&string_values, data_type)?;
++        let array = crate::parse_values::parse_string_values_to_array(
++            &string_values,
++            data_type,
++            crate::parse_values::ParseMode::Strict,
++        )?;
+         column_arrays.push(array);
+     }
+ 
+@@ -1213,308 +1217,6 @@ pub(crate) fn inlined_rows_to_batch(
+     )?)
+ }
+ 
+-/// Parse a decimal string (e.g. "123.45") to an i128 value scaled by 10^scale.
+-fn parse_decimal_string(s: &str, scale: i8) -> Result<i128> {
+-    let negative = s.starts_with('-');
+-    let s = if negative {
+-        &s[1..]
+-    } else {
+-        s
+-    };
+-
+-    let (integer_part, frac_part) = if let Some(dot_pos) = s.find('.') {
+-        (&s[..dot_pos], &s[dot_pos + 1..])
+-    } else {
+-        (s, "")
+-    };
+-
+-    let integer: i128 = if integer_part.is_empty() {
+-        0
+-    } else {
+-        integer_part.parse::<i128>().map_err(|_| {
+-            crate::error::DuckLakeError::Internal(format!(
+-                "Failed to parse decimal integer part '{}'",
+-                integer_part
+-            ))
+-        })?
+-    };
+-
+-    let scale_u = scale.max(0) as u32;
+-    let frac_len = frac_part.len() as u32;
+-    let frac: i128 = if frac_part.is_empty() {
+-        0
+-    } else if frac_len <= scale_u {
+-        let frac_val: i128 = frac_part.parse::<i128>().map_err(|_| {
+-            crate::error::DuckLakeError::Internal(format!(
+-                "Failed to parse decimal fraction part '{}'",
+-                frac_part
+-            ))
+-        })?;
+-        frac_val * 10i128.pow(scale_u - frac_len)
+-    } else {
+-        // Truncate extra digits
+-        let truncated = &frac_part[..scale_u as usize];
+-        truncated.parse::<i128>().map_err(|_| {
+-            crate::error::DuckLakeError::Internal(format!(
+-                "Failed to parse decimal fraction part '{}'",
+-                truncated
+-            ))
+-        })?
+-    };
+-
+-    let unscaled = integer * 10i128.pow(scale_u) + frac;
+-    Ok(if negative {
+-        -unscaled
+-    } else {
+-        unscaled
+-    })
+-}
+-
+-/// Parse string values into an Arrow array of the given data type.
+-pub(crate) fn parse_string_to_array(
+-    values: &[Option<String>],
+-    data_type: &arrow::datatypes::DataType,
+-) -> Result<Arc<dyn arrow::array::Array>> {
+-    use arrow::array::*;
+-    use arrow::datatypes::DataType;
+-
+-    macro_rules! parse_primitive {
+-        ($builder_ty:ty, $values:expr) => {{
+-            let mut builder = <$builder_ty>::with_capacity($values.len());
+-            for val in $values {
+-                match val {
+-                    Some(s) => match s.parse() {
+-                        Ok(v) => builder.append_value(v),
+-                        Err(_) => {
+-                            return Err(crate::error::DuckLakeError::Internal(format!(
+-                                "Failed to parse inlined value '{}' as {}",
+-                                s,
+-                                std::any::type_name::<$builder_ty>()
+-                            )));
+-                        },
+-                    },
+-                    None => builder.append_null(),
+-                }
+-            }
+-            Arc::new(builder.finish()) as Arc<dyn Array>
+-        }};
+-    }
+-
+-    let array: Arc<dyn arrow::array::Array> = match data_type {
+-        DataType::Boolean => {
+-            let mut builder = BooleanBuilder::with_capacity(values.len());
+-            for val in values {
+-                match val {
+-                    Some(s) => match s.to_lowercase().as_str() {
+-                        "true" | "1" | "t" => builder.append_value(true),
+-                        "false" | "0" | "f" => builder.append_value(false),
+-                        _ => {
+-                            return Err(crate::error::DuckLakeError::Internal(format!(
+-                                "Failed to parse inlined value '{}' as Boolean",
+-                                s
+-                            )));
+-                        },
+-                    },
+-                    None => builder.append_null(),
+-                }
+-            }
+-            Arc::new(builder.finish())
+-        },
+-        DataType::Int8 => parse_primitive!(Int8Builder, values),
+-        DataType::Int16 => parse_primitive!(Int16Builder, values),
+-        DataType::Int32 => parse_primitive!(Int32Builder, values),
+-        DataType::Int64 => parse_primitive!(Int64Builder, values),
+-        DataType::UInt8 => parse_primitive!(UInt8Builder, values),
+-        DataType::UInt16 => parse_primitive!(UInt16Builder, values),
+-        DataType::UInt32 => parse_primitive!(UInt32Builder, values),
+-        DataType::UInt64 => parse_primitive!(UInt64Builder, values),
+-        DataType::Float32 => parse_primitive!(Float32Builder, values),
+-        DataType::Float64 => parse_primitive!(Float64Builder, values),
+-        DataType::Utf8 => {
+-            let mut builder = StringBuilder::new();
+-            for val in values {
+-                match val {
+-                    Some(s) => builder.append_value(s),
+-                    None => builder.append_null(),
+-                }
+-            }
+-            Arc::new(builder.finish())
+-        },
+-        DataType::LargeUtf8 => {
+-            let mut builder = LargeStringBuilder::new();
+-            for val in values {
+-                match val {
+-                    Some(s) => builder.append_value(s),
+-                    None => builder.append_null(),
+-                }
+-            }
+-            Arc::new(builder.finish())
+-        },
+-        DataType::Date32 => {
+-            let mut builder = Date32Builder::with_capacity(values.len());
+-            for val in values {
+-                match val {
+-                    Some(s) => {
+-                        // Try ISO date string first ("2024-06-15"), then epoch days
+-                        let epoch_days =
+-                            if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+-                                let epoch: chrono::NaiveDate =
+-                                    chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+-                                date.signed_duration_since(epoch).num_days() as i32
+-                            } else if let Ok(v) = s.parse::<i32>() {
+-                                v
+-                            } else {
+-                                return Err(crate::error::DuckLakeError::Internal(format!(
+-                                    "Failed to parse inlined value '{}' as Date32",
+-                                    s
+-                                )));
+-                            };
+-                        builder.append_value(epoch_days);
+-                    },
+-                    None => builder.append_null(),
+-                }
+-            }
+-            Arc::new(builder.finish()) as Arc<dyn Array>
+-        },
+-        DataType::Date64 => {
+-            let mut builder = Date64Builder::with_capacity(values.len());
+-            for val in values {
+-                match val {
+-                    Some(s) => {
+-                        let epoch_ms =
+-                            if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+-                                let epoch: chrono::NaiveDate =
+-                                    chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+-                                date.signed_duration_since(epoch).num_days() as i64 * 86_400_000
+-                            } else if let Ok(v) = s.parse::<i64>() {
+-                                v
+-                            } else {
+-                                return Err(crate::error::DuckLakeError::Internal(format!(
+-                                    "Failed to parse inlined value '{}' as Date64",
+-                                    s
+-                                )));
+-                            };
+-                        builder.append_value(epoch_ms);
+-                    },
+-                    None => builder.append_null(),
+-                }
+-            }
+-            Arc::new(builder.finish()) as Arc<dyn Array>
+-        },
+-        DataType::Timestamp(unit, tz) => {
+-            use arrow::datatypes::TimeUnit;
+-
+-            /// Parse a timestamp string (ISO or epoch integer) to epoch microseconds.
+-            fn parse_timestamp_to_us(s: &str) -> std::result::Result<i64, String> {
+-                // Try ISO format first: "2024-06-15 12:30:00"
+-                if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+-                    let utc: chrono::DateTime<chrono::Utc> = dt.and_utc();
+-                    return Ok(utc.timestamp_micros());
+-                }
+-                // Try with fractional seconds: "2024-06-15 12:30:00.123456"
+-                if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
+-                    let utc: chrono::DateTime<chrono::Utc> = dt.and_utc();
+-                    return Ok(utc.timestamp_micros());
+-                }
+-                // Fallback: raw integer (epoch microseconds)
+-                s.parse::<i64>()
+-                    .map_err(|_| format!("Failed to parse '{}' as Timestamp", s))
+-            }
+-
+-            macro_rules! build_timestamp {
+-                ($builder_ty:ty, $convert:expr) => {{
+-                    let mut builder = <$builder_ty>::with_capacity(values.len());
+-                    let convert_fn: fn(i64) -> i64 = $convert;
+-                    for val in values {
+-                        match val {
+-                            Some(s) => match parse_timestamp_to_us(s) {
+-                                Ok(us) => builder.append_value(convert_fn(us)),
+-                                Err(msg) => {
+-                                    return Err(crate::error::DuckLakeError::Internal(msg));
+-                                },
+-                            },
+-                            None => builder.append_null(),
+-                        }
+-                    }
+-                    let arr = builder.finish();
+-                    match tz {
+-                        Some(tz) => Arc::new(arr.with_timezone(tz.as_ref())) as Arc<dyn Array>,
+-                        None => Arc::new(arr) as Arc<dyn Array>,
+-                    }
+-                }};
+-            }
+-
+-            match unit {
+-                TimeUnit::Second => {
+-                    build_timestamp!(TimestampSecondBuilder, |us: i64| us / 1_000_000)
+-                },
+-                TimeUnit::Millisecond => {
+-                    build_timestamp!(TimestampMillisecondBuilder, |us: i64| us / 1_000)
+-                },
+-                TimeUnit::Microsecond => {
+-                    build_timestamp!(TimestampMicrosecondBuilder, |us: i64| us)
+-                },
+-                TimeUnit::Nanosecond => {
+-                    build_timestamp!(TimestampNanosecondBuilder, |us: i64| us * 1_000)
+-                },
+-            }
+-        },
+-        DataType::Decimal128(precision, scale) => {
+-            let mut builder = Decimal128Builder::with_capacity(values.len());
+-            for val in values {
+-                match val {
+-                    Some(s) => {
+-                        let i128_val = parse_decimal_string(s, *scale)?;
+-                        builder.append_value(i128_val);
+-                    },
+-                    None => builder.append_null(),
+-                }
+-            }
+-            Arc::new(
+-                builder
+-                    .finish()
+-                    .with_precision_and_scale(*precision, *scale)
+-                    .map_err(|e| {
+-                        crate::error::DuckLakeError::Internal(format!(
+-                            "Invalid Decimal128 precision/scale: {}",
+-                            e
+-                        ))
+-                    })?,
+-            ) as Arc<dyn Array>
+-        },
+-        DataType::Decimal256(precision, scale) => {
+-            let mut builder = Decimal256Builder::with_capacity(values.len());
+-            for val in values {
+-                match val {
+-                    Some(s) => {
+-                        let i128_val = parse_decimal_string(s, *scale)?;
+-                        builder.append_value(arrow::datatypes::i256::from_i128(i128_val));
+-                    },
+-                    None => builder.append_null(),
+-                }
+-            }
+-            Arc::new(
+-                builder
+-                    .finish()
+-                    .with_precision_and_scale(*precision, *scale)
+-                    .map_err(|e| {
+-                        crate::error::DuckLakeError::Internal(format!(
+-                            "Invalid Decimal256 precision/scale: {}",
+-                            e
+-                        ))
+-                    })?,
+-            ) as Arc<dyn Array>
+-        },
+-        other => {
+-            return Err(crate::error::DuckLakeError::UnsupportedType(format!(
+-                "Unsupported data type {:?} in parse_string_to_array",
+-                other
+-            )));
+-        },
+-    };
+-
+-    Ok(array)
+-}
+ 
+ pub(crate) fn arrow_schema_to_column_defs(schema: &Schema) -> Result<Vec<ColumnDef>> {
+     schema
+@@ -1660,8 +1362,10 @@ fn parquet_stats_min_max(
+             );
+             if is_decimal {
+                 (
+-                    vs.min_opt().map(|v| decode_decimal_bytes(v.data())),
+-                    vs.max_opt().map(|v| decode_decimal_bytes(v.data())),
++                    vs.min_opt()
++                        .and_then(|v| decode_decimal_bytes(v.data()).ok()),
++                    vs.max_opt()
++                        .and_then(|v| decode_decimal_bytes(v.data()).ok()),
+                 )
+             } else {
+                 (
+@@ -1677,22 +1381,25 @@ fn parquet_stats_min_max(
+ }
+ 
+ /// Decode a big-endian two's complement byte array to a decimal string.
+-fn decode_decimal_bytes(bytes: &[u8]) -> String {
++///
++/// Returns an error if the input exceeds 16 bytes (R7-S-007).
++fn decode_decimal_bytes(bytes: &[u8]) -> crate::Result<String> {
+     if bytes.is_empty() {
+-        return "0".to_string();
++        return Ok("0".to_string());
++    }
++    if bytes.len() > 16 {
++        return Err(crate::error::DuckLakeError::Internal(
++            "Decimal value exceeds 16 bytes".into(),
++        ));
+     }
+     // Sign-extend to 16 bytes for i128
+     let negative = bytes[0] & 0x80 != 0;
+-    let fill = if negative {
+-        0xFF
+-    } else {
+-        0x00
+-    };
++    let fill = if negative { 0xFF } else { 0x00 };
+     let mut padded = [fill; 16];
+-    let start = 16usize.saturating_sub(bytes.len());
++    let start = 16 - bytes.len();
+     padded[start..].copy_from_slice(bytes);
+     let value = i128::from_be_bytes(padded);
+-    value.to_string()
++    Ok(value.to_string())
+ }
+ 
+ /// Decide whether a new min value should replace the current one.
+@@ -2084,7 +1791,7 @@ mod tests {
+     #[test]
+     fn test_parse_string_values_to_array_error_on_invalid() {
+         let values = vec![Some("not_a_number".to_string())];
+-        let result = parse_string_to_array(&values, &DataType::Int32);
++        let result = crate::parse_values::parse_string_values_to_array(&values, &DataType::Int32, crate::parse_values::ParseMode::Strict);
+         assert!(result.is_err());
+         let err_msg = result.unwrap_err().to_string();
+         assert!(err_msg.contains("Failed to parse"));
+@@ -2093,7 +1800,7 @@ mod tests {
+     #[test]
+     fn test_parse_string_values_to_array_bool_error_on_invalid() {
+         let values = vec![Some("maybe".to_string())];
+-        let result = parse_string_to_array(&values, &DataType::Boolean);
++        let result = crate::parse_values::parse_string_values_to_array(&values, &DataType::Boolean, crate::parse_values::ParseMode::Strict);
+         assert!(result.is_err());
+         let err_msg = result.unwrap_err().to_string();
+         assert!(err_msg.contains("Failed to parse"));
+@@ -2109,7 +1816,7 @@ mod tests {
+ 
+         // Read: ISO string "2024-06-15" -> Date32 value 19889
+         let values = vec![Some(serialized)];
+-        let result = parse_string_to_array(&values, &DataType::Date32).unwrap();
++        let result = crate::parse_values::parse_string_values_to_array(&values, &DataType::Date32, crate::parse_values::ParseMode::Strict).unwrap();
+         let date_array = result.as_any().downcast_ref::<Date32Array>().unwrap();
+         assert_eq!(date_array.value(0), 19889);
+     }
+@@ -2127,7 +1834,7 @@ mod tests {
+         // Read: ISO string -> Timestamp microseconds
+         let values = vec![Some(serialized)];
+         let result =
+-            parse_string_to_array(&values, &DataType::Timestamp(TimeUnit::Microsecond, None))
++            crate::parse_values::parse_string_values_to_array(&values, &DataType::Timestamp(TimeUnit::Microsecond, None), crate::parse_values::ParseMode::Strict)
+                 .unwrap();
+         let ts_array = result
+             .as_any()
+@@ -2141,7 +1848,7 @@ mod tests {
+         use arrow::array::Date32Array;
+         // Verify that old epoch-day strings ("19889") are still parseable
+         let values = vec![Some("19889".to_string())];
+-        let result = parse_string_to_array(&values, &DataType::Date32).unwrap();
++        let result = crate::parse_values::parse_string_values_to_array(&values, &DataType::Date32, crate::parse_values::ParseMode::Strict).unwrap();
+         let date_array = result.as_any().downcast_ref::<Date32Array>().unwrap();
+         assert_eq!(date_array.value(0), 19889);
+     }
+@@ -2154,7 +1861,7 @@ mod tests {
+         let epoch_us: i64 = 1_718_451_000_000_000;
+         let values = vec![Some(epoch_us.to_string())];
+         let result =
+-            parse_string_to_array(&values, &DataType::Timestamp(TimeUnit::Microsecond, None))
++            crate::parse_values::parse_string_values_to_array(&values, &DataType::Timestamp(TimeUnit::Microsecond, None), crate::parse_values::ParseMode::Strict)
+                 .unwrap();
+         let ts_array = result
+             .as_any()
+@@ -2169,9 +1876,10 @@ mod tests {
+         use arrow::datatypes::TimeUnit;
+         let epoch_us: i64 = 1_718_451_000_000_000;
+         let values = vec![Some(epoch_us.to_string())];
+-        let result = parse_string_to_array(
++        let result = crate::parse_values::parse_string_values_to_array(
+             &values,
+             &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
++            crate::parse_values::ParseMode::Strict,
+         )
+         .unwrap();
+         let ts_array = result
+diff --git a/tests/concurrent_write_tests.rs b/tests/concurrent_write_tests.rs
+index 0099e74..00fdb58 100644
+--- a/tests/concurrent_write_tests.rs
++++ b/tests/concurrent_write_tests.rs
+@@ -151,6 +151,39 @@ async fn test_concurrent_writes_same_table_append() {
+         let result = task.await.expect("Task panicked");
+         assert_eq!(result.unwrap().records_written, 1);
+     }
++
++    // Read back all rows and verify count: 1 initial + 10 appended = 11
++    let db_path = temp_dir.path().join("test.db");
++    let conn_str = format!("sqlite:{}?mode=rwc", db_path.display());
++    let data_path = temp_dir.path().join("data");
++
++    let provider = datafusion_ducklake::SqliteMetadataProvider::new(&conn_str)
++        .await
++        .unwrap();
++    let catalog = Arc::new(datafusion_ducklake::DuckLakeCatalog::new(provider).unwrap());
++
++    let ctx = datafusion::prelude::SessionContext::new();
++    let local_fs: Arc<dyn object_store::ObjectStore> =
++        Arc::new(object_store::local::LocalFileSystem::new());
++    let data_url = url::Url::from_directory_path(&data_path).unwrap();
++    ctx.runtime_env().register_object_store(&data_url, local_fs);
++    ctx.register_catalog("ducklake", catalog);
++
++    let df = ctx
++        .sql("SELECT COUNT(*) AS cnt FROM ducklake.main.shared_table")
++        .await
++        .unwrap();
++    let batches = df.collect().await.unwrap();
++    let count_array = batches[0]
++        .column(0)
++        .as_any()
++        .downcast_ref::<arrow::array::Int64Array>()
++        .unwrap();
++    assert_eq!(
++        count_array.value(0),
++        11,
++        "Expected 1 initial + 10 appended = 11 rows"
++    );
+ }
+ 
+ #[tokio::test(flavor = "multi_thread")]
+diff --git a/tests/hybrid_asyncdb.rs b/tests/hybrid_asyncdb.rs
+index b3ce173..ffccdbc 100644
+--- a/tests/hybrid_asyncdb.rs
++++ b/tests/hybrid_asyncdb.rs
+@@ -1061,6 +1061,85 @@ mod tests {
+         );
+     }
+ 
++    #[tokio::test]
++    async fn test_transaction_routing_end_to_end() {
++        use sqllogictest::AsyncDB;
++
++        let temp_dir = tempfile::TempDir::new().unwrap();
++        let catalog_path = temp_dir.path().join("test_tx_routing.ducklake");
++        let mut db = HybridDuckLakeDB::new(catalog_path).unwrap();
++
++        // Create a table outside a transaction
++        let _ = db
++            .run("CREATE TABLE ducklake.t_route(id INTEGER, val VARCHAR)")
++            .await;
++
++        // Insert initial data outside transaction so DataFusion can see it
++        let _ = db
++            .run("INSERT INTO ducklake.t_route VALUES (1, 'committed')")
++            .await;
++
++        // Verify DataFusion can read the committed row
++        let result = db
++            .run("SELECT id, val FROM ducklake.main.t_route ORDER BY id")
++            .await
++            .unwrap();
++        match &result {
++            sqllogictest::DBOutput::Rows { rows, .. } => {
++                assert_eq!(rows.len(), 1, "Should see 1 committed row via DataFusion");
++                assert_eq!(rows[0], vec!["1", "committed"]);
++            }
++            _ => panic!("Expected Rows output"),
++        }
++
++        // BEGIN a transaction
++        let _ = db.run("BEGIN").await;
++
++        // Insert uncommitted data (routed to DuckDB)
++        let _ = db
++            .run("INSERT INTO ducklake.t_route VALUES (2, 'uncommitted')")
++            .await;
++
++        // Read inside transaction — should route to DuckDB and see uncommitted data
++        let result = db
++            .run("SELECT id, val FROM ducklake.t_route ORDER BY id")
++            .await
++            .unwrap();
++        match &result {
++            sqllogictest::DBOutput::Rows { rows, .. } => {
++                assert_eq!(
++                    rows.len(),
++                    2,
++                    "DuckDB should see both committed and uncommitted rows"
++                );
++                assert_eq!(rows[0], vec!["1", "committed"]);
++                assert_eq!(rows[1], vec!["2", "uncommitted"]);
++            }
++            _ => panic!("Expected Rows output"),
++        }
++
++        // COMMIT the transaction
++        let _ = db.run("COMMIT").await;
++
++        // Read after commit — should route to DataFusion and see all data
++        let result = db
++            .run("SELECT id, val FROM ducklake.main.t_route ORDER BY id")
++            .await
++            .unwrap();
++        match &result {
++            sqllogictest::DBOutput::Rows { rows, .. } => {
++                assert_eq!(
++                    rows.len(),
++                    2,
++                    "DataFusion should see both rows after commit"
++                );
++                assert_eq!(rows[0], vec!["1", "committed"]);
++                assert_eq!(rows[1], vec!["2", "uncommitted"]);
++            }
++            _ => panic!("Expected Rows output"),
++        }
++    }
++
+     #[test]
+     fn test_rewrite_preserves_string_literals() {
+         // R5-S-033: rewrite_table_references should NOT rewrite inside string literals

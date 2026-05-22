@@ -1,0 +1,48 @@
+diff --git a/src/table_changes.rs b/src/table_changes.rs
+index d436a2e..e05f45e 100644
+--- a/src/table_changes.rs
++++ b/src/table_changes.rs
+@@ -439,7 +439,8 @@ impl TableChangesTable {
+             &self.table_path,
+             &data_file.path,
+             data_file.path_is_relative,
+-        );
++        )
++        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+ 
+         // Create PartitionedFile with footer size hint if available
+         let mut pf = PartitionedFile::new(&resolved_path, data_file.file_size_bytes as u64);
+@@ -556,7 +557,8 @@ impl TableProvider for TableChangesTable {
+                     &self.table_path,
+                     &data_file.path,
+                     data_file.path_is_relative,
+-                );
++                )
++                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                 builder.add_file(&resolved_path, data_file.encryption_key.as_deref());
+             }
+             let factory = builder.build();
+diff --git a/src/table_deletions.rs b/src/table_deletions.rs
+index f61cc05..9a330d4 100644
+--- a/src/table_deletions.rs
++++ b/src/table_deletions.rs
+@@ -108,7 +108,8 @@ impl TableDeletionsTable {
+             &self.table_path,
+             &delete_file.data_file_path,
+             delete_file.data_file_path_is_relative,
+-        );
++        )
++        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+ 
+         // Create scan for current delete file (if exists - None means full file delete)
+         let current_delete_exec = if let Some(ref current_path) = delete_file.current_delete_path {
+@@ -159,7 +160,8 @@ impl TableDeletionsTable {
+         size_bytes: i64,
+         footer_size: i64,
+     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+-        let resolved_path = resolve_path(&self.table_path, path, is_relative);
++        let resolved_path = resolve_path(&self.table_path, path, is_relative)
++            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+ 
+         let mut pf = PartitionedFile::new(&resolved_path, size_bytes as u64);
+         if footer_size > 0 {

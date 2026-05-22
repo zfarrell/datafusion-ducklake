@@ -1,0 +1,1306 @@
+diff --git a/src/cdc_common.rs b/src/cdc_common.rs
+index cc36cc9..04330d0 100644
+--- a/src/cdc_common.rs
++++ b/src/cdc_common.rs
+@@ -95,14 +95,18 @@ pub(crate) fn analyze_cdc_projection(
+                     0
+                 };
+ 
++            // Precompute table column index -> natural position map for O(1) lookups
++            let table_idx_to_natural: std::collections::HashMap<usize, usize> = table_indices
++                .iter()
++                .enumerate()
++                .map(|(pos, &ti)| (ti, pos))
++                .collect();
++
+             let natural_pos_map: Vec<usize> = indices
+                 .iter()
+                 .map(|&idx| {
+                     if idx < num_table_cols {
+-                        // Find position of this table column index in table_indices.
+-                        // Use position-by-position scan to handle duplicate projections:
+-                        // each occurrence maps to the corresponding table_indices position.
+-                        table_indices.iter().position(|&ti| ti == idx).unwrap_or(0)
++                        table_idx_to_natural.get(&idx).copied().unwrap_or(0)
+                     } else if idx == snapshot_id_idx {
+                         snapshot_natural_pos
+                     } else {
+diff --git a/src/compaction_functions.rs b/src/compaction_functions.rs
+index fa15871..c37c3ed 100644
+--- a/src/compaction_functions.rs
++++ b/src/compaction_functions.rs
+@@ -82,10 +82,15 @@ fn open_compaction_connection(catalog_path: &str) -> DataFusionResult<duckdb::Co
+     // Only INSTALL once per process — the extension is cached on disk (R6-S-026).
+     // INSTALL is idempotent but has overhead; LOAD is still needed per-connection.
+     // Uses AtomicBool so failures can be retried on subsequent calls (R7-S-001).
+-    if !DUCKLAKE_INSTALLED.load(Ordering::Acquire) {
+-        conn.execute("INSTALL ducklake;", [])
+-            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+-        DUCKLAKE_INSTALLED.store(true, Ordering::Release);
++    if DUCKLAKE_INSTALLED
++        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
++        .is_ok()
++    {
++        if let Err(e) = conn.execute("INSTALL ducklake;", []) {
++            // Reset flag so next call can retry
++            DUCKLAKE_INSTALLED.store(false, Ordering::Release);
++            return Err(datafusion::error::DataFusionError::External(Box::new(e)));
++        }
+     }
+     conn.execute("LOAD ducklake;", [])
+         .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+@@ -361,7 +366,7 @@ impl TableFunctionImpl for DucklakeRewriteDataFilesFunction {
+         let sql = match exprs.len() {
+             1 => {
+                 let threshold = extract_float_arg(&exprs[0], "ducklake_rewrite_data_files", 1)?;
+-                if threshold < 0.0 || threshold > 1.0 {
++                if !threshold.is_finite() || threshold < 0.0 || threshold > 1.0 {
+                     return plan_err!(
+                         "delete_threshold must be between 0.0 and 1.0, got {}",
+                         threshold
+@@ -375,7 +380,7 @@ impl TableFunctionImpl for DucklakeRewriteDataFilesFunction {
+             2 => {
+                 let table_name = extract_string_arg(&exprs[0], "ducklake_rewrite_data_files", 1)?;
+                 let threshold = extract_float_arg(&exprs[1], "ducklake_rewrite_data_files", 2)?;
+-                if threshold < 0.0 || threshold > 1.0 {
++                if !threshold.is_finite() || threshold < 0.0 || threshold > 1.0 {
+                     return plan_err!(
+                         "delete_threshold must be between 0.0 and 1.0, got {}",
+                         threshold
+diff --git a/src/delete_filter.rs b/src/delete_filter.rs
+index 40b5a6f..71ac6ef 100644
+--- a/src/delete_filter.rs
++++ b/src/delete_filter.rs
+@@ -157,7 +157,12 @@ impl Stream for DeleteFilterStream {
+                                 )))));
+                             },
+                         };
+-                        self.row_offset += num_rows;
++                        self.row_offset = self.row_offset.checked_add(num_rows).ok_or_else(|| {
++                            DataFusionError::Internal(format!(
++                                "row_offset overflow: {} + {}",
++                                self.row_offset, num_rows
++                            ))
++                        })?;
+                         Poll::Ready(Some(Ok(filtered_batch)))
+                     },
+                     Err(e) => Poll::Ready(Some(Err(e))),
+@@ -185,7 +190,12 @@ impl DeleteFilterStream {
+         let mut keep_indices: Vec<u32> = Vec::with_capacity(num_rows);
+ 
+         for i in 0..num_rows_u32 {
+-            let global_pos = self.row_offset + i64::from(i);
++            let global_pos = self.row_offset.checked_add(i64::from(i)).ok_or_else(|| {
++                DataFusionError::Internal(format!(
++                    "global position overflow: {} + {}",
++                    self.row_offset, i
++                ))
++            })?;
+             if !self.deleted_positions.contains(&global_pos) {
+                 keep_indices.push(i);
+             }
+diff --git a/src/insert_exec.rs b/src/insert_exec.rs
+index f96b5ea..0bf45b8 100644
+--- a/src/insert_exec.rs
++++ b/src/insert_exec.rs
+@@ -433,11 +433,11 @@ fn extract_temporal_component(
+                 arrow::datatypes::TimeUnit::Second => array
+                     .as_any()
+                     .downcast_ref::<TimestampSecondArray>()
+-                    .map(|a| a.value(row) * 1_000_000),
++                    .and_then(|a| a.value(row).checked_mul(1_000_000)),
+                 arrow::datatypes::TimeUnit::Millisecond => array
+                     .as_any()
+                     .downcast_ref::<TimestampMillisecondArray>()
+-                    .map(|a| a.value(row) * 1_000),
++                    .and_then(|a| a.value(row).checked_mul(1_000)),
+                 arrow::datatypes::TimeUnit::Microsecond => array
+                     .as_any()
+                     .downcast_ref::<TimestampMicrosecondArray>()
+@@ -813,9 +813,22 @@ async fn write_partitioned(
+     }
+ 
+     // 3. Atomic commit: end old files (if Replace) and register all new files + partition values
+-    let result = table_writer
++    // R11-S-002: Collect object paths before commit so we can clean up on failure
++    let cleanup_paths: Vec<_> = uploaded_files.iter().map(|(u, _)| u.object_path.clone()).collect();
++    let result = match table_writer
+         .commit_uploaded_files(&setup, uploaded_files, write_mode)
+-        .await?;
++        .await
++    {
++        Ok(r) => r,
++        Err(e) => {
++            // Clean up all uploaded files on commit failure to prevent orphans
++            crate::table_writer::cleanup_orphaned_files(
++                table_writer.object_store.as_ref(),
++                &cleanup_paths,
++            ).await;
++            return Err(e);
++        },
++    };
+ 
+     Ok(u64::try_from(result.records_written)
+         .map_err(|e| DataFusionError::Execution(format!("Record count overflow: {}", e)))?)
+diff --git a/src/merge_exec.rs b/src/merge_exec.rs
+index f7c8fea..389c6f2 100644
+--- a/src/merge_exec.rs
++++ b/src/merge_exec.rs
+@@ -31,17 +31,10 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+ use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+ use futures::stream::{self, TryStreamExt};
+ use object_store::path::Path as ObjectPath;
+-use object_store::{ObjectStore, PutPayload};
+-use parquet::arrow::ArrowWriter;
+-use parquet::file::properties::WriterProperties;
+-use uuid::Uuid;
++use object_store::ObjectStore;
+ 
+ use crate::metadata_provider::DuckLakeTableFile;
+ use crate::metadata_writer::{DataFileInfo, DeleteFileInfo, MetadataWriter};
+-use crate::path_resolver::join_paths;
+-use crate::table_writer::{
+-    build_schema_with_field_ids, calculate_footer_size_from_bytes, extract_column_stats,
+-};
+ 
+ use crate::delete_exec::make_dml_count_schema;
+ 
+@@ -458,6 +451,10 @@ impl ExecutionPlan for DuckLakeMergeExec {
+                     .map(|b| vec![false; b.num_rows()])
+                     .collect();
+ 
++                // Reusable key buffer to avoid per-row allocation
++                let mut target_key: Vec<HashableKeyValue> =
++                    Vec::with_capacity(target_col_indices.len());
++
+                 while let Some(batch) = parquet_stream.try_next().await? {
+                     let num_rows = batch.num_rows();
+ 
+@@ -475,12 +472,13 @@ impl ExecutionPlan for DuckLakeMergeExec {
+                         }
+ 
+                         // Build target key and look up in hash index (O(1) instead of O(M))
+-                        let target_key: Vec<HashableKeyValue> = target_col_indices
+-                            .iter()
+-                            .map(|&col_idx| {
+-                                extract_key_value(batch.column(col_idx).as_ref(), target_row_idx)
+-                            })
+-                            .collect::<DataFusionResult<Vec<_>>>()?;
++                        target_key.clear();
++                        for &col_idx in &target_col_indices {
++                            target_key.push(extract_key_value(
++                                batch.column(col_idx).as_ref(),
++                                target_row_idx,
++                            )?);
++                        }
+ 
+                         // NULL keys never match (SQL semantics)
+                         if target_key
+@@ -491,6 +489,16 @@ impl ExecutionPlan for DuckLakeMergeExec {
+                         }
+ 
+                         if let Some(candidates) = source_hash_index.get(&target_key) {
++                            // R11-S-003: SQL standard requires error when multiple source rows
++                            // match the same target row.
++                            if candidates.len() > 1 {
++                                return Err(DataFusionError::Execution(
++                                    "MERGE violation: multiple source rows matched the same target row. \
++                                     SQL standard requires each target row to be matched by at most one source row."
++                                        .to_string(),
++                                ));
++                            }
++
+                             for &(batch_idx, src_row_idx) in candidates {
+                                 let src_global = source_batch_offsets[batch_idx] + src_row_idx;
+                                 source_match_count[src_global] += 1;
+@@ -609,72 +617,15 @@ impl ExecutionPlan for DuckLakeMergeExec {
+             // Write new data file(s) for updated + inserted rows
+             let mut pending_data_files: Vec<DataFileInfo> = Vec::new();
+             if !new_data_batches.is_empty() {
+-                let data_file_name = format!("ducklake-{}.parquet", Uuid::new_v4());
+-
+-                // Use the catalog's stored table_path instead of deriving from names,
+-                // so writes go to the correct location even after table rename.
+-                let object_key = join_paths(table_path.trim_start_matches('/'), &data_file_name)?;
+-                let data_object_path = ObjectPath::from(object_key.trim_start_matches('/'));
+-
+-                let write_schema = Arc::new(
+-                    build_schema_with_field_ids(&table_schema, &column_ids)
+-                        .map_err(|e| DataFusionError::External(Box::new(e)))?,
+-                );
+-
+-                let props = WriterProperties::builder()
+-                    .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
+-                    .set_compression(parquet::basic::Compression::SNAPPY)
+-                    .build();
+-                let mut arrow_writer =
+-                    ArrowWriter::try_new(Vec::new(), write_schema.clone(), Some(props))
+-                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+-
+-                let mut total_records: i64 = 0;
+-                for batch in &new_data_batches {
+-                    let batch_with_ids =
+-                        RecordBatch::try_new(write_schema.clone(), batch.columns().to_vec())?;
+-                    let batch_rows = i64::try_from(batch_with_ids.num_rows()).map_err(|e| {
+-                        DataFusionError::Execution(format!("Row count overflow: {}", e))
+-                    })?;
+-                    total_records = total_records.checked_add(batch_rows).ok_or_else(|| {
+-                        DataFusionError::Execution(format!(
+-                            "Total record count overflow: {} + {} exceeds i64::MAX",
+-                            total_records, batch_rows
+-                        ))
+-                    })?;
+-                    arrow_writer
+-                        .write(&batch_with_ids)
+-                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+-                }
+-
+-                // R4-S-005: Extract column stats before consuming the writer
+-                arrow_writer
+-                    .flush()
+-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+-                let column_stats =
+-                    extract_column_stats(arrow_writer.flushed_row_groups(), &column_ids);
+-
+-                let buffer = arrow_writer
+-                    .into_inner()
+-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+-
+-                let file_size = i64::try_from(buffer.len()).map_err(|e| {
+-                    DataFusionError::Execution(format!("File size overflow: {}", e))
+-                })?;
+-                let footer_size = calculate_footer_size_from_bytes(&buffer)
+-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+-
+-                // Upload data file (guard cleans up on error)
+-                object_store
+-                    .put(&data_object_path, PutPayload::from(buffer))
+-                    .await
+-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+-                upload_guard.push(data_object_path);
+-
+-                let data_file_info = DataFileInfo::new(&data_file_name, file_size, total_records)
+-                    .with_footer_size(footer_size)
+-                    .with_column_stats(column_stats);
+-
++                let data_file_info = crate::table_writer::write_and_upload_parquet(
++                    &new_data_batches,
++                    &table_schema,
++                    &column_ids,
++                    &table_path,
++                    &*object_store,
++                    &mut upload_guard,
++                )
++                .await?;
+                 pending_data_files.push(data_file_info);
+             }
+ 
+diff --git a/src/metadata_provider_duckdb.rs b/src/metadata_provider_duckdb.rs
+index 63658ce..c506ad4 100644
+--- a/src/metadata_provider_duckdb.rs
++++ b/src/metadata_provider_duckdb.rs
+@@ -266,7 +266,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
+                     };
+ 
+                     // Parse delete file (columns 6-12) if exists
+-                    let delete_file = if let Ok(Some(_)) = row.get::<_, Option<i64>>(6) {
++                    let delete_file = if row.get::<_, Option<i64>>(6)?.is_some() {
+                         Some(DuckLakeFileData {
+                             path: row.get(7)?,
+                             path_is_relative: row.get(8)?,
+@@ -458,18 +458,17 @@ impl MetadataProvider for DuckdbMetadataProvider {
+                     };
+ 
+                     // Parse optional delete file (column 8: delete_file_id, check if exists but don't store)
+-                    let delete_file =
+-                        if let Ok(Some(_delete_file_id)) = row.get::<_, Option<i64>>(8) {
+-                            Some(DuckLakeFileData {
+-                                path: row.get(9)?,
+-                                path_is_relative: row.get(10)?,
+-                                file_size_bytes: row.get(11)?,
+-                                footer_size: row.get(12)?,
+-                                encryption_key: row.get(13)?,
+-                            })
+-                        } else {
+-                            None
+-                        };
++                    let delete_file = if row.get::<_, Option<i64>>(8)?.is_some() {
++                        Some(DuckLakeFileData {
++                            path: row.get(9)?,
++                            path_is_relative: row.get(10)?,
++                            file_size_bytes: row.get(11)?,
++                            footer_size: row.get(12)?,
++                            encryption_key: row.get(13)?,
++                        })
++                    } else {
++                        None
++                    };
+ 
+                     let max_row_count = row.get::<_, Option<i64>>(14)?;
+ 
+@@ -626,7 +625,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
+         // Verify the inlined data table actually exists before querying it
+         let table_exists: bool = conn
+             .query_row(
+-                "SELECT COUNT(*) > 0 FROM information_schema.tables WHERE table_name = ?",
++                "SELECT COUNT(*) > 0 FROM information_schema.tables WHERE table_schema = 'main' AND table_name = ?",
+                 [&inlined_table_name],
+                 |row| row.get(0),
+             )
+diff --git a/src/metadata_provider_impl.rs b/src/metadata_provider_impl.rs
+index 56be438..28811bd 100644
+--- a/src/metadata_provider_impl.rs
++++ b/src/metadata_provider_impl.rs
+@@ -691,16 +691,21 @@ macro_rules! impl_metadata_provider {
+                      FROM ducklake_file_column_stats s
+                      JOIN ducklake_data_file f ON s.data_file_id = f.data_file_id
+                      JOIN ducklake_column c ON s.column_id = c.column_id
+-                       AND c.table_id = s.table_id AND c.end_snapshot IS NULL
++                       AND c.table_id = s.table_id
++                       AND c.begin_snapshot <= {} AND (c.end_snapshot IS NULL OR c.end_snapshot > {})
+                      WHERE s.table_id = {}
+                        AND {} >= f.begin_snapshot
+                        AND ({} < f.end_snapshot OR f.end_snapshot IS NULL)",
+                     d.ph(1),
+                     d.ph(2),
+                     d.ph(3),
++                    d.ph(4),
++                    d.ph(5),
+                 );
+                 block_on(async {
+                     sqlx::query(&sql)
++                        .bind(snapshot_id)
++                        .bind(snapshot_id)
+                         .bind(table_id)
+                         .bind(snapshot_id)
+                         .bind(snapshot_id)
+@@ -788,7 +793,8 @@ macro_rules! impl_metadata_provider {
+                      JOIN ducklake_partition_column pc
+                          ON pi.partition_id = pc.partition_id AND pi.table_id = pc.table_id
+                      JOIN ducklake_column c ON pc.column_id = c.column_id
+-                       AND c.table_id = pi.table_id AND c.end_snapshot IS NULL
++                       AND c.table_id = pi.table_id
++                       AND c.begin_snapshot <= {} AND (c.end_snapshot IS NULL OR c.end_snapshot > {})
+                      WHERE pi.table_id = {}
+                        AND {} >= pi.begin_snapshot
+                        AND ({} < pi.end_snapshot OR pi.end_snapshot IS NULL)
+@@ -797,9 +803,13 @@ macro_rules! impl_metadata_provider {
+                     d.ph(1),
+                     d.ph(2),
+                     d.ph(3),
++                    d.ph(4),
++                    d.ph(5),
+                 );
+                 block_on(async {
+                     sqlx::query(&sql)
++                        .bind(snapshot_id)
++                        .bind(snapshot_id)
+                         .bind(table_id)
+                         .bind(snapshot_id)
+                         .bind(snapshot_id)
+diff --git a/src/metadata_provider_mysql.rs b/src/metadata_provider_mysql.rs
+index 047f0b5..f801b40 100644
+--- a/src/metadata_provider_mysql.rs
++++ b/src/metadata_provider_mysql.rs
+@@ -196,6 +196,8 @@ WHERE data.table_id = ?
+         snapshot_id: i64,
+     ) -> Result<Vec<InlinedDataRow>> {
+         block_on(async {
++            let mut tx = self.pool.begin().await?;
++
+             let table_info = sqlx::query(
+                 "SELECT table_name, schema_version FROM ducklake_inlined_data_tables \
+                  WHERE table_id = ? \
+@@ -204,7 +206,7 @@ WHERE data.table_id = ?
+             )
+             .bind(table_id)
+             .bind(snapshot_id)
+-            .fetch_optional(&self.pool)
++            .fetch_optional(&mut *tx)
+             .await?;
+ 
+             let Some(info_row) = table_info else {
+@@ -217,7 +219,7 @@ WHERE data.table_id = ?
+                 "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?",
+             )
+             .bind(&inlined_table_name)
+-            .fetch_one(&self.pool)
++            .fetch_one(&mut *tx)
+             .await?;
+             let count: i64 = exists.try_get(0)?;
+             if count == 0 {
+@@ -228,7 +230,7 @@ WHERE data.table_id = ?
+                 "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
+             )
+             .bind(&inlined_table_name)
+-            .fetch_all(&self.pool)
++            .fetch_all(&mut *tx)
+             .await?;
+ 
+             let user_columns: Vec<String> = columns
+@@ -260,7 +262,7 @@ WHERE data.table_id = ?
+             let rows = sqlx::query(&select_sql)
+                 .bind(snapshot_id)
+                 .bind(snapshot_id)
+-                .fetch_all(&self.pool)
++                .fetch_all(&mut *tx)
+                 .await?;
+ 
+             let num_columns = user_columns.len();
+diff --git a/src/metadata_provider_postgres.rs b/src/metadata_provider_postgres.rs
+index 146f58d..8aa9f36 100644
+--- a/src/metadata_provider_postgres.rs
++++ b/src/metadata_provider_postgres.rs
+@@ -188,6 +188,8 @@ WHERE data.table_id = $1
+         snapshot_id: i64,
+     ) -> Result<Vec<InlinedDataRow>> {
+         block_on(async {
++            let mut tx = self.pool.begin().await?;
++
+             let table_info = sqlx::query(
+                 "SELECT table_name, schema_version FROM ducklake_inlined_data_tables \
+                  WHERE table_id = $1 \
+@@ -196,7 +198,7 @@ WHERE data.table_id = $1
+             )
+             .bind(table_id)
+             .bind(snapshot_id)
+-            .fetch_optional(&self.pool)
++            .fetch_optional(&mut *tx)
+             .await?;
+ 
+             let Some(info_row) = table_info else {
+@@ -210,7 +212,7 @@ WHERE data.table_id = $1
+                  WHERE table_schema = current_schema() AND table_name = $1",
+             )
+             .bind(&inlined_table_name)
+-            .fetch_one(&self.pool)
++            .fetch_one(&mut *tx)
+             .await?;
+             let count: i64 = exists.try_get(0)?;
+             if count == 0 {
+@@ -223,7 +225,7 @@ WHERE data.table_id = $1
+                  ORDER BY ordinal_position",
+             )
+             .bind(&inlined_table_name)
+-            .fetch_all(&self.pool)
++            .fetch_all(&mut *tx)
+             .await?;
+ 
+             let user_columns: Vec<String> = columns
+@@ -255,7 +257,7 @@ WHERE data.table_id = $1
+             let rows = sqlx::query(&select_sql)
+                 .bind(snapshot_id)
+                 .bind(snapshot_id)
+-                .fetch_all(&self.pool)
++                .fetch_all(&mut *tx)
+                 .await?;
+ 
+             let num_columns = user_columns.len();
+diff --git a/src/metadata_provider_sqlite.rs b/src/metadata_provider_sqlite.rs
+index 3905a22..841e2c5 100644
+--- a/src/metadata_provider_sqlite.rs
++++ b/src/metadata_provider_sqlite.rs
+@@ -202,6 +202,8 @@ WHERE data.table_id = ?
+         snapshot_id: i64,
+     ) -> Result<Vec<InlinedDataRow>> {
+         block_on(async {
++            let mut tx = self.pool.begin().await?;
++
+             let table_info = sqlx::query(
+                 "SELECT table_name, schema_version FROM ducklake_inlined_data_tables \
+                  WHERE table_id = ? \
+@@ -210,7 +212,7 @@ WHERE data.table_id = ?
+             )
+             .bind(table_id)
+             .bind(snapshot_id)
+-            .fetch_optional(&self.pool)
++            .fetch_optional(&mut *tx)
+             .await?;
+ 
+             let Some(info_row) = table_info else {
+@@ -222,7 +224,7 @@ WHERE data.table_id = ?
+             let exists =
+                 sqlx::query("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?")
+                     .bind(&inlined_table_name)
+-                    .fetch_one(&self.pool)
++                    .fetch_one(&mut *tx)
+                     .await?;
+             let count: i64 = exists.try_get(0)?;
+             if count == 0 {
+@@ -233,7 +235,7 @@ WHERE data.table_id = ?
+                 "PRAGMA table_info({})",
+                 SqliteDialect.quote_id(&inlined_table_name)
+             );
+-            let columns = sqlx::query(&pragma_query).fetch_all(&self.pool).await?;
++            let columns = sqlx::query(&pragma_query).fetch_all(&mut *tx).await?;
+ 
+             let user_columns: Vec<String> = columns
+                 .iter()
+@@ -264,7 +266,7 @@ WHERE data.table_id = ?
+             let rows = sqlx::query(&select_sql)
+                 .bind(snapshot_id)
+                 .bind(snapshot_id)
+-                .fetch_all(&self.pool)
++                .fetch_all(&mut *tx)
+                 .await?;
+ 
+             let num_columns = user_columns.len();
+diff --git a/src/metadata_writer.rs b/src/metadata_writer.rs
+index 61c0eb0..7633d5e 100644
+--- a/src/metadata_writer.rs
++++ b/src/metadata_writer.rs
+@@ -85,8 +85,10 @@ pub struct AlterColumnTypeOp {
+ /// - float → double
+ /// - Unsigned integers can widen to larger signed integers
+ pub fn is_type_promotion_allowed(source: &str, target: &str) -> bool {
++    let source_lower = source.to_lowercase();
++    let target_lower = target.to_lowercase();
+     matches!(
+-        (source, target),
++        (source_lower.as_str(), target_lower.as_str()),
+         // Signed integer widening chain
+         ("int8", "int16" | "int32" | "int64")
+             | ("int16", "int32" | "int64")
+@@ -463,8 +465,8 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
+     /// (DELETE, UPDATE, MERGE) are committed atomically. If any registration
+     /// fails, none of them take effect.
+     ///
+-    /// Default implementation calls individual methods (non-atomic, for backward
+-    /// compatibility). Backends should override for true atomicity.
++    /// All backends must override this method to provide atomic transaction
++    /// semantics. The default panics to prevent accidental non-atomic usage.
+     fn register_dml_files(
+         &self,
+         table_id: i64,
+@@ -472,13 +474,8 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
+         delete_files: &[DeleteFileInfo],
+         data_files: &[DataFileInfo],
+     ) -> Result<()> {
+-        for file in delete_files {
+-            self.register_delete_file(table_id, snapshot_id, file)?;
+-        }
+-        for file in data_files {
+-            self.register_data_file(table_id, snapshot_id, file)?;
+-        }
+-        Ok(())
++        let _ = (table_id, snapshot_id, delete_files, data_files);
++        unimplemented!("register_dml_files must be implemented by the backend for atomicity")
+     }
+ 
+     /// Atomically replace table files: end existing files and register new ones.
+@@ -488,38 +485,16 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
+     ///
+     /// Returns the data_file_id for each registered file.
+     ///
+-    /// # Warning: Default implementation is NOT atomic
+-    ///
+-    /// The default implementation calls `end_table_files` followed by individual
+-    /// `register_data_file` / `register_column_stats` / `register_file_partition_value`
+-    /// calls **without** a wrapping transaction.  If a failure occurs mid-way, the
+-    /// table metadata will be left in an inconsistent state (some files ended, some
+-    /// new files registered).  Backends **should** override this method to wrap the
+-    /// entire operation in a single transaction for true atomicity.
++    /// All backends must override this method to provide atomic transaction
++    /// semantics. The default panics to prevent accidental non-atomic usage.
+     fn replace_table_files(
+         &self,
+         table_id: i64,
+         snapshot_id: i64,
+         files: &[ReplaceFileEntry],
+     ) -> Result<Vec<i64>> {
+-        self.end_table_files(table_id, snapshot_id)?;
+-        let mut ids = Vec::with_capacity(files.len());
+-        for entry in files {
+-            let data_file_id = self.register_data_file(table_id, snapshot_id, &entry.file_info)?;
+-            if !entry.file_info.column_stats.is_empty() {
+-                self.register_column_stats(data_file_id, table_id, &entry.file_info.column_stats)?;
+-            }
+-            for (key_index, val) in &entry.partition_values {
+-                self.register_file_partition_value(
+-                    data_file_id,
+-                    table_id,
+-                    *key_index,
+-                    val.as_deref(),
+-                )?;
+-            }
+-            ids.push(data_file_id);
+-        }
+-        Ok(ids)
++        let _ = (table_id, snapshot_id, files);
++        unimplemented!("replace_table_files must be implemented by the backend for atomicity")
+     }
+ 
+     /// Atomically append new files to a table (without ending existing files).
+@@ -530,35 +505,16 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
+     ///
+     /// Returns the data_file_id for each registered file.
+     ///
+-    /// # Warning: Default implementation is NOT atomic
+-    ///
+-    /// The default implementation calls individual `register_data_file` /
+-    /// `register_column_stats` / `register_file_partition_value` calls
+-    /// **without** a wrapping transaction. Backends **should** override this
+-    /// method to wrap the entire operation in a single transaction.
++    /// All backends must override this method to provide atomic transaction
++    /// semantics. The default panics to prevent accidental non-atomic usage.
+     fn append_table_files(
+         &self,
+         table_id: i64,
+         snapshot_id: i64,
+         files: &[ReplaceFileEntry],
+     ) -> Result<Vec<i64>> {
+-        let mut ids = Vec::with_capacity(files.len());
+-        for entry in files {
+-            let data_file_id = self.register_data_file(table_id, snapshot_id, &entry.file_info)?;
+-            if !entry.file_info.column_stats.is_empty() {
+-                self.register_column_stats(data_file_id, table_id, &entry.file_info.column_stats)?;
+-            }
+-            for (key_index, val) in &entry.partition_values {
+-                self.register_file_partition_value(
+-                    data_file_id,
+-                    table_id,
+-                    *key_index,
+-                    val.as_deref(),
+-                )?;
+-            }
+-            ids.push(data_file_id);
+-        }
+-        Ok(ids)
++        let _ = (table_id, snapshot_id, files);
++        unimplemented!("append_table_files must be implemented by the backend for atomicity")
+     }
+ 
+     /// Drop a table by setting its end_snapshot.
+diff --git a/src/metadata_writer_impl.rs b/src/metadata_writer_impl.rs
+index 7dca89b..91d3263 100644
+--- a/src/metadata_writer_impl.rs
++++ b/src/metadata_writer_impl.rs
+@@ -310,7 +310,11 @@ macro_rules! impl_writer_query_ops {
+                 sqlx::query(&sql)
+                     .bind(data_file_id)
+                     .bind(table_id)
+-                    .bind(partition_key_index as i64)
++                    .bind(i64::try_from(partition_key_index).map_err(|_| {
++                        crate::error::DuckLakeError::Internal(format!(
++                            "partition_key_index {} overflows i64", partition_key_index
++                        ))
++                    })?)
+                     .bind(partition_value)
+                     .execute(&self.pool)
+                     .await?;
+@@ -593,14 +597,14 @@ macro_rules! impl_writer_file_ops {
+             );
+             let insert_file_sql = if d.supports_returning() {
+                 format!(
+-                    "INSERT INTO ducklake_data_file (table_id, path, path_is_relative, file_size_bytes, footer_size, record_count, row_id_start, begin_snapshot)
+-                     VALUES ({}, {}, {}, {}, {}, {}, {}, {}) RETURNING data_file_id",
++                    "INSERT INTO ducklake_data_file (table_id, path, path_is_relative, file_size_bytes, footer_size, record_count, row_id_start, file_format, begin_snapshot)
++                     VALUES ({}, {}, {}, {}, {}, {}, {}, 'parquet', {}) RETURNING data_file_id",
+                     d.ph(1), d.ph(2), d.ph(3), d.ph(4), d.ph(5), d.ph(6), d.ph(7), d.ph(8),
+                 )
+             } else {
+                 format!(
+-                    "INSERT INTO ducklake_data_file (table_id, path, path_is_relative, file_size_bytes, footer_size, record_count, row_id_start, begin_snapshot)
+-                     VALUES ({}, {}, {}, {}, {}, {}, {}, {})",
++                    "INSERT INTO ducklake_data_file (table_id, path, path_is_relative, file_size_bytes, footer_size, record_count, row_id_start, file_format, begin_snapshot)
++                     VALUES ({}, {}, {}, {}, {}, {}, {}, 'parquet', {})",
+                     d.ph(1), d.ph(2), d.ph(3), d.ph(4), d.ph(5), d.ph(6), d.ph(7), d.ph(8),
+                 )
+             };
+@@ -772,16 +776,21 @@ macro_rules! impl_writer_file_ops {
+             use crate::error::DuckLakeError;
+             use sqlx::Row;
+             let d = $dialect;
++            let stats_sql = format!(
++                "SELECT next_row_id FROM ducklake_table_stats WHERE table_id = {}{}",
++                d.ph(1),
++                d.for_update(),
++            );
+             let insert_file_sql = if d.supports_returning() {
+                 format!(
+-                    "INSERT INTO ducklake_data_file (table_id, path, path_is_relative, file_size_bytes, footer_size, record_count, row_id_start, begin_snapshot)
+-                     VALUES ({}, {}, {}, {}, {}, {}, {}, {}) RETURNING data_file_id",
++                    "INSERT INTO ducklake_data_file (table_id, path, path_is_relative, file_size_bytes, footer_size, record_count, row_id_start, file_format, begin_snapshot)
++                     VALUES ({}, {}, {}, {}, {}, {}, {}, 'parquet', {}) RETURNING data_file_id",
+                     d.ph(1), d.ph(2), d.ph(3), d.ph(4), d.ph(5), d.ph(6), d.ph(7), d.ph(8),
+                 )
+             } else {
+                 format!(
+-                    "INSERT INTO ducklake_data_file (table_id, path, path_is_relative, file_size_bytes, footer_size, record_count, row_id_start, begin_snapshot)
+-                     VALUES ({}, {}, {}, {}, {}, {}, {}, {})",
++                    "INSERT INTO ducklake_data_file (table_id, path, path_is_relative, file_size_bytes, footer_size, record_count, row_id_start, file_format, begin_snapshot)
++                     VALUES ({}, {}, {}, {}, {}, {}, {}, 'parquet', {})",
+                     d.ph(1), d.ph(2), d.ph(3), d.ph(4), d.ph(5), d.ph(6), d.ph(7), d.ph(8),
+                 )
+             };
+@@ -795,6 +804,19 @@ macro_rules! impl_writer_file_ops {
+                  VALUES ({}, {}, {}, {})",
+                 d.ph(1), d.ph(2), d.ph(3), d.ph(4),
+             );
++            let update_stats_sql = format!(
++                "UPDATE ducklake_table_stats
++                 SET record_count = COALESCE(record_count, 0) + {},
++                     next_row_id = {},
++                     file_size_bytes = COALESCE(file_size_bytes, 0) + {}
++                 WHERE table_id = {}",
++                d.ph(1), d.ph(2), d.ph(3), d.ph(4),
++            );
++            let insert_stats_row_sql = format!(
++                "INSERT INTO ducklake_table_stats (table_id, record_count, next_row_id, file_size_bytes)
++                 VALUES ({}, {}, {}, {})",
++                d.ph(1), d.ph(2), d.ph(3), d.ph(4),
++            );
+             let next_file_id_sql = format!(
+                 "UPDATE ducklake_snapshot SET next_file_id = COALESCE({}, 0) WHERE snapshot_id = {}",
+                 d.greatest(
+@@ -808,8 +830,18 @@ macro_rules! impl_writer_file_ops {
+             $block_on(|| async {
+                 let mut tx = self.pool.begin().await?;
+ 
++                // Get current next_row_id from table_stats (locked for update)
++                let stats_row = sqlx::query(&stats_sql)
++                    .bind(table_id)
++                    .fetch_optional(&mut *tx)
++                    .await?;
++                let base_row_id: i64 = match stats_row {
++                    Some(r) => r.try_get::<Option<i64>, _>(0)?.unwrap_or(0),
++                    None => 0,
++                };
++
+                 let mut ids = Vec::with_capacity(files.len());
+-                let mut cumulative_row_id: i64 = 0;
++                let mut cumulative_row_id: i64 = base_row_id;
+                 for entry in files {
+                     let path_is_relative = entry.file_info.path_is_relative;
+                     let data_file_id: i64 = if d.supports_returning() {
+@@ -872,6 +904,42 @@ macro_rules! impl_writer_file_ops {
+                     ids.push(data_file_id);
+                 }
+ 
++                // Update ducklake_table_stats
++                let total_record_count: i64 = files.iter().try_fold(0i64, |acc, f| {
++                    acc.checked_add(f.file_info.record_count).ok_or_else(|| {
++                        DuckLakeError::Internal(
++                            "record_count sum overflow in append_table_files".into(),
++                        )
++                    })
++                })?;
++                let total_file_size: i64 = files.iter().try_fold(0i64, |acc, f| {
++                    acc.checked_add(f.file_info.file_size_bytes).ok_or_else(|| {
++                        DuckLakeError::Internal(
++                            "file_size_bytes sum overflow in append_table_files".into(),
++                        )
++                    })
++                })?;
++                let updated = sqlx::query(&update_stats_sql)
++                    .bind(total_record_count)
++                    .bind(cumulative_row_id)
++                    .bind(total_file_size)
++                    .bind(table_id)
++                    .execute(&mut *tx)
++                    .await?;
++
++                if updated.rows_affected() == 0 {
++                    sqlx::query(&insert_stats_row_sql)
++                        .bind(table_id)
++                        .bind(total_record_count)
++                        .bind(cumulative_row_id)
++                        .bind(total_file_size)
++                        .execute(&mut *tx)
++                        .await?;
++                }
++
++                // Recompute table column stats
++                Self::recompute_table_column_stats(&mut tx, table_id).await?;
++
+                 // Update snapshot's next_file_id
+                 sqlx::query(&next_file_id_sql)
+                     .bind(snapshot_id)
+@@ -924,14 +992,14 @@ macro_rules! impl_writer_file_ops {
+             );
+             let insert_data_file_sql = if d.supports_returning() {
+                 format!(
+-                    "INSERT INTO ducklake_data_file (table_id, path, path_is_relative, file_size_bytes, footer_size, record_count, row_id_start, begin_snapshot)
+-                     VALUES ({}, {}, {}, {}, {}, {}, {}, {}) RETURNING data_file_id",
++                    "INSERT INTO ducklake_data_file (table_id, path, path_is_relative, file_size_bytes, footer_size, record_count, row_id_start, file_format, begin_snapshot)
++                     VALUES ({}, {}, {}, {}, {}, {}, {}, 'parquet', {}) RETURNING data_file_id",
+                     d.ph(1), d.ph(2), d.ph(3), d.ph(4), d.ph(5), d.ph(6), d.ph(7), d.ph(8),
+                 )
+             } else {
+                 format!(
+-                    "INSERT INTO ducklake_data_file (table_id, path, path_is_relative, file_size_bytes, footer_size, record_count, row_id_start, begin_snapshot)
+-                     VALUES ({}, {}, {}, {}, {}, {}, {}, {})",
++                    "INSERT INTO ducklake_data_file (table_id, path, path_is_relative, file_size_bytes, footer_size, record_count, row_id_start, file_format, begin_snapshot)
++                     VALUES ({}, {}, {}, {}, {}, {}, {}, 'parquet', {})",
+                     d.ph(1), d.ph(2), d.ph(3), d.ph(4), d.ph(5), d.ph(6), d.ph(7), d.ph(8),
+                 )
+             };
+@@ -1211,12 +1279,15 @@ pub(crate) use impl_writer_file_ops;
+ macro_rules! create_ddl_snapshot {
+     ($tx:expr, $d:expr, $last_id:expr) => {{
+         let sv_lock_sql = format!(
+-            "SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot{}",
++            "SELECT schema_version FROM ducklake_snapshot ORDER BY snapshot_id DESC LIMIT 1{}",
+             $d.for_update()
+         );
+         let prev_sv_row = sqlx::query(&sv_lock_sql)
+-            .fetch_one(&mut *$tx).await?;
+-        let new_sv: i64 = prev_sv_row.try_get::<i64, _>(0)? + 1;
++            .fetch_optional(&mut *$tx).await?;
++        let new_sv: i64 = match prev_sv_row {
++            Some(r) => r.try_get::<i64, _>(0)? + 1,
++            None => 1,
++        };
+ 
+         let sid: i64 = if $d.supports_returning() {
+             let ins = format!(
+@@ -1473,7 +1544,7 @@ macro_rules! impl_writer_ddl_ops {
+                                 column_id: r.try_get(0)?,
+                                 column_name: r.try_get(1)?,
+                                 column_type: r.try_get(2)?,
+-                                column_order: r.try_get::<i32, _>(3)? as i64,
++                                column_order: i64::from(r.try_get::<i32, _>(3)?),
+                                 is_nullable: r.try_get::<Option<bool>, _>(4)?.unwrap_or(true),
+                                 initial_default: r.try_get(5)?,
+                                 default_value: r.try_get(6)?,
+diff --git a/src/metadata_writer_mysql.rs b/src/metadata_writer_mysql.rs
+index 011eea2..568ef03 100644
+--- a/src/metadata_writer_mysql.rs
++++ b/src/metadata_writer_mysql.rs
+@@ -557,8 +557,8 @@ impl MySqlMetadataWriter {
+         // F-013: Check if schema is identical — if so, preserve column IDs
+         let schema_matches = existing_columns.len() == columns.len()
+             && existing_columns.iter().zip(columns.iter()).all(
+-                |((name, col_type, _nullable), col)| {
+-                    name == &col.name && col_type == &col.ducklake_type
++                |((name, col_type, nullable), col)| {
++                    name == &col.name && col_type == &col.ducklake_type && *nullable == col.nullable
+                 },
+             );
+ 
+diff --git a/src/metadata_writer_postgres.rs b/src/metadata_writer_postgres.rs
+index 4717251..85afd98 100644
+--- a/src/metadata_writer_postgres.rs
++++ b/src/metadata_writer_postgres.rs
+@@ -440,8 +440,8 @@ impl PostgresMetadataWriter {
+         // F-013: Check if schema is identical — if so, preserve column IDs
+         let schema_matches = existing_columns.len() == columns.len()
+             && existing_columns.iter().zip(columns.iter()).all(
+-                |((name, col_type, _nullable), col)| {
+-                    name == &col.name && col_type == &col.ducklake_type
++                |((name, col_type, nullable), col)| {
++                    name == &col.name && col_type == &col.ducklake_type && *nullable == col.is_nullable
+                 },
+             );
+ 
+diff --git a/src/metadata_writer_sqlite.rs b/src/metadata_writer_sqlite.rs
+index 29f5b92..4228464 100644
+--- a/src/metadata_writer_sqlite.rs
++++ b/src/metadata_writer_sqlite.rs
+@@ -557,8 +557,8 @@ impl SqliteMetadataWriter {
+         // F-013: Check if schema is identical — if so, preserve column IDs
+         let schema_matches = existing_columns.len() == columns.len()
+             && existing_columns.iter().zip(columns.iter()).all(
+-                |((name, col_type, _nullable), col)| {
+-                    name == &col.name && col_type == &col.ducklake_type
++                |((name, col_type, nullable), col)| {
++                    name == &col.name && col_type == &col.ducklake_type && *nullable == col.is_nullable
+                 },
+             );
+ 
+@@ -703,7 +703,11 @@ impl SqliteMetadataWriter {
+         let (sql, needs_table_id) = crate::dialect::SqliteDialect.next_id_sql(entity);
+         let row = if needs_table_id {
+             sqlx::query(&sql)
+-                .bind(table_id.unwrap())
++                .bind(table_id.ok_or_else(|| {
++                    crate::error::DuckLakeError::Internal(
++                        "table_id required for entity ID generation".to_string(),
++                    )
++                })?)
+                 .fetch_one(&mut **tx)
+                 .await?
+         } else {
+@@ -1323,13 +1327,19 @@ impl MetadataWriter for SqliteMetadataWriter {
+             for inlined_row in rows {
+                 let mut query = sqlx::query(&insert_sql).bind(row_id).bind(snapshot_id);
+ 
+-                // Bind each column value
++                // Precompute column name -> index map to avoid O(cols) scan per column
++                let col_map: std::collections::HashMap<&str, usize> = inlined_row
++                    .column_names
++                    .iter()
++                    .enumerate()
++                    .map(|(i, name)| (name.as_str(), i))
++                    .collect();
++
++                // Bind each column value using precomputed map
+                 for col in columns {
+-                    let value = inlined_row
+-                        .column_names
+-                        .iter()
+-                        .position(|n| n == col.name())
+-                        .and_then(|pos| inlined_row.values.get(pos))
++                    let value = col_map
++                        .get(col.name())
++                        .and_then(|&pos| inlined_row.values.get(pos))
+                         .and_then(|v| v.clone());
+                     query = query.bind(value);
+                 }
+diff --git a/src/parse_values.rs b/src/parse_values.rs
+index 78c1ab6..be97025 100644
+--- a/src/parse_values.rs
++++ b/src/parse_values.rs
+@@ -127,7 +127,25 @@ pub fn parse_string_values_to_array(
+                         let epoch_days = if let Ok(date) =
+                             chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                         {
+-                            date.signed_duration_since(UNIX_EPOCH_DATE).num_days() as i32
++                            match i32::try_from(
++                                date.signed_duration_since(UNIX_EPOCH_DATE).num_days(),
++                            ) {
++                                Ok(d) => d,
++                                Err(_) => match mode {
++                                    ParseMode::Lenient => {
++                                        builder.append_null();
++                                        continue;
++                                    },
++                                    ParseMode::Strict => {
++                                        return Err(crate::error::DuckLakeError::Internal(
++                                            format!(
++                                                "Date32 days overflow for date '{}'",
++                                                s
++                                            ),
++                                        ));
++                                    },
++                                },
++                            }
+                         } else if let Ok(v) = s.parse::<i32>() {
+                             v
+                         } else {
+@@ -347,6 +365,12 @@ fn parse_decimal_string(s: &str, scale: i8) -> crate::Result<i128> {
+     };
+ 
+     let scale_u = scale.max(0) as u32;
++    if scale_u > 38 {
++        return Err(crate::error::DuckLakeError::Internal(format!(
++            "Decimal scale {} exceeds maximum supported scale of 38",
++            scale_u
++        )));
++    }
+     let frac_len = frac_part.len() as u32;
+     let frac: i128 = if frac_part.is_empty() {
+         0
+diff --git a/src/table.rs b/src/table.rs
+index ea7db72..bbca032 100644
+--- a/src/table.rs
++++ b/src/table.rs
+@@ -1374,9 +1374,9 @@ impl TableProvider for DuckLakeTable {
+                 continue;
+             }
+ 
+-            // Accumulate null counts
++            // Accumulate null counts (saturate to avoid overflow)
+             if let Some(nc) = fs.null_count {
+-                null_counts[col_idx] += nc;
++                null_counts[col_idx] = null_counts[col_idx].saturating_add(nc);
+                 has_null_count[col_idx] = true;
+             }
+ 
+diff --git a/src/table_writer.rs b/src/table_writer.rs
+index 6c91fc8..c050c91 100644
+--- a/src/table_writer.rs
++++ b/src/table_writer.rs
+@@ -52,7 +52,7 @@ use crate::path_resolver::join_paths;
+ #[derive(Debug)]
+ pub struct DuckLakeTableWriter {
+     metadata: Arc<dyn MetadataWriter>,
+-    object_store: Arc<dyn ObjectStore>,
++    pub(crate) object_store: Arc<dyn ObjectStore>,
+     /// The key path portion of the data_path (e.g., "/prefix/data/")
+     base_key_path: String,
+ }
+@@ -1155,7 +1155,12 @@ fn arrow_array_value_to_string(
+                                     "Failed to downcast TimestampSecond array".to_string(),
+                                 )
+                             })?;
+-                        a.value(idx) * 1_000_000
++                        a.value(idx).checked_mul(1_000_000).ok_or_else(|| {
++                            crate::error::DuckLakeError::Internal(format!(
++                                "Timestamp second-to-microsecond overflow: {}",
++                                a.value(idx)
++                            ))
++                        })?
+                     },
+                     TimeUnit::Millisecond => {
+                         let a = array
+@@ -1166,7 +1171,12 @@ fn arrow_array_value_to_string(
+                                     "Failed to downcast TimestampMillisecond array".to_string(),
+                                 )
+                             })?;
+-                        a.value(idx) * 1_000
++                        a.value(idx).checked_mul(1_000).ok_or_else(|| {
++                            crate::error::DuckLakeError::Internal(format!(
++                                "Timestamp millisecond-to-microsecond overflow: {}",
++                                a.value(idx)
++                            ))
++                        })?
+                     },
+                     TimeUnit::Microsecond => {
+                         let a = array
+@@ -1230,18 +1240,28 @@ pub(crate) fn inlined_rows_to_batch(
+     let num_rows = rows.len();
+     let mut column_arrays: Vec<Arc<dyn arrow::array::Array>> = Vec::new();
+ 
++    // Precompute column name -> index maps per row to avoid O(rows*cols) linear scans
++    let row_col_maps: Vec<HashMap<&str, usize>> = rows
++        .iter()
++        .map(|row| {
++            row.column_names
++                .iter()
++                .enumerate()
++                .map(|(i, name)| (name.as_str(), i))
++                .collect()
++        })
++        .collect();
++
+     for field in schema.fields().iter() {
+         let col_name = field.name();
+         let data_type = field.data_type();
+ 
+-        // Collect values for this column from all rows
++        // Collect values for this column from all rows using precomputed maps
+         let mut string_values: Vec<Option<String>> = Vec::with_capacity(num_rows);
+-        for row in rows {
+-            let value = row
+-                .column_names
+-                .iter()
+-                .position(|n| n == col_name)
+-                .and_then(|pos| row.values.get(pos))
++        for (row, col_map) in rows.iter().zip(row_col_maps.iter()) {
++            let value = col_map
++                .get(col_name.as_str())
++                .and_then(|&pos| row.values.get(pos))
+                 .and_then(|v| v.clone());
+             string_values.push(value);
+         }
+@@ -1645,6 +1665,79 @@ impl Drop for UploadCleanupGuard {
+     }
+ }
+ 
++/// Write record batches to a Parquet file and upload it to the object store.
++///
++/// Shared by UPDATE and MERGE exec plans to avoid duplicated write boilerplate.
++/// Returns the `DataFileInfo` for metadata registration.
++pub(crate) async fn write_and_upload_parquet(
++    batches: &[RecordBatch],
++    table_schema: &arrow::datatypes::Schema,
++    column_ids: &[i64],
++    table_path: &str,
++    object_store: &dyn ObjectStore,
++    upload_guard: &mut UploadCleanupGuard,
++) -> std::result::Result<DataFileInfo, datafusion::error::DataFusionError> {
++    use datafusion::error::DataFusionError;
++
++    let data_file_name = format!("ducklake-{}.parquet", Uuid::new_v4());
++    let object_key = join_paths(table_path.trim_start_matches('/'), &data_file_name)
++        .map_err(|e| DataFusionError::External(Box::new(e)))?;
++    let data_object_path = ObjectPath::from(object_key.trim_start_matches('/'));
++
++    let write_schema = Arc::new(
++        build_schema_with_field_ids(table_schema, column_ids)
++            .map_err(|e| DataFusionError::External(Box::new(e)))?,
++    );
++
++    let props = WriterProperties::builder()
++        .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
++        .set_compression(parquet::basic::Compression::SNAPPY)
++        .build();
++    let mut arrow_writer = ArrowWriter::try_new(Vec::new(), write_schema.clone(), Some(props))
++        .map_err(|e| DataFusionError::External(Box::new(e)))?;
++
++    let mut total_records: i64 = 0;
++    for batch in batches {
++        let batch_with_ids =
++            RecordBatch::try_new(write_schema.clone(), batch.columns().to_vec())?;
++        let batch_rows = i64::try_from(batch_with_ids.num_rows())
++            .map_err(|e| DataFusionError::Execution(format!("Row count overflow: {}", e)))?;
++        total_records = total_records.checked_add(batch_rows).ok_or_else(|| {
++            DataFusionError::Execution(format!(
++                "Total record count overflow: {} + {} exceeds i64::MAX",
++                total_records, batch_rows
++            ))
++        })?;
++        arrow_writer
++            .write(&batch_with_ids)
++            .map_err(|e| DataFusionError::External(Box::new(e)))?;
++    }
++
++    arrow_writer
++        .flush()
++        .map_err(|e| DataFusionError::External(Box::new(e)))?;
++    let column_stats = extract_column_stats(arrow_writer.flushed_row_groups(), column_ids);
++
++    let buffer = arrow_writer
++        .into_inner()
++        .map_err(|e| DataFusionError::External(Box::new(e)))?;
++
++    let file_size = i64::try_from(buffer.len())
++        .map_err(|e| DataFusionError::Execution(format!("File size overflow: {}", e)))?;
++    let footer_size = calculate_footer_size_from_bytes(&buffer)
++        .map_err(|e| DataFusionError::External(Box::new(e)))?;
++
++    object_store
++        .put(&data_object_path, PutPayload::from(buffer))
++        .await
++        .map_err(|e| DataFusionError::External(Box::new(e)))?;
++    upload_guard.push(data_object_path);
++
++    Ok(DataFileInfo::new(&data_file_name, file_size, total_records)
++        .with_footer_size(footer_size)
++        .with_column_stats(column_stats))
++}
++
+ /// Write a Parquet delete file and upload it to the object store.
+ ///
+ /// Shared by DELETE, UPDATE, and MERGE exec plans.
+diff --git a/src/update_exec.rs b/src/update_exec.rs
+index d2ec85d..bba8601 100644
+--- a/src/update_exec.rs
++++ b/src/update_exec.rs
+@@ -32,17 +32,10 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+ use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+ use futures::stream::{self, TryStreamExt};
+ use object_store::path::Path as ObjectPath;
+-use object_store::{ObjectStore, PutPayload};
+-use parquet::arrow::ArrowWriter;
+-use parquet::file::properties::WriterProperties;
+-use uuid::Uuid;
++use object_store::ObjectStore;
+ 
+ use crate::metadata_provider::DuckLakeTableFile;
+ use crate::metadata_writer::{DataFileInfo, DeleteFileInfo, MetadataWriter};
+-use crate::path_resolver::join_paths;
+-use crate::table_writer::{
+-    build_schema_with_field_ids, calculate_footer_size_from_bytes, extract_column_stats,
+-};
+ 
+ use crate::delete_exec::make_dml_count_schema;
+ 
+@@ -427,74 +420,15 @@ impl ExecutionPlan for DuckLakeUpdateExec {
+             // Write updated rows as new data file(s)
+             let mut pending_data_files: Vec<DataFileInfo> = Vec::new();
+             if !updated_batches.is_empty() {
+-                let data_file_name = format!("ducklake-{}.parquet", Uuid::new_v4());
+-
+-                // Use the catalog's stored table_path instead of deriving from names,
+-                // so writes go to the correct location even after table rename.
+-                let object_key = join_paths(table_path.trim_start_matches('/'), &data_file_name)?;
+-                let data_object_path = ObjectPath::from(object_key.trim_start_matches('/'));
+-
+-                // Build schema with field IDs for DuckDB compatibility
+-                let write_schema = Arc::new(
+-                    build_schema_with_field_ids(&table_schema, &column_ids)
+-                        .map_err(|e| DataFusionError::External(Box::new(e)))?,
+-                );
+-
+-                // Write all updated rows to a single Parquet file
+-                let props = WriterProperties::builder()
+-                    .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
+-                    .set_compression(parquet::basic::Compression::SNAPPY)
+-                    .build();
+-                let mut arrow_writer =
+-                    ArrowWriter::try_new(Vec::new(), write_schema.clone(), Some(props))
+-                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+-
+-                let mut total_records: i64 = 0;
+-                for batch in &updated_batches {
+-                    let batch_with_ids =
+-                        RecordBatch::try_new(write_schema.clone(), batch.columns().to_vec())?;
+-                    let batch_rows = i64::try_from(batch_with_ids.num_rows()).map_err(|e| {
+-                        DataFusionError::Execution(format!("Row count overflow: {}", e))
+-                    })?;
+-                    total_records = total_records.checked_add(batch_rows).ok_or_else(|| {
+-                        DataFusionError::Execution(format!(
+-                            "Total record count overflow: {} + {} exceeds i64::MAX",
+-                            total_records, batch_rows
+-                        ))
+-                    })?;
+-                    arrow_writer
+-                        .write(&batch_with_ids)
+-                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+-                }
+-
+-                // R4-S-005: Extract column stats before consuming the writer
+-                arrow_writer
+-                    .flush()
+-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+-                let column_stats =
+-                    extract_column_stats(arrow_writer.flushed_row_groups(), &column_ids);
+-
+-                let buffer = arrow_writer
+-                    .into_inner()
+-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+-
+-                let file_size = i64::try_from(buffer.len()).map_err(|e| {
+-                    DataFusionError::Execution(format!("File size overflow: {}", e))
+-                })?;
+-                let footer_size = calculate_footer_size_from_bytes(&buffer)
+-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+-
+-                // Upload data file (guard cleans up on error)
+-                object_store
+-                    .put(&data_object_path, PutPayload::from(buffer))
+-                    .await
+-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+-                upload_guard.push(data_object_path);
+-
+-                let data_file_info = DataFileInfo::new(&data_file_name, file_size, total_records)
+-                    .with_footer_size(footer_size)
+-                    .with_column_stats(column_stats);
+-
++                let data_file_info = crate::table_writer::write_and_upload_parquet(
++                    &updated_batches,
++                    &table_schema,
++                    &column_ids,
++                    &table_path,
++                    &*object_store,
++                    &mut upload_guard,
++                )
++                .await?;
+                 pending_data_files.push(data_file_info);
+             }
+ 
+diff --git a/tests/common/test_utils.rs b/tests/common/test_utils.rs
+index 4fe32ac..1d6c6a4 100644
+--- a/tests/common/test_utils.rs
++++ b/tests/common/test_utils.rs
+@@ -296,6 +296,11 @@ pub fn get_int_column(batch: &RecordBatch, col_idx: usize) -> Vec<i32> {
+ ///
+ /// Only normalizes values that look like floats (contain '.' or 'e'/'E') to avoid
+ /// collapsing distinct integer/float representations or losing large-integer precision.
++///
++/// **Limitation**: This is type-unaware — it cannot distinguish between Float32 "1.0"
++/// and Decimal "1.00" since both normalize to "1.000000". For tests where numeric type
++/// precision matters (e.g., Decimal vs Float32 confusion), use `assert_results_eq_strict`
++/// instead.
+ pub fn normalize_value(s: &str) -> String {
+     if s == "NULL" {
+         return s.to_string();
+diff --git a/tests/sqllogictest_runner.rs b/tests/sqllogictest_runner.rs
+index 5770c70..fdcdfed 100644
+--- a/tests/sqllogictest_runner.rs
++++ b/tests/sqllogictest_runner.rs
+@@ -695,7 +695,11 @@ const HYBRID_INCOMPATIBLE_PATTERNS: &[(&str, Option<&str>, &str)] = &[
+         None,
+         "hybrid adapter always has writable DuckDB",
+     ),
+-    ("DOES NOT EXIST!", None, "DETACH is skipped in hybrid mode"),
++    (
++        "DOES NOT EXIST!",
++        Some("DETACH"),
++        "DETACH is skipped in hybrid mode",
++    ),
+     (
+         "MISSING EXTENSION ERROR",
+         None,

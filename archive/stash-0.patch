@@ -1,0 +1,598 @@
+diff --git a/src/metadata_provider_duckdb.rs b/src/metadata_provider_duckdb.rs
+index 63658ce..89db33a 100644
+--- a/src/metadata_provider_duckdb.rs
++++ b/src/metadata_provider_duckdb.rs
+@@ -266,7 +266,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
+                     };
+ 
+                     // Parse delete file (columns 6-12) if exists
+-                    let delete_file = if let Ok(Some(_)) = row.get::<_, Option<i64>>(6) {
++                    let delete_file = if row.get::<_, Option<i64>>(6)?.is_some() {
+                         Some(DuckLakeFileData {
+                             path: row.get(7)?,
+                             path_is_relative: row.get(8)?,
+@@ -458,18 +458,17 @@ impl MetadataProvider for DuckdbMetadataProvider {
+                     };
+ 
+                     // Parse optional delete file (column 8: delete_file_id, check if exists but don't store)
+-                    let delete_file =
+-                        if let Ok(Some(_delete_file_id)) = row.get::<_, Option<i64>>(8) {
+-                            Some(DuckLakeFileData {
+-                                path: row.get(9)?,
+-                                path_is_relative: row.get(10)?,
+-                                file_size_bytes: row.get(11)?,
+-                                footer_size: row.get(12)?,
+-                                encryption_key: row.get(13)?,
+-                            })
+-                        } else {
+-                            None
+-                        };
++                    let delete_file = if row.get::<_, Option<i64>>(8)?.is_some() {
++                        Some(DuckLakeFileData {
++                            path: row.get(9)?,
++                            path_is_relative: row.get(10)?,
++                            file_size_bytes: row.get(11)?,
++                            footer_size: row.get(12)?,
++                            encryption_key: row.get(13)?,
++                        })
++                    } else {
++                        None
++                    };
+ 
+                     let max_row_count = row.get::<_, Option<i64>>(14)?;
+ 
+diff --git a/src/metadata_provider_mysql.rs b/src/metadata_provider_mysql.rs
+index 047f0b5..f801b40 100644
+--- a/src/metadata_provider_mysql.rs
++++ b/src/metadata_provider_mysql.rs
+@@ -196,6 +196,8 @@ WHERE data.table_id = ?
+         snapshot_id: i64,
+     ) -> Result<Vec<InlinedDataRow>> {
+         block_on(async {
++            let mut tx = self.pool.begin().await?;
++
+             let table_info = sqlx::query(
+                 "SELECT table_name, schema_version FROM ducklake_inlined_data_tables \
+                  WHERE table_id = ? \
+@@ -204,7 +206,7 @@ WHERE data.table_id = ?
+             )
+             .bind(table_id)
+             .bind(snapshot_id)
+-            .fetch_optional(&self.pool)
++            .fetch_optional(&mut *tx)
+             .await?;
+ 
+             let Some(info_row) = table_info else {
+@@ -217,7 +219,7 @@ WHERE data.table_id = ?
+                 "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?",
+             )
+             .bind(&inlined_table_name)
+-            .fetch_one(&self.pool)
++            .fetch_one(&mut *tx)
+             .await?;
+             let count: i64 = exists.try_get(0)?;
+             if count == 0 {
+@@ -228,7 +230,7 @@ WHERE data.table_id = ?
+                 "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
+             )
+             .bind(&inlined_table_name)
+-            .fetch_all(&self.pool)
++            .fetch_all(&mut *tx)
+             .await?;
+ 
+             let user_columns: Vec<String> = columns
+@@ -260,7 +262,7 @@ WHERE data.table_id = ?
+             let rows = sqlx::query(&select_sql)
+                 .bind(snapshot_id)
+                 .bind(snapshot_id)
+-                .fetch_all(&self.pool)
++                .fetch_all(&mut *tx)
+                 .await?;
+ 
+             let num_columns = user_columns.len();
+diff --git a/src/metadata_provider_postgres.rs b/src/metadata_provider_postgres.rs
+index 146f58d..8aa9f36 100644
+--- a/src/metadata_provider_postgres.rs
++++ b/src/metadata_provider_postgres.rs
+@@ -188,6 +188,8 @@ WHERE data.table_id = $1
+         snapshot_id: i64,
+     ) -> Result<Vec<InlinedDataRow>> {
+         block_on(async {
++            let mut tx = self.pool.begin().await?;
++
+             let table_info = sqlx::query(
+                 "SELECT table_name, schema_version FROM ducklake_inlined_data_tables \
+                  WHERE table_id = $1 \
+@@ -196,7 +198,7 @@ WHERE data.table_id = $1
+             )
+             .bind(table_id)
+             .bind(snapshot_id)
+-            .fetch_optional(&self.pool)
++            .fetch_optional(&mut *tx)
+             .await?;
+ 
+             let Some(info_row) = table_info else {
+@@ -210,7 +212,7 @@ WHERE data.table_id = $1
+                  WHERE table_schema = current_schema() AND table_name = $1",
+             )
+             .bind(&inlined_table_name)
+-            .fetch_one(&self.pool)
++            .fetch_one(&mut *tx)
+             .await?;
+             let count: i64 = exists.try_get(0)?;
+             if count == 0 {
+@@ -223,7 +225,7 @@ WHERE data.table_id = $1
+                  ORDER BY ordinal_position",
+             )
+             .bind(&inlined_table_name)
+-            .fetch_all(&self.pool)
++            .fetch_all(&mut *tx)
+             .await?;
+ 
+             let user_columns: Vec<String> = columns
+@@ -255,7 +257,7 @@ WHERE data.table_id = $1
+             let rows = sqlx::query(&select_sql)
+                 .bind(snapshot_id)
+                 .bind(snapshot_id)
+-                .fetch_all(&self.pool)
++                .fetch_all(&mut *tx)
+                 .await?;
+ 
+             let num_columns = user_columns.len();
+diff --git a/src/metadata_provider_sqlite.rs b/src/metadata_provider_sqlite.rs
+index 3905a22..841e2c5 100644
+--- a/src/metadata_provider_sqlite.rs
++++ b/src/metadata_provider_sqlite.rs
+@@ -202,6 +202,8 @@ WHERE data.table_id = ?
+         snapshot_id: i64,
+     ) -> Result<Vec<InlinedDataRow>> {
+         block_on(async {
++            let mut tx = self.pool.begin().await?;
++
+             let table_info = sqlx::query(
+                 "SELECT table_name, schema_version FROM ducklake_inlined_data_tables \
+                  WHERE table_id = ? \
+@@ -210,7 +212,7 @@ WHERE data.table_id = ?
+             )
+             .bind(table_id)
+             .bind(snapshot_id)
+-            .fetch_optional(&self.pool)
++            .fetch_optional(&mut *tx)
+             .await?;
+ 
+             let Some(info_row) = table_info else {
+@@ -222,7 +224,7 @@ WHERE data.table_id = ?
+             let exists =
+                 sqlx::query("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?")
+                     .bind(&inlined_table_name)
+-                    .fetch_one(&self.pool)
++                    .fetch_one(&mut *tx)
+                     .await?;
+             let count: i64 = exists.try_get(0)?;
+             if count == 0 {
+@@ -233,7 +235,7 @@ WHERE data.table_id = ?
+                 "PRAGMA table_info({})",
+                 SqliteDialect.quote_id(&inlined_table_name)
+             );
+-            let columns = sqlx::query(&pragma_query).fetch_all(&self.pool).await?;
++            let columns = sqlx::query(&pragma_query).fetch_all(&mut *tx).await?;
+ 
+             let user_columns: Vec<String> = columns
+                 .iter()
+@@ -264,7 +266,7 @@ WHERE data.table_id = ?
+             let rows = sqlx::query(&select_sql)
+                 .bind(snapshot_id)
+                 .bind(snapshot_id)
+-                .fetch_all(&self.pool)
++                .fetch_all(&mut *tx)
+                 .await?;
+ 
+             let num_columns = user_columns.len();
+diff --git a/src/metadata_writer_mysql.rs b/src/metadata_writer_mysql.rs
+index 011eea2..137d957 100644
+--- a/src/metadata_writer_mysql.rs
++++ b/src/metadata_writer_mysql.rs
+@@ -557,8 +557,10 @@ impl MySqlMetadataWriter {
+         // F-013: Check if schema is identical — if so, preserve column IDs
+         let schema_matches = existing_columns.len() == columns.len()
+             && existing_columns.iter().zip(columns.iter()).all(
+-                |((name, col_type, _nullable), col)| {
+-                    name == &col.name && col_type == &col.ducklake_type
++                |((name, col_type, nullable), col)| {
++                    name == &col.name
++                        && col_type == &col.ducklake_type
++                        && *nullable == col.is_nullable
+                 },
+             );
+ 
+diff --git a/src/metadata_writer_postgres.rs b/src/metadata_writer_postgres.rs
+index 4717251..3bf3dff 100644
+--- a/src/metadata_writer_postgres.rs
++++ b/src/metadata_writer_postgres.rs
+@@ -440,8 +440,10 @@ impl PostgresMetadataWriter {
+         // F-013: Check if schema is identical — if so, preserve column IDs
+         let schema_matches = existing_columns.len() == columns.len()
+             && existing_columns.iter().zip(columns.iter()).all(
+-                |((name, col_type, _nullable), col)| {
+-                    name == &col.name && col_type == &col.ducklake_type
++                |((name, col_type, nullable), col)| {
++                    name == &col.name
++                        && col_type == &col.ducklake_type
++                        && *nullable == col.is_nullable
+                 },
+             );
+ 
+diff --git a/tests/cross_engine_dml_tests.rs b/tests/cross_engine_dml_tests.rs
+index 49eb347..bfa54db 100644
+--- a/tests/cross_engine_dml_tests.rs
++++ b/tests/cross_engine_dml_tests.rs
+@@ -896,6 +896,85 @@ async fn cross_engine_bidirectional_update() {
+     assert_eq!(df_rows[4][1], "Eve-DuckDB");
+ }
+ 
++// ============================================================================
++// DELETE: DuckDB creates + inserts, DF deletes, DuckDB reads (sentinel field_id test)
++// ============================================================================
++
++/// Verify MOR delete files with sentinel field_ids work cross-engine:
++/// DuckDB creates the table and inserts data (with row_id_start),
++/// DataFusion produces a delete file, DuckDB reads and excludes deleted rows.
++#[tokio::test(flavor = "multi_thread")]
++async fn cross_engine_duckdb_insert_df_delete_duckdb_read() {
++    let temp_dir = TempDir::new().unwrap();
++    let catalog_db_path = temp_dir.path().join("catalog.db");
++    let data_path = temp_dir.path().join("data");
++    std::fs::create_dir_all(&data_path).unwrap();
++
++    // DuckDB creates table and inserts data via SQLite-backed catalog
++    {
++        let conn = duckdb::Connection::open_in_memory().unwrap();
++        conn.execute("INSTALL ducklake;", []).unwrap();
++        conn.execute("LOAD ducklake;", []).unwrap();
++        conn.execute(
++            &format!(
++                "ATTACH 'ducklake:sqlite:{}' AS ducklake (DATA_PATH '{}');",
++                catalog_db_path.display(),
++                data_path.display()
++            ),
++            [],
++        )
++        .unwrap();
++        conn.execute(
++            "CREATE TABLE ducklake.main.items (id INT, name VARCHAR, value DOUBLE)",
++            [],
++        )
++        .unwrap();
++        conn.execute(
++            "INSERT INTO ducklake.main.items VALUES \
++             (1, 'Alpha', 10.0), (2, 'Beta', 20.0), (3, 'Gamma', 30.0), \
++             (4, 'Delta', 40.0), (5, 'Epsilon', 50.0)",
++            [],
++        )
++        .unwrap();
++    }
++
++    // DataFusion deletes rows via SQLite-backed writable context
++    let ctx = open_writable_df_context(&catalog_db_path).await;
++    let df = ctx
++        .sql("DELETE FROM ducklake.main.items WHERE id >= 4")
++        .await
++        .unwrap();
++    let count = collect_dml_count(df).await;
++    assert_eq!(count, 2, "Should delete id=4 and id=5");
++
++    // DuckDB reads and verifies the DF-produced delete file is compatible
++    let duckdb = DuckDbConn::open(&catalog_db_path);
++    let rows = duckdb.query("SELECT id, name, value FROM ducklake.main.items ORDER BY id");
++    assert_eq!(
++        rows.len(),
++        3,
++        "DuckDB should see 3 remaining rows after DF delete"
++    );
++    assert_eq!(rows[0][0], "1");
++    assert_eq!(rows[0][1], "Alpha");
++    assert_eq!(rows[1][0], "2");
++    assert_eq!(rows[1][1], "Beta");
++    assert_eq!(rows[2][0], "3");
++    assert_eq!(rows[2][1], "Gamma");
++
++    // Also verify via DataFusion read-back
++    drop(duckdb);
++    let df_ctx = open_readonly_df_sqlite(&catalog_db_path).await;
++    let df_rows = df_query(
++        &df_ctx,
++        "SELECT id, name FROM ducklake.main.items ORDER BY id",
++    )
++    .await;
++    assert_eq!(df_rows.len(), 3);
++    assert_eq!(df_rows[0][0], "1");
++    assert_eq!(df_rows[2][0], "3");
++}
++
+ // ============================================================================
+ // Filesystem helpers for delete file inspection
+ // ============================================================================
+diff --git a/tests/cross_engine_partition_tests.rs b/tests/cross_engine_partition_tests.rs
+index ceea607..d77c8b0 100644
+--- a/tests/cross_engine_partition_tests.rs
++++ b/tests/cross_engine_partition_tests.rs
+@@ -17,7 +17,12 @@ use common::test_utils::{DuckDbConn, batches_to_strings_filtered};
+ use datafusion::prelude::*;
+ use tempfile::TempDir;
+ 
+-use datafusion_ducklake::{DuckLakeCatalog, DuckdbMetadataProvider, SqliteMetadataProvider};
++use datafusion::execution::session_state::SessionStateBuilder;
++
++use datafusion_ducklake::{
++    DuckLakeCatalog, DuckLakeQueryPlanner, DuckdbMetadataProvider, SqliteMetadataProvider,
++    SqliteMetadataWriter,
++};
+ 
+ // ==================== Setup helpers ====================
+ 
+@@ -253,3 +258,95 @@ async fn test_duckdb_empty_partitioned_table() {
+     let rows = batches_to_strings_filtered(&batches);
+     assert_eq!(rows.len(), 0);
+ }
++
++// ==================== DF-created partitioned data → DuckDB reads ====================
++
++/// Open a writable DataFusion context with DuckLakeQueryPlanner (SQLite-backed).
++async fn open_writable_df_context(catalog_path: &Path) -> SessionContext {
++    let conn_str = format!("sqlite:{}?mode=rwc", catalog_path.display());
++    let provider = Arc::new(SqliteMetadataProvider::new(&conn_str).await.unwrap());
++    let writer = Arc::new(SqliteMetadataWriter::new(&conn_str).await.unwrap());
++    let catalog = DuckLakeCatalog::with_writer(provider, writer).unwrap();
++
++    let state = SessionStateBuilder::new()
++        .with_default_features()
++        .with_query_planner(Arc::new(DuckLakeQueryPlanner))
++        .build();
++    let ctx = SessionContext::new_with_state(state);
++    ctx.register_catalog("ducklake", Arc::new(catalog));
++    ctx
++}
++
++/// Test: DuckDB creates partitioned table → DataFusion inserts data → DuckDB reads
++#[tokio::test(flavor = "multi_thread")]
++async fn test_df_insert_partitioned_duckdb_read() {
++    let temp_dir = TempDir::new().unwrap();
++    let catalog_db_path = temp_dir.path().join("catalog.db");
++    let data_path = temp_dir.path().join("data/");
++    std::fs::create_dir_all(&data_path).unwrap();
++
++    // DuckDB creates partitioned table via SQLite-backed catalog
++    {
++        let conn = duckdb::Connection::open_in_memory().unwrap();
++        conn.execute("INSTALL ducklake;", []).unwrap();
++        conn.execute("LOAD ducklake;", []).unwrap();
++        conn.execute(
++            &format!(
++                "ATTACH 'ducklake:sqlite:{}' AS ducklake (DATA_PATH '{}');",
++                catalog_db_path.display(),
++                data_path.display()
++            ),
++            [],
++        )
++        .unwrap();
++        conn.execute(
++            "CREATE TABLE ducklake.main.products (id INTEGER, category VARCHAR, price DOUBLE)",
++            [],
++        )
++        .unwrap();
++        conn.execute(
++            "ALTER TABLE ducklake.main.products SET PARTITIONED BY (category)",
++            [],
++        )
++        .unwrap();
++    }
++
++    // DataFusion inserts partitioned data
++    let ctx = open_writable_df_context(&catalog_db_path).await;
++    ctx.sql(
++        "INSERT INTO ducklake.main.products VALUES \
++         (1, 'Electronics', 99.99), (2, 'Books', 12.50), \
++         (3, 'Electronics', 149.99), (4, 'Clothing', 29.99), \
++         (5, 'Books', 8.99)",
++    )
++    .await
++    .unwrap()
++    .collect()
++    .await
++    .unwrap();
++
++    // DuckDB reads and verifies all data
++    let duckdb = DuckDbConn::open(&catalog_db_path);
++    let rows = duckdb.query(
++        "SELECT id, category, price FROM ducklake.main.products ORDER BY id",
++    );
++    assert_eq!(rows.len(), 5, "DuckDB should see all 5 DF-inserted rows");
++    assert_eq!(rows[0][0], "1");
++    assert_eq!(rows[0][1], "Electronics");
++    assert_eq!(rows[1][0], "2");
++    assert_eq!(rows[1][1], "Books");
++    assert_eq!(rows[2][0], "3");
++    assert_eq!(rows[2][1], "Electronics");
++    assert_eq!(rows[3][0], "4");
++    assert_eq!(rows[3][1], "Clothing");
++    assert_eq!(rows[4][0], "5");
++    assert_eq!(rows[4][1], "Books");
++
++    // DuckDB: filtered read on partition column
++    let filtered = duckdb.query(
++        "SELECT id, price FROM ducklake.main.products WHERE category = 'Electronics' ORDER BY id",
++    );
++    assert_eq!(filtered.len(), 2);
++    assert_eq!(filtered[0][0], "1");
++    assert_eq!(filtered[1][0], "3");
++}
+diff --git a/tests/delete_tests.rs b/tests/delete_tests.rs
+index 13bdab8..6245fa2 100644
+--- a/tests/delete_tests.rs
++++ b/tests/delete_tests.rs
+@@ -5,42 +5,23 @@
+ 
+ #![cfg(all(feature = "write-sqlite", feature = "metadata-sqlite"))]
+ 
++mod common;
++
+ use std::sync::Arc;
+ 
+ use arrow::array::{Int32Array, StringArray, UInt64Array};
+ use arrow::datatypes::{DataType, Field, Schema};
+ use arrow::record_batch::RecordBatch;
+ use datafusion::prelude::*;
+-use object_store::local::LocalFileSystem;
+ use tempfile::TempDir;
+ 
++use common::sqlite_helpers::{
++    create_object_store, create_read_context, create_test_env, create_writable_context,
++};
+ use datafusion_ducklake::{
+-    DuckLakeCatalog, DuckLakeTable, DuckLakeTableWriter, MetadataWriter, SqliteMetadataProvider,
+-    SqliteMetadataWriter,
++    DuckLakeCatalog, DuckLakeTable, DuckLakeTableWriter, MetadataWriter, SqliteMetadataWriter,
+ };
+ 
+-/// Create a local filesystem object store
+-fn create_object_store() -> Arc<dyn object_store::ObjectStore> {
+-    Arc::new(LocalFileSystem::new())
+-}
+-
+-/// Helper to create a test environment with writer and data directory.
+-/// Returns the writer, temp directory, and connection string.
+-async fn create_test_env() -> (Arc<SqliteMetadataWriter>, TempDir) {
+-    let temp_dir = TempDir::new().unwrap();
+-    let db_path = temp_dir.path().join("test.db");
+-    let data_path = temp_dir.path().join("data");
+-    std::fs::create_dir_all(&data_path).unwrap();
+-
+-    let conn_str = format!("sqlite:{}?mode=rwc", db_path.display());
+-    let writer = SqliteMetadataWriter::new_with_init(&conn_str)
+-        .await
+-        .unwrap();
+-    writer.set_data_path(data_path.to_str().unwrap()).unwrap();
+-
+-    (Arc::new(writer), temp_dir)
+-}
+-
+ /// Write test data: a simple (id, name) table with the given rows.
+ async fn write_test_data(writer: Arc<SqliteMetadataWriter>, batches: &[RecordBatch]) {
+     let object_store = create_object_store();
+@@ -51,33 +32,6 @@ async fn write_test_data(writer: Arc<SqliteMetadataWriter>, batches: &[RecordBat
+         .unwrap();
+ }
+ 
+-/// Create a writable SessionContext for the test environment.
+-async fn create_writable_context(temp_dir: &TempDir) -> SessionContext {
+-    let db_path = temp_dir.path().join("test.db");
+-    let conn_str = format!("sqlite:{}", db_path.display());
+-
+-    let provider = Arc::new(SqliteMetadataProvider::new(&conn_str).await.unwrap());
+-    let writer = Arc::new(SqliteMetadataWriter::new(&conn_str).await.unwrap());
+-    let catalog = DuckLakeCatalog::with_writer(provider, writer).unwrap();
+-
+-    let ctx = SessionContext::new();
+-    ctx.register_catalog("test", Arc::new(catalog));
+-    ctx
+-}
+-
+-/// Create a read-only SessionContext for the test environment.
+-async fn create_read_context(temp_dir: &TempDir) -> SessionContext {
+-    let db_path = temp_dir.path().join("test.db");
+-    let conn_str = format!("sqlite:{}", db_path.display());
+-
+-    let provider = SqliteMetadataProvider::new(&conn_str).await.unwrap();
+-    let catalog = DuckLakeCatalog::new(provider).unwrap();
+-
+-    let ctx = SessionContext::new();
+-    ctx.register_catalog("test", Arc::new(catalog));
+-    ctx
+-}
+-
+ /// Helper to make a simple (id INT32, name UTF8) schema.
+ fn test_schema() -> Arc<Schema> {
+     Arc::new(Schema::new(vec![
+diff --git a/tests/update_tests.rs b/tests/update_tests.rs
+index c033286..10ae0ba 100644
+--- a/tests/update_tests.rs
++++ b/tests/update_tests.rs
+@@ -6,39 +6,24 @@
+ 
+ #![cfg(all(feature = "write-sqlite", feature = "metadata-sqlite"))]
+ 
++mod common;
++
+ use std::sync::Arc;
+ 
+ use arrow::array::{Int32Array, StringArray, UInt64Array};
+ use arrow::datatypes::{DataType, Field, Schema};
+ use arrow::record_batch::RecordBatch;
+ use datafusion::prelude::*;
+-use object_store::local::LocalFileSystem;
+ use tempfile::TempDir;
+ 
++use common::sqlite_helpers::{
++    create_object_store, create_read_context, create_test_env, create_writable_context,
++};
+ use datafusion_ducklake::{
+-    DuckLakeCatalog, DuckLakeTable, DuckLakeTableWriter, MetadataWriter, SqliteMetadataProvider,
+-    SqliteMetadataWriter, UpdateAssignment,
++    DuckLakeCatalog, DuckLakeTable, DuckLakeTableWriter, MetadataWriter, SqliteMetadataWriter,
++    UpdateAssignment,
+ };
+ 
+-fn create_object_store() -> Arc<dyn object_store::ObjectStore> {
+-    Arc::new(LocalFileSystem::new())
+-}
+-
+-async fn create_test_env() -> (Arc<SqliteMetadataWriter>, TempDir) {
+-    let temp_dir = TempDir::new().unwrap();
+-    let db_path = temp_dir.path().join("test.db");
+-    let data_path = temp_dir.path().join("data");
+-    std::fs::create_dir_all(&data_path).unwrap();
+-
+-    let conn_str = format!("sqlite:{}?mode=rwc", db_path.display());
+-    let writer = SqliteMetadataWriter::new_with_init(&conn_str)
+-        .await
+-        .unwrap();
+-    writer.set_data_path(data_path.to_str().unwrap()).unwrap();
+-
+-    (Arc::new(writer), temp_dir)
+-}
+-
+ async fn write_test_data(writer: Arc<SqliteMetadataWriter>, batches: &[RecordBatch]) {
+     let object_store = create_object_store();
+     let table_writer = DuckLakeTableWriter::new(writer, object_store).unwrap();
+@@ -48,31 +33,6 @@ async fn write_test_data(writer: Arc<SqliteMetadataWriter>, batches: &[RecordBat
+         .unwrap();
+ }
+ 
+-async fn create_writable_context(temp_dir: &TempDir) -> SessionContext {
+-    let db_path = temp_dir.path().join("test.db");
+-    let conn_str = format!("sqlite:{}", db_path.display());
+-
+-    let provider = Arc::new(SqliteMetadataProvider::new(&conn_str).await.unwrap());
+-    let writer = Arc::new(SqliteMetadataWriter::new(&conn_str).await.unwrap());
+-    let catalog = DuckLakeCatalog::with_writer(provider, writer).unwrap();
+-
+-    let ctx = SessionContext::new();
+-    ctx.register_catalog("test", Arc::new(catalog));
+-    ctx
+-}
+-
+-async fn create_read_context(temp_dir: &TempDir) -> SessionContext {
+-    let db_path = temp_dir.path().join("test.db");
+-    let conn_str = format!("sqlite:{}", db_path.display());
+-
+-    let provider = SqliteMetadataProvider::new(&conn_str).await.unwrap();
+-    let catalog = DuckLakeCatalog::new(provider).unwrap();
+-
+-    let ctx = SessionContext::new();
+-    ctx.register_catalog("test", Arc::new(catalog));
+-    ctx
+-}
+-
+ fn test_schema() -> Arc<Schema> {
+     Arc::new(Schema::new(vec![
+         Field::new("id", DataType::Int32, false),

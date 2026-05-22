@@ -1,0 +1,12 @@
+diff --git a/src/table_deletions.rs b/src/table_deletions.rs
+index 9a330d4..b505056 100644
+--- a/src/table_deletions.rs
++++ b/src/table_deletions.rs
+@@ -36,6 +36,7 @@ use futures::Stream;
+ 
+ use crate::metadata_provider::{DeleteFileChange, MetadataProvider};
+ use crate::path_resolver::resolve_path;
++use crate::table::validated_file_size;
+ 
+ /// Delete file schema: (file_path: VARCHAR, pos: INT64)
+ fn delete_file_schema() -> SchemaRef {

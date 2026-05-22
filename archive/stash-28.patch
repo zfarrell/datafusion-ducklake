@@ -1,0 +1,120 @@
+diff --git a/src/path_resolver.rs b/src/path_resolver.rs
+index 4254cfd..a1771c2 100644
+--- a/src/path_resolver.rs
++++ b/src/path_resolver.rs
+@@ -7,6 +7,51 @@ use crate::{DuckLakeError, Result};
+ use datafusion::datasource::object_store::ObjectStoreUrl;
+ use std::sync::Arc;
+ 
++/// Reject paths containing null bytes (literal \0 or URL-encoded %00)
++fn validate_no_null_bytes(path: &str) -> Result<()> {
++    if path.contains('\0') {
++        return Err(DuckLakeError::InvalidConfig(format!(
++            "Path contains null byte: {}",
++            path.replace('\0', "\\0")
++        )));
++    }
++    if path.to_ascii_lowercase().contains("%00") {
++        return Err(DuckLakeError::InvalidConfig(format!(
++            "Path contains URL-encoded null byte (%00): {}",
++            path
++        )));
++    }
++    Ok(())
++}
++
++/// Reject paths containing .. traversal (literal or URL-encoded %2e%2e)
++fn validate_no_path_traversal(path: &str) -> Result<()> {
++    // Check URL-encoded variants first (case-insensitive)
++    if path.to_ascii_lowercase().contains("%2e%2e") {
++        return Err(DuckLakeError::InvalidConfig(format!(
++            "Path traversal detected: URL-encoded '..': {}",
++            path
++        )));
++    }
++    // Check literal .. as standalone path component (split on both / and \)
++    for component in path.split(|c| c == '/' || c == '\\') {
++        if component == ".." {
++            return Err(DuckLakeError::InvalidConfig(format!(
++                "Path traversal detected: path contains '..' component: {}",
++                path
++            )));
++        }
++    }
++    Ok(())
++}
++
++/// Combined path validation: reject null bytes and path traversal
++fn validate_path(path: &str) -> Result<()> {
++    validate_no_null_bytes(path)?;
++    validate_no_path_traversal(path)?;
++    Ok(())
++}
++
+ /// Parses a data path into an ObjectStoreUrl and key path
+ ///
+ /// Supports three formats:
+@@ -37,6 +82,7 @@ use std::sync::Arc;
+ /// # Ok::<(), datafusion_ducklake::DuckLakeError>(())
+ /// ```
+ pub fn parse_object_store_url(data_path: &str) -> Result<(ObjectStoreUrl, String)> {
++    validate_path(data_path)?;
+     if data_path.starts_with("s3://") {
+         parse_s3_url(data_path)
+     } else if data_path.starts_with("file://") {
+@@ -112,20 +158,25 @@ fn parse_local_path(data_path: &str) -> Result<(ObjectStoreUrl, String)> {
+ /// # Returns
+ /// The resolved absolute path
+ ///
++/// # Errors
++/// Returns error if either path contains null bytes or path traversal sequences
++///
+ /// # Example
+ /// ```
+ /// # use datafusion_ducklake::path_resolver::resolve_path;
+-/// let resolved = resolve_path("/data/schema1/", "table1/data.parquet", true);
++/// let resolved = resolve_path("/data/schema1/", "table1/data.parquet", true).unwrap();
+ /// assert_eq!(resolved, "/data/schema1/table1/data.parquet");
+ ///
+-/// let absolute = resolve_path("/data/schema1/", "/other/path/data.parquet", false);
++/// let absolute = resolve_path("/data/schema1/", "/other/path/data.parquet", false).unwrap();
+ /// assert_eq!(absolute, "/other/path/data.parquet");
+ /// ```
+-pub fn resolve_path(base_path: &str, path: &str, is_relative: bool) -> String {
++pub fn resolve_path(base_path: &str, path: &str, is_relative: bool) -> Result<String> {
++    validate_path(base_path)?;
++    validate_path(path)?;
+     if is_relative {
+         join_paths(base_path, path)
+     } else {
+-        path.to_string()
++        Ok(path.to_string())
+     }
+ }
+ 
+diff --git a/src/table.rs b/src/table.rs
+index 62fb865..ca25688 100644
+--- a/src/table.rs
++++ b/src/table.rs
+@@ -49,6 +49,21 @@ use datafusion::execution::parquet_encryption::EncryptionFactory;
+ pub const DELETE_FILE_PATH_COL: &str = "file_path";
+ pub const DELETE_POS_COL: &str = "pos";
+ 
++/// Validate and convert file_size_bytes from i64 (as stored in DuckLake metadata) to u64.
++///
++/// DuckLake stores file sizes as signed integers in SQL. A negative value indicates
++/// corrupt or invalid metadata. Without this check, a negative i64 cast to u64 would
++/// wrap to a huge value (e.g., -1 becomes u64::MAX), causing confusing "invalid range"
++/// errors downstream.
++pub(crate) fn validated_file_size(file_size_bytes: i64, file_path: &str) -> DataFusionResult<u64> {
++    u64::try_from(file_size_bytes).map_err(|_| {
++        DataFusionError::Execution(format!(
++            "Invalid file_size_bytes ({}) for file '{}': file size cannot be negative",
++            file_size_bytes, file_path
++        ))
++    })
++}
++
+ /// Returns the expected schema for DuckLake delete files
+ ///
+ /// Delete files have a standard schema: (file_path: VARCHAR, pos: INT64)

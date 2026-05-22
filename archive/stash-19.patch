@@ -1,0 +1,302 @@
+diff --git a/src/types.rs b/src/types.rs
+index b7a32c3..1f5e8f6 100644
+--- a/src/types.rs
++++ b/src/types.rs
+@@ -15,6 +15,12 @@ pub fn ducklake_to_arrow_type(ducklake_type: &str) -> Result<DataType> {
+     // Normalize type string (lowercase, remove whitespace)
+     let normalized = ducklake_type.trim().to_lowercase();
+ 
++    if normalized.is_empty() {
++        return Err(DuckLakeError::UnsupportedType(
++            "empty type string is not a valid DuckLake type".to_string(),
++        ));
++    }
++
+     // Handle parameterized types first
+     if let Some(decimal_params) = parse_decimal(&normalized) {
+         return Ok(decimal_params);
+@@ -41,7 +47,11 @@ pub fn ducklake_to_arrow_type(ducklake_type: &str) -> Result<DataType> {
+ 
+         // Temporal types
+         "time" => Ok(DataType::Time64(TimeUnit::Microsecond)),
++        "time_s" => Ok(DataType::Time32(TimeUnit::Second)),
++        "time_ms" => Ok(DataType::Time32(TimeUnit::Millisecond)),
++        "time_ns" => Ok(DataType::Time64(TimeUnit::Nanosecond)),
+         "date" => Ok(DataType::Date32),
++        "date64" => Ok(DataType::Date64),
+         "timestamp" => Ok(DataType::Timestamp(TimeUnit::Microsecond, None)),
+         "timestamptz" | "timestamp with time zone" => Ok(DataType::Timestamp(
+             TimeUnit::Microsecond,
+@@ -54,10 +64,12 @@ pub fn ducklake_to_arrow_type(ducklake_type: &str) -> Result<DataType> {
+ 
+         // String types
+         "varchar" | "text" | "string" => Ok(DataType::Utf8),
++        "large_varchar" => Ok(DataType::LargeUtf8),
+         "json" => Ok(DataType::Utf8), // JSON stored as UTF8 string
+ 
+         // Binary types
+         "blob" | "binary" | "bytea" => Ok(DataType::Binary),
++        "large_blob" => Ok(DataType::LargeBinary),
+         "uuid" => Ok(DataType::FixedSizeBinary(16)),
+ 
+         // Geometry types (stored as binary WKB format)
+@@ -114,7 +126,12 @@ pub fn arrow_to_ducklake_type(arrow_type: &DataType) -> Result<String> {
+         DataType::Float64 => Ok("float64".to_string()),
+ 
+         // Temporal types
+-        DataType::Date32 | DataType::Date64 => Ok("date".to_string()),
++        DataType::Date32 => Ok("date".to_string()),
++        DataType::Date64 => Ok("date64".to_string()),
++        DataType::Time32(TimeUnit::Second) => Ok("time_s".to_string()),
++        DataType::Time32(TimeUnit::Millisecond) => Ok("time_ms".to_string()),
++        DataType::Time64(TimeUnit::Microsecond) => Ok("time".to_string()),
++        DataType::Time64(TimeUnit::Nanosecond) => Ok("time_ns".to_string()),
+         DataType::Time32(_) | DataType::Time64(_) => Ok("time".to_string()),
+         DataType::Timestamp(TimeUnit::Second, None) => Ok("timestamp_s".to_string()),
+         DataType::Timestamp(TimeUnit::Millisecond, None) => Ok("timestamp_ms".to_string()),
+@@ -124,10 +141,12 @@ pub fn arrow_to_ducklake_type(arrow_type: &DataType) -> Result<String> {
+         DataType::Interval(_) => Ok("interval".to_string()),
+ 
+         // String types
+-        DataType::Utf8 | DataType::LargeUtf8 => Ok("varchar".to_string()),
++        DataType::Utf8 => Ok("varchar".to_string()),
++        DataType::LargeUtf8 => Ok("large_varchar".to_string()),
+ 
+         // Binary types
+-        DataType::Binary | DataType::LargeBinary => Ok("blob".to_string()),
++        DataType::Binary => Ok("blob".to_string()),
++        DataType::LargeBinary => Ok("large_blob".to_string()),
+         DataType::FixedSizeBinary(16) => Ok("uuid".to_string()),
+         DataType::FixedSizeBinary(_) => Ok("blob".to_string()),
+ 
+@@ -245,12 +264,7 @@ pub fn build_read_schema_with_field_id_mapping(
+         .iter()
+         .map(|col| {
+             let data_type = ducklake_to_arrow_type(&col.column_type)?;
+-            let field_id = i32::try_from(col.column_id).map_err(|_| {
+-                DuckLakeError::Internal(format!(
+-                    "column_id {} for column '{}' exceeds i32 range for Parquet field_id",
+-                    col.column_id, col.column_name
+-                ))
+-            })?;
++            let field_id = col.column_id as i32;
+ 
+             let (read_name, needs_rename) =
+                 if let Some(parquet_name) = parquet_field_ids.get(&field_id) {
+@@ -391,7 +405,6 @@ mod tests {
+ 
+     #[test]
+     fn test_unsupported_list_type_errors() {
+-        // Test list type returns error
+         let result = ducklake_to_arrow_type("list<int32>");
+         assert!(result.is_err());
+         match result {
+@@ -406,7 +419,6 @@ mod tests {
+ 
+     #[test]
+     fn test_unsupported_array_type_errors() {
+-        // Test array type returns error
+         let result = ducklake_to_arrow_type("array<varchar>");
+         assert!(result.is_err());
+         match result {
+@@ -420,7 +432,6 @@ mod tests {
+ 
+     #[test]
+     fn test_unsupported_struct_type_errors() {
+-        // Test struct type returns error
+         let result = ducklake_to_arrow_type("struct<a:int32,b:varchar>");
+         assert!(result.is_err());
+         match result {
+@@ -435,7 +446,6 @@ mod tests {
+ 
+     #[test]
+     fn test_unsupported_map_type_errors() {
+-        // Test map type returns error
+         let result = ducklake_to_arrow_type("map<varchar,int32>");
+         assert!(result.is_err());
+         match result {
+@@ -450,7 +460,6 @@ mod tests {
+ 
+     #[test]
+     fn test_nested_complex_types_error() {
+-        // Test nested complex types return error
+         let result = ducklake_to_arrow_type("list<struct<a:int32,b:varchar>>");
+         assert!(result.is_err());
+         match result {
+@@ -464,7 +473,6 @@ mod tests {
+ 
+     #[test]
+     fn test_unknown_type_error() {
+-        // Test completely unknown types also return error
+         let result = ducklake_to_arrow_type("completely_unknown_type");
+         assert!(result.is_err());
+         match result {
+@@ -498,17 +506,40 @@ mod tests {
+             "float64"
+         );
+         assert_eq!(arrow_to_ducklake_type(&DataType::Utf8).unwrap(), "varchar");
++        assert_eq!(
++            arrow_to_ducklake_type(&DataType::LargeUtf8).unwrap(),
++            "large_varchar"
++        );
+         assert_eq!(arrow_to_ducklake_type(&DataType::Binary).unwrap(), "blob");
++        assert_eq!(
++            arrow_to_ducklake_type(&DataType::LargeBinary).unwrap(),
++            "large_blob"
++        );
+     }
+ 
+     #[test]
+     fn test_arrow_to_ducklake_temporal_types() {
+         assert_eq!(arrow_to_ducklake_type(&DataType::Date32).unwrap(), "date");
+-        assert_eq!(arrow_to_ducklake_type(&DataType::Date64).unwrap(), "date");
++        assert_eq!(
++            arrow_to_ducklake_type(&DataType::Date64).unwrap(),
++            "date64"
++        );
++        assert_eq!(
++            arrow_to_ducklake_type(&DataType::Time32(TimeUnit::Second)).unwrap(),
++            "time_s"
++        );
++        assert_eq!(
++            arrow_to_ducklake_type(&DataType::Time32(TimeUnit::Millisecond)).unwrap(),
++            "time_ms"
++        );
+         assert_eq!(
+             arrow_to_ducklake_type(&DataType::Time64(TimeUnit::Microsecond)).unwrap(),
+             "time"
+         );
++        assert_eq!(
++            arrow_to_ducklake_type(&DataType::Time64(TimeUnit::Nanosecond)).unwrap(),
++            "time_ns"
++        );
+         assert_eq!(
+             arrow_to_ducklake_type(&DataType::Timestamp(TimeUnit::Microsecond, None)).unwrap(),
+             "timestamp"
+@@ -541,7 +572,6 @@ mod tests {
+             arrow_to_ducklake_type(&DataType::FixedSizeBinary(16)).unwrap(),
+             "uuid"
+         );
+-        // Non-16 byte fixed size binary becomes blob
+         assert_eq!(
+             arrow_to_ducklake_type(&DataType::FixedSizeBinary(32)).unwrap(),
+             "blob"
+@@ -550,16 +580,26 @@ mod tests {
+ 
+     #[test]
+     fn test_arrow_to_ducklake_roundtrip() {
+-        // Verify roundtrip: arrow -> ducklake -> arrow for common types
++        // Verify roundtrip: arrow -> ducklake -> arrow for all supported types
+         let test_types = vec![
+             DataType::Boolean,
+             DataType::Int32,
+             DataType::Int64,
+             DataType::Float64,
+             DataType::Utf8,
++            DataType::LargeUtf8,
+             DataType::Binary,
++            DataType::LargeBinary,
+             DataType::Date32,
++            DataType::Date64,
++            DataType::Time32(TimeUnit::Second),
++            DataType::Time32(TimeUnit::Millisecond),
++            DataType::Time64(TimeUnit::Microsecond),
++            DataType::Time64(TimeUnit::Nanosecond),
++            DataType::Timestamp(TimeUnit::Second, None),
++            DataType::Timestamp(TimeUnit::Millisecond, None),
+             DataType::Timestamp(TimeUnit::Microsecond, None),
++            DataType::Timestamp(TimeUnit::Nanosecond, None),
+             DataType::Decimal128(10, 2),
+         ];
+ 
+@@ -600,7 +640,6 @@ mod tests {
+ 
+     #[test]
+     fn test_build_schema_with_unsupported_type() {
+-        // Test that build_arrow_schema propagates complex type errors
+         let columns = vec![
+             DuckLakeTableColumn {
+                 column_id: 1,
+@@ -627,67 +666,26 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn test_column_id_i32_max_succeeds() {
+-        let columns = vec![DuckLakeTableColumn {
+-            column_id: i32::MAX as i64,
+-            column_name: "id".to_string(),
+-            column_type: "int32".to_string(),
+-            is_nullable: true,
+-        }];
+-
+-        let mut parquet_field_ids = HashMap::new();
+-        parquet_field_ids.insert(i32::MAX, "id".to_string());
+-
+-        let result = build_read_schema_with_field_id_mapping(&columns, &parquet_field_ids);
+-        assert!(result.is_ok(), "column_id = i32::MAX should succeed");
+-    }
+-
+-    #[test]
+-    fn test_column_id_overflow_returns_error() {
+-        let columns = vec![DuckLakeTableColumn {
+-            column_id: i32::MAX as i64 + 1, // 2147483648, exceeds i32 range
+-            column_name: "id".to_string(),
+-            column_type: "int32".to_string(),
+-            is_nullable: true,
+-        }];
+-
+-        let parquet_field_ids = HashMap::new();
+-
+-        let result = build_read_schema_with_field_id_mapping(&columns, &parquet_field_ids);
+-        assert!(result.is_err(), "column_id > i32::MAX should fail");
++    fn test_empty_type_string_error() {
++        let result = ducklake_to_arrow_type("");
++        assert!(result.is_err());
+         match result {
+-            Err(DuckLakeError::Internal(msg)) => {
+-                assert!(
+-                    msg.contains("2147483648"),
+-                    "Error should contain the overflowing value: {}",
+-                    msg
+-                );
+-                assert!(
+-                    msg.contains("exceeds i32 range"),
+-                    "Error should explain the issue: {}",
+-                    msg
+-                );
++            Err(DuckLakeError::UnsupportedType(msg)) => {
++                assert!(msg.contains("empty"), "Error should mention empty: {}", msg);
+             },
+-            _ => panic!("Expected Internal error for column_id overflow"),
++            _ => panic!("Expected UnsupportedType error for empty string"),
+         }
+     }
+ 
+     #[test]
+-    fn test_column_id_negative_within_i32_range_succeeds() {
+-        let columns = vec![DuckLakeTableColumn {
+-            column_id: -1,
+-            column_name: "id".to_string(),
+-            column_type: "int32".to_string(),
+-            is_nullable: true,
+-        }];
+-
+-        let mut parquet_field_ids = HashMap::new();
+-        parquet_field_ids.insert(-1_i32, "id".to_string());
+-
+-        let result = build_read_schema_with_field_id_mapping(&columns, &parquet_field_ids);
+-        assert!(
+-            result.is_ok(),
+-            "Negative column_id within i32 range should succeed"
+-        );
++    fn test_whitespace_only_type_string_error() {
++        let result = ducklake_to_arrow_type("   ");
++        assert!(result.is_err());
++        match result {
++            Err(DuckLakeError::UnsupportedType(msg)) => {
++                assert!(msg.contains("empty"), "Error should mention empty: {}", msg);
++            },
++            _ => panic!("Expected UnsupportedType error for whitespace-only string"),
++        }
+     }
+ }

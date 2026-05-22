@@ -1,0 +1,21 @@
+diff --git a/tests/delete_filter_tests.rs b/tests/delete_filter_tests.rs
+index afdef64..459f98f 100644
+--- a/tests/delete_filter_tests.rs
++++ b/tests/delete_filter_tests.rs
+@@ -477,11 +477,11 @@ mod integration_tests {
+                 let path = entry.path();
+                 if path.is_dir() {
+                     walk_and_remove(&path, removed)?;
+-                } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+-                    if name.ends_with("-delete.parquet") {
+-                        std::fs::remove_file(&path)?;
+-                        *removed += 1;
+-                    }
++                } else if let Some(name) = path.file_name().and_then(|n| n.to_str())
++                    && name.ends_with("-delete.parquet")
++                {
++                    std::fs::remove_file(&path)?;
++                    *removed += 1;
+                 }
+             }
+             Ok(())

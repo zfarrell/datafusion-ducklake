@@ -1,0 +1,47 @@
+diff --git a/src/table.rs b/src/table.rs
+index 1165754..9598fda 100644
+--- a/src/table.rs
++++ b/src/table.rs
+@@ -362,7 +362,11 @@ impl DuckLakeTable {
+             }
+ 
+             // Parse string values into the appropriate Arrow array type
+-            let array = crate::table_writer::parse_string_to_array(&string_values, data_type)?;
++            let array = crate::parse_values::parse_string_values_to_array(
++                &string_values,
++                data_type,
++                crate::parse_values::ParseMode::Lenient,
++            )?;
+             column_arrays.push(array);
+         }
+ 
+diff --git a/src/table_writer.rs b/src/table_writer.rs
+index cbf516d..93a86b0 100644
+--- a/src/table_writer.rs
++++ b/src/table_writer.rs
+@@ -1203,7 +1203,11 @@ pub(crate) fn inlined_rows_to_batch(
+         }
+ 
+         // Parse string values into the appropriate Arrow array type
+-        let array = parse_string_to_array(&string_values, data_type)?;
++        let array = crate::parse_values::parse_string_values_to_array(
++            &string_values,
++            data_type,
++            crate::parse_values::ParseMode::Strict,
++        )?;
+         column_arrays.push(array);
+     }
+ 
+@@ -1213,10 +1217,8 @@ pub(crate) fn inlined_rows_to_batch(
+     )?)
+ }
+ 
+-/// Parse a decimal string (e.g. "123.45") to an i128 value scaled by 10^scale.
+-fn parse_decimal_string(s: &str, scale: i8) -> Result<i128> {
+-    let negative = s.starts_with('-');
+-    let s = if negative {
++pub(crate) fn arrow_schema_to_column_defs(schema: &Schema) -> Result<Vec<ColumnDef>> {
++    schema
+         &s[1..]
+     } else {
+         s

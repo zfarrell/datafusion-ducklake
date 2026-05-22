@@ -1,0 +1,84 @@
+diff --git a/tests/adversarial_storage_tests.rs b/tests/adversarial_storage_tests.rs
+index 627b0b6..8117c61 100644
+--- a/tests/adversarial_storage_tests.rs
++++ b/tests/adversarial_storage_tests.rs
+@@ -1029,27 +1029,60 @@ async fn test_file_size_bytes_negative() -> DataFusionResult<()> {
+         .collect()
+         .await;
+ 
+-    // FINDING: file_size_bytes = -1i64 cast to u64 = u64::MAX.
+-    // PartitionedFile::new() takes u64, so -1i64 as u64 = 18446744073709551615.
+-    // This may cause DataFusion planning issues (absurdly large file).
+-    match result {
+-        Ok(batches) => {
+-            let count: i64 = batches[0]
+-                .column(0)
+-                .as_any()
+-                .downcast_ref::<arrow::array::Int64Array>()
+-                .unwrap()
+-                .value(0);
+-            println!(
+-                "WARNING: file_size_bytes=-1 (u64::MAX) succeeded with count={}",
+-                count
+-            );
+-        }
+-        Err(e) => {
+-            println!("file_size_bytes=-1 caused error: {}", e);
+-        }
++    // Fix for #58: negative file_size_bytes must produce a clear error
++    // instead of wrapping to u64::MAX via unchecked cast
++    let err = result.expect_err("negative file_size_bytes should produce an error");
++    let err_msg = err.to_string();
++    assert!(
++        err_msg.contains("Invalid file_size_bytes") && err_msg.contains("-1"),
++        "Error should mention invalid file_size_bytes and the value, got: {}",
++        err_msg
++    );
++
++    Ok(())
++}
++
++/// Regression test for #58: file_size_bytes = i64::MIN should also be caught
++#[tokio::test]
++async fn test_file_size_bytes_negative_i64_min() -> DataFusionResult<()> {
++    let temp_dir =
++        TempDir::new().map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
++    let catalog_path = temp_dir.path().join("filesize_min.ducklake");
++
++    common::create_catalog_no_deletes(&catalog_path).map_err(common::to_datafusion_error)?;
++
++    // Set file_size_bytes to i64::MIN (most extreme negative value)
++    {
++        let conn = duckdb::Connection::open(&catalog_path)
++            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
++        conn.execute(
++            &format!(
++                "UPDATE ducklake_data_file SET file_size_bytes = {};",
++                i64::MIN
++            ),
++            [],
++        )
++        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+     }
+ 
++    let catalog = create_catalog(&catalog_path.to_string_lossy())?;
++    let ctx = SessionContext::new();
++    ctx.register_catalog("test", catalog);
++
++    let result = ctx
++        .sql("SELECT * FROM test.main.users")
++        .await?
++        .collect()
++        .await;
++
++    let err = result.expect_err("i64::MIN file_size_bytes should produce an error");
++    let err_msg = err.to_string();
++    assert!(
++        err_msg.contains("Invalid file_size_bytes") && err_msg.contains("file size cannot be negative"),
++        "Error should clearly indicate invalid file size, got: {}",
++        err_msg
++    );
++
+     Ok(())
+ }
+ 

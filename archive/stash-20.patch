@@ -1,0 +1,24 @@
+diff --git a/src/table_changes.rs b/src/table_changes.rs
+index a07c1c6..135ddf6 100644
+--- a/src/table_changes.rs
++++ b/src/table_changes.rs
+@@ -440,8 +440,7 @@ impl TableChangesTable {
+             &self.table_path,
+             &data_file.path,
+             data_file.path_is_relative,
+-        )
+-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
++        );
+ 
+         // Create PartitionedFile with footer size hint if available
+         let mut pf = PartitionedFile::new(&resolved_path, validated_file_size(data_file.file_size_bytes, &resolved_path)?);
+@@ -560,8 +559,7 @@ impl TableProvider for TableChangesTable {
+                     &self.table_path,
+                     &data_file.path,
+                     data_file.path_is_relative,
+-                )
+-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
++                );
+                 builder.add_file(&resolved_path, data_file.encryption_key.as_deref());
+             }
+             let factory = builder.build();
