@@ -1566,7 +1566,15 @@ pub(crate) fn calculate_footer_size_from_bytes(buffer: &[u8]) -> Result<i64> {
             metadata_len
         )));
     }
-    Ok(i64::from(metadata_len) + 8)
+    // DuckLake spec / DuckDB extension semantics: `footer_size` is the thrift
+    // metadata length stored in the last 8 bytes of the file (the i32 LE value),
+    // NOT including the trailing 4-byte length + 4-byte PAR1 magic. Verified by
+    // having the DuckDB DuckLake extension write a file and inspecting the value
+    // it stored in ducklake_data_file.footer_size — it equals exactly this i32.
+    // A previous fix (R8-S-003) added +8 on parquet 57; parquet 58 + the DuckDB
+    // reader's footer-length validation now reject that, producing
+    // "Parquet footer length stored in file is not equal to footer length provided".
+    Ok(i64::from(metadata_len))
 }
 
 /// Validate NOT NULL constraints on a set of record batches.
