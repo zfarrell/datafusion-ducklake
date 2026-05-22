@@ -904,6 +904,26 @@ mod tests {
         let values = vec![Some("../../etc/passwd".to_string())];
         let result = build_hive_dir(&cols, &values);
         assert!(result.contains("%2F"));
+
+        // Space → %20 (per DuckLake spec / standard Hive partition encoding)
+        let values = vec![Some("hello world".to_string())];
+        let result = build_hive_dir(&cols, &values);
+        assert_eq!(result, "path=hello%20world");
+
+        // Percent literal must be encoded so a decode round-trip is unambiguous
+        let values = vec![Some("100%".to_string())];
+        let result = build_hive_dir(&cols, &values);
+        assert_eq!(result, "path=100%25");
+
+        // Unicode characters are UTF-8 percent-encoded per spec.
+        let values = vec![Some("café".to_string())];
+        let result = build_hive_dir(&cols, &values);
+        assert_eq!(result, "path=caf%C3%A9");
+
+        // CJK unicode (multi-byte) also percent-encoded
+        let values = vec![Some("日本".to_string())];
+        let result = build_hive_dir(&cols, &values);
+        assert_eq!(result, "path=%E6%97%A5%E6%9C%AC");
     }
 
     #[test]
