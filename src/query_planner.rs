@@ -231,20 +231,52 @@ fn extract_update_info(
     let schema = table.schema();
     let mut assignments = Vec::new();
 
-    if projection_exprs.len() > schema.fields().len() {
-        tracing::warn!(
-            "UPDATE projection has {} expressions but table schema has {} fields; \
-             extra expressions will be ignored",
+    // Audit-flagged fragility (#16): UPDATE detection uses positional matching:
+    // we treat `projection_exprs[i]` as the new value for `schema.fields()[i]`.
+    // This assumes DataFusion's SQL planner emits projection expressions in the
+    // same order as target-table columns and aliases each one to the column name.
+    // If a future DataFusion change ever reorders or renames those projections,
+    // silently trusting the index would corrupt data. We assert the invariant
+    // explicitly and fail loudly with a planner error instead.
+    if projection_exprs.len() != schema.fields().len() {
+        return Err(DataFusionError::Plan(format!(
+            "UPDATE planner invariant violated: projection has {} expressions but target table \
+             schema has {} fields. This usually indicates a DataFusion version change that \
+             altered UPDATE plan shape; please file a bug against datafusion-ducklake.",
             projection_exprs.len(),
             schema.fields().len()
-        );
+        )));
     }
 
     for (i, expr) in projection_exprs.iter().enumerate() {
-        if i >= schema.fields().len() {
-            break;
-        }
         let field = &schema.fields()[i];
+
+        // The projection expression for column i must be aliased to that column's
+        // name. This catches positional drift before it can corrupt data.
+        let alias_name: Option<&str> = match expr {
+            Expr::Alias(alias) => Some(alias.name.as_str()),
+            Expr::Column(col) => Some(col.name.as_str()),
+            _ => None,
+        };
+        match alias_name {
+            Some(name) if name == field.name() => {},
+            Some(name) => {
+                return Err(DataFusionError::Plan(format!(
+                    "UPDATE planner invariant violated: projection expression {i} is named \
+                     '{name}' but target column at index {i} is '{}'. This usually indicates a \
+                     DataFusion version change that altered UPDATE projection ordering; please \
+                     file a bug against datafusion-ducklake.",
+                    field.name()
+                )));
+            },
+            None => {
+                return Err(DataFusionError::Plan(format!(
+                    "UPDATE planner invariant violated: projection expression {i} for target \
+                     column '{}' is not aliased or a column reference; cannot verify alignment.",
+                    field.name()
+                )));
+            },
+        }
 
         // Unwrap alias to get the inner expression
         let inner = match expr {
