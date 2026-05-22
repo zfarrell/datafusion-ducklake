@@ -449,3 +449,88 @@ async fn test_select_works_with_custom_planner() {
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 3);
 }
+
+// ============================================================================
+// Planning-only tests: verify the right physical exec node is selected
+// (covers #16 acceptance criteria — exec semantics are tested elsewhere)
+// ============================================================================
+
+/// Render a physical plan tree to a string we can substring-match against.
+fn plan_to_string(plan: &std::sync::Arc<dyn datafusion::physical_plan::ExecutionPlan>) -> String {
+    datafusion::physical_plan::displayable(plan.as_ref())
+        .indent(true)
+        .to_string()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_planner_delete_produces_delete_exec_node() {
+    let batch = make_batch(vec![1, 2, 3], vec!["a", "b", "c"]);
+    let temp_dir = setup_test_data(&[batch]).await;
+    let ctx = create_ctx_with_planner(&temp_dir).await;
+
+    let df = ctx
+        .sql("DELETE FROM ducklake.main.test_table WHERE id = 1")
+        .await
+        .unwrap();
+    let physical = df.create_physical_plan().await.unwrap();
+    let rendered = plan_to_string(&physical);
+
+    assert!(
+        rendered.contains("DuckLakeDeleteExec"),
+        "expected physical plan to contain DuckLakeDeleteExec, got:\n{rendered}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_planner_update_produces_update_exec_node() {
+    let batch = make_batch(vec![1, 2, 3], vec!["a", "b", "c"]);
+    let temp_dir = setup_test_data(&[batch]).await;
+    let ctx = create_ctx_with_planner(&temp_dir).await;
+
+    let df = ctx
+        .sql("UPDATE ducklake.main.test_table SET name = 'z' WHERE id = 2")
+        .await
+        .unwrap();
+    let physical = df.create_physical_plan().await.unwrap();
+    let rendered = plan_to_string(&physical);
+
+    assert!(
+        rendered.contains("DuckLakeUpdateExec"),
+        "expected physical plan to contain DuckLakeUpdateExec, got:\n{rendered}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_planner_rejects_delete_with_subquery() {
+    let batch = make_batch(vec![1, 2, 3], vec!["a", "b", "c"]);
+    let temp_dir = setup_test_data(&[batch]).await;
+    let ctx = create_ctx_with_planner(&temp_dir).await;
+
+    // IN (SELECT ...) gets rewritten through a SemiJoin — the planner must reject
+    // this rather than silently dropping the predicate (which would delete all rows).
+    let result = ctx
+        .sql("DELETE FROM ducklake.main.test_table WHERE id IN (SELECT id FROM ducklake.main.test_table WHERE id > 1)")
+        .await;
+
+    // Either sql() or create_physical_plan() may surface the error depending on
+    // when DataFusion materializes the logical plan. Accept either path.
+    let err = match result {
+        Err(e) => e,
+        Ok(df) => df.create_physical_plan().await.expect_err(
+            "DELETE with subquery should be rejected by the DuckLake query planner",
+        ),
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("not supported")
+            || msg.contains("not_impl")
+            || msg.contains("Expected TableScan")
+            || msg.contains("complex WHERE"),
+        "expected explicit rejection error from planner, got: {msg}"
+    );
+
+    // The table must still contain all original rows — no silent full-table delete.
+    let read_ctx = create_read_ctx(&temp_dir).await;
+    let ids = query_ids(&read_ctx).await;
+    assert_eq!(ids, vec![1, 2, 3], "subquery DELETE must not have touched data");
+}
