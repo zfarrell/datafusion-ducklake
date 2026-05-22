@@ -499,7 +499,10 @@ impl ExecutionPlan for DuckLakeMergeExec {
                                 ));
                             }
 
-                            for &(batch_idx, src_row_idx) in candidates {
+                            // First match is sufficient — but we still need to
+                            // record the source-row match for the SQL-standard
+                            // "source row matches more than one target" check.
+                            if let Some(&(batch_idx, src_row_idx)) = candidates.first() {
                                 let src_global = source_batch_offsets[batch_idx] + src_row_idx;
                                 source_match_count[src_global] += 1;
 
@@ -517,7 +520,6 @@ impl ExecutionPlan for DuckLakeMergeExec {
                                     positions_to_delete.push(global_pos);
                                     source_match_masks[batch_idx][src_row_idx] = true;
                                 }
-                                break; // First match is sufficient
                             }
                         }
                     }

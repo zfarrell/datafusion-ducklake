@@ -615,7 +615,7 @@ async fn test_corrupt_catalog_negative_file_size() {
             // If query plan succeeds, collecting may still fail, but should not panic
             match df.collect().await {
                 Ok(batches) => assert!(
-                    batches.iter().all(|b| b.num_rows() >= 0),
+                    !batches.is_empty() || batches.is_empty(), // just check collect didn't panic
                     "batches should be valid"
                 ),
                 Err(e) => eprintln!("Expected error with negative file size: {e}"),
@@ -660,7 +660,7 @@ async fn test_corrupt_catalog_oversized_footer() {
     match result {
         Ok(df) => match df.collect().await {
             Ok(batches) => assert!(
-                batches.iter().all(|b| b.num_rows() >= 0),
+                !batches.is_empty() || batches.is_empty(), // just check collect didn't panic
                 "batches should be valid"
             ),
             Err(e) => eprintln!("Expected error with oversized footer: {e}"),

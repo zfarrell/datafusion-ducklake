@@ -1393,7 +1393,7 @@ async fn cross_engine_df_write_schema_duckdb_verifies() {
             Arc::new(Int32Array::from(vec![1])),
             Arc::new(Int64Array::from(vec![100i64])),
             Arc::new(StringArray::from(vec!["test"])),
-            Arc::new(Float64Array::from(vec![3.14])),
+            Arc::new(Float64Array::from(vec![3.15])),
         ],
     )
     .unwrap();
