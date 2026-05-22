@@ -2,13 +2,51 @@
 //!
 //! Implements UPDATE table SET col = val WHERE condition by:
 //! 1. Scanning each data file to find matching rows (collecting full row data + positions)
-//! 2. Writing delete files for matched rows
-//! 3. Applying SET transformations to matched row data
-//! 4. Writing new data files with transformed rows
-//! 5. Registering both delete files and new data files in catalog metadata
+//! 2. Applying SET transformations to the matched row data (in memory)
+//! 3. Validating NOT NULL constraints on the transformed rows **before any
+//!    disk I/O** — so a failing constraint never leaves orphan files behind
+//! 4. Writing delete files for matched rows
+//! 5. Writing a new data file containing the transformed rows
+//! 6. Atomically registering both in catalog metadata
 //!
 //! This implements the copy-on-write (MOR) pattern: old rows are marked deleted,
 //! new rows with updated values are written as new data files.
+//!
+//! ## Concurrency
+//!
+//! Like DELETE (see `delete_exec.rs`), the exec captures the table's
+//! `snapshot_id` at plan time and threads it through
+//! `MetadataWriter::register_dml_files` as `since_snapshot`. The writer's
+//! conflict check runs inside the same transaction as the metadata mutations,
+//! so a concurrent DML that committed against the same `data_file_id` after
+//! `since_snapshot` will cause this UPDATE to fail with
+//! `TransactionConflict` and the `UploadCleanupGuard` will clean up any files
+//! already uploaded to the object store.
+//!
+//! **Granularity note (see TODO at the call site):** the conflict check is
+//! currently *file-level* — any two transactions that target the same
+//! `data_file_id` and were planned at the same snapshot will conflict, even
+//! if their predicates select disjoint row positions. This is correct for
+//! correctness but is conservative for UPDATE: two UPDATEs that touch
+//! disjoint rows in the same file *could* in principle both commit. Refining
+//! the check to be row-position-aware is tracked as a follow-up.
+//!
+//! ## Memory bounds
+//!
+//! UPDATE buffers the full set of transformed rows in memory before writing
+//! them out as a new data file. The size cap is read from
+//! [`crate::config::DuckLakeConfig::max_buffered_rows_per_dml`] (default
+//! 10M); raise it via session config for legitimate large UPDATEs.
+//!
+//! ## Partition-column updates
+//!
+//! Updating a column that is part of the table's partitioning expression is
+//! ambiguous in the DuckLake spec (the row's partition assignment would have
+//! to change). The current implementation does not move rows across
+//! partition files — the SET expression is applied to the row in-place and
+//! the resulting batch is written to the same new data file regardless of
+//! whether the partition value changed. Tracked as a follow-up; do not
+//! redesign in this exec.
 //!
 //! If metadata registration fails after files have been uploaded,
 //! best-effort cleanup removes all orphaned files (both delete and data files).
@@ -71,6 +109,12 @@ pub struct DuckLakeUpdateExec {
     table_path: String,
     /// Existing deleted positions per file (pre-loaded)
     existing_deletes: Arc<HashMap<String, HashSet<i64>>>,
+    /// Snapshot id this UPDATE was planned against, for optimistic-concurrency
+    /// conflict detection. A concurrent DML that ended any of this UPDATE's
+    /// target data files (or installed a newer active delete file on them)
+    /// after this snapshot will cause `register_dml_files` to reject the
+    /// commit with `TransactionConflict`.
+    since_snapshot: i64,
     /// Cached plan properties
     cache: Arc<PlanProperties>,
 }
@@ -89,6 +133,7 @@ impl DuckLakeUpdateExec {
         object_store_url: Arc<ObjectStoreUrl>,
         table_path: String,
         existing_deletes: HashMap<String, HashSet<i64>>,
+        since_snapshot: i64,
     ) -> Self {
         let cache = Self::compute_properties();
         Self {
@@ -103,6 +148,7 @@ impl DuckLakeUpdateExec {
             object_store_url,
             table_path,
             existing_deletes: Arc::new(existing_deletes),
+            since_snapshot,
             cache,
         }
     }
@@ -199,7 +245,18 @@ impl ExecutionPlan for DuckLakeUpdateExec {
         let object_store_url = self.object_store_url.clone();
         let table_path = self.table_path.clone();
         let existing_deletes = Arc::clone(&self.existing_deletes);
+        let since_snapshot = self.since_snapshot;
         let output_schema = make_dml_count_schema();
+
+        // Honour the session-config override for `max_buffered_rows_per_dml`
+        // if present; otherwise fall back to the legacy 10M default.
+        let max_buffered_rows = context
+            .session_config()
+            .options()
+            .extensions
+            .get::<crate::config::DuckLakeConfig>()
+            .map(|c| c.max_buffered_rows_per_dml)
+            .unwrap_or_else(|| crate::config::DuckLakeConfig::default().max_buffered_rows_per_dml);
 
         let stream = stream::once(async move {
             let object_store = context
@@ -227,14 +284,28 @@ impl ExecutionPlan for DuckLakeUpdateExec {
             // Track buffered row count to guard against OOM on large updates.
             let mut updated_batches: Vec<RecordBatch> = Vec::new();
             let mut buffered_rows: usize = 0;
-            const MAX_BUFFERED_ROWS: usize = 10_000_000; // 10M row safety limit
-            // Cleanup guard ensures orphan files are removed on any error path
+            // Cleanup guard ensures orphan files are removed on any error path.
+            // It is initialised here so that subsequent uploads (delete files,
+            // new data file) register their `ObjectPath` with the guard and
+            // are removed on any `?`-propagated error.
             let mut upload_guard =
                 crate::table_writer::UploadCleanupGuard::new(Arc::clone(&object_store));
             // Collect file metadata for atomic registration
             let mut pending_delete_files: Vec<DeleteFileInfo> = Vec::new();
 
-            // Process each data file
+            // Phase 1: For each data file, scan, identify matching positions,
+            // apply SET, and validate NOT NULL on the resulting batches —
+            // BEFORE any delete file or data file is uploaded. Collect the
+            // per-file work so phase 2 can perform the disk I/O once all
+            // validation passes have succeeded.
+            struct PerFileWork {
+                resolved_path: String,
+                data_file_id: i64,
+                positions_to_delete: Vec<i64>,
+                existing_positions: Option<HashSet<i64>>,
+            }
+            let mut per_file_work: Vec<PerFileWork> = Vec::new();
+
             for table_file in &*table_files {
                 let data_file_id = table_file.data_file_id.ok_or_else(|| {
                     DataFusionError::Internal(
@@ -352,7 +423,12 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                     ))
                 })?;
 
-                // Apply SET transformations to matching rows
+                // Apply SET transformations to matching rows. We do this here
+                // (in phase 1, before any disk writes) so that NOT NULL
+                // validation below can short-circuit before we upload
+                // anything. The buffered batches are accumulated into
+                // `updated_batches` and become the new data file in phase 3.
+                let updated_batches_before = updated_batches.len();
                 for matched_batch in &matching_rows {
                     if matched_batch.num_rows() == 0 {
                         continue;
@@ -361,7 +437,13 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                     // Start with the original columns
                     let mut columns: Vec<ArrayRef> = matched_batch.columns().to_vec();
 
-                    // Apply each SET assignment
+                    // Apply each SET assignment.
+                    //
+                    // Self-referencing expressions (e.g. `SET x = x + 1`) are
+                    // evaluated against `matched_batch`, which holds the
+                    // *pre-update* column values, so they see the prior `x`
+                    // and not any previously-assigned value within the same
+                    // SET clause.
                     for (col_idx, phys_expr) in &physical_assignments {
                         if *col_idx >= columns.len() {
                             return Err(DataFusionError::Plan(format!(
@@ -377,29 +459,62 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                     }
 
                     let updated_batch = RecordBatch::try_new(table_schema.clone(), columns)?;
-                    buffered_rows += updated_batch.num_rows();
+                    buffered_rows = buffered_rows.checked_add(updated_batch.num_rows())
+                        .ok_or_else(|| DataFusionError::Execution(
+                            "UPDATE buffered_rows overflow".to_string()
+                        ))?;
                     updated_batches.push(updated_batch);
 
-                    if buffered_rows > MAX_BUFFERED_ROWS {
+                    if buffered_rows > max_buffered_rows {
                         return Err(DataFusionError::ResourcesExhausted(format!(
                             "UPDATE affects too many rows ({} rows buffered, limit is {}). \
-                             Consider updating in smaller batches using a more selective WHERE clause.",
-                            buffered_rows, MAX_BUFFERED_ROWS
+                             Raise `ducklake.max_buffered_rows_per_dml` in the session config \
+                             or use a more selective WHERE clause.",
+                            buffered_rows, max_buffered_rows
                         )));
                     }
                 }
 
-                // Merge with existing deletes for the delete file
+                // Enforce NOT NULL constraints on the rows that were just
+                // generated for THIS file, before any delete file or data
+                // file has been written to disk. This guarantees the
+                // ticket's acceptance criterion that "UPDATE setting NOT
+                // NULL column to NULL returns an error before any write".
+                if updated_batches.len() > updated_batches_before {
+                    crate::table_writer::validate_not_null_constraints(
+                        &table_schema,
+                        &updated_batches[updated_batches_before..],
+                    )?;
+                }
+
+                per_file_work.push(PerFileWork {
+                    resolved_path,
+                    data_file_id,
+                    positions_to_delete,
+                    existing_positions: existing_positions.cloned(),
+                });
+            }
+
+            // Phase 2: now that ALL per-file SET applications and NOT NULL
+            // checks have passed, perform the disk I/O. Any error from this
+            // point on still cleans up via `upload_guard`.
+            for work in per_file_work {
+                let PerFileWork {
+                    resolved_path,
+                    data_file_id,
+                    positions_to_delete,
+                    existing_positions,
+                } = work;
+
                 let mut all_positions = positions_to_delete;
                 if let Some(existing) = existing_positions {
-                    for pos in existing {
+                    for pos in &existing {
                         all_positions.push(*pos);
                     }
                     all_positions.sort_unstable();
                     all_positions.dedup();
                 }
 
-                // Write and upload delete file using shared helper
                 let delete_file_info = crate::table_writer::write_delete_file(
                     &*object_store,
                     &table_path,
@@ -413,12 +528,15 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                 pending_delete_files.push(delete_file_info);
             }
 
-            // Enforce NOT NULL constraints on updated rows before writing
-            crate::table_writer::validate_not_null_constraints(&table_schema, &updated_batches)?;
-
-            // Write updated rows as new data file(s)
+            // Phase 3: write the new data file. NOT NULL has already been
+            // validated per-batch above, but we keep the full-set check here
+            // as a safety net (e.g. in case future refactors reorder phases).
             let mut pending_data_files: Vec<DataFileInfo> = Vec::new();
             if !updated_batches.is_empty() {
+                crate::table_writer::validate_not_null_constraints(
+                    &table_schema,
+                    &updated_batches,
+                )?;
                 let data_file_info = crate::table_writer::write_and_upload_parquet(
                     &updated_batches,
                     &table_schema,
@@ -442,16 +560,26 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                 .create_snapshot()
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-            // Atomically register all delete files and data files (guard cleans up on error).
-            // TODO(#18): plumb `since_snapshot` through UPDATE for optimistic-concurrency
-            // conflict detection (matching the path added for DELETE in #17).
+            // Atomically register all delete files and data files (guard
+            // cleans up on error). Passing `since_snapshot` opts UPDATE into
+            // the same optimistic-concurrency conflict detection DELETE got
+            // in #17: any concurrent DML that ended a targeted data file or
+            // installed a newer active delete file on it since this UPDATE
+            // was planned will cause `register_dml_files` to fail with
+            // `TransactionConflict`.
+            //
+            // Granularity: the writer's check is file-level (any conflict
+            // on the same `data_file_id`). For UPDATE this is conservative:
+            // two UPDATEs that touch disjoint row positions in the same file
+            // will conflict. Refining this to be row-position-aware is
+            // tracked as a follow-up; see the module-level docs.
             writer
                 .register_dml_files(
                     table_id,
                     snapshot_id,
                     &pending_delete_files,
                     &pending_data_files,
-                    None,
+                    Some(since_snapshot),
                 )
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
 

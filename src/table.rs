@@ -744,6 +744,10 @@ impl DuckLakeTable {
             Arc::clone(&self.object_store_url),
             self.table_path.clone(),
             existing_deletes,
+            // Capture the plan-time snapshot so the writer can detect
+            // concurrent DML conflicts inside its transaction (matches the
+            // path #17 added for DELETE; #19 will mirror this for MERGE).
+            self.snapshot_id,
         )))
     }
 

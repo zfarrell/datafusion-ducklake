@@ -38,6 +38,8 @@
 pub mod catalog;
 pub mod cdc_common;
 pub mod column_rename;
+#[cfg(feature = "write")]
+pub mod config;
 pub mod delete_filter;
 pub(crate) mod dialect;
 pub mod encryption;
@@ -148,5 +150,7 @@ pub use table_writer::{
     DuckLakeTableWriter, DucklakeFlushInlinedDataFunction, TableWriteSession,
     cleanup_orphaned_files,
 };
+#[cfg(feature = "write")]
+pub use config::DuckLakeConfig;
 #[cfg(feature = "write")]
 pub use update_exec::{DuckLakeUpdateExec, UpdateAssignment};
