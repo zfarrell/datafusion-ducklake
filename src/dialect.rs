@@ -1,3 +1,41 @@
+//! SQL dialect abstraction for the catalog metadata writers and providers.
+//!
+//! The [`SqlDialect`] trait names the small set of SQL syntax differences
+//! that DuckLake's metadata catalog needs to paper over when targeting
+//! SQLite, PostgreSQL, or MySQL. The
+//! [`metadata_writer_impl`][crate::metadata_writer_impl] and
+//! [`metadata_provider_impl`][crate::metadata_provider_impl] macros call into
+//! this trait so the same source can emit per-backend SQL at compile time.
+//!
+//! ## Scope
+//!
+//! - **Identifier quoting**: `"col"` (SQLite/PG) vs `` `col` `` (MySQL).
+//! - **Parameter placeholders**: `?` (SQLite/MySQL) vs `$n` (Postgres).
+//! - **Boolean literals**: `1`/`0` (SQLite) vs `TRUE`/`FALSE` (PG/MySQL).
+//! - **CAST targets**: `TEXT` / `VARCHAR` / `CHAR`, `BIGINT` / `SIGNED`.
+//! - **Upsert syntax**: `ON CONFLICT (...) DO UPDATE` vs
+//!   `ON DUPLICATE KEY UPDATE`.
+//! - **Row locks**: `FOR UPDATE` support (no-op on SQLite).
+//! - **`RETURNING`**: supported on SQLite + PG, not on MySQL — call sites
+//!   branch on [`SqlDialect::supports_returning`].
+//! - **Existence checks**: `SELECT COUNT(*) ...` vs `SELECT EXISTS(...)`.
+//! - **Sequence allocation**: [`SqlDialect::next_id_sql`] for PG sequences and
+//!   SQLite `COALESCE(MAX(...)) + 1`. MySQL provides its own async helper.
+//!
+//! ## Not in scope
+//!
+//! - The catalog table *schema* itself. The DuckLake spec fixes column names
+//!   and types; this trait describes only how to compose SQL against them.
+//! - Maximum identifier length, which is informational only and currently not
+//!   exposed because identifiers in the catalog are spec-fixed and short.
+//!
+//! ## Visibility
+//!
+//! `SqlDialect` and its three implementors are `pub(crate)`. They are
+//! consumed exclusively by the writer and provider macros in this crate;
+//! callers do not see dialect details. New backends should be added inside
+//! this crate alongside the existing ones.
+
 /// SQL dialect differences between SQLite, PostgreSQL, and MySQL.
 /// Each method returns a SQL fragment or performs a dialect-specific operation.
 pub(crate) trait SqlDialect: Send + Sync + 'static {
@@ -17,11 +55,6 @@ pub(crate) trait SqlDialect: Send + Sync + 'static {
 
     /// SQL expression for current timestamp.
     fn now(&self) -> &'static str;
-
-    /// Generate a UUID. Returns (sql_expr_or_placeholder, Option<bind_value>).
-    #[cfg(feature = "write")]
-    #[allow(dead_code)]
-    fn uuid_value(&self) -> (String, Option<String>);
 
     /// Boolean literal in SQL text. SQLite: "1"/"0", PG/MySQL: "TRUE"/"FALSE".
     fn bool_lit(&self, val: bool) -> &'static str;
@@ -47,14 +80,6 @@ pub(crate) trait SqlDialect: Send + Sync + 'static {
 
     /// FOR UPDATE clause. SQLite: "" (empty), PG/MySQL: " FOR UPDATE".
     fn for_update(&self) -> &'static str;
-
-    /// INSERT-or-ignore syntax.
-    ///
-    /// # Safety (SQL injection)
-    /// `table`, `columns`, and `values` are interpolated directly into SQL.
-    /// Only pass known catalog table/column names and placeholders — never user input.
-    #[allow(dead_code)]
-    fn insert_or_ignore(&self, table: &str, columns: &str, values: &str) -> String;
 
     /// Whether existence checks use COUNT(*) (true) or SELECT EXISTS (false).
     fn existence_check_is_count(&self) -> bool;
@@ -84,7 +109,10 @@ pub(crate) trait SqlDialect: Send + Sync + 'static {
 
 // --- SQLite ---
 
-#[cfg_attr(not(feature = "write"), allow(dead_code))]
+#[cfg_attr(
+    not(any(feature = "metadata-sqlite", feature = "write-sqlite")),
+    allow(dead_code)
+)]
 pub(crate) struct SqliteDialect;
 
 impl SqlDialect for SqliteDialect {
@@ -102,11 +130,6 @@ impl SqlDialect for SqliteDialect {
 
     fn now(&self) -> &'static str {
         "strftime('%Y-%m-%d %H:%M:%f+00:00','now')"
-    }
-
-    #[cfg(feature = "write")]
-    fn uuid_value(&self) -> (String, Option<String>) {
-        ("?".to_string(), Some(uuid::Uuid::new_v4().to_string()))
     }
 
     fn bool_lit(&self, val: bool) -> &'static str {
@@ -147,10 +170,6 @@ impl SqlDialect for SqliteDialect {
 
     fn for_update(&self) -> &'static str {
         ""
-    }
-
-    fn insert_or_ignore(&self, table: &str, columns: &str, values: &str) -> String {
-        format!("INSERT OR IGNORE INTO {table} ({columns}) VALUES ({values})")
     }
 
     fn existence_check_is_count(&self) -> bool {
@@ -202,7 +221,10 @@ impl SqlDialect for SqliteDialect {
 
 // --- PostgreSQL ---
 
-#[cfg_attr(not(feature = "write"), allow(dead_code))]
+#[cfg_attr(
+    not(any(feature = "metadata-postgres", feature = "write-postgres")),
+    allow(dead_code)
+)]
 pub(crate) struct PostgresDialect;
 
 impl SqlDialect for PostgresDialect {
@@ -220,11 +242,6 @@ impl SqlDialect for PostgresDialect {
 
     fn now(&self) -> &'static str {
         "CURRENT_TIMESTAMP"
-    }
-
-    #[cfg(feature = "write")]
-    fn uuid_value(&self) -> (String, Option<String>) {
-        ("gen_random_uuid()".to_string(), None)
     }
 
     fn bool_lit(&self, val: bool) -> &'static str {
@@ -267,10 +284,6 @@ impl SqlDialect for PostgresDialect {
         " FOR UPDATE"
     }
 
-    fn insert_or_ignore(&self, table: &str, columns: &str, values: &str) -> String {
-        format!("INSERT INTO {table} ({columns}) VALUES ({values}) ON CONFLICT DO NOTHING")
-    }
-
     fn existence_check_is_count(&self) -> bool {
         false
     }
@@ -305,7 +318,10 @@ impl SqlDialect for PostgresDialect {
 
 // --- MySQL ---
 
-#[cfg_attr(not(feature = "write"), allow(dead_code))]
+#[cfg_attr(
+    not(any(feature = "metadata-mysql", feature = "write-mysql")),
+    allow(dead_code)
+)]
 pub(crate) struct MySqlDialect;
 
 impl SqlDialect for MySqlDialect {
@@ -326,11 +342,6 @@ impl SqlDialect for MySqlDialect {
 
     fn now(&self) -> &'static str {
         "NOW(6)"
-    }
-
-    #[cfg(feature = "write")]
-    fn uuid_value(&self) -> (String, Option<String>) {
-        ("?".to_string(), Some(uuid::Uuid::new_v4().to_string()))
     }
 
     fn bool_lit(&self, val: bool) -> &'static str {
@@ -368,10 +379,6 @@ impl SqlDialect for MySqlDialect {
 
     fn for_update(&self) -> &'static str {
         " FOR UPDATE"
-    }
-
-    fn insert_or_ignore(&self, table: &str, columns: &str, values: &str) -> String {
-        format!("INSERT IGNORE INTO {table} ({columns}) VALUES ({values})")
     }
 
     fn existence_check_is_count(&self) -> bool {
@@ -527,35 +534,6 @@ mod tests {
         assert_eq!(
             result,
             "ON DUPLICATE KEY UPDATE name = VALUES(name), value = VALUES(value)"
-        );
-    }
-
-    // --- insert_or_ignore() ---
-
-    #[test]
-    fn test_sqlite_insert_or_ignore() {
-        let d = SqliteDialect;
-        assert_eq!(
-            d.insert_or_ignore("t", "a, b", "?, ?"),
-            "INSERT OR IGNORE INTO t (a, b) VALUES (?, ?)"
-        );
-    }
-
-    #[test]
-    fn test_postgres_insert_or_ignore() {
-        let d = PostgresDialect;
-        assert_eq!(
-            d.insert_or_ignore("t", "a, b", "$1, $2"),
-            "INSERT INTO t (a, b) VALUES ($1, $2) ON CONFLICT DO NOTHING"
-        );
-    }
-
-    #[test]
-    fn test_mysql_insert_or_ignore() {
-        let d = MySqlDialect;
-        assert_eq!(
-            d.insert_or_ignore("t", "a, b", "?, ?"),
-            "INSERT IGNORE INTO t (a, b) VALUES (?, ?)"
         );
     }
 
