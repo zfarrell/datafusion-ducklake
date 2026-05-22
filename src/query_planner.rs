@@ -15,7 +15,7 @@ use datafusion::catalog::TableProvider;
 use datafusion::datasource::DefaultTableSource;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::QueryPlanner;
-use datafusion::execution::session_state::SessionState;
+use datafusion::execution::session_state::{SessionState, SessionStateBuilder};
 use datafusion::logical_expr::dml::DmlStatement;
 use datafusion::logical_expr::expr_rewriter::unnormalize_col;
 use datafusion::logical_expr::{Expr, Filter, LogicalPlan, Projection, WriteOp};
@@ -27,9 +27,23 @@ use crate::update_exec::UpdateAssignment;
 
 /// Custom query planner that adds DELETE and UPDATE support for DuckLake tables.
 ///
-/// Register with `SessionStateBuilder::with_query_planner(Arc::new(DuckLakeQueryPlanner))`.
+/// The easiest way to register is via [`DuckLakeQueryPlanner::register_into`]:
 ///
-/// # Example
+/// ```no_run
+/// use datafusion::prelude::*;
+/// use datafusion::execution::session_state::SessionStateBuilder;
+/// use datafusion_ducklake::DuckLakeQueryPlanner;
+///
+/// let state = DuckLakeQueryPlanner::register_into(
+///     SessionStateBuilder::new().with_default_features(),
+/// )
+/// .build();
+/// let ctx = SessionContext::new_with_state(state);
+/// // Now ctx.sql("DELETE FROM ...") and ctx.sql("UPDATE ...") work on DuckLake tables.
+/// ```
+///
+/// You can also wire it up manually via `with_query_planner`:
+///
 /// ```no_run
 /// use datafusion::prelude::*;
 /// use datafusion::execution::session_state::SessionStateBuilder;
@@ -41,10 +55,28 @@ use crate::update_exec::UpdateAssignment;
 ///     .with_query_planner(Arc::new(DuckLakeQueryPlanner))
 ///     .build();
 /// let ctx = SessionContext::new_with_state(state);
-/// // Now ctx.sql("DELETE FROM ...") and ctx.sql("UPDATE ...") work on DuckLake tables
 /// ```
-#[derive(Debug)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct DuckLakeQueryPlanner;
+
+impl DuckLakeQueryPlanner {
+    /// Construct a planner instance wrapped in [`Arc`], ready to pass to
+    /// [`SessionStateBuilder::with_query_planner`].
+    #[must_use]
+    pub fn new_arc() -> Arc<Self> {
+        Arc::new(Self)
+    }
+
+    /// Install this planner on a [`SessionStateBuilder`] and return the builder
+    /// so it can be chained further.
+    ///
+    /// This is the recommended entry point for downstream users who want DELETE
+    /// and UPDATE support on DuckLake tables.
+    #[must_use]
+    pub fn register_into(builder: SessionStateBuilder) -> SessionStateBuilder {
+        builder.with_query_planner(Arc::new(Self))
+    }
+}
 
 #[async_trait]
 impl QueryPlanner for DuckLakeQueryPlanner {
