@@ -11,7 +11,7 @@
 //! This extension provides read-only access to DuckLake catalogs through DataFusion's
 //! catalog and table provider interfaces.
 //!
-//! ## Example
+//! ## Example: Read-only access
 //!
 //! ```no_run
 //! # async fn example() -> datafusion_ducklake::Result<()> {
@@ -31,6 +31,40 @@
 //! // Query tables from the catalog
 //! let df = ctx.sql("SELECT * FROM ducklake.main.my_table").await?;
 //! df.show().await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Example: SQL `DELETE` / `UPDATE`
+//!
+//! DataFusion natively plans `INSERT` against a `TableProvider`, but it does
+//! **not** natively plan `DELETE` or `UPDATE`. To enable those statements,
+//! install [`DuckLakeQueryPlanner`] on the [`SessionStateBuilder`]:
+//!
+//! ```no_run
+//! # #[cfg(all(feature = "write", feature = "write-sqlite", feature = "metadata-sqlite"))]
+//! # async fn example() -> datafusion_ducklake::Result<()> {
+//! use std::sync::Arc;
+//! use datafusion::prelude::*;
+//! use datafusion::execution::session_state::SessionStateBuilder;
+//! use datafusion_ducklake::{
+//!     DuckLakeCatalog, DuckLakeQueryPlanner, SqliteMetadataProvider, SqliteMetadataWriter,
+//! };
+//!
+//! let provider = Arc::new(SqliteMetadataProvider::new("sqlite:catalog.db").await?);
+//! let writer = Arc::new(SqliteMetadataWriter::new("sqlite:catalog.db?mode=rwc").await?);
+//! let catalog = DuckLakeCatalog::with_writer(provider, writer)?;
+//!
+//! // Install the DuckLake query planner so DELETE/UPDATE are routed to DuckLake execs.
+//! let state = DuckLakeQueryPlanner::register_into(
+//!     SessionStateBuilder::new().with_default_features(),
+//! )
+//! .build();
+//! let ctx = SessionContext::new_with_state(state);
+//! ctx.register_catalog("ducklake", Arc::new(catalog));
+//!
+//! ctx.sql("DELETE FROM ducklake.main.my_table WHERE id = 1").await?.collect().await?;
+//! ctx.sql("UPDATE ducklake.main.my_table SET name = 'x' WHERE id = 2").await?.collect().await?;
 //! # Ok(())
 //! # }
 //! ```
