@@ -9,7 +9,32 @@
 //! 3. DuckDB writes via ducklake:mysql: → DF reads via MySqlMetadataProvider
 //! 4. SQL-based DDL/DML (CREATE TABLE, INSERT, SELECT)
 //!
-//! Requires: Docker (testcontainers spins up MySQL), features: write-mysql, metadata-duckdb
+//! # Test setup
+//!
+//! Requires a running Docker daemon. `testcontainers_modules::mysql::Mysql::default()`
+//! pulls the official `mysql:8.1` image, starts a container on a random host port,
+//! and tears it down per test — no env vars, no manual `docker run`, no port pinning.
+//!
+//! Required features: `write-mysql` (catalog writer + provider) and `metadata-duckdb`
+//! (DuckDB-side reader / writer used to verify cross-engine interop).
+//!
+//! Run with:
+//! ```bash
+//! cargo test --features write-mysql --test cross_engine_mysql_tests -- --ignored
+//! ```
+//!
+//! All tests are `#[ignore]`d by default so the suite still runs in environments
+//! without Docker (e.g. minimal CI runners). Pass `--ignored` to opt in.
+//!
+//! # Parallelism note
+//!
+//! These tests run safely in parallel because each test owns its own container.
+//! However, the per-binary unit-test files (`tests/mysql_metadata_writer_test.rs`,
+//! `tests/mysql_metadata_provider_test.rs`) spin up ~30 containers each and can
+//! exhaust the host's AIO/`fs.aio-max-nr` budget on macOS Docker Desktop,
+//! manifesting as `[InnoDB] io_setup() failed with EAGAIN`. Run those binaries
+//! with `-- --test-threads=1` if you see that. The cross-engine suite (this file)
+//! has only 8 tests and has not been observed to hit the limit.
 
 #![cfg(all(feature = "write-mysql", feature = "metadata-duckdb"))]
 
