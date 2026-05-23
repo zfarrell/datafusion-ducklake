@@ -9,7 +9,40 @@
 //! 3. DuckDB writes via ducklake:postgres: → DF reads via PostgresMetadataProvider
 //! 4. SQL-based DDL/DML (CREATE TABLE, INSERT, SELECT, DELETE, UPDATE)
 //!
-//! Requires: Docker (testcontainers spins up PostgreSQL), features: write-postgres, metadata-duckdb
+//! # Running these tests
+//!
+//! Every test below is `#[ignore]`-gated because it spins up a Postgres
+//! container via [`testcontainers_modules::postgres::Postgres::default()`]
+//! (`postgres:11-alpine` at the time of writing). The container is created
+//! and torn down per test, so the only host requirement is a working Docker
+//! daemon — no port allocation, env var, or manual `docker run` is needed.
+//!
+//! Run the suite with:
+//!
+//! ```sh
+//! cargo test --features write-postgres --test cross_engine_postgres_tests \
+//!     -- --ignored --nocapture
+//! ```
+//!
+//! If Docker is unavailable (e.g. macOS CI without nested virtualization), the
+//! tests will panic at `Postgres::default().start()`. The `skip-tests-with-docker`
+//! crate feature is the recommended escape hatch for those environments — these
+//! tests are still gated behind `#[ignore]` for that reason.
+//!
+//! ## Pattern 2 expected failures
+//!
+//! The four tests that round-trip through the DuckDB Postgres extension
+//! (`*_df_write_duckdb_read`, `*_bidirectional_roundtrip`, `*_count_query`,
+//! `*_null_handling`) currently fail at the DuckDB-read step with
+//! `Parquet footer length stored in file is not equal to footer length
+//! provided`. This is the same DuckDB-vs-DataFusion parquet footer parity
+//! issue that affects the SQLite and DuckDB-backed cross-engine suites; it
+//! is unrelated to the Postgres writer. See the "34 cross-engine
+//! write-then-DuckDB-read" failure cluster documented in #20's verification
+//! comment. Production-code fixes for that cluster live outside the
+//! metadata writer.
+//!
+//! ## Requires: Docker (testcontainers spins up PostgreSQL); features: write-postgres, metadata-duckdb
 
 #![cfg(all(feature = "write-postgres", feature = "metadata-duckdb"))]
 
