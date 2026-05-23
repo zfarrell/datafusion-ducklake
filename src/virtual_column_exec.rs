@@ -1,16 +1,29 @@
-//! Custom execution plan for appending virtual columns
+//! Custom execution plan for appending scan-time virtual columns.
 //!
-//! TODO(#22): This module is currently a compilable orphan. Upstream landed
-//! its own `row_id` design (`src/row_id.rs`) which is what the active scan
-//! path uses. The virtual-column reconciliation (`rowid` collision, scan
-//! wiring, public surface) is tracked in ticket #22. Until then, the types
-//! here remain reachable from `lib.rs` re-exports so downstream code can
-//! continue to reference them, but the wiring into `DuckLakeTable::scan`
-//! has been intentionally left out.
+//! This exec emits four DuckLake virtual columns whose values are entirely
+//! scan-time metadata — they describe *where* a row came from rather than
+//! anything stored in the row itself:
 //!
-//! This module implements a DataFusion execution plan that wraps a scan
-//! and appends virtual columns (`filename`, `file_row_number`, `rowid`,
-//! `snapshot_id`, `file_index`) to the output.
+//! * [`VIRTUAL_COL_FILENAME`] — the data file's resolved path
+//! * [`VIRTUAL_COL_FILE_ROW_NUMBER`] — 0-based position within the scanned file
+//! * [`VIRTUAL_COL_SNAPSHOT_ID`] — snapshot in which the file was committed
+//! * [`VIRTUAL_COL_FILE_INDEX`] — 0-based ordinal of the file in the scan
+//!
+//! `rowid` is intentionally *not* handled here. The DuckLake spec requires
+//! rowid to survive `UPDATE` / compaction rewrites, which is fundamentally
+//! incompatible with synthesizing values from `row_id_start + position`:
+//! UPDATE-rewritten files embed the original rowids in a column tagged with
+//! parquet field-id [`crate::row_id::ROW_ID_PARQUET_FIELD_ID`]. Reading those
+//! values back out requires inspecting the parquet schema and dispatching
+//! per-file, which is the job of [`crate::row_id::RowIdExec`] (and the
+//! field-id-detection path in `table.rs`). See ticket #22 for the design
+//! reconciliation that landed this split.
+//!
+//! Ordering of virtual columns in the output schema is:
+//! `[ real_cols..., filename?, file_row_number?, rowid?, snapshot_id?, file_index? ]`
+//! where `rowid` is contributed by the upstream RowIdExec when row lineage is
+//! enabled. `VirtualColumnExec` simply leaves the rowid column untouched and
+//! passes it through.
 
 use std::any::Any;
 use std::pin::Pin;
@@ -22,12 +35,10 @@ use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
-use datafusion::physical_expr::EquivalenceProperties;
-use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_expr::{Distribution, EquivalenceProperties};
 use datafusion::physical_plan::execution_plan::Boundedness;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning,
-    PlanProperties,
+    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
 use futures::Stream;
 
@@ -35,43 +46,56 @@ use futures::Stream;
 pub const VIRTUAL_COL_FILENAME: &str = "filename";
 /// Virtual column name for the row number within a file
 pub const VIRTUAL_COL_FILE_ROW_NUMBER: &str = "file_row_number";
-/// Virtual column name for the global row ID
+/// Virtual column name for the global row ID (owned by [`crate::row_id`], not this exec).
 pub const VIRTUAL_COL_ROWID: &str = "rowid";
 /// Virtual column name for the snapshot ID when the file was committed
 pub const VIRTUAL_COL_SNAPSHOT_ID: &str = "snapshot_id";
 /// Virtual column name for the 0-based file index within the table
 pub const VIRTUAL_COL_FILE_INDEX: &str = "file_index";
 
-/// Per-file metadata needed to populate virtual columns
+/// Per-file metadata needed to populate the scan-time virtual columns.
+///
+/// `rowid` metadata (`row_id_start`) is *not* included here — rowid is
+/// handled by [`crate::row_id::RowIdExec`] / per-file embedded-column
+/// detection, not by this exec. See module docs.
 #[derive(Debug, Clone)]
 pub struct VirtualColumnFileInfo {
     /// The filename/path for the `filename` virtual column
     pub filename: String,
-    /// Starting row ID for this file (from `ducklake_data_file.row_id_start`)
-    pub row_id_start: Option<i64>,
     /// Snapshot ID when this file was committed (from `ducklake_data_file.begin_snapshot`)
     pub snapshot_id: Option<i64>,
     /// 0-based ordinal position of this file in the table's file list
     pub file_index: u64,
 }
 
-/// Tracks which virtual columns are requested in the query
+/// Tracks which scan-time virtual columns are requested in the query.
+///
+/// `rowid` is intentionally absent — it is provisioned separately via the
+/// row_id machinery (see module docs).
 #[derive(Debug, Clone, Default)]
 pub struct VirtualColumnSet {
     pub filename: bool,
     pub file_row_number: bool,
-    pub rowid: bool,
     pub snapshot_id: bool,
     pub file_index: bool,
 }
 
 impl VirtualColumnSet {
     pub fn any(&self) -> bool {
-        self.filename || self.file_row_number || self.rowid || self.snapshot_id || self.file_index
+        self.filename || self.file_row_number || self.snapshot_id || self.file_index
     }
 }
 
-/// Custom execution plan that appends virtual columns to the output
+/// Custom execution plan that appends scan-time virtual columns to the output.
+///
+/// The exec consumes a single-partition input. Row-number synthesis requires
+/// strict file ordering; emitting `file_row_number` from a repartitioned
+/// stream would yield interleaved cursor values that don't correspond to
+/// real file offsets. We enforce that invariant via
+/// [`required_input_distribution`] returning `SinglePartition`, mirroring the
+/// guard rail in [`crate::row_id::RowIdExec`] so DataFusion's
+/// `EnforceDistribution` rule can't legally insert a `RepartitionExec`
+/// underneath us and break the cursor.
 #[derive(Debug)]
 pub struct VirtualColumnExec {
     /// The input execution plan
@@ -93,25 +117,25 @@ impl VirtualColumnExec {
         included: VirtualColumnSet,
         output_schema: SchemaRef,
     ) -> Self {
-        // When row-number-dependent virtual columns are requested and the input
-        // has multiple partitions, coalesce into a single partition to avoid
-        // duplicate row numbers across partitions (F-033).
-        let needs_single_partition = included.file_row_number || included.rowid;
-        let input = if needs_single_partition && input.output_partitioning().partition_count() > 1 {
-            Arc::new(CoalescePartitionsExec::new(input)) as Arc<dyn ExecutionPlan>
-        } else {
-            input
-        };
-
-        let eq_props = EquivalenceProperties::new(Arc::clone(&output_schema));
-        let partitioning = if needs_single_partition {
-            Partitioning::UnknownPartitioning(1)
-        } else {
-            input.output_partitioning().clone()
-        };
+        // Preserve the child's orderings on the wider output schema. We only
+        // append new columns to the right, so column-referenced sort exprs
+        // from the child stay valid. Without this propagation an upstream
+        // `SortPreservingMergeExec` sanity-check rejects the plan because
+        // `VirtualColumnExec` would advertise an empty ordering even though
+        // a `SortExec` ran underneath.
+        let child_orderings: Vec<_> = input
+            .equivalence_properties()
+            .oeq_class()
+            .iter()
+            .cloned()
+            .collect();
+        let eq_props = EquivalenceProperties::new_with_orderings(
+            Arc::clone(&output_schema),
+            child_orderings,
+        );
         let properties = Arc::new(PlanProperties::new(
             eq_props,
-            partitioning,
+            input.output_partitioning().clone(),
             input.pipeline_behavior(),
             Boundedness::Bounded,
         ));
@@ -130,11 +154,10 @@ impl DisplayAs for VirtualColumnExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "VirtualColumnExec: file={}, filename={}, row_number={}, rowid={}, snapshot_id={}, file_index={}",
+            "VirtualColumnExec: file={}, filename={}, row_number={}, snapshot_id={}, file_index={}",
             self.file_info.filename,
             self.included.filename,
             self.included.file_row_number,
-            self.included.rowid,
             self.included.snapshot_id,
             self.included.file_index,
         )
@@ -156,6 +179,20 @@ impl ExecutionPlan for VirtualColumnExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
+    }
+
+    /// `file_row_number` is a position-in-file cursor; if DataFusion's
+    /// `EnforceDistribution` rule inserted a `RepartitionExec` below us, the
+    /// cursor would interleave across partitions and the emitted row numbers
+    /// would no longer correspond to real file offsets. Pin the child to a
+    /// single partition to prevent that.
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        vec![Distribution::SinglePartition]
+    }
+
+    /// Order-preserving wrapper — we only append columns.
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true]
     }
 
     fn with_new_children(
@@ -211,10 +248,12 @@ impl Stream for VirtualColumnStream {
                 let num_rows = batch.num_rows();
                 let row_offset = self.row_offset;
 
-                // Start with input columns
+                // Start with input columns (which may include rowid already if
+                // RowIdExec ran upstream of us — we pass it through unchanged).
                 let mut columns: Vec<Arc<dyn arrow::array::Array>> = batch.columns().to_vec();
 
-                // Append virtual columns in schema order: filename, file_row_number, rowid, snapshot_id, file_index
+                // Append virtual columns in schema order:
+                //   filename, file_row_number, snapshot_id, file_index
                 if self.included.filename {
                     let filename_array =
                         StringArray::from(vec![self.file_info.filename.as_str(); num_rows]);
@@ -233,37 +272,6 @@ impl Stream for VirtualColumnStream {
                     let row_numbers: Vec<i64> = (row_offset..end).collect();
                     let row_number_array = Int64Array::from(row_numbers);
                     columns.push(Arc::new(row_number_array));
-                }
-
-                if self.included.rowid {
-                    match self.file_info.row_id_start {
-                        Some(row_id_start) => {
-                            let num_rows_i64 = i64::try_from(num_rows).map_err(|e| {
-                                DataFusionError::Execution(format!("Row count overflow: {}", e))
-                            })?;
-                            let end = row_offset.checked_add(num_rows_i64).ok_or_else(|| {
-                                DataFusionError::Execution(
-                                    "Row offset overflow computing rowid".to_string(),
-                                )
-                            })?;
-                            // R5-S-020: Return error on rowid overflow instead of
-                            // silently clipping to i64::MAX (which causes duplicate rowids).
-                            let rowids: Vec<i64> = (row_offset..end)
-                                .map(|offset| {
-                                    row_id_start.checked_add(offset).ok_or_else(|| {
-                                        DataFusionError::Execution(format!(
-                                            "Rowid overflow: row_id_start={} + offset={} exceeds i64::MAX",
-                                            row_id_start, offset
-                                        ))
-                                    })
-                                })
-                                .collect::<std::result::Result<Vec<_>, _>>()?;
-                            columns.push(Arc::new(Int64Array::from(rowids)));
-                        },
-                        None => {
-                            columns.push(Arc::new(Int64Array::from(vec![None::<i64>; num_rows])));
-                        },
-                    }
                 }
 
                 if self.included.snapshot_id {
@@ -324,7 +332,6 @@ mod tests {
             Field::new("id", DataType::Int32, false),
             Field::new(VIRTUAL_COL_FILENAME, DataType::Utf8, true),
             Field::new(VIRTUAL_COL_FILE_ROW_NUMBER, DataType::Int64, true),
-            Field::new(VIRTUAL_COL_ROWID, DataType::Int64, true),
             Field::new(VIRTUAL_COL_SNAPSHOT_ID, DataType::Int64, true),
             Field::new(VIRTUAL_COL_FILE_INDEX, DataType::UInt64, true),
         ]));
@@ -333,14 +340,12 @@ mod tests {
             input: Box::pin(EmptyRecordBatchStream::new(input_schema)),
             file_info: VirtualColumnFileInfo {
                 filename: "test.parquet".to_string(),
-                row_id_start: Some(0),
                 snapshot_id: Some(1),
                 file_index: 0,
             },
             included: VirtualColumnSet {
                 filename: true,
                 file_row_number: true,
-                rowid: true,
                 snapshot_id: true,
                 file_index: true,
             },
@@ -348,11 +353,10 @@ mod tests {
             output_schema: Arc::clone(&output_schema),
         };
 
-        assert_eq!(stream.schema().fields().len(), 6);
+        assert_eq!(stream.schema().fields().len(), 5);
         assert_eq!(stream.schema().field(1).name(), VIRTUAL_COL_FILENAME);
         assert_eq!(stream.schema().field(2).name(), VIRTUAL_COL_FILE_ROW_NUMBER);
-        assert_eq!(stream.schema().field(3).name(), VIRTUAL_COL_ROWID);
-        assert_eq!(stream.schema().field(4).name(), VIRTUAL_COL_SNAPSHOT_ID);
-        assert_eq!(stream.schema().field(5).name(), VIRTUAL_COL_FILE_INDEX);
+        assert_eq!(stream.schema().field(3).name(), VIRTUAL_COL_SNAPSHOT_ID);
+        assert_eq!(stream.schema().field(4).name(), VIRTUAL_COL_FILE_INDEX);
     }
 }
