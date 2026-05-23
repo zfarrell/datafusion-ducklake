@@ -291,3 +291,235 @@ fn test_unknown_ducklake_type_errors() {
     let result = ducklake_to_arrow_type("timestamp");
     assert!(result.is_ok(), "Timestamp should be supported");
 }
+
+// ==================== #23: Decimal precision boundary round-trips ====================
+
+/// Decimal(38, 18) — large precision, large scale — must round-trip without loss.
+/// This is at the upper edge of Decimal128 capacity.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_decimal_38_18_roundtrip() {
+    let (writer, temp_dir) = create_test_env().await;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("v", DataType::Decimal128(38, 18), true),
+    ]));
+
+    // Pick a value with 20 integer digits + 18 fractional digits — full width.
+    // 12345678901234567890_123456789012345678 fits within i128 range.
+    let big: i128 = 12345678901234567890_123456789012345678_i128;
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(
+                Decimal128Array::from(vec![Some(big), Some(-big)])
+                    .with_precision_and_scale(38, 18)
+                    .unwrap(),
+            ),
+        ],
+    )
+    .unwrap();
+
+    let object_store = create_object_store();
+    let table_writer = DuckLakeTableWriter::new(writer.clone(), object_store).unwrap();
+    table_writer
+        .write_table("main", "d38_18", &[batch])
+        .await
+        .unwrap();
+
+    let ctx = create_read_context(&temp_dir).await;
+    let df = ctx
+        .sql("SELECT id, v FROM ducklake.main.d38_18 ORDER BY id")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+
+    let out = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .unwrap();
+    assert_eq!(out.value(0), big);
+    assert_eq!(out.value(1), -big);
+    let (p, s) = match batches[0].schema().field(1).data_type() {
+        DataType::Decimal128(p, s) => (*p, *s),
+        other => panic!("expected Decimal128, got {:?}", other),
+    };
+    assert_eq!((p, s), (38, 18));
+}
+
+/// Decimal(1, 0) — minimal precision edge case — must round-trip without loss.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_decimal_1_0_roundtrip() {
+    let (writer, temp_dir) = create_test_env().await;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("v", DataType::Decimal128(1, 0), true),
+    ]));
+
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(
+                Decimal128Array::from(vec![Some(0), Some(9), Some(-9)])
+                    .with_precision_and_scale(1, 0)
+                    .unwrap(),
+            ),
+        ],
+    )
+    .unwrap();
+
+    let object_store = create_object_store();
+    let table_writer = DuckLakeTableWriter::new(writer.clone(), object_store).unwrap();
+    table_writer
+        .write_table("main", "d1_0", &[batch])
+        .await
+        .unwrap();
+
+    let ctx = create_read_context(&temp_dir).await;
+    let df = ctx
+        .sql("SELECT id, v FROM ducklake.main.d1_0 ORDER BY id")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+
+    let out = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .unwrap();
+    assert_eq!(out.value(0), 0);
+    assert_eq!(out.value(1), 9);
+    assert_eq!(out.value(2), -9);
+    let (p, s) = match batches[0].schema().field(1).data_type() {
+        DataType::Decimal128(p, s) => (*p, *s),
+        other => panic!("expected Decimal128, got {:?}", other),
+    };
+    assert_eq!((p, s), (1, 0));
+}
+
+// ==================== #23: Timestamp precision round-trips ====================
+//
+// Verifies that every TimeUnit variant (Second/Millisecond/Microsecond/Nanosecond)
+// survives a write -> read round-trip without precision loss or unit confusion.
+
+/// Timestamp(Second) round-trip.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_timestamp_second_roundtrip() {
+    let (writer, temp_dir) = create_test_env().await;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("t", DataType::Timestamp(TimeUnit::Second, None), true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(TimestampSecondArray::from(vec![Some(1_718_451_000)])),
+        ],
+    )
+    .unwrap();
+    let object_store = create_object_store();
+    let table_writer = DuckLakeTableWriter::new(writer.clone(), object_store).unwrap();
+    table_writer
+        .write_table("main", "ts_s", &[batch])
+        .await
+        .unwrap();
+    let ctx = create_read_context(&temp_dir).await;
+    let batches = ctx
+        .sql("SELECT t FROM ducklake.main.ts_s ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let arr = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<TimestampSecondArray>()
+        .expect("expected Timestamp(Second)");
+    assert_eq!(arr.value(0), 1_718_451_000);
+}
+
+/// Timestamp(Millisecond) round-trip.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_timestamp_millisecond_roundtrip() {
+    let (writer, temp_dir) = create_test_env().await;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("t", DataType::Timestamp(TimeUnit::Millisecond, None), true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(TimestampMillisecondArray::from(vec![Some(
+                1_718_451_000_123,
+            )])),
+        ],
+    )
+    .unwrap();
+    let object_store = create_object_store();
+    let table_writer = DuckLakeTableWriter::new(writer.clone(), object_store).unwrap();
+    table_writer
+        .write_table("main", "ts_ms", &[batch])
+        .await
+        .unwrap();
+    let ctx = create_read_context(&temp_dir).await;
+    let batches = ctx
+        .sql("SELECT t FROM ducklake.main.ts_ms ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let arr = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<TimestampMillisecondArray>()
+        .expect("expected Timestamp(Millisecond)");
+    assert_eq!(arr.value(0), 1_718_451_000_123);
+}
+
+/// Timestamp(Nanosecond) round-trip.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_timestamp_nanosecond_roundtrip() {
+    let (writer, temp_dir) = create_test_env().await;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("t", DataType::Timestamp(TimeUnit::Nanosecond, None), true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(TimestampNanosecondArray::from(vec![Some(
+                1_718_451_000_123_456_789,
+            )])),
+        ],
+    )
+    .unwrap();
+    let object_store = create_object_store();
+    let table_writer = DuckLakeTableWriter::new(writer.clone(), object_store).unwrap();
+    table_writer
+        .write_table("main", "ts_ns", &[batch])
+        .await
+        .unwrap();
+    let ctx = create_read_context(&temp_dir).await;
+    let batches = ctx
+        .sql("SELECT t FROM ducklake.main.ts_ns ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let arr = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<TimestampNanosecondArray>()
+        .expect("expected Timestamp(Nanosecond)");
+    assert_eq!(arr.value(0), 1_718_451_000_123_456_789);
+}
