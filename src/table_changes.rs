@@ -764,11 +764,19 @@ impl TableProvider for TableChangesTable {
                     None
                 };
             for delete_file in &delete_files {
+                // NOTE: `parquet_source` here is used to scan the underlying
+                // *data file* (not the delete file). It must therefore carry
+                // the table schema, not `delete_file_schema()` — otherwise the
+                // schema adapter tries to find a `pos` column in the data
+                // file and errors with "Non-nullable column 'pos' is missing
+                // from the physical schema". The delete file scans use their
+                // own dedicated `delete_file_schema()` inside
+                // `build_delete_file_scan`.
                 let parquet_source = if let Some(ref factory) = del_encryption_factory {
-                    ParquetSource::new(delete_file_schema())
+                    ParquetSource::new(self.table_schema.clone())
                         .with_encryption_factory(Arc::clone(factory))
                 } else {
-                    ParquetSource::new(delete_file_schema())
+                    ParquetSource::new(self.table_schema.clone())
                 };
                 let exec =
                     self.build_exec_for_delete_entry(delete_file, &proj_info, parquet_source)?;
@@ -777,10 +785,11 @@ impl TableProvider for TableChangesTable {
         }
         #[cfg(not(feature = "encryption"))]
         for delete_file in &delete_files {
+            // See note above: data-file scan needs the table schema.
             let exec = self.build_exec_for_delete_entry(
                 delete_file,
                 &proj_info,
-                ParquetSource::new(delete_file_schema()),
+                ParquetSource::new(self.table_schema.clone()),
             )?;
             execs.push(exec);
         }
