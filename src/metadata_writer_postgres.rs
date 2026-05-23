@@ -789,6 +789,13 @@ impl MetadataWriter for PostgresMetadataWriter {
             // would leave an unusable catalog (R5-S-072).
             let mut tx = self.pool.begin().await?;
 
+            // Ensure gen_random_uuid() is available. It became a built-in in
+            // Postgres 13; on older releases it lives in the pgcrypto extension.
+            // Using IF NOT EXISTS is idempotent and a no-op on PG 13+.
+            sqlx::query("CREATE EXTENSION IF NOT EXISTS pgcrypto")
+                .execute(&mut *tx)
+                .await?;
+
             for ddl in SQL_CREATE_TABLES {
                 sqlx::query(ddl).execute(&mut *tx).await?;
             }
@@ -895,9 +902,13 @@ impl MetadataWriter for PostgresMetadataWriter {
             )
             .fetch_optional(&mut *tx)
             .await?;
-            // R8-S-005: Sync schema_version sequence with existing data
+            // R8-S-005: Sync schema_version sequence with existing data.
+            // Skip when MAX(schema_version) is 0 because Postgres sequences cannot
+            // be set below their minimum value (1). The seed snapshot has
+            // schema_version = 0, and nextval() on a fresh sequence returns 1, so
+            // no sync is needed in that case.
             sqlx::query(
-                "SELECT setval('ducklake_schema_version_seq', MAX(schema_version)) FROM ducklake_snapshot HAVING MAX(schema_version) IS NOT NULL",
+                "SELECT setval('ducklake_schema_version_seq', MAX(schema_version)) FROM ducklake_snapshot HAVING MAX(schema_version) > 0",
             )
             .fetch_optional(&mut *tx)
             .await?;
