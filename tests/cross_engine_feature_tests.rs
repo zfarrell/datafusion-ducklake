@@ -59,7 +59,12 @@ async fn open_df_sqlite_readonly(catalog_path: &Path) -> SessionContext {
     let provider = SqliteMetadataProvider::new(&conn_str)
         .await
         .expect("create SqliteMetadataProvider");
-    let catalog = DuckLakeCatalog::new(provider).expect("create DuckLakeCatalog");
+    // Enable row lineage so DuckLake virtual columns appear in the schema —
+    // the virtual-column tests in this file project them by name. Ticket #22
+    // moved the virtual-column surface behind this opt-in flag.
+    let catalog = DuckLakeCatalog::new(provider)
+        .expect("create DuckLakeCatalog")
+        .with_row_lineage(true);
     let ctx = SessionContext::new();
     ctx.register_catalog("ducklake", Arc::new(catalog));
     ctx
@@ -194,9 +199,11 @@ async fn cross_engine_duckdb_write_df_read_virtual_columns() {
         );
     }
 
-    // DataFusion reads with virtual columns
+    // DataFusion reads with virtual columns. Row lineage is enabled so
+    // the DuckLake virtual columns (filename, file_row_number, rowid,
+    // snapshot_id, file_index) appear in the table schema.
     let provider = DuckdbMetadataProvider::new(catalog_path.to_str().unwrap()).unwrap();
-    let catalog = DuckLakeCatalog::new(provider).unwrap();
+    let catalog = DuckLakeCatalog::new(provider).unwrap().with_row_lineage(true);
     let ctx = SessionContext::new();
     ctx.register_catalog("ducklake", Arc::new(catalog));
 

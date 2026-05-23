@@ -1,7 +1,9 @@
 //! Integration tests for extended virtual columns (rowid, snapshot_id, file_index).
 //!
 //! Tests cover individual virtual columns, multi-file scenarios, cross-engine
-//! value matching, and WHERE clause filtering.
+//! value matching, and WHERE clause filtering. All catalogs in this file are
+//! opted in to row lineage via `with_row_lineage(true)` so the virtual
+//! columns are exposed in the table schema.
 
 #![cfg(all(feature = "write-sqlite", feature = "metadata-sqlite", feature = "metadata-duckdb"))]
 
@@ -36,7 +38,7 @@ async fn setup_multi_file_catalog() -> (SessionContext, TempDir) {
 
     // Create DataFusion read context
     let provider = DuckdbMetadataProvider::new(catalog_path.to_str().unwrap()).unwrap();
-    let catalog = DuckLakeCatalog::new(provider).unwrap();
+    let catalog = DuckLakeCatalog::new(provider).unwrap().with_row_lineage(true);
     let ctx = SessionContext::new();
     ctx.register_catalog("ducklake", Arc::new(catalog));
     (ctx, temp_dir)
@@ -260,7 +262,7 @@ async fn test_cross_engine_rowid_values() {
 
     // DataFusion values
     let provider = DuckdbMetadataProvider::new(catalog_path.to_str().unwrap()).unwrap();
-    let catalog = DuckLakeCatalog::new(provider).unwrap();
+    let catalog = DuckLakeCatalog::new(provider).unwrap().with_row_lineage(true);
     let ctx = SessionContext::new();
     ctx.register_catalog("ducklake", Arc::new(catalog));
 
@@ -309,7 +311,7 @@ async fn test_cross_engine_snapshot_id_values() {
     };
 
     let provider = DuckdbMetadataProvider::new(catalog_path.to_str().unwrap()).unwrap();
-    let catalog = DuckLakeCatalog::new(provider).unwrap();
+    let catalog = DuckLakeCatalog::new(provider).unwrap().with_row_lineage(true);
     let ctx = SessionContext::new();
     ctx.register_catalog("ducklake", Arc::new(catalog));
 
@@ -362,7 +364,7 @@ async fn test_cross_engine_file_index_values() {
     };
 
     let provider = DuckdbMetadataProvider::new(catalog_path.to_str().unwrap()).unwrap();
-    let catalog = DuckLakeCatalog::new(provider).unwrap();
+    let catalog = DuckLakeCatalog::new(provider).unwrap().with_row_lineage(true);
     let ctx = SessionContext::new();
     ctx.register_catalog("ducklake", Arc::new(catalog));
 

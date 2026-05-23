@@ -1,18 +1,21 @@
 #![cfg(feature = "metadata-duckdb")]
 //! End-to-end tests for DuckLake row-lineage (`rowid` virtual column).
 //!
-//! TODO(#22): Upstream's `RowIdExec` (PR #115) and the fork's
-//! `VirtualColumnExec` both want to own the `rowid` column. The integration
-//! port currently leaves `VirtualColumnExec` as the active scan-path wiring,
-//! so these upstream-style assertions fail (they see all five virtual
-//! columns instead of just `rowid`). Reconciliation is tracked in #22 —
-//! these tests are deliberately `#[ignore]`d until then so downstream
-//! tickets see a clean test surface.
+//! These tests cover the rowid materialization path resolved by ticket #22:
+//! `RowIdExec` synthesizes rowid for INSERT-only files (`row_id_start +
+//! position`), and the embedded `_ducklake_internal_row_id` parquet column
+//! (field-id `ROW_ID_PARQUET_FIELD_ID = 2_147_483_540`) is read back
+//! directly for files rewritten by `UPDATE` / compaction. The DuckLake spec
+//! requires rowids to survive file rewrites — `rowid_preserved_across_update_rewrite`
+//! verifies that path; a synthesis-only design (the previous fork
+//! mechanism) could not pass it.
 //!
-//! These tests build small DuckLake catalogs via the DuckDB CLI (so the
-//! catalog tables, including `data_file.row_id_start`, are populated by the
-//! official extension) and then query through DataFusion to verify our
-//! injected `rowid` column matches what DuckDB itself would return.
+//! The catalogs are built via the DuckDB CLI so catalog tables (including
+//! `data_file.row_id_start` and the embedded rowid column in rewritten
+//! parquet files) are populated by the official extension, then queried
+//! through DataFusion. With `with_row_lineage(false)` no virtual columns
+//! are exposed; with `with_row_lineage(true)` all five DuckLake virtual
+//! columns appear in the schema.
 
 mod common;
 
@@ -132,7 +135,7 @@ fn collect_rowid_i_sorted(batches: &[RecordBatch]) -> Vec<(i64, i32)> {
 }
 
 #[tokio::test]
-#[ignore = "TODO(#22): rowid vs virtual_column_exec reconciliation"]
+
 async fn rowid_disabled_by_default() -> DataFusionResult<()> {
     let temp =
         TempDir::new().map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
@@ -169,7 +172,7 @@ async fn rowid_disabled_by_default() -> DataFusionResult<()> {
 }
 
 #[tokio::test]
-#[ignore = "TODO(#22): rowid vs virtual_column_exec reconciliation"]
+
 async fn rowid_sequential_across_files() -> DataFusionResult<()> {
     let temp =
         TempDir::new().map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
@@ -180,11 +183,24 @@ async fn rowid_sequential_across_files() -> DataFusionResult<()> {
     let ctx = SessionContext::new();
     ctx.register_catalog("c", catalog);
 
-    // Verify rowid IS in the table schema and is BIGINT.
+    // Verify rowid (and the rest of the DuckLake virtual columns) appear in
+    // the table schema once row lineage is enabled. The full surface is
+    // `[real_cols..., filename, file_row_number, rowid, snapshot_id,
+    // file_index]` (ticket #22).
     let df = ctx.sql("SELECT * FROM c.main.t").await?;
     let schema = df.schema().clone();
     let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-    assert_eq!(field_names, vec!["i", "rowid"]);
+    assert_eq!(
+        field_names,
+        vec![
+            "i",
+            "filename",
+            "file_row_number",
+            "rowid",
+            "snapshot_id",
+            "file_index"
+        ]
+    );
 
     // Query rowid + i; rowid values should be globally unique and contiguous
     // starting at 0 (DuckLake assigns sequentially across files inserted in
@@ -213,7 +229,7 @@ async fn rowid_sequential_across_files() -> DataFusionResult<()> {
 }
 
 #[tokio::test]
-#[ignore = "TODO(#22): rowid vs virtual_column_exec reconciliation"]
+
 async fn rowid_preserved_under_deletes() -> DataFusionResult<()> {
     let temp =
         TempDir::new().map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
@@ -242,7 +258,7 @@ async fn rowid_preserved_under_deletes() -> DataFusionResult<()> {
 }
 
 #[tokio::test]
-#[ignore = "TODO(#22): rowid vs virtual_column_exec reconciliation"]
+
 async fn rowid_only_projection() -> DataFusionResult<()> {
     // Edge case: physical projection is empty (just rowid). Verifies that
     // RowIdExec works when ParquetExec emits zero-column count batches.
@@ -275,7 +291,7 @@ async fn rowid_only_projection() -> DataFusionResult<()> {
 }
 
 #[tokio::test]
-#[ignore = "TODO(#22): rowid vs virtual_column_exec reconciliation"]
+
 async fn rowid_preserved_across_update_rewrite() -> DataFusionResult<()> {
     // The critical test: UPDATE rewrites the file with embedded rowids.
     // Our scan must read those embedded values rather than compute
@@ -314,7 +330,7 @@ async fn rowid_preserved_across_update_rewrite() -> DataFusionResult<()> {
 }
 
 #[tokio::test]
-#[ignore = "TODO(#22): rowid vs virtual_column_exec reconciliation"]
+
 async fn rowid_count_star_unaffected() -> DataFusionResult<()> {
     // COUNT(*) should not trigger the rowid path (it asks for zero columns).
     let temp =

@@ -1,4 +1,13 @@
-//! Integration tests for virtual column support (filename, file_row_number).
+//! Integration tests for the DuckLake scan-time virtual columns
+//! (`filename`, `file_row_number`, `snapshot_id`, `file_index`).
+//!
+//! The `rowid` column is owned by the row-id mechanism in `src/row_id.rs`
+//! and is exercised separately by `tests/row_id_tests.rs` (which uses the
+//! DuckDB-backed catalog so files written by `UPDATE` / compaction embed
+//! `_ducklake_internal_row_id` and the spec-required "rowid survives file
+//! rewrites" semantics can be asserted end-to-end). The tests in *this*
+//! file enable `with_row_lineage(true)` so all five virtual columns are
+//! exposed, but they exercise the four scan-time-only columns.
 
 #![cfg(all(feature = "write-sqlite", feature = "metadata-sqlite"))]
 
@@ -54,10 +63,12 @@ async fn setup_test_table() -> (SessionContext, TempDir) {
         .await
         .unwrap();
 
-    // Create read context
+    // Create read context with row-lineage enabled so virtual columns
+    // (filename, file_row_number, rowid, snapshot_id, file_index) appear
+    // in the table's public schema. See module docs.
     let read_conn_str = format!("sqlite:{}", db_path.display());
     let provider = SqliteMetadataProvider::new(&read_conn_str).await.unwrap();
-    let catalog = DuckLakeCatalog::new(provider).unwrap();
+    let catalog = DuckLakeCatalog::new(provider).unwrap().with_row_lineage(true);
 
     let ctx = SessionContext::new();
     ctx.register_catalog("ducklake", Arc::new(catalog));

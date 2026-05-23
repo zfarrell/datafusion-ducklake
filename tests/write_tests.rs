@@ -73,8 +73,11 @@ async fn test_write_and_read_basic_types() {
 
     assert_eq!(batches.len(), 1);
     assert_eq!(batches[0].num_rows(), 3);
-    // 5 real columns + 5 virtual columns (filename, file_row_number, rowid, snapshot_id, file_index)
-    assert_eq!(batches[0].num_columns(), 10);
+    // 5 real columns. DuckLake virtual columns are now gated behind
+    // `DuckLakeCatalog::with_row_lineage(true)` (ticket #22); this catalog
+    // was constructed without that opt-in, so `SELECT *` returns only the
+    // physical schema.
+    assert_eq!(batches[0].num_columns(), 5);
 
     // Verify data
     let ids = batches[0]

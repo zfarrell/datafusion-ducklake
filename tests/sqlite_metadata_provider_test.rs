@@ -929,12 +929,13 @@ async fn test_query_real_parquet_files() {
     let batch = &results[0];
     assert_eq!(batch.num_rows(), 4, "Should have 4 rows");
 
-    // Verify schema
-    // 3 real columns + 5 virtual columns (filename, file_row_number, rowid, snapshot_id, file_index)
+    // Verify schema. 3 real columns. DuckLake virtual columns are now
+    // gated behind `DuckLakeCatalog::with_row_lineage(true)` (ticket #22);
+    // this catalog was constructed without that opt-in.
     assert_eq!(
         batch.num_columns(),
-        8,
-        "Should have 8 columns (3 real + 5 virtual)"
+        3,
+        "Should have 3 real columns (row lineage is disabled)"
     );
     let schema = batch.schema();
     assert_eq!(schema.field(0).name(), "id");
