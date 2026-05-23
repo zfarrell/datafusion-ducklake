@@ -670,17 +670,28 @@ impl MetadataWriter for MySqlMetadataWriter {
     fn create_snapshot(&self) -> Result<i64> {
         block_on(async {
             let mut conn = self.pool.acquire().await?;
+            // MySQL error 1093 forbids referencing the INSERT target table
+            // (`ducklake_snapshot`) inside a subquery of the same statement.
+            // Read the prior schema_version into a Rust value first, then bind
+            // it as a parameter. The other subqueries reference different
+            // tables, which is allowed.
+            let prev_schema_version: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(MAX(schema_version), 1) FROM ducklake_snapshot",
+            )
+            .fetch_one(&mut *conn)
+            .await?;
             sqlx::query(
                 "INSERT INTO ducklake_snapshot (snapshot_time, schema_version, next_file_id)
                  VALUES (
                      NOW(6),
-                     COALESCE((SELECT MAX(schema_version) FROM ducklake_snapshot), 1),
+                     ?,
                      COALESCE(GREATEST(
                          (SELECT COALESCE(MAX(data_file_id), 0) + 1 FROM ducklake_data_file),
                          (SELECT COALESCE(MAX(delete_file_id), 0) + 1 FROM ducklake_delete_file)
                      ), 0)
                  )",
             )
+            .bind(prev_schema_version)
             .execute(&mut *conn)
             .await?;
             last_insert_id_conn(&mut conn).await
