@@ -89,7 +89,20 @@ impl RowIdExec {
         fields.insert(insert_at, Arc::new(rowid_field()));
         let schema = Arc::new(Schema::new(fields));
 
-        let eq_properties = EquivalenceProperties::new(schema.clone());
+        // Preserve the child's orderings on the wider output schema.
+        // Real columns are at the same indices in input and output
+        // (rowid is appended) so column-referenced sort exprs remain valid.
+        // Without this, an upstream `SortPreservingMergeExec` sanity-check
+        // would reject the plan because `RowIdExec.equivalence_properties()`
+        // would advertise no ordering even though the child has one.
+        let child_orderings: Vec<_> = input
+            .equivalence_properties()
+            .oeq_class()
+            .iter()
+            .cloned()
+            .collect();
+        let eq_properties =
+            EquivalenceProperties::new_with_orderings(schema.clone(), child_orderings);
         let properties = Arc::new(PlanProperties::new(
             eq_properties,
             input.output_partitioning().clone(),
