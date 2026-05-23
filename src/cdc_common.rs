@@ -56,9 +56,17 @@ pub(crate) fn analyze_cdc_projection(
             let mut need_snapshot_id = false;
             let mut need_change_type = false;
 
+            // Deduplicate table column indices so the underlying Parquet scan
+            // reads each physical column at most once. Duplicate output slots
+            // are then materialized via `reorder_indices` (see below). Without
+            // this, `SELECT col, col` would push `[0, 0]` to DataFusion's
+            // projection and the second occurrence would collapse onto the
+            // first when looking up positions, dropping the second output.
             for &idx in indices {
                 if idx < num_table_cols {
-                    table_indices.push(idx);
+                    if !table_indices.contains(&idx) {
+                        table_indices.push(idx);
+                    }
                 } else if idx == snapshot_id_idx {
                     need_snapshot_id = true;
                 } else if idx == change_type_idx {
@@ -167,23 +175,92 @@ mod tests {
 
     #[test]
     fn test_cdc_projection_duplicate_columns() {
-        // R5-S-037: Duplicate column projections (SELECT col, col) should not collapse
+        // R5-S-037: Duplicate column projections (SELECT col, col) must produce
+        // two independent output slots that both reference the same underlying
+        // physical column. We achieve this by reading the physical column once
+        // (deduplicated `table_indices`) and materializing duplicates via
+        // `reorder_indices`.
         let (table_schema, output_schema) = make_test_schemas();
         let projection = vec![0, 0]; // id, id
         let result =
             analyze_cdc_projection(Some(&projection), &table_schema, &output_schema).unwrap();
 
-        // Both projected columns should map to valid positions
-        assert_eq!(result.table_indices.len(), 2);
-        assert_eq!(result.output_schema.fields().len(), 2);
+        // Physical scan should read column 0 exactly once.
+        assert_eq!(result.table_indices, vec![0]);
 
-        // Reorder indices should be valid (both mapping to the same natural position is OK)
-        if let Some(reorder) = &result.reorder_indices {
-            assert_eq!(reorder.len(), 2);
-            // Both should map to position 0 (the column index in table_indices)
-            assert_eq!(reorder[0], 0);
-            assert_eq!(reorder[1], 0);
-        }
+        // Output schema should still have two columns (both `id`).
+        assert_eq!(result.output_schema.fields().len(), 2);
+        assert_eq!(result.output_schema.field(0).name(), "id");
+        assert_eq!(result.output_schema.field(1).name(), "id");
+
+        // Reorder must populate two output slots from the single scan column.
+        let reorder = result
+            .reorder_indices
+            .expect("duplicate projection requires reorder");
+        assert_eq!(reorder, vec![0, 0]);
+    }
+
+    #[test]
+    fn test_cdc_projection_duplicate_columns_produces_independent_outputs() {
+        // Regression test for the audit-flagged bug: applying the projection
+        // analysis to a real batch must yield two independent output columns,
+        // both containing the source column's data, even when projected twice.
+        use arrow::array::{Int32Array, RecordBatch};
+
+        let (table_schema, output_schema) = make_test_schemas();
+        let projection = vec![0, 0]; // SELECT id, id
+        let result =
+            analyze_cdc_projection(Some(&projection), &table_schema, &output_schema).unwrap();
+
+        // Simulate the scan: deduped table_indices = [0], so scan reads one
+        // column. This mimics what `AppendCDCColumnsStream::transform_batch`
+        // sees as input.
+        let id_array = Arc::new(Int32Array::from(vec![10, 20, 30])) as arrow::array::ArrayRef;
+        let scan_schema = Arc::new(Schema::new(vec![table_schema.field(0).clone()]));
+        let scan_batch = RecordBatch::try_new(scan_schema, vec![id_array.clone()]).unwrap();
+
+        // Apply reorder the same way `transform_batch` does.
+        let reorder = result.reorder_indices.unwrap();
+        let columns: Vec<arrow::array::ArrayRef> = reorder
+            .iter()
+            .map(|&i| scan_batch.column(i).clone())
+            .collect();
+
+        let out = RecordBatch::try_new(result.output_schema.clone(), columns).unwrap();
+
+        // Two output columns, both holding the id data independently.
+        assert_eq!(out.num_columns(), 2);
+        let col0 = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let col1 = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(col0.values(), &[10, 20, 30]);
+        assert_eq!(col1.values(), &[10, 20, 30]);
+    }
+
+    #[test]
+    fn test_cdc_projection_duplicate_with_cdc_columns() {
+        // SELECT id, id, snapshot_id, change_type — duplicates plus CDC cols.
+        let (table_schema, output_schema) = make_test_schemas();
+        let projection = vec![0, 0, 2, 3];
+        let result =
+            analyze_cdc_projection(Some(&projection), &table_schema, &output_schema).unwrap();
+
+        assert_eq!(result.table_indices, vec![0]); // deduped
+        assert!(result.need_snapshot_id);
+        assert!(result.need_change_type);
+
+        // Natural order after dedup: [id, snapshot_id, change_type]
+        // Projection order:          [id, id,         snapshot_id, change_type]
+        // So reorder maps:           [0,  0,          1,           2]
+        let reorder = result.reorder_indices.expect("reorder required");
+        assert_eq!(reorder, vec![0, 0, 1, 2]);
     }
 
     #[test]
