@@ -393,7 +393,6 @@ async fn test_table_changes_includes_cdc_columns() -> DataFusionResult<()> {
 // =============================================================================
 
 #[tokio::test]
-#[ignore = "TODO(#21): CDC delete-file scan trips Parquet schema validation against DuckDB-written delete files"]
 async fn test_table_deletions_returns_deleted_rows() -> DataFusionResult<()> {
     let temp_dir = TempDir::new().unwrap();
     let catalog_path = temp_dir.path().join("deletions_verify.ducklake");
@@ -423,7 +422,6 @@ async fn test_table_deletions_returns_deleted_rows() -> DataFusionResult<()> {
 // =============================================================================
 
 #[tokio::test]
-#[ignore = "TODO(#21): CDC delete-file scan trips Parquet schema validation against DuckDB-written delete files"]
 async fn test_insertions_vs_changes_row_count() -> DataFusionResult<()> {
     let temp_dir = TempDir::new().unwrap();
     let catalog_path = temp_dir.path().join("consistency.ducklake");

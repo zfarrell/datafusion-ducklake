@@ -122,7 +122,6 @@ mod integration_tests {
 
     /// Test that ducklake_table_changes returns insert changes with actual row data
     #[tokio::test]
-    #[ignore = "TODO(#21): CDC delete-file scan trips Parquet schema validation against DuckDB-written delete files"]
     async fn test_table_changes_inserts() -> DataFusionResult<()> {
         let temp_dir = TempDir::new().unwrap();
         let catalog_path = temp_dir.path().join("multi_snapshot.ducklake");
@@ -199,7 +198,6 @@ mod integration_tests {
 
     /// Test that ducklake_table_changes works with table name without schema
     #[tokio::test]
-    #[ignore = "TODO(#21): CDC delete-file scan trips Parquet schema validation against DuckDB-written delete files"]
     async fn test_table_changes_default_schema() -> DataFusionResult<()> {
         let temp_dir = TempDir::new().unwrap();
         let catalog_path = temp_dir.path().join("multi_snapshot.ducklake");
@@ -358,6 +356,69 @@ mod integration_tests {
         Ok(())
     }
 
+    /// Regression test for the audit-flagged duplicate-column projection bug
+    /// in `cdc_common::analyze_cdc_projection`.
+    ///
+    /// Prior to the fix, `SELECT col, col FROM ducklake_table_changes(...)`
+    /// would either collapse the second output slot or fail at execution.
+    /// After the fix, the physical scan reads `col` once and both output
+    /// columns must independently contain the same data.
+    #[tokio::test]
+    async fn test_table_changes_duplicate_column_projection() -> DataFusionResult<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let catalog_path = temp_dir.path().join("dup_col.ducklake");
+
+        common::create_catalog_multiple_snapshots(&catalog_path)
+            .map_err(common::to_datafusion_error)?;
+
+        let ctx = create_context_with_functions(catalog_path.to_str().unwrap()).await?;
+
+        // Project `id` twice, plus a CDC column to also exercise the
+        // table+CDC reorder path.
+        let df = ctx
+            .sql(
+                "SELECT id AS a, id AS b, change_type \
+                 FROM ducklake_table_changes('main.events', 0, 100) \
+                 WHERE change_type = 'insert' \
+                 ORDER BY a",
+            )
+            .await?;
+
+        let batches: Vec<RecordBatch> = df.collect().await?;
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert!(total_rows > 0, "expected some insert rows");
+
+        // Validate that both output columns are populated and identical for
+        // every row — the bug previously left the second slot duplicated
+        // incorrectly or dropped, so we check both equality and that the
+        // values themselves are the expected non-null insert ids.
+        let mut left: Vec<i32> = Vec::new();
+        let mut right: Vec<i32> = Vec::new();
+        for batch in &batches {
+            assert_eq!(
+                batch.num_columns(),
+                3,
+                "expected 3 output columns (id, id, change_type)"
+            );
+            left.extend(get_int32_column(batch, 0));
+            right.extend(get_int32_column(batch, 1));
+        }
+        assert_eq!(left.len(), total_rows);
+        assert_eq!(right.len(), total_rows);
+        assert_eq!(
+            left, right,
+            "duplicate-column projection must produce identical, independently populated output columns"
+        );
+        // Also confirm we actually got non-trivial data, not e.g. all zeros.
+        assert!(
+            left.iter().any(|&v| v != 0),
+            "expected non-zero ids in projection output, got {:?}",
+            left
+        );
+
+        Ok(())
+    }
+
     /// Test error handling for invalid snapshot range (start > end)
     #[tokio::test]
     async fn test_table_changes_invalid_snapshot_range() -> DataFusionResult<()> {
@@ -441,7 +502,6 @@ mod table_deletions_tests {
 
     /// Test that ducklake_table_deletions returns deleted rows correctly
     #[tokio::test]
-    #[ignore = "TODO(#21): CDC delete-file scan trips Parquet schema validation against DuckDB-written delete files"]
     async fn test_table_deletions_with_deletes() -> DataFusionResult<()> {
         let temp_dir = TempDir::new().unwrap();
         let catalog_path = temp_dir.path().join("with_deletes.ducklake");
@@ -488,7 +548,6 @@ mod table_deletions_tests {
     /// Test ducklake_table_deletions with complex scenario:
     /// delete all rows, insert more, delete few more
     #[tokio::test]
-    #[ignore = "TODO(#21): CDC delete-file scan trips Parquet schema validation against DuckDB-written delete files"]
     async fn test_table_deletions_complex_scenario() -> DataFusionResult<()> {
         let temp_dir = TempDir::new().unwrap();
         let catalog_path = temp_dir.path().join("complex_deletes.ducklake");
