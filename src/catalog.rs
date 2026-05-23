@@ -56,11 +56,12 @@ pub struct DuckLakeCatalog {
     catalog_path: String,
     /// Whether to expose the `rowid` virtual column on tables in this catalog.
     ///
-    /// TODO(#22): the actual scan-path wiring is intentionally not present yet —
-    /// it conflicts with the fork's `virtual_column_exec` design and is tracked
-    /// in #22. This field is plumbed through the constructor so existing callers
-    /// (and the `compare_rowid_against_duckdb` / `rowid_lifecycle` examples)
-    /// continue to compile.
+    /// When `true`, every `DuckLakeTable` produced by this catalog includes
+    /// `rowid` in its public schema and scans materialize it via the row-id
+    /// machinery in `src/row_id.rs` (either embedded-column read or
+    /// `RowIdExec` cursor synthesis, depending on per-file provenance). When
+    /// `false`, `rowid` is hidden and references to it fail to plan. Matches
+    /// DuckDB's behavior of gating row-lineage behind an explicit opt-in.
     row_lineage: bool,
     /// Write configuration (when write feature is enabled)
     #[cfg(feature = "write")]
@@ -184,10 +185,18 @@ impl DuckLakeCatalog {
 
     /// Enable or disable the `rowid` virtual column for tables in this catalog.
     ///
-    /// TODO(#22): the rowid scan-path integration is being reconciled with the
-    /// fork's `virtual_column_exec` design in #22. For now this just records
-    /// the preference on the catalog so that existing call sites (and the
-    /// rowid example binaries) continue to type-check.
+    /// When enabled, tables in this catalog expose `rowid` (BIGINT, nullable)
+    /// as the last column of their schema. Scans materialize rowid per-file:
+    /// INSERT-only files synthesize values as `row_id_start + position_in_file`
+    /// via [`crate::row_id::RowIdExec`]; files rewritten by `UPDATE` or
+    /// compaction read the embedded `_ducklake_internal_row_id` column
+    /// (parquet field-id [`crate::row_id::ROW_ID_PARQUET_FIELD_ID`]) so
+    /// original rowids survive file rewrites — required by the DuckLake spec.
+    ///
+    /// Disabled by default to keep the table surface stable for existing
+    /// callers. Note that DataFusion has no hidden-column concept, so once
+    /// enabled `rowid` IS included in `SELECT *` (differs from DuckDB, which
+    /// hides it).
     pub fn with_row_lineage(mut self, enabled: bool) -> Self {
         self.row_lineage = enabled;
         self
@@ -281,7 +290,8 @@ impl CatalogProvider for DuckLakeCatalog {
             new_snapshot,
             self.object_store_url.clone(),
             schema_path,
-        );
+        )
+        .with_row_lineage(self.row_lineage);
 
         Ok(Some(Arc::new(schema) as Arc<dyn SchemaProvider>))
     }
@@ -339,6 +349,7 @@ impl CatalogProvider for DuckLakeCatalog {
             self.object_store_url.clone(),
             schema_path,
         )
+        .with_row_lineage(self.row_lineage)
         .with_writer(Arc::clone(&config.writer))
         .with_catalog_snapshot_id(Arc::clone(&self.snapshot_id));
 
@@ -417,7 +428,8 @@ impl CatalogProvider for DuckLakeCatalog {
                     snapshot_id,
                     self.object_store_url.clone(),
                     schema_path,
-                );
+                )
+                .with_row_lineage(self.row_lineage);
 
                 // Configure writer and object store if this catalog is writable
                 #[cfg(feature = "write")]

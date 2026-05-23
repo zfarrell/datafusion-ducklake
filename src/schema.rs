@@ -85,6 +85,9 @@ pub struct DuckLakeSchema {
     snapshot_id: i64,
     /// Schema path for resolving relative table paths
     schema_path: String,
+    /// Whether the `rowid` virtual column is exposed on tables in this schema.
+    /// Propagated from the parent catalog's `with_row_lineage` setting.
+    row_lineage: bool,
     /// Metadata writer for write operations (when write feature is enabled)
     #[cfg(feature = "write")]
     writer: Option<Arc<dyn MetadataWriter>>,
@@ -115,6 +118,7 @@ impl DuckLakeSchema {
             snapshot_id,
             object_store_url,
             schema_path,
+            row_lineage: false,
             #[cfg(feature = "write")]
             writer: None,
             #[cfg(feature = "write")]
@@ -122,6 +126,18 @@ impl DuckLakeSchema {
             #[cfg(feature = "write")]
             catalog_snapshot_id: None,
         }
+    }
+
+    /// Enable or disable the `rowid` virtual column for tables in this schema.
+    ///
+    /// Called by [`crate::DuckLakeCatalog`] when constructing schema providers
+    /// for a catalog that has `with_row_lineage(true)`. When enabled, tables
+    /// returned by [`SchemaProvider::table`] will expose `rowid` in their
+    /// schema; when disabled, `rowid` is hidden and references to it fail
+    /// to plan.
+    pub fn with_row_lineage(mut self, enabled: bool) -> Self {
+        self.row_lineage = enabled;
+        self
     }
 
     /// Configure this schema for write operations.
@@ -295,7 +311,7 @@ impl SchemaProvider for DuckLakeSchema {
                 let table_path = resolve_path(&self.schema_path, &meta.path, meta.path_is_relative)
                     .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
 
-                // Pass snapshot_id to table
+                // Pass snapshot_id and row_lineage to table
                 let table = DuckLakeTable::new(
                     meta.table_id,
                     meta.table_name.clone(),
@@ -304,7 +320,8 @@ impl SchemaProvider for DuckLakeSchema {
                     Arc::clone(&self.object_store_url),
                     table_path,
                 )
-                .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+                .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?
+                .with_row_lineage(self.row_lineage);
 
                 // Configure writer if this schema is writable
                 #[cfg(feature = "write")]

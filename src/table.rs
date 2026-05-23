@@ -12,11 +12,12 @@ use crate::metadata_provider::{
     PartitionColumn,
 };
 use crate::path_resolver::resolve_path;
+use crate::row_id::{ROW_ID_PARQUET_FIELD_ID, ROWID_COLUMN_NAME, RowIdExec, rowid_field};
 use crate::types::{
     build_arrow_schema, build_read_schema_with_field_id_mapping, extract_parquet_field_ids,
 };
 use crate::virtual_column_exec::{
-    VIRTUAL_COL_FILE_INDEX, VIRTUAL_COL_FILE_ROW_NUMBER, VIRTUAL_COL_FILENAME, VIRTUAL_COL_ROWID,
+    VIRTUAL_COL_FILE_INDEX, VIRTUAL_COL_FILE_ROW_NUMBER, VIRTUAL_COL_FILENAME,
     VIRTUAL_COL_SNAPSHOT_ID, VirtualColumnExec, VirtualColumnFileInfo, VirtualColumnSet,
 };
 
@@ -118,8 +119,20 @@ pub struct DuckLakeTable {
     table_path: String,
     /// Base schema without virtual columns
     schema: SchemaRef,
-    /// Full schema including virtual columns (filename, file_row_number)
+    /// Full schema including virtual columns (filename, file_row_number,
+    /// snapshot_id, file_index — and, when row lineage is enabled, rowid).
     full_schema: SchemaRef,
+    /// Whether `rowid` is included in `full_schema` and scans materialize it.
+    row_lineage: bool,
+    /// Per-file cache of whether the parquet contains the embedded
+    /// `_ducklake_internal_row_id` column (field-id [`ROW_ID_PARQUET_FIELD_ID`]).
+    ///
+    /// Looked up lazily on first scan that requests `rowid` for the file. Files
+    /// written by `UPDATE` or compaction embed the column and must be read
+    /// from parquet directly; INSERT-only files don't embed it and need the
+    /// `RowIdExec` cursor path. Mirrors the per-file `FileReadConfig` cache
+    /// in upstream PR #115.
+    rowid_embedded_cache: Arc<std::sync::Mutex<HashMap<String, Option<String>>>>,
     /// Column metadata from DuckLake (needed for field_id mapping)
     columns: Vec<DuckLakeTableColumn>,
     /// Table files with paths as stored in metadata (resolved on-the-fly when needed)
@@ -171,35 +184,13 @@ impl DuckLakeTable {
         // Load ALL metadata with this snapshot_id
         let columns = provider.get_table_structure(table_id, snapshot_id)?;
         let schema = Arc::new(build_arrow_schema(&columns)?);
-        let full_schema = {
-            let mut fields = schema.fields().to_vec();
-            fields.push(Arc::new(Field::new(
-                VIRTUAL_COL_FILENAME,
-                DataType::Utf8,
-                true,
-            )));
-            fields.push(Arc::new(Field::new(
-                VIRTUAL_COL_FILE_ROW_NUMBER,
-                DataType::Int64,
-                true,
-            )));
-            fields.push(Arc::new(Field::new(
-                VIRTUAL_COL_ROWID,
-                DataType::Int64,
-                true,
-            )));
-            fields.push(Arc::new(Field::new(
-                VIRTUAL_COL_SNAPSHOT_ID,
-                DataType::Int64,
-                true,
-            )));
-            fields.push(Arc::new(Field::new(
-                VIRTUAL_COL_FILE_INDEX,
-                DataType::UInt64,
-                true,
-            )));
-            Arc::new(Schema::new(fields))
-        };
+        // DuckLake virtual columns (filename, file_row_number, rowid,
+        // snapshot_id, file_index) are exposed only when the catalog has
+        // `with_row_lineage(true)`. Default `full_schema` is just the
+        // physical columns so existing read-only consumers don't see new
+        // synthetic columns in `SELECT *`. The virtual columns are appended
+        // in `with_row_lineage()` below.
+        let full_schema = Arc::clone(&schema);
         let table_files = provider.get_table_files_for_select(table_id, snapshot_id)?;
 
         // Load row count from metadata for COUNT(*) optimization
@@ -304,6 +295,8 @@ impl DuckLakeTable {
             table_path,
             schema,
             full_schema,
+            row_lineage: false,
+            rowid_embedded_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             columns,
             table_files,
             cached_row_count,
@@ -487,6 +480,98 @@ impl DuckLakeTable {
             .await
     }
 
+    /// Detect whether a data file embeds the DuckLake row-id column
+    /// (`_ducklake_internal_row_id`, parquet field-id
+    /// [`ROW_ID_PARQUET_FIELD_ID`]).
+    ///
+    /// Returns:
+    /// * `Some(name)` — the column exists; `name` is the actual parquet column
+    ///   name (typically `_ducklake_internal_row_id`) which scans should read
+    ///   and rename to `rowid`.
+    /// * `None` — the column is absent; the scan path must use
+    ///   [`RowIdExec`] with `row_id_start` from the catalog.
+    ///
+    /// Results are cached per (resolved) file path in
+    /// `rowid_embedded_cache`, mirroring the per-file `FileReadConfig` cache
+    /// in upstream PR #115. The cache is keyed by the file path so a scan
+    /// that touches the same file twice in one plan only opens the parquet
+    /// metadata once.
+    async fn detect_embedded_rowid_column(
+        &self,
+        state: &dyn Session,
+        table_file: &DuckLakeTableFile,
+    ) -> DataFusionResult<Option<String>> {
+        let resolved_path = self.resolve_file_path(&table_file.file)?;
+
+        // Cache lookup
+        if let Some(cached) = self
+            .rowid_embedded_cache
+            .lock()
+            .map_err(|e| {
+                DataFusionError::Internal(format!("rowid_embedded_cache poisoned: {}", e))
+            })?
+            .get(&resolved_path)
+        {
+            return Ok(cached.clone());
+        }
+
+        let object_store = state
+            .runtime_env()
+            .object_store(self.object_store_url.as_ref())?;
+        let object_path = ObjectPath::from(resolved_path.as_str());
+        let reader = ParquetObjectReader::new(object_store, object_path);
+
+        #[cfg(feature = "encryption")]
+        let builder = {
+            use parquet::arrow::arrow_reader::ArrowReaderOptions;
+
+            let options = if let Some(ref key) = table_file.file.encryption_key {
+                if !key.is_empty() {
+                    let key_bytes =
+                        crate::encryption::DuckLakeEncryptionFactory::decode_key(key)?;
+                    let decryption_props =
+                        parquet::encryption::decrypt::FileDecryptionProperties::builder(
+                            key_bytes,
+                        )
+                        .build()
+                        .map_err(|e| {
+                            DataFusionError::Execution(format!(
+                                "Failed to create decryption properties: {}",
+                                e
+                            ))
+                        })?;
+                    ArrowReaderOptions::new().with_file_decryption_properties(decryption_props)
+                } else {
+                    ArrowReaderOptions::new()
+                }
+            } else {
+                ArrowReaderOptions::new()
+            };
+
+            ParquetRecordBatchStreamBuilder::new_with_options(reader, options)
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?
+        };
+
+        #[cfg(not(feature = "encryption"))]
+        let builder = ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        let field_id_map = extract_parquet_field_ids(builder.metadata());
+        let embedded = field_id_map.get(&ROW_ID_PARQUET_FIELD_ID).cloned();
+
+        // Cache it
+        self.rowid_embedded_cache
+            .lock()
+            .map_err(|e| {
+                DataFusionError::Internal(format!("rowid_embedded_cache poisoned: {}", e))
+            })?
+            .insert(resolved_path, embedded.clone());
+
+        Ok(embedded)
+    }
+
     /// Read a delete file and extract all deleted row positions
     ///
     /// The delete file is already associated with a specific data file via metadata.
@@ -645,6 +730,55 @@ impl DuckLakeTable {
         self
     }
 
+    /// Enable or disable DuckLake virtual columns on this table.
+    ///
+    /// When enabled, `full_schema` is extended with the five DuckLake virtual
+    /// columns (`filename`, `file_row_number`, `rowid`, `snapshot_id`,
+    /// `file_index`) and `scan()` materializes each per-file via the
+    /// appropriate mechanism:
+    ///
+    /// * `rowid` — embedded `_ducklake_internal_row_id` for UPDATE/compaction
+    ///   rewrites; [`RowIdExec`] cursor for INSERT-only files.
+    /// * `filename`, `file_row_number`, `snapshot_id`, `file_index` — synthesized
+    ///   at scan time by [`VirtualColumnExec`].
+    ///
+    /// Normally called by `DuckLakeSchema` when the parent catalog has
+    /// `with_row_lineage(true)`. The flag name is retained from PR #115 for
+    /// API stability even though the surface now covers all five DuckLake
+    /// virtual columns, not just `rowid` (see ticket #22).
+    #[must_use]
+    pub fn with_row_lineage(mut self, enabled: bool) -> Self {
+        self.row_lineage = enabled;
+        if enabled {
+            let mut fields = self.schema.fields().to_vec();
+            fields.push(Arc::new(Field::new(
+                VIRTUAL_COL_FILENAME,
+                DataType::Utf8,
+                true,
+            )));
+            fields.push(Arc::new(Field::new(
+                VIRTUAL_COL_FILE_ROW_NUMBER,
+                DataType::Int64,
+                true,
+            )));
+            fields.push(Arc::new(rowid_field()));
+            fields.push(Arc::new(Field::new(
+                VIRTUAL_COL_SNAPSHOT_ID,
+                DataType::Int64,
+                true,
+            )));
+            fields.push(Arc::new(Field::new(
+                VIRTUAL_COL_FILE_INDEX,
+                DataType::UInt64,
+                true,
+            )));
+            self.full_schema = Arc::new(Schema::new(fields));
+        } else {
+            self.full_schema = Arc::clone(&self.schema);
+        }
+        self
+    }
+
     /// Create a DELETE execution plan for this table.
     ///
     /// Returns an execution plan that, when executed, will:
@@ -797,6 +931,181 @@ impl DuckLakeTable {
             Arc::clone(&self.object_store_url),
             self.table_path.clone(),
             existing_deletes,
+        )))
+    }
+
+    /// Build a per-file scan with a `rowid` column materialized as the last
+    /// output column.
+    ///
+    /// If the file embeds `_ducklake_internal_row_id` (field-id
+    /// [`ROW_ID_PARQUET_FIELD_ID`]) — i.e. it was produced by `UPDATE` or
+    /// compaction — read it directly from parquet and rename to `rowid` via
+    /// [`ColumnRenameExec`]. Otherwise wrap the real-column scan with
+    /// [`RowIdExec`], which synthesizes `rowid = row_id_start + position`.
+    ///
+    /// The returned plan's schema is `[real projected cols..., rowid]`.
+    /// Caller is responsible for further wrapping with `VirtualColumnExec`
+    /// if other virtual columns are also requested.
+    async fn build_exec_for_file_with_rowid(
+        &self,
+        state: &dyn Session,
+        table_file: &DuckLakeTableFile,
+        real_projection: Option<&Vec<usize>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let embedded = self.detect_embedded_rowid_column(state, table_file).await?;
+
+        let base_plan: Arc<dyn ExecutionPlan> = if let Some(ref embedded_name) = embedded {
+            // Read the embedded column alongside real cols, then rename to `rowid`.
+            // Delete filtering is applied inside this builder because it sees
+            // the raw parquet positions.
+            self.build_exec_for_file_with_embedded_rowid(
+                state,
+                table_file,
+                real_projection,
+                embedded_name,
+            )
+            .await?
+        } else {
+            // Cursor synthesis path: `RowIdExec` must wrap the *raw* parquet
+            // scan so its cursor corresponds to physical file positions.
+            // `DeleteFilterExec` is then applied **on top** of `RowIdExec` so
+            // deleted rows' rowids get elided alongside their data — exactly
+            // the behavior `rowid_preserved_under_deletes` asserts. (The
+            // reverse order would compute rowids over the post-delete row
+            // stream, yielding a contiguous range and silently breaking the
+            // spec-required "rowid survives deletes" guarantee.)
+            let scan = self
+                .build_exec_for_single_file(state, table_file, real_projection, None)
+                .await?;
+            let with_rowid: Arc<dyn ExecutionPlan> =
+                Arc::new(RowIdExec::new(scan, table_file.row_id_start));
+            if let Some(ref delete_file) = table_file.delete_file {
+                let deleted = self.read_delete_file_positions(state, delete_file).await?;
+                if !deleted.is_empty() {
+                    Arc::new(DeleteFilterExec::new(
+                        with_rowid,
+                        table_file.file.path.clone(),
+                        Arc::new(deleted),
+                    )) as Arc<dyn ExecutionPlan>
+                } else {
+                    with_rowid
+                }
+            } else {
+                with_rowid
+            }
+        };
+
+        Ok(base_plan)
+    }
+
+    /// Specialized scan for a file that embeds the internal row-id column.
+    ///
+    /// Extends the parquet read_schema with the embedded column at the end,
+    /// projects it alongside the real columns, applies delete filtering if
+    /// needed, then renames the embedded column to `rowid`.
+    async fn build_exec_for_file_with_embedded_rowid(
+        &self,
+        state: &dyn Session,
+        table_file: &DuckLakeTableFile,
+        real_projection: Option<&Vec<usize>>,
+        embedded_col_name: &str,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let (real_read_schema, name_mapping) = self.get_schema_mapping(state).await?;
+
+        // Build an extended read_schema that includes the embedded rowid column
+        // tagged with the spec field-id. The parquet reader matches columns by
+        // name *or* by field-id metadata; pinning the field-id ensures we read
+        // the right physical column even if its name varies across writers.
+        let mut ext_fields: Vec<Arc<Field>> = real_read_schema.fields().iter().cloned().collect();
+        let mut rowid_field_metadata = HashMap::new();
+        rowid_field_metadata.insert(
+            "PARQUET:field_id".to_string(),
+            ROW_ID_PARQUET_FIELD_ID.to_string(),
+        );
+        ext_fields.push(Arc::new(
+            Field::new(embedded_col_name, DataType::Int64, true)
+                .with_metadata(rowid_field_metadata),
+        ));
+        let ext_read_schema = Arc::new(Schema::new(ext_fields));
+        let embedded_idx = ext_read_schema.fields().len() - 1;
+
+        // Build projection that includes the embedded column index alongside
+        // the real-projection indices.
+        let scan_projection: Vec<usize> = match real_projection {
+            Some(indices) => {
+                let mut v: Vec<usize> = indices.to_vec();
+                v.push(embedded_idx);
+                v
+            },
+            None => (0..ext_read_schema.fields().len()).collect(),
+        };
+
+        let resolved_path = self.resolve_file_path(&table_file.file)?;
+        let mut pf = PartitionedFile::new(
+            &resolved_path,
+            validated_file_size(table_file.file.file_size_bytes, &resolved_path)?,
+        );
+        if let Some(footer_size) = table_file.file.footer_size
+            && footer_size > 0
+            && let Ok(hint) = usize::try_from(footer_size)
+        {
+            pf = pf.with_metadata_size_hint(hint);
+        }
+
+        let file_scan_config = FileScanConfigBuilder::new(
+            self.object_store_url.as_ref().clone(),
+            Arc::new(self.create_parquet_source(Arc::clone(&ext_read_schema))),
+        )
+        .with_file_group(FileGroup::new(vec![pf]))
+        .with_projection_indices(Some(scan_projection))?
+        .build();
+
+        let parquet_exec: Arc<dyn ExecutionPlan> =
+            DataSourceExec::from_data_source(file_scan_config);
+
+        // Apply delete filtering if present (positions are relative to the
+        // file, so deletes work the same whether or not rowid is in the
+        // projection).
+        let exec_after_delete: Arc<dyn ExecutionPlan> =
+            if let Some(ref delete_file) = table_file.delete_file {
+                let deleted = self.read_delete_file_positions(state, delete_file).await?;
+                if !deleted.is_empty() {
+                    Arc::new(DeleteFilterExec::new(
+                        parquet_exec,
+                        table_file.file.path.clone(),
+                        Arc::new(deleted),
+                    ))
+                } else {
+                    parquet_exec
+                }
+            } else {
+                parquet_exec
+            };
+
+        // The scan output schema is [real_renamed..., embedded_col_name].
+        // We want [real_current..., rowid]. Build a combined name_mapping
+        // that includes the rowid rename, and an output_schema that has
+        // proper DuckLake names + a trailing `rowid` field.
+        let real_output_schema = match real_projection {
+            Some(indices) if !indices.is_empty() => Arc::new(self.schema.project(indices)?),
+            Some(_) => Arc::new(Schema::empty()),
+            None => Arc::clone(&self.schema),
+        };
+        let mut output_fields: Vec<Arc<Field>> =
+            real_output_schema.fields().iter().cloned().collect();
+        output_fields.push(Arc::new(rowid_field()));
+        let output_schema = Arc::new(Schema::new(output_fields));
+
+        let mut combined_mapping = name_mapping.clone();
+        // Rename the embedded column to `rowid`. Use `entry`-style insert so
+        // existing keys (none expected for this internal column) aren't
+        // overwritten silently.
+        combined_mapping.insert(embedded_col_name.to_string(), ROWID_COLUMN_NAME.to_string());
+
+        Ok(Arc::new(ColumnRenameExec::new(
+            exec_after_delete,
+            output_schema,
+            combined_mapping,
         )))
     }
 
@@ -1469,6 +1778,10 @@ impl TableProvider for DuckLakeTable {
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let base_field_count = self.schema.fields().len();
+        // Virtual column indices in `full_schema`. Only meaningful when
+        // `row_lineage` is enabled (those indices won't appear in a
+        // projection otherwise — DataFusion validates indices against
+        // `schema()` which equals `full_schema`).
         let filename_idx = base_field_count;
         let row_number_idx = base_field_count + 1;
         let rowid_idx = base_field_count + 2;
@@ -1481,24 +1794,33 @@ impl TableProvider for DuckLakeTable {
         // Apply stats-based file pruning using per-file column statistics
         let active_files = self.prune_files_by_stats(partition_pruned, filters);
 
-        // Determine which virtual columns are requested
-        let included = match projection {
-            Some(indices) => VirtualColumnSet {
-                filename: indices.contains(&filename_idx),
-                file_row_number: indices.contains(&row_number_idx),
-                rowid: indices.contains(&rowid_idx),
-                snapshot_id: indices.contains(&snapshot_id_idx),
-                file_index: indices.contains(&file_index_idx),
-            },
-            None => VirtualColumnSet {
-                filename: true,
-                file_row_number: true,
-                rowid: true,
-                snapshot_id: true,
-                file_index: true,
-            },
+        // Determine which virtual columns are requested. Only honor the
+        // request when `row_lineage` is on — otherwise the indices fall
+        // outside `full_schema` and `projection` can't reference them.
+        let included = if self.row_lineage {
+            match projection {
+                Some(indices) => VirtualColumnSet {
+                    filename: indices.contains(&filename_idx),
+                    file_row_number: indices.contains(&row_number_idx),
+                    snapshot_id: indices.contains(&snapshot_id_idx),
+                    file_index: indices.contains(&file_index_idx),
+                },
+                None => VirtualColumnSet {
+                    filename: true,
+                    file_row_number: true,
+                    snapshot_id: true,
+                    file_index: true,
+                },
+            }
+        } else {
+            VirtualColumnSet::default()
         };
-        let needs_virtual = included.any();
+        let needs_rowid = self.row_lineage
+            && match projection {
+                Some(indices) => indices.contains(&rowid_idx),
+                None => true,
+            };
+        let needs_virtual = included.any() || needs_rowid;
 
         if !needs_virtual {
             // No virtual columns — use optimized grouped scan path
@@ -1545,8 +1867,8 @@ impl TableProvider for DuckLakeTable {
             return combine_execution_plans(execs);
         }
 
-        // Virtual columns requested — scan files individually
-        // Build the "real" projection (base schema indices only)
+        // Virtual columns requested — scan files individually.
+        // Build the "real" projection (base schema indices only).
         let real_projection: Option<Vec<usize>> = projection.map(|indices| {
             indices
                 .iter()
@@ -1555,13 +1877,24 @@ impl TableProvider for DuckLakeTable {
                 .collect()
         });
 
-        // Build VirtualColumnExec output schema: [real projected cols..., virtual cols...]
+        // Final per-file output column order is:
+        //   [ real projected cols..., rowid?, filename?, file_row_number?, snapshot_id?, file_index? ]
+        //
+        // rowid (when requested) is contributed by `build_exec_for_file_with_rowid`
+        // as a trailing column appended to the real-projection scan. The
+        // remaining four virtual columns are then appended by
+        // `VirtualColumnExec` on top of that. We tell `VirtualColumnExec`
+        // what its output schema is by constructing `vc_output_schema` to
+        // match this order exactly.
         let real_output_schema = match &real_projection {
             Some(indices) if !indices.is_empty() => Arc::new(self.schema.project(indices)?),
             Some(_) => Arc::new(Schema::empty()),
             None => self.schema.clone(),
         };
-        let mut vc_fields = real_output_schema.fields().to_vec();
+        let mut vc_fields: Vec<Arc<Field>> = real_output_schema.fields().to_vec();
+        if needs_rowid {
+            vc_fields.push(Arc::new(rowid_field()));
+        }
         if included.filename {
             vc_fields.push(Arc::new(Field::new(
                 VIRTUAL_COL_FILENAME,
@@ -1572,13 +1905,6 @@ impl TableProvider for DuckLakeTable {
         if included.file_row_number {
             vc_fields.push(Arc::new(Field::new(
                 VIRTUAL_COL_FILE_ROW_NUMBER,
-                DataType::Int64,
-                true,
-            )));
-        }
-        if included.rowid {
-            vc_fields.push(Arc::new(Field::new(
-                VIRTUAL_COL_ROWID,
                 DataType::Int64,
                 true,
             )));
@@ -1603,43 +1929,61 @@ impl TableProvider for DuckLakeTable {
         let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
         for (file_idx, table_file) in active_files.iter().enumerate() {
             let resolved_path = self.resolve_file_path(&table_file.file)?;
-            let file_info = VirtualColumnFileInfo {
-                filename: resolved_path,
-                row_id_start: table_file.row_id_start,
-                snapshot_id: table_file.snapshot_id,
-                file_index: file_idx as u64,
-            };
-            let file_exec = if table_file.delete_file.is_some() {
-                // Don't push limit for files with deletes (same as non-virtual path)
+
+            // Layer 1: real columns (+ rowid if needed)
+            let file_exec_with_rowid: Arc<dyn ExecutionPlan> = if needs_rowid {
+                self.build_exec_for_file_with_rowid(state, table_file, real_proj_ref)
+                    .await?
+            } else if table_file.delete_file.is_some() {
                 self.build_exec_for_file_with_deletes(state, table_file, real_proj_ref, None)
                     .await?
             } else {
-                // Don't push limit to individual file scans — the combined plan
-                // handles the overall limit, pushing it here would read limit*N rows
                 self.build_exec_for_single_file(state, table_file, real_proj_ref, None)
                     .await?
             };
-            execs.push(Arc::new(VirtualColumnExec::new(
-                file_exec,
-                file_info,
-                included.clone(),
-                Arc::clone(&vc_output_schema),
-            )));
-        }
-        // Add inlined data with virtual columns (empty path for inlined rows)
-        if let Some(inlined_exec) = self.build_inlined_data_exec(state, real_proj_ref).await? {
-            let inlined_info = VirtualColumnFileInfo {
-                filename: String::new(),
-                row_id_start: None,
-                snapshot_id: None,
-                file_index: active_files.len() as u64,
+
+            // Layer 2: scan-time virtual columns (filename / row_num /
+            // snapshot_id / file_index). If `included.any()` is false we
+            // skip this layer entirely — the rowid plan is already in the
+            // right shape.
+            let final_exec: Arc<dyn ExecutionPlan> = if included.any() {
+                let file_info = VirtualColumnFileInfo {
+                    filename: resolved_path,
+                    snapshot_id: table_file.snapshot_id,
+                    file_index: file_idx as u64,
+                };
+                Arc::new(VirtualColumnExec::new(
+                    file_exec_with_rowid,
+                    file_info,
+                    included.clone(),
+                    Arc::clone(&vc_output_schema),
+                ))
+            } else {
+                file_exec_with_rowid
             };
-            execs.push(Arc::new(VirtualColumnExec::new(
-                inlined_exec,
-                inlined_info,
-                included.clone(),
-                Arc::clone(&vc_output_schema),
-            )));
+            execs.push(final_exec);
+        }
+        // Inlined data — only join if no rowid is needed (inlined rows
+        // have no embedded rowid and no row_id_start in current schema).
+        if !needs_rowid
+            && let Some(inlined_exec) = self.build_inlined_data_exec(state, real_proj_ref).await?
+        {
+            let final_exec: Arc<dyn ExecutionPlan> = if included.any() {
+                let inlined_info = VirtualColumnFileInfo {
+                    filename: String::new(),
+                    snapshot_id: None,
+                    file_index: active_files.len() as u64,
+                };
+                Arc::new(VirtualColumnExec::new(
+                    inlined_exec,
+                    inlined_info,
+                    included.clone(),
+                    Arc::clone(&vc_output_schema),
+                ))
+            } else {
+                inlined_exec
+            };
+            execs.push(final_exec);
         }
 
         if execs.is_empty() {
@@ -1653,23 +1997,26 @@ impl TableProvider for DuckLakeTable {
 
         let combined = combine_execution_plans(execs)?;
 
-        // Check if we need to reorder columns (virtual cols not at the end of projection)
+        // Check if we need to reorder columns to match the requested
+        // projection. The plan currently emits columns in
+        //   [ real_proj..., rowid?, filename?, row_num?, snapshot_id?, file_index? ]
+        // order, but the requested `projection` indices into `full_schema`
+        // may be in any order. Insert a `ProjectionExec` to reorder.
         if let Some(indices) = projection {
-            // Build expected order: real indices first, then virtual
             let mut expected: Vec<usize> = Vec::new();
             for &idx in indices {
                 if idx < base_field_count {
                     expected.push(idx);
                 }
             }
+            if needs_rowid {
+                expected.push(rowid_idx);
+            }
             if included.filename {
                 expected.push(filename_idx);
             }
             if included.file_row_number {
                 expected.push(row_number_idx);
-            }
-            if included.rowid {
-                expected.push(rowid_idx);
             }
             if included.snapshot_id {
                 expected.push(snapshot_id_idx);
@@ -1679,7 +2026,8 @@ impl TableProvider for DuckLakeTable {
             }
 
             if indices != expected.as_slice() {
-                // Need to reorder: map each requested index to its position in vc_output_schema
+                // Need to reorder. Map each requested index to its position
+                // in the combined plan's output schema.
                 let mut real_col_pos = 0usize;
                 let mut index_to_vc_pos: HashMap<usize, usize> = HashMap::new();
                 for &idx in indices {
@@ -1689,16 +2037,16 @@ impl TableProvider for DuckLakeTable {
                     }
                 }
                 let mut vc_pos = real_col_pos;
+                if needs_rowid {
+                    index_to_vc_pos.insert(rowid_idx, vc_pos);
+                    vc_pos += 1;
+                }
                 if included.filename {
                     index_to_vc_pos.insert(filename_idx, vc_pos);
                     vc_pos += 1;
                 }
                 if included.file_row_number {
                     index_to_vc_pos.insert(row_number_idx, vc_pos);
-                    vc_pos += 1;
-                }
-                if included.rowid {
-                    index_to_vc_pos.insert(rowid_idx, vc_pos);
                     vc_pos += 1;
                 }
                 if included.snapshot_id {
