@@ -224,6 +224,10 @@ pub struct DuckLakeWriteOptions {
     /// setting [`crate::file_indexing::COLUMNS_SETTING`], table scope first).
     /// `None` = none declared.
     pub ext_file_index_columns: Option<Vec<String>>,
+    /// EXPERIMENTAL: the time column the backfill counts heavy hitters per
+    /// hour over, from the table setting
+    /// [`crate::file_indexing::COUNT_COLUMN_SETTING`]. `None` = no counts.
+    pub ext_file_index_count_column: Option<String>,
     deferred_error: Option<String>,
 }
 
@@ -291,6 +295,10 @@ impl DuckLakeWriteOptions {
                 .get(crate::file_indexing::COLUMNS_SETTING)
                 .map(|value| crate::file_indexing::parse_columns_setting(value))
                 .filter(|columns| !columns.is_empty()),
+            ext_file_index_count_column: settings
+                .get(crate::file_indexing::COUNT_COLUMN_SETTING)
+                .map(|value| value.trim().to_string())
+                .filter(|name| !name.is_empty()),
             deferred_error: None,
         })
     }
@@ -389,6 +397,9 @@ impl DuckLakeWriteOptions {
         }
         if overrides.ext_file_index_columns.is_some() {
             self.ext_file_index_columns = overrides.ext_file_index_columns.clone();
+        }
+        if overrides.ext_file_index_count_column.is_some() {
+            self.ext_file_index_count_column = overrides.ext_file_index_count_column.clone();
         }
         self
     }

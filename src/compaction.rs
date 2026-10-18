@@ -2352,6 +2352,10 @@ pub struct BuildIndexOptions {
     /// Index these columns; `None` = the table's
     /// [`crate::file_indexing::COLUMNS_SETTING`].
     pub columns: Option<Vec<String>>,
+    /// Also record hourly heavy-hitter counts over this top-level timestamp
+    /// column; `None` = the table's
+    /// [`crate::file_indexing::COUNT_COLUMN_SETTING`], if any.
+    pub count_column: Option<String>,
     /// Files read and indexed at once; 0 is taken as 1.
     pub parallelism: usize,
 }
@@ -2375,6 +2379,13 @@ impl BuildIndexOptions {
     #[must_use]
     pub fn with_columns(mut self, columns: Vec<String>) -> Self {
         self.columns = Some(columns);
+        self
+    }
+
+    /// Record hourly heavy-hitter counts over this timestamp column.
+    #[must_use]
+    pub fn with_count_column(mut self, column: impl Into<String>) -> Self {
+        self.count_column = Some(column.into());
         self
     }
 
@@ -2433,7 +2444,7 @@ impl DuckLakeTable {
         use parquet::arrow::async_reader::{AsyncFileReader, ParquetRecordBatchStreamBuilder};
 
         use crate::ext_file_index::{FILE_INDEX_FORMAT_VERSION, IndexValueType};
-        use crate::file_indexing::{FileIndexColumn, FileIndexRequest};
+        use crate::file_indexing::{FileIndexColumn, FileIndexRequest, FileIndexTs};
 
         let mut result = BuildIndexResult::default();
         let writer = self.writer().ok_or_else(|| {
@@ -2474,6 +2485,30 @@ impl DuckLakeTable {
             return Ok(result);
         }
         let wanted_ids: Vec<i64> = wanted.iter().map(|(id, _, _)| *id).collect();
+        // (column_id, name) of the time column to count heavy hitters over.
+        let ts_wanted: Option<(i64, String)> = match opts
+            .count_column
+            .clone()
+            .or_else(|| self.write_options().ext_file_index_count_column.clone())
+        {
+            None => None,
+            Some(name) => {
+                let index = physical_schema.index_of(&name).map_err(|_| {
+                    DuckLakeError::InvalidConfig(format!(
+                        "build_file_indexes: no top-level count column '{name}'"
+                    ))
+                })?;
+                if !matches!(
+                    physical_schema.field(index).data_type(),
+                    arrow::datatypes::DataType::Timestamp(..)
+                ) {
+                    return Err(DuckLakeError::InvalidConfig(format!(
+                        "build_file_indexes: count column '{name}' is not a timestamp"
+                    )));
+                }
+                Some((column_ids[index], name))
+            },
+        };
 
         let object_store = state
             .runtime_env()
@@ -2506,6 +2541,13 @@ impl DuckLakeTable {
                     && wanted
                         .iter()
                         .any(|(id, _, ty)| *id == meta.column_id && *ty == meta.value_type)
+                    // With counts asked for, a row without them is rebuilt.
+                    && ts_wanted.as_ref().is_none_or(|(ts_id, _)| {
+                        meta.bucket_counts.as_ref().is_some_and(|c| {
+                            c.ts_column_id == *ts_id
+                                && c.grain_us == crate::ext_file_index::BUCKET_GRAIN_HOUR_US
+                        })
+                    })
             })
             .map(|meta| (meta.path, meta.file_size_bytes, meta.column_id))
             .collect();
@@ -2553,6 +2595,7 @@ impl DuckLakeTable {
             let readers = &readers;
             let reader_metrics = &reader_metrics;
             let object_store = &object_store;
+            let ts_wanted = &ts_wanted;
             async move {
                 let source = ObjectPath::from(crate::path_resolver::resolve_path(
                     self.table_path(),
@@ -2605,7 +2648,30 @@ impl DuckLakeTable {
                     return Ok::<_, DuckLakeError>(Outcome::Skipped);
                 }
                 roots.sort_unstable_by_key(|(root, _, _)| *root);
-                let root_indices: Vec<usize> = roots.iter().map(|(r, _, _)| *r).collect();
+                // The time column, when counting and the file holds it as a
+                // timestamp; without it the file gets an index but no counts.
+                let ts_root = ts_wanted.as_ref().and_then(|(ts_id, name)| {
+                    let root = if by_name {
+                        file_schema.index_of(name).ok()
+                    } else {
+                        file_schema
+                            .fields()
+                            .iter()
+                            .position(|f| field_id(f) == Some(*ts_id))
+                    }?;
+                    matches!(
+                        file_schema.field(root).data_type(),
+                        arrow::datatypes::DataType::Timestamp(..)
+                    )
+                    .then_some((root, *ts_id))
+                });
+                let mut root_indices: Vec<usize> = roots.iter().map(|(r, _, _)| *r).collect();
+                if let Some((root, _)) = ts_root {
+                    root_indices.push(root);
+                }
+                root_indices.sort_unstable();
+                root_indices.dedup();
+                let position = |root: usize| root_indices.binary_search(&root).expect("projected");
                 let descr = footer.file_metadata().schema_descr();
                 let bytes_read = footer
                     .row_groups()
@@ -2619,7 +2685,7 @@ impl DuckLakeTable {
                     .iter()
                     .map(|rg| rg.num_rows().max(0) as u64)
                     .collect();
-                let mask = ProjectionMask::roots(descr, root_indices);
+                let mask = ProjectionMask::roots(descr, root_indices.clone());
                 let reader: Box<dyn AsyncFileReader> = open()?;
                 let mut stream =
                     ParquetRecordBatchStreamBuilder::new_with_metadata(reader, reader_metadata)
@@ -2628,21 +2694,23 @@ impl DuckLakeTable {
                 // The projected batch holds the roots in ascending order.
                 let columns: Vec<FileIndexColumn> = roots
                     .iter()
-                    .enumerate()
-                    .map(
-                        |(field_index, (_, column_id, value_type))| FileIndexColumn {
-                            column_id: *column_id,
-                            field_index,
-                            value_type: *value_type,
-                        },
-                    )
+                    .map(|(root, column_id, value_type)| FileIndexColumn {
+                        column_id: *column_id,
+                        field_index: position(*root),
+                        value_type: *value_type,
+                    })
                     .collect();
+                let ts = ts_root.map(|(root, column_id)| FileIndexTs {
+                    column_id,
+                    field_index: position(root),
+                });
                 let request = FileIndexRequest::from_columns(
                     Arc::clone(writer),
                     Arc::clone(object_store),
                     self.table_id(),
                     crate::ext_file_index::BUILT_BY_BACKFILL,
                     columns,
+                    ts,
                 );
                 let mut builders = request.builders();
                 while let Some(batch) = stream.next().await {

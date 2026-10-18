@@ -4657,8 +4657,8 @@ impl MetadataWriter for SqliteMetadataWriter {
                         "INSERT INTO ext_ducklake_file_index
                              (table_id, path, file_size_bytes, column_id, index_path, index_key,
                               index_size_bytes, format_version, value_type, row_count,
-                              row_group_rows, heavy_hitters, built_by)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                              row_group_rows, heavy_hitters, built_by, bucket_counts)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                          ON CONFLICT (table_id, path, column_id) DO UPDATE SET
                              file_size_bytes = excluded.file_size_bytes,
                              index_path = excluded.index_path,
@@ -4670,6 +4670,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                              row_group_rows = excluded.row_group_rows,
                              heavy_hitters = excluded.heavy_hitters,
                              built_by = excluded.built_by,
+                             bucket_counts = excluded.bucket_counts,
                              built_at = CURRENT_TIMESTAMP",
                     )
                     .bind(table_id)
@@ -4685,6 +4686,11 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .bind(encode_u64_list(&meta.row_group_rows))
                     .bind(encode_heavy_hitters(&meta.heavy_hitters))
                     .bind(built_by)
+                    .bind(
+                        meta.bucket_counts
+                            .as_ref()
+                            .map(crate::ext_file_index_counts::bucket_counts_to_json),
+                    )
                     .execute(&mut *tx)
                     .await?
                     .rows_affected();

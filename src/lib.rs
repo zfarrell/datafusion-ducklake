@@ -81,6 +81,7 @@ mod delete_memo;
 pub mod encryption;
 pub mod error;
 pub mod ext_file_index;
+pub mod ext_file_index_counts;
 pub mod ext_file_order;
 pub(crate) mod field_id_adapter;
 pub mod file_index_scan;
