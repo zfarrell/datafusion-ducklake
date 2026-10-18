@@ -1465,3 +1465,37 @@ mod older_than_tests {
         assert_eq!(older_than("0 days", now()).unwrap(), now());
     }
 }
+
+/// EXPERIMENTAL (`ext_file_index`): drop the sidecar rows of index objects
+/// whose data file no catalog row lists any more and that are older than
+/// `min_age` (see [`MetadataWriter::prune_file_indexes`]), then delete those
+/// objects from `object_store`. Run it after expiry and cleanup; `min_age`
+/// must exceed the longest write still running, as for the orphan sweep's
+/// cutoff. Returns the keys deleted. An object already gone counts as
+/// deleted; any other delete failure is warned and left for the orphan sweep,
+/// since its row is already gone.
+///
+/// [`MetadataWriter::prune_file_indexes`]: crate::metadata_writer::MetadataWriter::prune_file_indexes
+pub async fn prune_file_indexes(
+    writer: &dyn crate::metadata_writer::MetadataWriter,
+    object_store: Arc<dyn ObjectStore>,
+    min_age: std::time::Duration,
+) -> Result<Vec<String>> {
+    let keys = writer.prune_file_indexes(min_age)?;
+    let mut deleted = Vec::with_capacity(keys.len());
+    for key in keys {
+        match object_store
+            .delete(&crate::file_indexing::object_key(&key))
+            .await
+        {
+            Ok(())
+            | Err(object_store::Error::NotFound {
+                ..
+            }) => deleted.push(key),
+            Err(error) => {
+                tracing::warn!(%error, key, "ext_file_index: pruned row's object not deleted");
+            },
+        }
+    }
+    Ok(deleted)
+}
