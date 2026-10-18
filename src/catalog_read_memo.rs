@@ -529,7 +529,7 @@ fn listing_page(
 }
 
 /// Estimated memory one file of a listing holds.
-fn file_metadata_bytes(metadata: &DuckLakeFileMetadata) -> usize {
+pub(crate) fn file_metadata_bytes(metadata: &DuckLakeFileMetadata) -> usize {
     let file = &metadata.file;
     let delete_file = file.delete_file.as_ref().map_or(0, |delete_file| {
         size_of::<DuckLakeFileData>() + file_data_heap_bytes(delete_file)
