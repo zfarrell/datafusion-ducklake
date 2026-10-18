@@ -17,7 +17,7 @@
 //!     heavy_hitters    VARCHAR NOT NULL,  -- JSON [[value, count],...]
 //!     built_by         VARCHAR NOT NULL,  -- 'write' | 'compact' | 'backfill'
 //!     built_at         TIMESTAMP NOT NULL,
-//!     bucket_counts    VARCHAR,           -- W7 stretch; NULL until then
+//!     bucket_counts    VARCHAR,           -- JSON (crate::ext_file_index_counts); NULL = none
 //!     PRIMARY KEY (table_id, path, column_id)
 //! )
 //! ```
@@ -42,6 +42,11 @@ pub const TABLE: &str = "ext_ducklake_file_index";
 /// Table-scoped `ducklake_metadata` key: comma-separated top-level column
 /// names whose files get an index. Read by writes with the option on.
 pub const COLUMNS_SETTING: &str = "ext_file_index_columns";
+
+/// Table-scoped `ducklake_metadata` key: the top-level timestamp column the
+/// backfill records hourly heavy-hitter counts over
+/// ([`crate::ext_file_index_counts`]). Unset = no counts.
+pub const COUNT_COLUMN_SETTING: &str = "ext_file_index_count_column";
 
 /// One row to record: the reader-facing meta plus the object's store key.
 #[derive(Debug, Clone, PartialEq)]
@@ -94,7 +99,8 @@ pub(crate) const POSTGRES_DDL: &str = "CREATE TABLE IF NOT EXISTS ext_ducklake_f
 /// The columns every provider selects, in [`decode_row`]'s order.
 #[cfg(any(feature = "metadata-sqlite", feature = "multicatalog-postgres"))]
 pub(crate) const SELECT_COLUMNS: &str = "path, file_size_bytes, column_id, index_path, \
-     index_size_bytes, format_version, value_type, row_count, row_group_rows, heavy_hitters";
+     index_size_bytes, format_version, value_type, row_count, row_group_rows, heavy_hitters, \
+     bucket_counts";
 
 /// One sidecar row as read, in [`SELECT_COLUMNS`] order. `None` for a row
 /// this build cannot interpret (unknown value type, malformed JSON), which a
@@ -111,6 +117,7 @@ pub(crate) fn meta_from_parts(
     row_count: i64,
     row_group_rows: &str,
     heavy_hitters: &str,
+    bucket_counts: Option<&str>,
 ) -> Option<crate::ext_file_index::FileIndexMeta> {
     let value_type = IndexValueType::parse(value_type)?;
     Some(crate::ext_file_index::FileIndexMeta {
@@ -124,8 +131,10 @@ pub(crate) fn meta_from_parts(
         row_count,
         row_group_rows: decode_u64_list(row_group_rows)?,
         heavy_hitters: decode_heavy_hitters(heavy_hitters, value_type)?,
-        // Stored as NULL until W7 defines its encoding; read back as none.
-        bucket_counts: None,
+        // Malformed counts lose only the counts, never the index row.
+        bucket_counts: bucket_counts.and_then(|text| {
+            crate::ext_file_index_counts::bucket_counts_from_json(text, value_type)
+        }),
     })
 }
 
@@ -138,6 +147,7 @@ macro_rules! decode_file_index_row {
         let value_type: String = row.try_get(6)?;
         let row_group_rows: String = row.try_get(8)?;
         let heavy_hitters: String = row.try_get(9)?;
+        let bucket_counts: Option<String> = row.try_get(10)?;
         let format_version: i64 = row
             .try_get::<i32, _>(5)
             .map(i64::from)
@@ -153,6 +163,7 @@ macro_rules! decode_file_index_row {
             row.try_get(7)?,
             &row_group_rows,
             &heavy_hitters,
+            bucket_counts.as_deref(),
         )
     }};
 }
@@ -209,7 +220,7 @@ pub fn object_key(index_key: &str) -> object_store::path::Path {
 }
 
 #[cfg(feature = "write")]
-pub(crate) use write::{FileIndexBuilders, FileIndexColumn, FileIndexRequest};
+pub(crate) use write::{FileIndexBuilders, FileIndexColumn, FileIndexRequest, FileIndexTs};
 
 #[cfg(feature = "write")]
 mod write {
@@ -222,7 +233,7 @@ mod write {
 
     use super::{FileIndexRow, object_key};
     use crate::ext_file_index::{
-        IndexValueType, PostingBuilder, index_file_name, index_object_path,
+        BUCKET_GRAIN_HOUR_US, IndexValueType, PostingBuilder, index_file_name, index_object_path,
     };
     use crate::metadata_writer::MetadataWriter;
 
@@ -233,6 +244,14 @@ mod write {
         /// Top-level field index in the written (field-id-tagged) schema.
         pub(crate) field_index: usize,
         pub(crate) value_type: IndexValueType,
+    }
+
+    /// The time column hourly bucket counts are over, as read.
+    #[derive(Debug, Clone, Copy)]
+    pub(crate) struct FileIndexTs {
+        pub(crate) column_id: i64,
+        /// Column index in the batches fed to the builders.
+        pub(crate) field_index: usize,
     }
 
     /// What a write asks of each file under the `ext_file_index` option:
@@ -248,6 +267,7 @@ mod write {
         table_id: i64,
         built_by: &'static str,
         columns: Vec<FileIndexColumn>,
+        ts: Option<FileIndexTs>,
     }
 
     impl std::fmt::Debug for FileIndexRequest {
@@ -296,6 +316,9 @@ mod write {
                     table_id,
                     built_by,
                     columns,
+                    // Writes build postings only; bucket counts come from
+                    // the backfill (`with_count_column`).
+                    ts: None,
                 }))
             })
         }
@@ -308,6 +331,7 @@ mod write {
             table_id: i64,
             built_by: &'static str,
             columns: Vec<FileIndexColumn>,
+            ts: Option<FileIndexTs>,
         ) -> Self {
             Self(Arc::new(Inner {
                 metadata,
@@ -315,6 +339,7 @@ mod write {
                 table_id,
                 built_by,
                 columns,
+                ts,
             }))
         }
 
@@ -326,8 +351,18 @@ mod write {
                     .0
                     .columns
                     .iter()
-                    .map(|c| (c.clone(), PostingBuilder::new(c.column_id, c.value_type)))
+                    .map(|c| {
+                        let builder = PostingBuilder::new(c.column_id, c.value_type);
+                        let builder = match self.0.ts {
+                            Some(ts) => {
+                                builder.with_bucket_counts(ts.column_id, BUCKET_GRAIN_HOUR_US)
+                            },
+                            None => builder,
+                        };
+                        (c.clone(), builder)
+                    })
                     .collect(),
+                ts_field_index: self.0.ts.map(|ts| ts.field_index),
                 failed: false,
             }
         }
@@ -456,6 +491,8 @@ mod write {
     pub(crate) struct FileIndexBuilders {
         request: FileIndexRequest,
         columns: Vec<(FileIndexColumn, PostingBuilder)>,
+        /// Where the time column is in each batch, when counting buckets.
+        ts_field_index: Option<usize>,
         /// A batch failed to observe: the postings are incomplete, so nothing
         /// is recorded for this file.
         failed: bool,
@@ -477,11 +514,19 @@ mod write {
             if self.failed {
                 return;
             }
+            let ts = self
+                .ts_field_index
+                .and_then(|index| batch.columns().get(index));
             for (column, builder) in &mut self.columns {
                 let Some(array) = batch.columns().get(column.field_index) else {
                     self.failed = true;
                     return;
                 };
+                // A missing time column leaves the builder short of rows, so
+                // it records no counts.
+                if let Some(ts) = ts {
+                    builder.observe_ts(ts);
+                }
                 if let Err(error) = builder.observe(array) {
                     tracing::warn!(%error, "ext_file_index: postings incomplete; file unindexed");
                     self.failed = true;

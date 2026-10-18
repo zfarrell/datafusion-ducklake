@@ -7118,6 +7118,80 @@ impl PruningStatistics for FilePruningStatistics {
     }
 }
 
+/// EXPERIMENTAL (`ext_file_index_counts`): see [`crate::ext_file_index_counts`].
+impl DuckLakeTable {
+    pub(crate) fn ext_file_index_counts_enabled(&self) -> bool {
+        self.read_options.ext_file_index_counts
+    }
+
+    /// The DuckLake `column_id` of the top-level column `name`.
+    pub(crate) fn top_level_column_id(&self, name: &str) -> Option<i64> {
+        self.columns
+            .iter()
+            .find(|column| column.column_name == name)
+            .map(|column| column.column_id)
+    }
+
+    /// The files whose rows in `[req.lo, req.hi)` their recorded counts serve,
+    /// at this table's pinned snapshot. A failure counts no file.
+    pub(crate) fn resolve_bucket_counts(
+        &self,
+        req: &crate::ext_file_index_counts::BucketCountRequest,
+    ) -> crate::ext_file_index_counts::Resolution {
+        match self.try_resolve_bucket_counts(req) {
+            Ok(resolution) => resolution,
+            Err(error) => {
+                tracing::debug!(%error, "bucket counts unavailable; scanning every file");
+                Default::default()
+            },
+        }
+    }
+
+    fn try_resolve_bucket_counts(
+        &self,
+        req: &crate::ext_file_index_counts::BucketCountRequest,
+    ) -> DataFusionResult<crate::ext_file_index_counts::Resolution> {
+        let inlined_deletes = self.inlined_deletes_by_file()?;
+        let mut resolution = crate::ext_file_index_counts::Resolution::default();
+        for metadata in self.file_metadata_pages("bucket counts", None) {
+            let (table_files, _, _) = self.page_files_with_both_statistics(metadata?);
+            // Counts ignore deletes and snapshot filters, and are keyed by
+            // column id, so only plain files without deletes qualify.
+            let eligible: Vec<&DuckLakeTableFile> = table_files
+                .iter()
+                .filter(|tf| {
+                    tf.delete_file.is_none()
+                        && !inlined_deletes.contains_key(&tf.data_file_id)
+                        && !self.needs_snapshot_filter(tf)
+                        && tf.file.mapping_id.is_none()
+                })
+                .collect();
+            let rows = self.file_index_rows(&eligible, &[req.key_column_id]);
+            for tf in eligible {
+                let Some(meta) = rows.get(&(tf.file.path.clone(), req.key_column_id)) else {
+                    continue;
+                };
+                // A row applies only to the file it was built from.
+                if meta.file_size_bytes != tf.file.file_size_bytes
+                    || meta.format_version != crate::ext_file_index::FILE_INDEX_FORMAT_VERSION
+                    || meta.value_type != req.value_type
+                {
+                    continue;
+                }
+                if let Some(counts) = &meta.bucket_counts {
+                    resolution.add_file(tf, counts, req);
+                }
+            }
+        }
+        tracing::debug!(
+            counted_files = resolution.counted.len(),
+            buckets = resolution.buckets.len(),
+            "bucket counts resolved"
+        );
+        Ok(resolution)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

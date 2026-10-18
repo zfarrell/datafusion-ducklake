@@ -288,6 +288,9 @@ pub struct PostingBuilder {
     value_type: IndexValueType,
     rows_seen: u64,
     map: PostingMap,
+    /// Opt-in (W7): per-row time buckets, histogrammed per heavy hitter at
+    /// `finish` into [`BuiltIndex::bucket_counts`].
+    buckets: Option<crate::ext_file_index_counts::BucketCountBuilder>,
 }
 
 impl std::fmt::Debug for PostingBuilder {
@@ -316,6 +319,27 @@ impl PostingBuilder {
             value_type,
             rows_seen: 0,
             map,
+            buckets: None,
+        }
+    }
+
+    /// Also count each heavy hitter's rows per `grain_us` bucket of the time
+    /// column `ts_column_id`: feed that column to [`Self::observe_ts`] for
+    /// every batch given to [`Self::observe`]. Costs 4 B per row.
+    #[must_use]
+    pub fn with_bucket_counts(mut self, ts_column_id: i64, grain_us: i64) -> Self {
+        self.buckets = Some(crate::ext_file_index_counts::BucketCountBuilder::new(
+            ts_column_id,
+            grain_us,
+        ));
+        self
+    }
+
+    /// The batch's time column, when counting buckets. Never errors: a column
+    /// it cannot bucket leaves the file without counts.
+    pub fn observe_ts(&mut self, ts: &ArrayRef) {
+        if let Some(buckets) = &mut self.buckets {
+            buckets.observe(ts);
         }
     }
 
@@ -445,13 +469,23 @@ impl PostingBuilder {
             heavy.sort_by(|a, b| a.0.cmp(&b.0));
         }
 
+        // Counts only when every row was bucketed, in step with the postings.
+        let bucket_counts = self
+            .buckets
+            .filter(|b| b.rows_seen() == self.rows_seen)
+            .and_then(|b| {
+                b.finish(heavy.iter().filter_map(|(key, _)| {
+                    let i = entries.binary_search_by(|(k, _)| k.cmp(key)).ok()?;
+                    Some((key.clone(), entries[i].1.as_slice()))
+                }))
+            });
         let bytes = write_object(self.column_id, self.value_type, self.rows_seen, &entries)?;
         Ok(BuiltIndex {
             bytes,
             row_count: self.rows_seen,
             row_group_rows,
             heavy_hitters: heavy,
-            bucket_counts: None,
+            bucket_counts,
         })
     }
 }

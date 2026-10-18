@@ -55,6 +55,11 @@ pub struct DuckLakeReadOptions {
     /// that an equality or `IN` filter on an indexed column cannot match. Off
     /// by default: the table is never read, and scans plan as without it.
     pub ext_file_index: bool,
+    /// EXPERIMENTAL: whether [`crate::ext_file_index_counts::BucketCountRule`]
+    /// may answer `count(*) GROUP BY date_trunc('hour', ts)` for this table
+    /// from the per-file bucket counts in `ext_ducklake_file_index`. Off by
+    /// default: the rule leaves the table's plans alone.
+    pub ext_file_index_counts: bool,
 }
 
 impl DuckLakeReadOptions {
@@ -89,6 +94,14 @@ impl DuckLakeReadOptions {
     #[must_use]
     pub fn with_ext_file_index(mut self, enabled: bool) -> Self {
         self.ext_file_index = enabled;
+        self
+    }
+
+    /// EXPERIMENTAL: let [`crate::ext_file_index_counts::BucketCountRule`]
+    /// serve whole hours from recorded per-file bucket counts. Off by default.
+    #[must_use]
+    pub fn with_ext_file_index_counts(mut self, enabled: bool) -> Self {
+        self.ext_file_index_counts = enabled;
         self
     }
 }

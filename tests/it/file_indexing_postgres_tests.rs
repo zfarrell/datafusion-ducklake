@@ -303,3 +303,48 @@ async fn backfill_then_prune() {
     );
     assert_eq!(env.metas().await.len(), 2, "live files keep their rows");
 }
+
+/// `bucket_counts` (W7) round-trips through the Postgres writer and the
+/// multicatalog reader, and a row without counts reads back without them.
+#[tokio::test(flavor = "multi_thread")]
+async fn bucket_counts_round_trip() {
+    use datafusion_ducklake::ext_file_index::{BUCKET_GRAIN_HOUR_US, BucketCounts};
+    let env = Env::new().await;
+    env.append(batch(0..350)).await;
+    env.backfill().await;
+    let mut metas = env.metas().await;
+    assert!(metas.iter().all(|m| m.bucket_counts.is_none()));
+    let h = BUCKET_GRAIN_HOUR_US;
+    let counts = BucketCounts {
+        ts_column_id: 99,
+        grain_us: h,
+        keys: vec![
+            (
+                IndexKey::Utf8(b"u0".to_vec().into()),
+                vec![(-h, 3), (0, 18)],
+            ),
+            (IndexKey::Utf8(b"u1".to_vec().into()), vec![(5 * h, 21)]),
+        ],
+    };
+    metas[0].bucket_counts = Some(counts.clone());
+    let path = metas[0].path.clone();
+    env.writer()
+        .await
+        .record_file_indexes(
+            env.table_id,
+            "backfill",
+            &[FileIndexRow {
+                meta: metas[0].clone(),
+                index_key: "unused/key.pidx".to_string(),
+            }],
+        )
+        .unwrap();
+    let back = env.metas().await;
+    let row = back.iter().find(|m| m.path == path).unwrap();
+    assert_eq!(row.bucket_counts.as_ref(), Some(&counts));
+    assert!(
+        back.iter()
+            .filter(|m| m.path != path)
+            .all(|m| m.bucket_counts.is_none())
+    );
+}

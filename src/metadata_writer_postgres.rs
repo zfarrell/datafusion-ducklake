@@ -6952,6 +6952,15 @@ impl MetadataWriter for PostgresMetadataWriter {
             .iter()
             .map(|r| encode_heavy_hitters(&r.meta.heavy_hitters))
             .collect();
+        let bucket_counts: Vec<Option<String>> = rows
+            .iter()
+            .map(|r| {
+                r.meta
+                    .bucket_counts
+                    .as_ref()
+                    .map(crate::ext_file_index_counts::bucket_counts_to_json)
+            })
+            .collect();
         self.block_on(async {
             // A rebuild of the same object wins: same bytes, so only the
             // builder (a newer format) can differ.
@@ -6960,13 +6969,13 @@ impl MetadataWriter for PostgresMetadataWriter {
                     "INSERT INTO ext_ducklake_file_index
                          (table_id, path, file_size_bytes, column_id, index_path, index_key,
                           index_size_bytes, format_version, value_type, row_count,
-                          row_group_rows, heavy_hitters, built_by)
+                          row_group_rows, heavy_hitters, built_by, bucket_counts)
                      SELECT $1, u.path, u.size, u.col, u.ipath, u.ikey, u.isize, u.ver, u.vt,
-                            u.rows, u.groups, u.hh, $13
+                            u.rows, u.groups, u.hh, $13, u.bc
                      FROM UNNEST($2::text[], $3::bigint[], $4::bigint[], $5::text[], $6::text[],
                                  $7::bigint[], $8::int[], $9::text[], $10::bigint[], $11::text[],
-                                 $12::text[])
-                          AS u(path, size, col, ipath, ikey, isize, ver, vt, rows, groups, hh)
+                                 $12::text[], $14::text[])
+                          AS u(path, size, col, ipath, ikey, isize, ver, vt, rows, groups, hh, bc)
                      ON CONFLICT (table_id, path, column_id) DO UPDATE SET
                          file_size_bytes = EXCLUDED.file_size_bytes,
                          index_path = EXCLUDED.index_path,
@@ -6978,6 +6987,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                          row_group_rows = EXCLUDED.row_group_rows,
                          heavy_hitters = EXCLUDED.heavy_hitters,
                          built_by = EXCLUDED.built_by,
+                         bucket_counts = EXCLUDED.bucket_counts,
                          built_at = now()",
                 )
                 .bind(table_id)
@@ -6993,6 +7003,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                 .bind(&groups)
                 .bind(&hitters)
                 .bind(built_by)
+                .bind(&bucket_counts)
                 .execute(&self.pool)
             };
             // Created only when missing, as for ext_ducklake_file_order.
