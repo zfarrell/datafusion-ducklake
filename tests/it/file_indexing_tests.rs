@@ -773,6 +773,7 @@ fn sample_meta() -> datafusion_ducklake::ext_file_index::FileIndexMeta {
         row_count: 1,
         row_group_rows: vec![1],
         heavy_hitters: vec![],
+        bucket_counts: None,
     }
 }
 
@@ -1039,4 +1040,58 @@ async fn renamed_column_keeps_its_rows() {
         "already indexed under its id: {result:?}"
     );
     assert_eq!(env.rows().await.len(), before.len());
+}
+
+/// The read side's contract: the provider's rows, resolved from the data
+/// file's directory and looked up through the format library, give exactly
+/// the positions of each key, including keys the file lacks.
+#[tokio::test(flavor = "multi_thread")]
+async fn provider_rows_serve_exact_lookups() {
+    use datafusion_ducklake::metadata_provider::MetadataProvider;
+    let env = indexed_env().await;
+    env.append(&[batch(0..700), batch(700..1_000)], &options())
+        .await;
+    env.append(&[batch(1_000..1_400)], &options()).await;
+    env.backfill().await;
+
+    let ids = env.column_ids().await;
+    let live = env.live_files().await;
+    let paths: Vec<&str> = live.iter().map(|(p, _)| p.as_str()).collect();
+    let provider = SqliteMetadataProvider::new(&env.url()).await.unwrap();
+    let metas = provider
+        .file_indexes(env.table_id, &paths, &[ids["user_id"], ids["n"]])
+        .unwrap();
+    assert_eq!(metas.len(), live.len() * 2);
+    for meta in &metas {
+        let (_, size) = live.iter().find(|(p, _)| *p == meta.path).unwrap();
+        assert_eq!(meta.file_size_bytes, *size);
+        let data = env.data_file(&meta.path);
+        let location =
+            ObjectPath::from_filesystem_path(data.parent().unwrap().join(&meta.index_path))
+                .unwrap();
+        let (postings, _) = brute_force(&data);
+        let column = if meta.column_id == ids["n"] {
+            "n"
+        } else {
+            "user_id"
+        };
+        let mut keys: Vec<IndexKey> = postings[column].keys().cloned().collect();
+        keys.push(match meta.value_type {
+            datafusion_ducklake::ext_file_index::IndexValueType::Int64 => IndexKey::Int64(-99),
+            _ => IndexKey::Utf8(b"absent".to_vec().into()),
+        });
+        for key in &keys {
+            let got = datafusion_ducklake::ext_file_index::lookup_postings(
+                env.store(),
+                &location,
+                meta,
+                std::slice::from_ref(key),
+                None,
+            )
+            .await
+            .unwrap();
+            let want = postings[column].get(key).cloned().unwrap_or_default();
+            assert_eq!(got.rows, want, "{} {column} {key:?}", meta.path);
+        }
+    }
 }

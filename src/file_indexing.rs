@@ -124,6 +124,8 @@ pub(crate) fn meta_from_parts(
         row_count,
         row_group_rows: decode_u64_list(row_group_rows)?,
         heavy_hitters: decode_heavy_hitters(heavy_hitters, value_type)?,
+        // Stored as NULL until W7 defines its encoding; read back as none.
+        bucket_counts: None,
     })
 }
 
