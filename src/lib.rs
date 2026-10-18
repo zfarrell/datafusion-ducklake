@@ -82,6 +82,7 @@ pub mod encryption;
 pub mod error;
 pub mod ext_file_order;
 pub(crate) mod field_id_adapter;
+pub mod file_index_scan;
 pub(crate) mod file_ordering;
 pub mod information_schema;
 pub mod inlined_filter;

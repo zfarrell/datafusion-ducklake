@@ -1354,6 +1354,11 @@ pub struct DuckLakeTable {
     /// remembered key stays true; a remembered `None` can only miss a row
     /// recorded later (the verify job), until the table is built again.
     file_order_memo: Arc<std::sync::Mutex<FileOrderMemo>>,
+    /// The `ext_file_index` sidecar's rows this table's scans have read, by
+    /// `(path, column_id)`. Shared with every clone. A row describes immutable
+    /// bytes (it is checked against the listed size on use), so it is kept; an
+    /// absence is kept only briefly, so a backfill is picked up.
+    file_index_memo: Arc<std::sync::Mutex<FileIndexMemo>>,
     /// How this table reuses what its scans read. The delete memo is off by
     /// default.
     read_options: DuckLakeReadOptions,
@@ -1515,6 +1520,7 @@ impl DuckLakeTable {
             inlined_materialized_row_count: Arc::new(AtomicUsize::new(0)),
             inlined_absent_through: Arc::new(AtomicI64::new(i64::MIN)),
             file_order_memo: Arc::default(),
+            file_index_memo: Arc::default(),
             read_options: DuckLakeReadOptions::default(),
             delete_memo: None,
             #[cfg(feature = "write")]
@@ -3270,6 +3276,7 @@ impl DuckLakeTable {
         summary_statistics: &HashMap<i64, Arc<Statistics>>,
         projection: Option<&Vec<usize>>,
         limit: Option<usize>,
+        index_decisions: &FileIndexDecisions,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         // A name-mapped file reads under the schema its mapping describes, which
         // can differ from file to file. Files sharing a mapped schema share one
@@ -3281,7 +3288,11 @@ impl DuckLakeTable {
         let mut group_index: HashMap<String, usize> = HashMap::new();
 
         for table_file in files {
-            let pf = self.partitioned_data_file(table_file, false, file_statistics)?;
+            let pf = with_file_index_selection(
+                self.partitioned_data_file(table_file, false, file_statistics)?,
+                table_file.data_file_id,
+                index_decisions,
+            );
             let (mapping, key, resolved_by_field_id) = match table_file.file.mapping_id {
                 Some(mapping_id) => {
                     let resolved_path = self.resolve_file_path(&table_file.file)?;
@@ -3302,8 +3313,17 @@ impl DuckLakeTable {
 
             // Kept positionally alongside the group's files so the rollup can
             // refuse a group where any file lacks a summary, rather than
-            // silently merging a subset.
-            let summary = summary_statistics.get(&table_file.data_file_id).cloned();
+            // silently merging a subset. A file read through an index
+            // selection publishes none: its row count is not what it yields.
+            let summary = summary_statistics
+                .get(&table_file.data_file_id)
+                .filter(|_| {
+                    !matches!(
+                        index_decisions.get(&table_file.data_file_id),
+                        Some(crate::file_index_scan::FileDecision::Select { .. })
+                    )
+                })
+                .cloned();
             match group_index.get(&key) {
                 Some(&gi) => {
                     groups[gi].files.push(pf);
@@ -4745,6 +4765,7 @@ impl DuckLakeTable {
             inlined_materialized_row_count: Arc::clone(&self.inlined_materialized_row_count),
             inlined_absent_through: Arc::clone(&self.inlined_absent_through),
             file_order_memo: Arc::clone(&self.file_order_memo),
+            file_index_memo: Arc::clone(&self.file_index_memo),
             read_options: self.read_options.clone(),
             delete_memo: self.delete_memo.clone(),
             #[cfg(feature = "encryption")]
@@ -5525,6 +5546,41 @@ pub(crate) struct FileUpdateOutput {
 /// key, `None` for no row.
 type FileOrderMemo = HashMap<(String, i64), Option<String>>;
 
+/// See `DuckLakeTable::file_index_memo`.
+type FileIndexMemo = HashMap<(String, i64), FileIndexMemoEntry>;
+
+#[derive(Clone, Debug)]
+enum FileIndexMemoEntry {
+    Row(Arc<crate::ext_file_index::FileIndexMeta>),
+    /// No row when asked at this instant.
+    Absent(std::time::Instant),
+}
+
+/// How long a remembered absence of a sidecar row holds.
+const FILE_INDEX_ABSENT_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// EXPERIMENTAL (`ext_file_index`): each file's decision, by `data_file_id`.
+/// Files without an entry scan as before.
+type FileIndexDecisions = HashMap<i64, crate::file_index_scan::FileDecision>;
+
+/// `pf` with the access plan and coverage the index decided for it, if any.
+fn with_file_index_selection(
+    mut pf: PartitionedFile,
+    data_file_id: i64,
+    decisions: &FileIndexDecisions,
+) -> PartitionedFile {
+    if let Some(crate::file_index_scan::FileDecision::Select {
+        plan,
+        coverage,
+        ..
+    }) = decisions.get(&data_file_id)
+    {
+        pf.extensions.insert_arc(Arc::clone(plan));
+        pf.extensions.insert_arc(Arc::clone(coverage));
+    }
+    pf
+}
+
 /// EXPERIMENTAL (`ext_file_order`): the ordered alternative's ingredients,
 /// gathered across a scan's pages of files and only used if a sort asks for
 /// them (see [`crate::order_on_request`]).
@@ -5555,6 +5611,7 @@ impl DuckLakeTable {
         recipe: &mut OrderRecipe,
         files: &[&DuckLakeTableFile],
         file_statistics: &HashMap<i64, Arc<Statistics>>,
+        index_decisions: &FileIndexDecisions,
     ) -> DataFusionResult<()> {
         if !recipe.ok {
             return Ok(());
@@ -5564,11 +5621,11 @@ impl DuckLakeTable {
             Some((ordering, ids)) if recipe.ordering.as_ref().is_none_or(|o| *o == ordering) => {
                 for table_file in files {
                     if ids.contains(&table_file.data_file_id) {
-                        recipe.files.push(self.partitioned_data_file(
-                            table_file,
-                            false,
-                            file_statistics,
-                        )?);
+                        recipe.files.push(with_file_index_selection(
+                            self.partitioned_data_file(table_file, false, file_statistics)?,
+                            table_file.data_file_id,
+                            index_decisions,
+                        ));
                     }
                 }
                 recipe.ordering = Some(ordering);
@@ -5612,6 +5669,299 @@ impl DuckLakeTable {
                     options.optimizer.repartition_file_min_size,
                 )
             }),
+        ))
+    }
+
+    /// Whether scans read the `ext_file_index` sidecar (see
+    /// [`DuckLakeReadOptions::with_ext_file_index`]).
+    fn ext_file_index_enabled(&self) -> bool {
+        self.read_options.ext_file_index
+    }
+
+    /// The `ext_ducklake_file_index` rows for `files` x `column_ids`, by
+    /// `(path, column_id)`: one sidecar query for the pairs not yet in
+    /// [`Self::file_index_memo`], none once all are. A failed lookup is
+    /// remembered as nothing, so the next scan asks again.
+    fn file_index_rows(
+        &self,
+        files: &[&DuckLakeTableFile],
+        column_ids: &[i64],
+    ) -> HashMap<(String, i64), Arc<crate::ext_file_index::FileIndexMeta>> {
+        let memo = || {
+            self.file_index_memo
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        };
+        let known = |entry: Option<&FileIndexMemoEntry>| match entry {
+            Some(FileIndexMemoEntry::Row(_)) => true,
+            Some(FileIndexMemoEntry::Absent(at)) => at.elapsed() < FILE_INDEX_ABSENT_TTL,
+            None => false,
+        };
+        let unknown: Vec<&str> = {
+            let memo = memo();
+            files
+                .iter()
+                .filter(|tf| {
+                    column_ids
+                        .iter()
+                        .any(|&c| !known(memo.get(&(tf.file.path.clone(), c))))
+                })
+                .map(|tf| tf.file.path.as_str())
+                .collect()
+        };
+        // The lock is not held across the query: a concurrent scan may ask
+        // too, and both store the same answer.
+        if !unknown.is_empty() {
+            match self
+                .provider
+                .file_indexes(self.table_id, &unknown, column_ids)
+            {
+                Ok(rows) => {
+                    let now = std::time::Instant::now();
+                    let mut memo = memo();
+                    if memo.len() + unknown.len() * column_ids.len()
+                        > crate::file_index_scan::MEMO_MAX_ENTRIES
+                    {
+                        memo.clear();
+                    }
+                    for &path in &unknown {
+                        for &c in column_ids {
+                            memo.insert((path.to_string(), c), FileIndexMemoEntry::Absent(now));
+                        }
+                    }
+                    for row in rows {
+                        if column_ids.contains(&row.column_id) {
+                            memo.insert(
+                                (row.path.clone(), row.column_id),
+                                FileIndexMemoEntry::Row(Arc::new(row)),
+                            );
+                        }
+                    }
+                },
+                Err(error) => {
+                    tracing::debug!(%error, "ext_file_index lookup failed; scanning without it");
+                },
+            }
+        }
+        let memo = memo();
+        let mut out = HashMap::new();
+        for tf in files {
+            for &c in column_ids {
+                let key = (tf.file.path.clone(), c);
+                if let Some(FileIndexMemoEntry::Row(row)) = memo.get(&key) {
+                    out.insert(key, Arc::clone(row));
+                }
+            }
+        }
+        out
+    }
+
+    /// EXPERIMENTAL (`ext_file_index`): what the index decides for each of
+    /// `files` under the cheapest of `predicates` (see
+    /// [`crate::file_index_scan`]). `selectable` says whether a file may be
+    /// read through a selection; any other file is only ever dropped. Empty
+    /// when no file has a usable row.
+    async fn file_index_decisions(
+        &self,
+        state: &dyn Session,
+        predicates: &[crate::file_index_scan::IndexPredicate],
+        files: &[&DuckLakeTableFile],
+        selectable: impl Fn(&DuckLakeTableFile) -> bool,
+    ) -> FileIndexDecisions {
+        use crate::file_index_scan::{
+            FallbackReason, FileDecision, ScanSummary, estimated_postings, usable_meta,
+        };
+        use futures::StreamExt;
+
+        // A name-mapped file resolves its columns by name, not field id; it
+        // is scanned as before.
+        let files: Vec<&DuckLakeTableFile> = files
+            .iter()
+            .copied()
+            .filter(|tf| tf.file.mapping_id.is_none())
+            .collect();
+        if predicates.is_empty() || files.is_empty() {
+            return HashMap::new();
+        }
+        let started = std::time::Instant::now();
+        let mut column_ids: Vec<i64> = predicates.iter().map(|p| p.column_id).collect();
+        column_ids.sort_unstable();
+        column_ids.dedup();
+        let rows = self.file_index_rows(&files, &column_ids);
+
+        let meta_for = |tf: &DuckLakeTableFile, p: &crate::file_index_scan::IndexPredicate| {
+            usable_meta(
+                rows.get(&(tf.file.path.clone(), p.column_id))
+                    .map(Arc::as_ref),
+                tf.file.file_size_bytes,
+                tf.max_row_count,
+                p,
+            )
+        };
+        // The conjunct predicted to leave the fewest rows; a file it cannot
+        // answer counts as all its rows.
+        let Some(predicate) = predicates.iter().min_by_key(|p| {
+            files
+                .iter()
+                .map(|tf| match meta_for(tf, p) {
+                    Ok(meta) => estimated_postings(meta, p),
+                    Err(_) => tf.max_row_count.unwrap_or(i64::MAX).max(0) as u64,
+                })
+                .fold(0u64, u64::saturating_add)
+        }) else {
+            return HashMap::new();
+        };
+
+        let mut decisions = FileIndexDecisions::new();
+        let mut lookups = Vec::new();
+        for tf in &files {
+            match meta_for(tf, predicate) {
+                Err(reason) => {
+                    decisions.insert(tf.data_file_id, FileDecision::Scan(reason));
+                },
+                // Its postings are certainly not empty, and while the filter
+                // stays, a selection over every page buys nothing.
+                Ok(meta)
+                    if predicate
+                        .keys
+                        .iter()
+                        .any(|k| meta.heavy_hitter_count(k).is_some()) =>
+                {
+                    decisions.insert(
+                        tf.data_file_id,
+                        FileDecision::Scan(FallbackReason::HeavyHitter),
+                    );
+                },
+                Ok(_) => {
+                    let meta = Arc::clone(&rows[&(tf.file.path.clone(), predicate.column_id)]);
+                    lookups.push((
+                        tf.data_file_id,
+                        self.file_index_location(tf, &meta),
+                        meta,
+                        selectable(tf),
+                    ));
+                },
+            }
+        }
+        if !lookups.is_empty() {
+            let store = match state
+                .runtime_env()
+                .object_store(self.object_store_url.as_ref())
+            {
+                Ok(store) => store,
+                Err(error) => {
+                    tracing::debug!(%error, "ext_file_index: no object store; scanning without it");
+                    return HashMap::new();
+                },
+            };
+            let metadata_cache = Some(state.runtime_env().cache_manager.get_file_metadata_cache());
+            let cache = crate::ext_file_index::PostingCache::global();
+            let keys: Arc<[crate::ext_file_index::IndexKey]> = predicate.keys.clone().into();
+            let column_id = predicate.column_id;
+            // Owned inputs only: the futures must not borrow the scan's
+            // locals (the scan future is `Send` for any lifetime).
+            let results: Vec<(i64, FileDecision)> = futures::stream::iter(lookups)
+                .map(move |(data_file_id, location, meta, selectable)| {
+                    let store = Arc::clone(&store);
+                    let metadata_cache = metadata_cache.clone();
+                    let keys = Arc::clone(&keys);
+                    async move {
+                        let Some(location) = location else {
+                            return (
+                                data_file_id,
+                                FileDecision::Scan(FallbackReason::LookupError),
+                            );
+                        };
+                        let decision = match crate::ext_file_index::lookup_postings_cached(
+                            cache,
+                            store,
+                            &location,
+                            &meta,
+                            &keys,
+                            metadata_cache,
+                        )
+                        .await
+                        {
+                            Err(error) => {
+                                tracing::debug!(%error, %location, "ext_file_index lookup failed");
+                                FileDecision::Scan(FallbackReason::LookupError)
+                            },
+                            Ok(postings) if postings.rows.is_empty() => FileDecision::Drop,
+                            Ok(_) if !selectable => {
+                                FileDecision::Scan(FallbackReason::NotSelectable)
+                            },
+                            Ok(postings) => {
+                                match crate::ext_file_index::access_plan(
+                                    &postings,
+                                    &meta.row_group_rows,
+                                ) {
+                                    Some(plan) => FileDecision::Select {
+                                        plan: Arc::new(plan),
+                                        coverage: Arc::new(
+                                            crate::ext_file_index::FileIndexCoverage {
+                                                column_id,
+                                                keys: keys.to_vec(),
+                                            },
+                                        ),
+                                        rows_selected: postings.rows.len() as u64,
+                                    },
+                                    None => FileDecision::Scan(FallbackReason::NoAccessPlan),
+                                }
+                            },
+                        };
+                        (data_file_id, decision)
+                    }
+                })
+                .buffer_unordered(crate::file_index_scan::LOOKUP_CONCURRENCY)
+                .collect()
+                .await;
+            decisions.extend(results);
+        }
+
+        let mut summary = ScanSummary {
+            column_id: predicate.column_id,
+            keys: predicate.keys.len(),
+            lookup_micros: started.elapsed().as_micros() as u64,
+            ..ScanSummary::default()
+        };
+        decisions.values().for_each(|d| summary.add(d));
+        crate::file_index_scan::FileIndexReadStats::global().record(&summary);
+        tracing::debug!(
+            table_id = self.table_id,
+            column_id = summary.column_id,
+            keys = summary.keys,
+            files = files.len(),
+            files_pruned = summary.files_pruned,
+            files_selected = summary.files_selected,
+            rows_selected = summary.rows_selected,
+            lookup_us = summary.lookup_micros,
+            fallback = ?summary.fallback,
+            "ext_file_index"
+        );
+        decisions
+    }
+
+    /// Where `meta`'s index object lives: `index_path` in the data file's
+    /// directory.
+    fn file_index_location(
+        &self,
+        table_file: &DuckLakeTableFile,
+        meta: &crate::ext_file_index::FileIndexMeta,
+    ) -> Option<ObjectPath> {
+        let data = self.partitioned_file(&table_file.file).ok()?;
+        let parts: Vec<_> = data.object_meta.location.parts().collect();
+        let (_, dir) = parts.split_last()?;
+        let mut index_parts = Vec::new();
+        for segment in meta.index_path.split('/') {
+            // `index_path` names a file beside the data file; anything that
+            // climbs out of the directory is not ours to read.
+            if segment.is_empty() || segment == "." || segment == ".." {
+                return None;
+            }
+            index_parts.push(object_store::path::PathPart::from(segment));
+        }
+        Some(ObjectPath::from_iter(
+            dir.iter().cloned().chain(index_parts),
         ))
     }
 
@@ -5912,6 +6262,16 @@ impl TableProvider for DuckLakeTable {
         // (`session_parquet_source`), so an `IN` list that prunes row groups
         // prunes files too instead of the two layers disagreeing.
         let max_in_list_size = state.config_options().execution.parquet.max_in_list_size;
+        let index_predicates = if self.ext_file_index_enabled() {
+            let column_ids: Vec<i64> = self.columns.iter().map(|c| c.column_id).collect();
+            crate::file_index_scan::eligible_predicates(
+                &conjuncts,
+                &self.physical_schema,
+                &column_ids,
+            )
+        } else {
+            Vec::new()
+        };
         let pruning = match self.pruning_predicates(conjuncts, Some(max_in_list_size)) {
             Ok(pruning) => pruning,
             Err(error) => {
@@ -5928,6 +6288,26 @@ impl TableProvider for DuckLakeTable {
 
             let table_files =
                 self.prune_table_files_iteratively(&pruning, &table_files, &file_statistics);
+            // EXPERIMENTAL `ext_file_index`: drop files the index proves hold
+            // no match, before any of them is grouped or chained; only files
+            // without deletes or snapshot filters get a selection (v1).
+            let index_decisions = self
+                .file_index_decisions(state, &index_predicates, &table_files, |tf| {
+                    !rowid_in_proj
+                        && !self.needs_snapshot_filter(tf)
+                        && tf.delete_file.is_none()
+                        && !inlined_deletes.contains_key(&tf.data_file_id)
+                })
+                .await;
+            let table_files: Vec<&DuckLakeTableFile> = table_files
+                .into_iter()
+                .filter(|tf| {
+                    !matches!(
+                        index_decisions.get(&tf.data_file_id),
+                        Some(crate::file_index_scan::FileDecision::Drop)
+                    )
+                })
+                .collect();
 
             if rowid_in_proj {
                 let rowid_idx = rowid_idx.unwrap();
@@ -5993,6 +6373,7 @@ impl TableProvider for DuckLakeTable {
                     &mut order_recipe,
                     &files_without_deletes,
                     &file_statistics,
+                    &index_decisions,
                 )?;
                 execs.push(self.build_exec_for_files_without_deletes(
                     state,
@@ -6001,6 +6382,7 @@ impl TableProvider for DuckLakeTable {
                     &summary_statistics,
                     projection,
                     limit,
+                    &index_decisions,
                 )?);
             }
             if !files_with_deletes.is_empty() {

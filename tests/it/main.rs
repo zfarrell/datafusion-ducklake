@@ -39,6 +39,7 @@ mod early_upload_tests;
 mod empty_data_file_tests;
 mod encrypted_catalog_write_tests;
 mod encryption_tests;
+mod file_index_read_tests;
 mod file_ordering_postgres_tests;
 mod file_ordering_tests;
 mod files_matching_tests;

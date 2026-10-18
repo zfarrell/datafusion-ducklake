@@ -50,6 +50,11 @@ pub struct DuckLakeReadOptions {
     /// from the files it records, in order and without a sort. Off by default:
     /// the table is never read, and scans plan as without this option.
     pub ext_file_order: bool,
+    /// EXPERIMENTAL: whether scans read the `ext_ducklake_file_index` table
+    /// (see [`crate::ext_file_index`]) to skip files, and rows within files,
+    /// that an equality or `IN` filter on an indexed column cannot match. Off
+    /// by default: the table is never read, and scans plan as without it.
+    pub ext_file_index: bool,
 }
 
 impl DuckLakeReadOptions {
@@ -76,6 +81,14 @@ impl DuckLakeReadOptions {
     #[must_use]
     pub fn with_ext_file_order(mut self, enabled: bool) -> Self {
         self.ext_file_order = enabled;
+        self
+    }
+
+    /// EXPERIMENTAL: prune files and rows by the per-file secondary index; see
+    /// [`Self::ext_file_index`].
+    #[must_use]
+    pub fn with_ext_file_index(mut self, enabled: bool) -> Self {
+        self.ext_file_index = enabled;
         self
     }
 }

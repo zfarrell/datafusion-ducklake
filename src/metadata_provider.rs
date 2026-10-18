@@ -2758,6 +2758,19 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         Ok(Vec::new())
     }
 
+    /// EXPERIMENTAL (`ext_file_index`): the sidecar rows of `table_id` for
+    /// `paths` and `column_ids` (see [`crate::ext_file_index`]). A file without
+    /// a row, or whose row does not match its size, is scanned without the
+    /// index, so the default (no rows) is always correct.
+    fn file_indexes(
+        &self,
+        _table_id: i64,
+        _paths: &[&str],
+        _column_ids: &[i64],
+    ) -> Result<Vec<crate::ext_file_index::FileIndexMeta>> {
+        Ok(Vec::new())
+    }
+
     /// Load one keyset-paginated batch of visible files and their statistics.
     ///
     /// `after_data_file_id` is exclusive. Implementations must return records
