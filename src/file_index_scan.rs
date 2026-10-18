@@ -228,7 +228,9 @@ pub struct FileIndexReadStatsSnapshot {
     pub files_selected: u64,
     pub rows_selected: u64,
     pub lookup_micros: u64,
-    /// `(reason, files)` for each [`FallbackReason`].
+    /// `(reason, files)` for each fallback reason: `no_row`, `stale_size`,
+    /// `mismatch`, `lookup_error`, `heavy_hitter`, `no_access_plan`,
+    /// `not_selectable`.
     pub fallback: Vec<(&'static str, u64)>,
 }
 
