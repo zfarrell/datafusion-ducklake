@@ -6163,6 +6163,11 @@ impl DuckLakeTable {
             let cache = crate::ext_file_index::PostingCache::global();
             let keys: Arc<[crate::ext_file_index::IndexKey]> = predicate.keys.clone().into();
             let column_id = predicate.column_id;
+            let column_name = self
+                .physical_schema
+                .field(predicate.field_index)
+                .name()
+                .clone();
             // Owned inputs only: the futures must not borrow the scan's
             // locals (the scan future is `Send` for any lifetime).
             let results: Vec<(i64, FileDecision)> = futures::stream::iter(lookups)
@@ -6170,6 +6175,7 @@ impl DuckLakeTable {
                     let store = Arc::clone(&store);
                     let metadata_cache = metadata_cache.clone();
                     let keys = Arc::clone(&keys);
+                    let column_name = column_name.clone();
                     async move {
                         let Some(location) = location else {
                             return (
@@ -6205,6 +6211,7 @@ impl DuckLakeTable {
                                         coverage: Arc::new(
                                             crate::ext_file_index::FileIndexCoverage {
                                                 column_id,
+                                                column_name,
                                                 keys: keys.to_vec(),
                                             },
                                         ),

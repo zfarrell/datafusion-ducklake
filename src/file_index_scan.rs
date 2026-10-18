@@ -435,6 +435,7 @@ mod tests {
             row_count: 10,
             row_group_rows: vec![4, 6],
             heavy_hitters: vec![],
+            bucket_counts: None,
         }
     }
 
