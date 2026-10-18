@@ -1,5 +1,6 @@
-//! EXPERIMENTAL, opt-in: the write side of the per-file secondary index (see
-//! [`crate::ext_file_index`] for the object format) and its catalog sidecar:
+//! EXPERIMENTAL, opt-in: the catalog sidecar of the per-file secondary index
+//! (see [`crate::ext_file_index`] for the object format), and how
+//! `DuckLakeTable::build_file_indexes` stores an index:
 //!
 //! ```sql
 //! CREATE TABLE ext_ducklake_file_index (
@@ -17,6 +18,7 @@
 //!     heavy_hitters    VARCHAR NOT NULL,  -- JSON [[value, count],...]
 //!     built_by         VARCHAR NOT NULL,  -- 'write' | 'compact' | 'backfill'
 //!     built_at         TIMESTAMP NOT NULL,
+//!     bucket_counts    VARCHAR,           -- W7 stretch; NULL until then
 //!     PRIMARY KEY (table_id, path, column_id)
 //! )
 //! ```
@@ -27,9 +29,10 @@
 //! missing row means "scan normally". `index_key` is stored because prune
 //! runs after expiry, when the table's path chain may no longer resolve.
 //!
-//! Writes are best effort: the index object is PUT after the data object, and
-//! the row is recorded after the index object, so a row never normally
-//! points at a missing object. Any failure warns and leaves the file unindexed.
+//! Indexes are built by the backfill only (writes and compaction outputs get
+//! none yet; they scan normally until the backfill reaches them). The index
+//! object is PUT before its row is recorded, so a row never normally points at
+//! a missing object; a failure leaves the file unindexed.
 
 use crate::ext_file_index::{IndexKey, IndexValueType};
 
@@ -64,6 +67,7 @@ pub(crate) const SQLITE_DDL: &str = "CREATE TABLE IF NOT EXISTS ext_ducklake_fil
     heavy_hitters VARCHAR NOT NULL,
     built_by VARCHAR NOT NULL,
     built_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    bucket_counts VARCHAR,
     PRIMARY KEY (table_id, path, column_id)
 )";
 
@@ -83,6 +87,7 @@ pub(crate) const POSTGRES_DDL: &str = "CREATE TABLE IF NOT EXISTS ext_ducklake_f
     heavy_hitters VARCHAR NOT NULL,
     built_by VARCHAR NOT NULL,
     built_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    bucket_counts VARCHAR,
     PRIMARY KEY (table_id, path, column_id)
 )";
 
@@ -119,6 +124,8 @@ pub(crate) fn meta_from_parts(
         row_count,
         row_group_rows: decode_u64_list(row_group_rows)?,
         heavy_hitters: decode_heavy_hitters(heavy_hitters, value_type)?,
+        // Stored as NULL until W7 defines its encoding; read back as none.
+        bucket_counts: None,
     })
 }
 
@@ -202,13 +209,12 @@ pub fn object_key(index_key: &str) -> object_store::path::Path {
 }
 
 #[cfg(feature = "write")]
-pub(crate) use write::{FileIndexBuilders, FileIndexColumn, FileIndexRequest};
+pub(crate) use write::{FileIndexColumn, FileIndexRequest};
 
 #[cfg(feature = "write")]
 mod write {
     use std::sync::Arc;
 
-    use arrow::datatypes::Schema;
     use arrow::record_batch::RecordBatch;
     use object_store::path::Path as ObjectPath;
     use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
@@ -219,19 +225,17 @@ mod write {
     };
     use crate::metadata_writer::MetadataWriter;
 
-    /// One indexed column of a written file's schema.
+    /// One indexed column of a file, as read.
     #[derive(Debug, Clone)]
     pub(crate) struct FileIndexColumn {
         pub(crate) column_id: i64,
-        /// Top-level field index in the written (field-id-tagged) schema.
+        /// Column index in the batches fed to the builders.
         pub(crate) field_index: usize,
         pub(crate) value_type: IndexValueType,
     }
 
-    /// What a write asks of each file under the `ext_file_index` option:
-    /// build postings for the declared columns, PUT the index objects next to
-    /// the data object, and record their sidecar rows. One pointer wide, like
-    /// `FileOrderRequest`.
+    /// How to index files of one table: build postings for `columns`, PUT the
+    /// index objects next to the data object, and record their sidecar rows.
     #[derive(Clone)]
     pub(crate) struct FileIndexRequest(Arc<Inner>);
 
@@ -254,45 +258,6 @@ mod write {
     }
 
     impl FileIndexRequest {
-        /// The request for `declared` column names over `schema`, whose
-        /// top-level fields are the written file's leading columns. Column ids
-        /// come from `column_ids` (one per field of `schema`) when given, else
-        /// from each field's `PARQUET:field_id`. A name that is missing,
-        /// without an id, or of a type the index cannot key is skipped with a
-        /// debug log. `None` when nothing is left.
-        pub(crate) fn new(
-            metadata: Arc<dyn MetadataWriter>,
-            store: Arc<dyn ObjectStore>,
-            table_id: i64,
-            built_by: &'static str,
-            declared: &[String],
-            schema: &Schema,
-            column_ids: Option<&[i64]>,
-        ) -> Option<Self> {
-            let columns: Vec<FileIndexColumn> = declared
-                .iter()
-                .filter_map(|name| {
-                    let column = resolve_column(schema, name, column_ids);
-                    if column.is_none() {
-                        tracing::debug!(
-                            column = name.as_str(),
-                            "ext_file_index: declared column not indexable in this write"
-                        );
-                    }
-                    column
-                })
-                .collect();
-            (!columns.is_empty()).then(|| {
-                Self(Arc::new(Inner {
-                    metadata,
-                    store,
-                    table_id,
-                    built_by,
-                    columns,
-                }))
-            })
-        }
-
         /// A request for already-resolved `columns` (the backfill, which
         /// resolves them per file against the file's own schema).
         pub(crate) fn from_columns(
@@ -314,7 +279,6 @@ mod write {
         /// Fresh builders for one file.
         pub(crate) fn builders(&self) -> FileIndexBuilders {
             FileIndexBuilders {
-                request: self.clone(),
                 columns: self
                     .0
                     .columns
@@ -325,36 +289,10 @@ mod write {
             }
         }
 
-        /// Build, PUT and record the indexes of the finished file at catalog
-        /// `path` (relative to the table directory, as committed), stored at
-        /// `data_object`. Call after the data object is uploaded and before
-        /// the commit. Best effort: never fails the write. Returns the rows
-        /// recorded.
-        pub(crate) async fn record(
-            &self,
-            path: &str,
-            data_object: &ObjectPath,
-            file_size_bytes: i64,
-            builders: FileIndexBuilders,
-            row_group_rows: Vec<u64>,
-        ) -> u64 {
-            match self
-                .try_record(path, data_object, file_size_bytes, builders, row_group_rows)
-                .await
-            {
-                Ok(done) => done.rows,
-                Err(error) => {
-                    tracing::warn!(
-                        %error,
-                        path,
-                        "ext_file_index: not recorded; the file scans unindexed"
-                    );
-                    0
-                },
-            }
-        }
-
-        /// [`Self::record`], reporting failure to the caller (the backfill).
+        /// Build, PUT and record the indexes of the file at catalog `path`
+        /// (relative to the table directory, as listed), stored at
+        /// `data_object`: each index object first, then the rows, so a row
+        /// never normally points at a missing object. Returns what it stored.
         pub(crate) async fn try_record(
             &self,
             path: &str,
@@ -407,12 +345,10 @@ mod write {
                     index_key,
                 });
             }
-            let rows =
-                self.0
-                    .metadata
-                    .record_file_indexes(self.0.table_id, self.0.built_by, &rows)?;
+            self.0
+                .metadata
+                .record_file_indexes(self.0.table_id, self.0.built_by, &rows)?;
             Ok(Recorded {
-                rows,
                 bytes_written,
             })
         }
@@ -421,33 +357,11 @@ mod write {
     /// What [`FileIndexRequest::try_record`] stored.
     #[derive(Debug, Default, Clone, Copy)]
     pub(crate) struct Recorded {
-        pub(crate) rows: u64,
         pub(crate) bytes_written: u64,
     }
 
-    /// The top-level `name` of `schema` as an index column: it needs a
-    /// catalog column id and a keyable type.
-    pub(crate) fn resolve_column(
-        schema: &Schema,
-        name: &str,
-        column_ids: Option<&[i64]>,
-    ) -> Option<FileIndexColumn> {
-        let (field_index, field) = schema.column_with_name(name)?;
-        let column_id = match column_ids {
-            Some(ids) => *ids.get(field_index)?,
-            None => field.metadata().get("PARQUET:field_id")?.parse().ok()?,
-        };
-        let value_type = IndexValueType::for_arrow(field.data_type())?;
-        Some(FileIndexColumn {
-            column_id,
-            field_index,
-            value_type,
-        })
-    }
-
-    /// The postings of one open file, fed every batch in write order.
+    /// The postings of one file, fed every batch in file order.
     pub(crate) struct FileIndexBuilders {
-        request: FileIndexRequest,
         columns: Vec<(FileIndexColumn, PostingBuilder)>,
         /// A batch failed to observe: the postings are incomplete, so nothing
         /// is recorded for this file.
@@ -464,8 +378,8 @@ mod write {
     }
 
     impl FileIndexBuilders {
-        /// Feed the next batch (the file's full schema). Never errors: a
-        /// failure marks the file unindexed.
+        /// Feed the next batch. Never errors: a failure marks the postings
+        /// incomplete, and [`FileIndexRequest::try_record`] then refuses them.
         pub(crate) fn observe(&mut self, batch: &RecordBatch) {
             if self.failed {
                 return;
@@ -485,11 +399,6 @@ mod write {
 
         pub(crate) fn rows_seen(&self) -> u64 {
             self.columns.first().map_or(0, |(_, b)| b.rows_seen())
-        }
-
-        /// The request these builders belong to.
-        pub(crate) fn request(&self) -> &FileIndexRequest {
-            &self.request
         }
     }
 }
