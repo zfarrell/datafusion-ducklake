@@ -1293,12 +1293,6 @@ impl DuckLakeTable {
                     partial,
                     subpath.as_deref(),
                     self.ext_file_order_request(physical_schema.as_ref())?,
-                    self.ext_file_index_request(
-                        table_writer.object_store(),
-                        physical_schema.as_ref(),
-                        &top_level_column_ids,
-                        crate::ext_file_index::BUILT_BY_COMPACT,
-                    ),
                 )
                 .await?;
             if let Some(start) = carried_row_id_start {
@@ -1704,12 +1698,6 @@ impl DuckLakeTable {
                     false,
                     subpath.as_deref(),
                     self.ext_file_order_request(physical_schema.as_ref())?,
-                    self.ext_file_index_request(
-                        table_writer.object_store(),
-                        physical_schema.as_ref(),
-                        &top_level_column_ids,
-                        crate::ext_file_index::BUILT_BY_COMPACT,
-                    ),
                 )
                 .await?;
             rows_written += file.record_count;
@@ -2027,35 +2015,6 @@ impl DuckLakeTable {
             self.live_sort_spec()?.as_ref(),
             schema,
         ))
-    }
-}
-
-impl DuckLakeTable {
-    /// What a maintenance write of this table (merge, rewrite, inlined flush)
-    /// asks of its outputs under the experimental `ext_file_index` option;
-    /// `schema` holds the written data columns, `column_ids` their catalog ids.
-    pub(crate) fn ext_file_index_request(
-        &self,
-        store: &Arc<dyn object_store::ObjectStore>,
-        schema: &Schema,
-        column_ids: &[i64],
-        built_by: &'static str,
-    ) -> Option<crate::file_indexing::FileIndexRequest> {
-        let options = self.write_options();
-        if !options.ext_file_index.unwrap_or(false) {
-            return None;
-        }
-        let declared = options.ext_file_index_columns.as_ref()?;
-        let writer = self.writer()?;
-        crate::file_indexing::FileIndexRequest::new(
-            Arc::clone(writer),
-            Arc::clone(store),
-            self.table_id(),
-            built_by,
-            declared,
-            schema,
-            Some(column_ids),
-        )
     }
 }
 

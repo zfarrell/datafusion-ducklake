@@ -44,10 +44,8 @@ fn batch(range: std::ops::Range<i64>) -> RecordBatch {
     .unwrap()
 }
 
-fn options(index: bool) -> DuckLakeWriteOptions {
-    let mut options = DuckLakeWriteOptions::default()
-        .with_data_inlining_row_limit(0)
-        .with_ext_file_index(index);
+fn options() -> DuckLakeWriteOptions {
+    let mut options = DuckLakeWriteOptions::default().with_data_inlining_row_limit(0);
     options.max_row_group_rows = Some(100);
     options
 }
@@ -92,7 +90,7 @@ impl Env {
             .unwrap();
         let created = DuckLakeTableWriter::new(writer.clone(), Arc::new(LocalFileSystem::new()))
             .unwrap()
-            .with_options(&options(false))
+            .with_options(&options())
             .write_table("public", "logs", &[batch(0..1)])
             .await
             .unwrap();
@@ -118,13 +116,44 @@ impl Env {
             .unwrap()
     }
 
-    async fn append(&self, rows: RecordBatch, index: bool) {
+    async fn append(&self, rows: RecordBatch) {
         DuckLakeTableWriter::new(self.writer().await, Arc::new(LocalFileSystem::new()))
             .unwrap()
             .with_options(&options(index))
             .append_table("public", "logs", &[rows])
             .await
             .unwrap();
+    }
+
+    async fn table(&self) -> (SessionContext, DuckLakeTable) {
+        let catalog =
+            DuckLakeCatalog::with_writer(Arc::new(self.provider().await), self.writer().await)
+                .unwrap()
+                .with_write_options(options());
+        let ctx = SessionContext::new();
+        ctx.register_catalog("cat", Arc::new(catalog));
+        let table = ctx
+            .catalog("cat")
+            .unwrap()
+            .schema("public")
+            .unwrap()
+            .table("logs")
+            .await
+            .unwrap()
+            .unwrap();
+        let table = (table.as_ref() as &dyn std::any::Any)
+            .downcast_ref::<DuckLakeTable>()
+            .unwrap()
+            .clone();
+        (ctx, table)
+    }
+
+    async fn backfill(&self) -> datafusion_ducklake::BuildIndexResult {
+        let (ctx, table) = self.table().await;
+        table
+            .build_file_indexes(&ctx.state(), BuildIndexOptions::default())
+            .await
+            .unwrap()
     }
 
     /// Live `(path, size)` of the table.
@@ -164,15 +193,17 @@ impl Env {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn written_files_are_recorded_and_read_back() {
+async fn backfilled_files_are_recorded_and_read_back() {
     let env = Env::new().await;
     // Before anything is recorded, the sidecar does not exist: no rows.
     assert!(env.metas().await.is_empty());
-    env.append(batch(0..350), true).await;
+    env.append(batch(0..350)).await;
+    env.backfill().await;
     let live = env.live().await;
     let metas = env.metas().await;
-    assert_eq!(metas.len(), 1, "only the indexed write: {metas:?}");
-    let meta = &metas[0];
+    // The creating write (one row) and the append.
+    assert_eq!(metas.len(), 2, "{metas:?}");
+    let meta = metas.iter().find(|m| m.row_count == 350).unwrap();
     let (path, size) = live
         .iter()
         .find(|(p, _)| *p == meta.path)
@@ -194,10 +225,12 @@ async fn written_files_are_recorded_and_read_back() {
         meta.heavy_hitters
             .contains(&(IndexKey::Utf8(b"u0".to_vec().into()), 21))
     );
-    let key: String = sqlx::query_scalar("SELECT index_key FROM ext_ducklake_file_index")
-        .fetch_one(&env.pool)
-        .await
-        .unwrap();
+    let key: String =
+        sqlx::query_scalar("SELECT index_key FROM ext_ducklake_file_index WHERE path = $1")
+            .bind(&meta.path)
+            .fetch_one(&env.pool)
+            .await
+            .unwrap();
     let bytes = std::fs::read(format!("/{key}")).unwrap();
     assert_eq!(meta.index_size_bytes, bytes.len() as i64);
 }
@@ -205,28 +238,8 @@ async fn written_files_are_recorded_and_read_back() {
 #[tokio::test(flavor = "multi_thread")]
 async fn backfill_then_prune() {
     let env = Env::new().await;
-    env.append(batch(0..200), false).await;
-    let provider = MulticatalogProvider::with_pool(env.pool.clone(), "cat")
-        .await
-        .unwrap();
-    let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), env.writer().await)
-        .unwrap()
-        .with_write_options(options(true));
-    let ctx = SessionContext::new();
-    ctx.register_catalog("cat", Arc::new(catalog));
-    let table = ctx
-        .catalog("cat")
-        .unwrap()
-        .schema("public")
-        .unwrap()
-        .table("logs")
-        .await
-        .unwrap()
-        .unwrap();
-    let table = (table.as_ref() as &dyn std::any::Any)
-        .downcast_ref::<DuckLakeTable>()
-        .unwrap()
-        .clone();
+    env.append(batch(0..200)).await;
+    let (ctx, table) = env.table().await;
     let built = table
         .build_file_indexes(&ctx.state(), BuildIndexOptions::default())
         .await

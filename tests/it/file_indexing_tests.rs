@@ -1,8 +1,9 @@
-//! The write side of the experimental `ext_file_index` option (see
-//! `src/file_indexing.rs`): every writer path builds a per-file posting index
-//! for the declared columns, stores it next to the data file and records it
-//! in the `ext_ducklake_file_index` sidecar; a backfill indexes older files;
-//! prune and the orphan sweep remove an index only with its data file.
+//! The catalog side of the experimental `ext_file_index` (see
+//! `src/file_indexing.rs`): `build_file_indexes` builds a per-file posting
+//! index for the declared columns of files from every writer path, stores it
+//! next to the data file and records it in the `ext_ducklake_file_index`
+//! sidecar; writes and compaction build none; prune and the orphan sweep
+//! remove an index only with its data file.
 //!
 //! Every check rebuilds the postings by brute force from the committed data
 //! file and compares them with the stored index object, so an index that
@@ -30,9 +31,9 @@ use tempfile::TempDir;
 use datafusion_ducklake::ext_file_index::IndexKey;
 use datafusion_ducklake::maintenance::{CleanupCriteria, ExpireCriteria};
 use datafusion_ducklake::{
-    BuildIndexOptions, ColumnDef, DuckLakeCatalog, DuckLakeTable, DuckLakeTableWriter,
-    DuckLakeWriteOptions, MergeOptions, MetadataWriter, RewriteOptions, SqliteMetadataProvider,
-    SqliteMetadataWriter, WriteMode,
+    BuildIndexOptions, BuildIndexResult, ColumnDef, DuckLakeCatalog, DuckLakeTable,
+    DuckLakeTableWriter, DuckLakeWriteOptions, MergeOptions, MetadataWriter, RewriteOptions,
+    SqliteMetadataProvider, SqliteMetadataWriter, WriteMode,
 };
 
 fn schema() -> SchemaRef {
@@ -218,20 +219,20 @@ impl Env {
         session.finish().await.unwrap();
     }
 
-    async fn catalog(&self, index: bool) -> DuckLakeCatalog {
+    async fn catalog(&self) -> DuckLakeCatalog {
         DuckLakeCatalog::with_writer(
             Arc::new(SqliteMetadataProvider::new(&self.url()).await.unwrap()),
             Arc::new(self.writer().await),
         )
         .unwrap()
-        .with_write_options(options(index))
+        .with_write_options(options())
     }
 
-    async fn table(&self, index: bool) -> (SessionContext, DuckLakeTable) {
+    async fn table(&self) -> (SessionContext, DuckLakeTable) {
         let ctx = SessionContext::new();
         ctx.runtime_env()
             .register_object_store(&url::Url::parse("file://").unwrap(), self.store());
-        ctx.register_catalog("ducklake", Arc::new(self.catalog(index).await));
+        ctx.register_catalog("ducklake", Arc::new(self.catalog().await));
         let table = ctx
             .catalog("ducklake")
             .unwrap()
@@ -483,8 +484,8 @@ fn decode_index(bytes: Vec<u8>) -> BTreeMap<IndexKey, Vec<u32>> {
     out
 }
 
-fn options(index: bool) -> DuckLakeWriteOptions {
-    let mut options = DuckLakeWriteOptions::default().with_ext_file_index(index);
+fn options() -> DuckLakeWriteOptions {
+    let mut options = DuckLakeWriteOptions::default();
     // Small row groups, so files have several and positions cross them.
     options.max_row_group_rows = Some(300);
     options.data_inlining_row_limit = Some(0);
@@ -540,42 +541,51 @@ async fn indexed_env() -> Env {
 }
 
 // ---------------------------------------------------------------------------
-// Writer paths
+// Files from every writer path
 // ---------------------------------------------------------------------------
 
-#[tokio::test(flavor = "multi_thread")]
-async fn session_append_is_indexed() {
-    let env = indexed_env().await;
-    env.append(&[batch(0..700), batch(700..1_000)], &options(true))
-        .await;
-    env.append(&[batch(1_000..1_100)], &options(true)).await;
-    let rows = env.assert_indexed(&["user_id", "n"], "write").await;
-    assert_eq!(rows.len(), 4);
+impl Env {
+    async fn backfill(&self) -> BuildIndexResult {
+        self.backfill_with(BuildIndexOptions::default()).await
+    }
+
+    async fn backfill_with(&self, opts: BuildIndexOptions) -> BuildIndexResult {
+        let (ctx, table) = self.table().await;
+        table.build_file_indexes(&ctx.state(), opts).await.unwrap()
+    }
 }
 
+/// Session appends (several batches, several row groups) and a rolled
+/// session: every file gets an exact index.
 #[tokio::test(flavor = "multi_thread")]
-async fn rolling_session_indexes_every_file() {
+async fn session_and_rolled_files_are_indexed() {
     let env = indexed_env().await;
-    let mut opts = options(true);
-    opts.target_file_size = Some(4_000);
+    env.append(&[batch(0..700), batch(700..1_000)], &options())
+        .await;
+    let mut rolled = options();
+    rolled.target_file_size = Some(4_000);
     env.append(
         &(0..10)
-            .map(|i| batch(i * 500..(i + 1) * 500))
+            .map(|i| batch(1_000 + i * 500..1_000 + (i + 1) * 500))
             .collect::<Vec<_>>(),
-        &opts,
+        &rolled,
     )
     .await;
-    assert!(env.live_files().await.len() > 1, "the write rolled");
-    env.assert_indexed(&["user_id", "n"], "write").await;
+    let files = env.live_files().await.len();
+    assert!(files > 2, "the second write rolled");
+    let result = env.backfill().await;
+    assert_eq!(result.files_indexed as usize, files, "{result:?}");
+    let rows = env.assert_indexed(&["user_id", "n"], "backfill").await;
+    assert_eq!(rows.len(), files * 2);
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn buffered_append_indexes_every_file() {
+async fn buffered_and_flushed_files_are_indexed() {
     let env = indexed_env().await;
-    let mut opts = options(true);
+    let mut opts = options();
     opts.target_file_size = Some(4_000);
-    let writer = env.table_writer(&opts).await;
-    writer
+    env.table_writer(&opts)
+        .await
         .append_table(
             "main",
             "logs",
@@ -585,52 +595,52 @@ async fn buffered_append_indexes_every_file() {
         )
         .await
         .unwrap();
-    assert!(env.live_files().await.len() > 1, "the write rolled");
-    env.assert_indexed(&["user_id", "n"], "write").await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn inlined_flush_output_is_indexed() {
-    let env = indexed_env().await;
-    let mut opts = options(true);
-    opts.data_inlining_row_limit = Some(1_000);
-    let writer = env.table_writer(&opts).await;
+    let mut inline = options();
+    inline.data_inlining_row_limit = Some(1_000);
+    let writer = env.table_writer(&inline).await;
     for i in 0..3 {
         writer
-            .append_table("main", "logs", &[batch(i * 100..(i + 1) * 100)])
+            .append_table(
+                "main",
+                "logs",
+                &[batch(5_000 + i * 100..5_000 + (i + 1) * 100)],
+            )
             .await
             .unwrap();
     }
-    assert!(env.live_files().await.is_empty(), "all rows inlined");
-    let catalog = env.catalog(true).await;
-    let ctx = SessionContext::new();
-    let flushed = catalog
-        .flush_inlined_data(&ctx.state(), Some("main"), Some("logs"))
+    let flushed = env
+        .catalog()
+        .await
+        .flush_inlined_data(&SessionContext::new().state(), Some("main"), Some("logs"))
         .await
         .unwrap();
     assert_eq!(flushed.len(), 1, "{flushed:?}");
-    env.assert_indexed(&["user_id", "n"], "write").await;
+    env.backfill().await;
+    env.assert_indexed(&["user_id", "n"], "backfill").await;
 }
 
+/// Compaction outputs are new files: no index until the backfill runs
+/// again, which is safe after compaction and indexes only the new file.
 #[tokio::test(flavor = "multi_thread")]
-async fn merge_and_rewrite_outputs_are_indexed() {
+async fn backfill_after_merge_and_rewrite() {
     let env = indexed_env().await;
     for i in 0..3 {
-        env.append(&[batch(i * 400..(i + 1) * 400)], &options(false))
+        env.append(&[batch(i * 400..(i + 1) * 400)], &options())
             .await;
     }
-    assert!(env.rows().await.is_empty());
+    assert_eq!(env.backfill().await.files_indexed, 3);
 
-    let (ctx, table) = env.table(true).await;
+    let (ctx, table) = env.table().await;
     let merged = table
         .merge_adjacent_files(&ctx.state(), MergeOptions::default())
         .await
         .unwrap();
     assert_eq!(merged.files_processed, 3, "{merged:?}");
-    assert_eq!(env.live_files().await.len(), 1);
-    env.assert_indexed(&["user_id", "n"], "compact").await;
+    let after = env.backfill().await;
+    assert_eq!(after.files_indexed, 1, "only the merge output: {after:?}");
+    env.assert_indexed(&["user_id", "n"], "backfill").await;
 
-    let (ctx, table) = env.table(true).await;
+    let (ctx, table) = env.table().await;
     let ids: Vec<i64> = {
         use sqlx::Row as _;
         sqlx::query("SELECT data_file_id FROM ducklake_data_file WHERE end_snapshot IS NULL")
@@ -654,15 +664,17 @@ async fn merge_and_rewrite_outputs_are_indexed() {
         .unwrap();
     assert_eq!(rewritten.files_processed, 1, "{rewritten:?}");
     assert_ne!(env.live_files().await, before, "a new file was written");
-    env.assert_indexed(&["user_id", "n"], "compact").await;
+    assert_eq!(env.backfill().await.files_indexed, 1);
+    env.assert_indexed(&["user_id", "n"], "backfill").await;
 }
 
+/// Writes and compaction build nothing, with columns declared.
 #[tokio::test(flavor = "multi_thread")]
-async fn option_off_writes_nothing() {
+async fn writes_and_compaction_build_nothing() {
     let env = indexed_env().await;
-    env.append(&[batch(0..500)], &options(false)).await;
-    let (ctx, table) = env.table(false).await;
-    env.append(&[batch(500..900)], &options(false)).await;
+    env.append(&[batch(0..500)], &options()).await;
+    env.append(&[batch(500..900)], &options()).await;
+    let (ctx, table) = env.table().await;
     table
         .merge_adjacent_files(&ctx.state(), MergeOptions::default())
         .await
@@ -672,45 +684,50 @@ async fn option_off_writes_nothing() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn nothing_declared_writes_nothing() {
+async fn nothing_declared_builds_nothing() {
     let env = setup().await;
-    env.append(&[batch(0..500)], &options(true)).await;
+    env.append(&[batch(0..500)], &options()).await;
+    let result = env.backfill().await;
+    assert_eq!(result, BuildIndexResult::default());
     assert!(!env.has_sidecar().await);
     assert!(env.pidx_files().is_empty());
 }
 
+/// An index object that fails to upload gets no row; the next pass retries.
 #[tokio::test(flavor = "multi_thread")]
-async fn failed_index_upload_keeps_the_data_write() {
+async fn failed_index_upload_records_nothing() {
     let env = indexed_env().await;
+    env.append(&[batch(0..500)], &options()).await;
     env.store.fail_index_puts.store(true, Ordering::SeqCst);
-    env.append(&[batch(0..500)], &options(true)).await;
-    assert_eq!(env.live_files().await.len(), 1, "the data write committed");
+    let failed = env.backfill().await;
+    assert_eq!(failed.files_failed, 1, "{failed:?}");
+    assert_eq!(failed.files_indexed, 0);
     assert!(env.rows().await.is_empty(), "no row without its object");
     env.store.fail_index_puts.store(false, Ordering::SeqCst);
-    env.append(&[batch(500..900)], &options(true)).await;
-    assert_eq!(env.rows().await.len(), 2, "later writes index normally");
+    assert_eq!(env.backfill().await.files_indexed, 1);
+    env.assert_indexed(&["user_id", "n"], "backfill").await;
 }
 
 // ---------------------------------------------------------------------------
 // Prune and the orphan sweep
 // ---------------------------------------------------------------------------
 
-/// A write whose commit failed leaves a row (and object) no file lists; prune
-/// drops it once it is older than the grace period, and deletes its object.
+/// A row for a path no file lists (a backfill racing a compaction that
+/// retired the file) is pruned once older than the grace period, with its
+/// object.
 #[tokio::test(flavor = "multi_thread")]
-async fn uncommitted_write_index_is_pruned_after_grace() {
+async fn unlisted_row_is_pruned_after_grace() {
     let env = indexed_env().await;
-    env.append(&[batch(0..500)], &options(true)).await;
+    env.append(&[batch(0..500)], &options()).await;
+    env.backfill().await;
     let live = env.rows().await;
-    // Simulate a commit that failed after the index was recorded: forge a row
-    // and object for a path no data file has.
     let ghost = format!("{}.ghost", live[0].index_key);
     std::fs::write(format!("/{ghost}"), b"x").unwrap();
     env.writer()
         .await
         .record_file_indexes(
             env.table_id,
-            "write",
+            "backfill",
             &[datafusion_ducklake::file_indexing::FileIndexRow {
                 meta: datafusion_ducklake::ext_file_index::FileIndexMeta {
                     path: "never-committed.parquet".to_string(),
@@ -723,7 +740,7 @@ async fn uncommitted_write_index_is_pruned_after_grace() {
     assert_eq!(env.rows().await.len(), 3);
 
     let writer = env.writer().await;
-    // Inside the grace period: kept (it may be an in-flight write).
+    // Inside the grace period: kept.
     let kept = datafusion_ducklake::maintenance::prune_file_indexes(
         &writer,
         env.store(),
@@ -740,9 +757,8 @@ async fn uncommitted_write_index_is_pruned_after_grace() {
             .unwrap();
     assert_eq!(pruned, vec![ghost.clone()]);
     assert!(!std::path::Path::new(&format!("/{ghost}")).exists());
-    // The live file's rows stay.
-    assert_eq!(env.rows().await.len(), 2);
-    env.assert_indexed(&["user_id", "n"], "write").await;
+    assert_eq!(env.rows().await.len(), 2, "the live file's rows stay");
+    env.assert_indexed(&["user_id", "n"], "backfill").await;
 }
 
 fn sample_meta() -> datafusion_ducklake::ext_file_index::FileIndexMeta {
@@ -760,26 +776,28 @@ fn sample_meta() -> datafusion_ducklake::ext_file_index::FileIndexMeta {
     }
 }
 
-/// A file compacted away keeps its index while time travel can read it, and
+/// A file compacted away keeps its index while any snapshot lists it, and
 /// loses row and object once expiry removes the file.
 #[tokio::test(flavor = "multi_thread")]
 async fn prune_after_expiry_removes_index_with_file() {
     let env = indexed_env().await;
     for i in 0..2 {
-        env.append(&[batch(i * 400..(i + 1) * 400)], &options(true))
+        env.append(&[batch(i * 400..(i + 1) * 400)], &options())
             .await;
     }
+    env.backfill().await;
     let old = env.rows().await;
     assert_eq!(old.len(), 4);
-    let (ctx, table) = env.table(true).await;
+    let (ctx, table) = env.table().await;
     table
         .merge_adjacent_files(&ctx.state(), MergeOptions::default())
         .await
         .unwrap();
+    env.backfill().await;
     let writer = env.writer().await;
 
-    // Retired files still listed by an older snapshot keep their rows.
-    let still_listed: usize = {
+    // Retired files a snapshot still lists keep their rows.
+    let listed: usize = {
         use sqlx::Row as _;
         sqlx::query("SELECT count(*) FROM ducklake_data_file")
             .fetch_one(&env.pool().await)
@@ -787,11 +805,11 @@ async fn prune_after_expiry_removes_index_with_file() {
             .unwrap()
             .get::<i64, _>(0) as usize
     };
-    let pruned =
+    let mut pruned =
         datafusion_ducklake::maintenance::prune_file_indexes(&writer, env.store(), Duration::ZERO)
             .await
             .unwrap();
-    if still_listed > 1 {
+    if listed > 1 {
         assert!(pruned.is_empty(), "{pruned:?}");
     }
 
@@ -808,21 +826,20 @@ async fn prune_after_expiry_removes_index_with_file() {
     )
     .await
     .unwrap();
-    let mut pruned_after = pruned;
-    pruned_after.extend(
+    pruned.extend(
         datafusion_ducklake::maintenance::prune_file_indexes(&writer, env.store(), Duration::ZERO)
             .await
             .unwrap(),
     );
     let mut want: Vec<String> = old.iter().map(|r| r.index_key.clone()).collect();
     want.sort();
-    pruned_after.sort();
-    assert_eq!(pruned_after, want);
+    pruned.sort();
+    assert_eq!(pruned, want);
     for row in &old {
         assert!(!std::path::Path::new(&format!("/{}", row.index_key)).exists());
     }
     // The merge output keeps its index.
-    let rows = env.assert_indexed(&["user_id", "n"], "compact").await;
+    let rows = env.assert_indexed(&["user_id", "n"], "backfill").await;
     assert_eq!(env.rows().await.len(), rows.len());
 }
 
@@ -831,10 +848,11 @@ async fn prune_after_expiry_removes_index_with_file() {
 #[tokio::test(flavor = "multi_thread")]
 async fn orphan_sweep_keeps_live_indexes() {
     let env = indexed_env().await;
-    env.append(&[batch(0..500)], &options(true)).await;
-    let live = env.pidx_files();
-    assert_eq!(live.len(), 2);
-    // An index of a data file that is not referenced (an aborted write).
+    env.append(&[batch(0..500)], &options()).await;
+    env.backfill().await;
+    assert_eq!(env.pidx_files().len(), 2);
+    // An index of a data file that is not referenced (a retired file whose
+    // row prune already dropped).
     let orphan = env.data_path().join("main/logs/aborted.parquet.c2.v1.pidx");
     std::fs::write(&orphan, b"x").unwrap();
     // Not an index name: the sweep's `.parquet`-only rule leaves it alone.
@@ -854,79 +872,72 @@ async fn orphan_sweep_keeps_live_indexes() {
     assert!(!orphan.exists());
     assert!(other.exists());
     assert_eq!(env.pidx_files().len(), 3);
-    env.assert_indexed(&["user_id", "n"], "write").await;
+    env.assert_indexed(&["user_id", "n"], "backfill").await;
 }
 
 // ---------------------------------------------------------------------------
-// Backfill
+// Backfill passes
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
 async fn backfill_is_idempotent_and_resumes() {
     let env = indexed_env().await;
     for i in 0..4 {
-        env.append(&[batch(i * 400..(i + 1) * 400)], &options(false))
+        env.append(&[batch(i * 400..(i + 1) * 400)], &options())
             .await;
     }
     assert!(env.rows().await.is_empty());
-    let (ctx, table) = env.table(true).await;
 
     // A bounded pass, as an interrupted one leaves it.
-    let first = table
-        .build_file_indexes(&ctx.state(), BuildIndexOptions::default().with_max_files(1))
-        .await
-        .unwrap();
+    let first = env
+        .backfill_with(BuildIndexOptions::default().with_max_files(1))
+        .await;
     assert_eq!(first.files_indexed, 1, "{first:?}");
     assert!(first.bytes_read > 0 && first.bytes_written > 0);
     assert_eq!(env.rows().await.len(), 2);
 
-    let rest = table
-        .build_file_indexes(
-            &ctx.state(),
-            BuildIndexOptions::default().with_parallelism(3),
-        )
-        .await
-        .unwrap();
+    let rest = env
+        .backfill_with(BuildIndexOptions::default().with_parallelism(3))
+        .await;
     assert_eq!(rest.files_indexed, 3, "{rest:?}");
     assert_eq!(rest.files_skipped, 1, "the first pass's file is done");
     assert_eq!(rest.files_failed, 0);
     env.assert_indexed(&["user_id", "n"], "backfill").await;
 
-    let again = table
-        .build_file_indexes(&ctx.state(), BuildIndexOptions::default())
-        .await
-        .unwrap();
+    let again = env.backfill().await;
     assert_eq!(again.files_indexed, 0, "{again:?}");
     assert_eq!(again.files_skipped, 4);
     assert_eq!(again.bytes_written, 0);
 }
 
-/// A row whose size does not match the file (a stale row) is rebuilt.
+/// A row whose size does not match the file (a stale row) is rebuilt; the
+/// matching row of the other column is left alone.
 #[tokio::test(flavor = "multi_thread")]
 async fn backfill_rebuilds_a_mismatched_row() {
     let env = indexed_env().await;
-    env.append(&[batch(0..500)], &options(true)).await;
-    sqlx::query("UPDATE ext_ducklake_file_index SET file_size_bytes = 1 WHERE column_id = ?")
-        .bind(env.column_ids().await["n"])
+    env.append(&[batch(0..500)], &options()).await;
+    env.backfill().await;
+    let n_id = env.column_ids().await["n"];
+    sqlx::query(
+        "UPDATE ext_ducklake_file_index SET file_size_bytes = 1, built_by = 'stale'
+         WHERE column_id = ?",
+    )
+    .bind(n_id)
+    .execute(&env.pool().await)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE ext_ducklake_file_index SET built_by = 'kept' WHERE column_id != ?")
+        .bind(n_id)
         .execute(&env.pool().await)
         .await
         .unwrap();
-    let (ctx, table) = env.table(true).await;
-    let result = table
-        .build_file_indexes(&ctx.state(), BuildIndexOptions::default())
-        .await
-        .unwrap();
+    let result = env.backfill().await;
     assert_eq!(result.files_indexed, 1, "{result:?}");
     let rows = env.rows().await;
     assert_eq!(rows.len(), 2);
-    let n_id = env.column_ids().await["n"];
     let n = rows.iter().find(|r| r.column_id == n_id).unwrap();
     assert_eq!(n.built_by, "backfill");
-    assert_eq!(
-        rows.iter().filter(|r| r.built_by == "write").count(),
-        1,
-        "the matching user_id row is left as written"
-    );
+    assert!(rows.iter().any(|r| r.built_by == "kept"));
     let (path, size) = env.live_files().await[0].clone();
     assert_eq!(n.path, path);
     assert_eq!(n.file_size_bytes, size);
@@ -935,48 +946,38 @@ async fn backfill_rebuilds_a_mismatched_row() {
 #[tokio::test(flavor = "multi_thread")]
 async fn backfill_of_explicit_columns() {
     let env = setup().await;
-    env.append(&[batch(0..500)], &options(false)).await;
-    let (ctx, table) = env.table(true).await;
-    // Nothing declared: nothing to do.
-    let none = table
-        .build_file_indexes(&ctx.state(), BuildIndexOptions::default())
-        .await
-        .unwrap();
-    assert_eq!(none.files_indexed, 0);
-    let some = table
-        .build_file_indexes(
-            &ctx.state(),
-            BuildIndexOptions::default().with_columns(vec!["n".to_string()]),
-        )
-        .await
-        .unwrap();
+    env.append(&[batch(0..500)], &options()).await;
+    let some = env
+        .backfill_with(BuildIndexOptions::default().with_columns(vec!["n".to_string()]))
+        .await;
     assert_eq!(some.files_indexed, 1);
     env.assert_indexed(&["n"], "backfill").await;
-    assert!(
-        table
-            .build_file_indexes(
-                &ctx.state(),
-                BuildIndexOptions::default().with_columns(vec!["ts".to_string()]),
-            )
-            .await
-            .is_err(),
-        "a timestamp column cannot be keyed"
-    );
+    let (ctx, table) = env.table().await;
+    for bad in ["ts", "missing"] {
+        assert!(
+            table
+                .build_file_indexes(
+                    &ctx.state(),
+                    BuildIndexOptions::default().with_columns(vec![bad.to_string()]),
+                )
+                .await
+                .is_err(),
+            "{bad}: not indexable"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Schema evolution
 // ---------------------------------------------------------------------------
 
-/// A column added later: older files get no row for it (they scan
-/// normally), newer files do; the backfill skips files without it.
+/// A column added later: files written before it get no row for it (they
+/// scan normally) and are not counted as failures.
 #[tokio::test(flavor = "multi_thread")]
 async fn column_added_later() {
     let env = setup().await;
     env.declare("user_id, tag").await;
-    env.append(&[batch(0..400)], &options(true)).await;
-    let before = env.rows().await;
-    assert_eq!(before.len(), 1, "only user_id exists yet");
+    env.append(&[batch(0..400)], &options()).await;
 
     // Appending rows with a new column evolves the table.
     let wide = Arc::new(Schema::new(
@@ -987,31 +988,31 @@ async fn column_added_later() {
             .chain([Field::new("tag", DataType::Utf8, true)])
             .collect::<Vec<_>>(),
     ));
-    let base = batch(400..800);
-    let mut columns = base.columns().to_vec();
+    let mut columns = batch(400..800).columns().to_vec();
     columns.push(Arc::new(StringArray::from_iter_values(
         (400..800).map(|i| format!("t{}", i % 5)),
     )));
     let wide_batch = RecordBatch::try_new(Arc::clone(&wide), columns).unwrap();
-    let table_writer = env.table_writer(&options(true)).await;
+    let table_writer = env.table_writer(&options()).await;
     let mut session = table_writer
         .begin_write("main", "logs", wide.as_ref(), WriteMode::Append)
         .unwrap();
     session.write_batch(&wide_batch).unwrap();
     session.finish().await.unwrap();
 
+    let result = env.backfill().await;
+    assert_eq!(result.files_indexed, 2, "{result:?}");
+    assert_eq!(result.files_failed, 0);
     let ids = env.column_ids().await;
     let rows = env.rows().await;
     assert_eq!(rows.len(), 3, "{rows:?}");
     assert_eq!(rows.iter().filter(|r| r.column_id == ids["tag"]).count(), 1);
 
-    let (ctx, table) = env.table(true).await;
-    let result = table
-        .build_file_indexes(&ctx.state(), BuildIndexOptions::default())
-        .await
-        .unwrap();
-    assert_eq!(result.files_indexed, 0, "{result:?}");
-    assert_eq!(result.files_failed, 0);
+    // The old file still lacks `tag`; another pass reads it again (it is
+    // missing a row) but builds nothing.
+    let again = env.backfill().await;
+    assert_eq!(again.files_indexed, 0, "{again:?}");
+    assert_eq!(again.files_failed, 0);
     assert_eq!(env.rows().await.len(), 3);
 }
 
@@ -1020,7 +1021,8 @@ async fn column_added_later() {
 #[tokio::test(flavor = "multi_thread")]
 async fn renamed_column_keeps_its_rows() {
     let env = indexed_env().await;
-    env.append(&[batch(0..400)], &options(true)).await;
+    env.append(&[batch(0..400)], &options()).await;
+    env.backfill().await;
     let before = env.rows().await;
     let id = env.column_ids().await["user_id"];
     // The catalog side of a rename: same column id, new name.
@@ -1030,16 +1032,11 @@ async fn renamed_column_keeps_its_rows() {
         .await
         .unwrap();
     assert_eq!(env.column_ids().await["uid"], id);
-    assert_eq!(env.rows().await.len(), before.len());
-
     env.declare("uid, n").await;
-    let (ctx, table) = env.table(true).await;
-    let result = table
-        .build_file_indexes(&ctx.state(), BuildIndexOptions::default())
-        .await
-        .unwrap();
+    let result = env.backfill().await;
     assert_eq!(
         result.files_indexed, 0,
         "already indexed under its id: {result:?}"
     );
+    assert_eq!(env.rows().await.len(), before.len());
 }
