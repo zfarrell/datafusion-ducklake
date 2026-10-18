@@ -60,6 +60,10 @@ pub struct DuckLakeReadOptions {
     /// from the per-file bucket counts in `ext_ducklake_file_index`. Off by
     /// default: the rule leaves the table's plans alone.
     pub ext_file_index_counts: bool,
+    /// Bytes of file listing a table may keep for the life of the table (and
+    /// its clones). Zero, the default, reads the listing on every scan. See
+    /// [`Self::with_listing_memo`].
+    pub listing_memo_bytes: usize,
 }
 
 impl DuckLakeReadOptions {
@@ -102,6 +106,28 @@ impl DuckLakeReadOptions {
     #[must_use]
     pub fn with_ext_file_index_counts(mut self, enabled: bool) -> Self {
         self.ext_file_index_counts = enabled;
+        self
+    }
+
+    /// Keep each table's whole file listing at its snapshot, up to
+    /// `max_bytes`, so later scans of the same table (and its clones, such as
+    /// one rebound per query with `DuckLakeTable::with_metadata_provider`)
+    /// read no listing. Zero turns it off.
+    ///
+    /// **Not DuckLake behaviour.** Official DuckLake lists a scan's files in
+    /// every transaction. A listing at one snapshot is final only until a
+    /// merge, rewrite or flush commits: those also rewrite the listing of
+    /// older snapshots. Turn this on only when each table instance is dropped
+    /// once its table commits again, as a caller does that keys built tables
+    /// by the table's own latest snapshot (RuntimeDB keys them by the
+    /// generation it republishes after every commit, compaction included).
+    /// A kept listing then serves only reads at a snapshot whose listing no
+    /// later commit has rewritten. The catalog-side statistics filter is not
+    /// applied to a kept listing; the scan prunes it in memory, as it prunes
+    /// every page.
+    #[must_use]
+    pub fn with_listing_memo(mut self, max_bytes: usize) -> Self {
+        self.listing_memo_bytes = max_bytes;
         self
     }
 }

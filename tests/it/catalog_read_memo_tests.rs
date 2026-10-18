@@ -41,7 +41,7 @@ type Hook = (&'static str, Box<dyn FnOnce() + Send>);
 
 /// Forwards every `MetadataProvider` method to `inner` and counts the calls.
 #[derive(Clone)]
-struct CountingProvider {
+pub(crate) struct CountingProvider {
     inner: Arc<dyn MetadataProvider>,
     calls: Arc<Mutex<BTreeMap<&'static str, usize>>>,
     hook: Arc<Mutex<Option<Hook>>>,
@@ -56,7 +56,7 @@ impl std::fmt::Debug for CountingProvider {
 }
 
 impl CountingProvider {
-    fn new(inner: Arc<dyn MetadataProvider>) -> Self {
+    pub(crate) fn new(inner: Arc<dyn MetadataProvider>) -> Self {
         Self {
             inner,
             calls: Arc::new(Mutex::new(BTreeMap::new())),
@@ -80,7 +80,7 @@ impl CountingProvider {
     }
 
     /// The calls made since the last `take`, cleared.
-    fn take(&self) -> BTreeMap<&'static str, usize> {
+    pub(crate) fn take(&self) -> BTreeMap<&'static str, usize> {
         std::mem::take(&mut *self.calls.lock().unwrap())
     }
 }
@@ -178,6 +178,23 @@ impl MetadataProvider for CountingProvider {
         self.count("get_table_summary_statistics");
         self.inner
             .get_table_summary_statistics(table_id, snapshot_id)
+    }
+    fn verified_file_orders(
+        &self,
+        table_id: i64,
+        paths: &[&str],
+    ) -> Result<Vec<datafusion_ducklake::ext_file_order::FileOrder>> {
+        self.count("verified_file_orders");
+        self.inner.verified_file_orders(table_id, paths)
+    }
+    fn file_indexes(
+        &self,
+        table_id: i64,
+        paths: &[&str],
+        column_ids: &[i64],
+    ) -> Result<Vec<datafusion_ducklake::ext_file_index::FileIndexMeta>> {
+        self.count("file_indexes");
+        self.inner.file_indexes(table_id, paths, column_ids)
     }
     fn get_table_file_metadata_page(
         &self,

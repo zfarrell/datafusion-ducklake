@@ -612,3 +612,133 @@ async fn inflate_counts(pool: &sqlx::SqlitePool, path: &str) {
         .await
         .unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Catalog reads per query (the counting provider lives in a duckdb-gated module)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "metadata-duckdb")]
+mod catalog_reads {
+    use super::*;
+    use crate::catalog_read_memo_tests::CountingProvider;
+
+    /// Listing statements among `calls`.
+    fn listings(calls: &BTreeMap<&'static str, usize>) -> usize {
+        calls
+            .iter()
+            .filter(|(method, _)| method.starts_with("get_table_file_metadata_page"))
+            .map(|(_, n)| n)
+            .sum()
+    }
+
+    /// A context over one kept table, `logs`, read through a counting provider:
+    /// the shape of a caller that caches built tables across queries.
+    async fn kept(
+        env: &Env,
+        options: DuckLakeReadOptions,
+        rule: bool,
+    ) -> (SessionContext, CountingProvider) {
+        let counting = CountingProvider::new(Arc::new(
+            SqliteMetadataProvider::new(&env.url()).await.unwrap(),
+        ));
+        let catalog = DuckLakeCatalog::new(counting.clone())
+            .unwrap()
+            .with_read_options(options);
+        let table = datafusion::catalog::CatalogProvider::schema(&catalog, "main")
+            .unwrap()
+            .table("logs")
+            .await
+            .unwrap()
+            .unwrap();
+        let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(3));
+        if rule {
+            ctx.add_optimizer_rule(Arc::new(BucketCountRule::default()));
+        }
+        ctx.register_table("logs", table).unwrap();
+        counting.take();
+        (ctx, counting)
+    }
+
+    fn kept_hist(user: &str) -> String {
+        format!(
+            "SELECT count(1) AS doc_count, date_trunc('hour', ts) AS key FROM logs \
+             WHERE ts >= {} AND ts <= {} AND user_id = '{user}' GROUP BY key ORDER BY key DESC",
+            ts_lit(T0 + H / 3, None),
+            ts_lit(T0 + 7 * H + 17, None)
+        )
+    }
+
+    const KEPT_HITS: &str = "SELECT ts, user_id, id FROM logs WHERE user_id = 'u1' ORDER BY ts DESC NULLS LAST, id LIMIT 50";
+
+    /// The rewrite's resolution and its two branch scans share one listing: it
+    /// lists the table no more often than the plain query does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_rewrite_lists_the_files_once() {
+        let env = setup(None).await;
+        populate(&env).await;
+        env.record_counts().await;
+        let options = DuckLakeReadOptions::default().with_ext_file_index_counts(true);
+        let (plain, plain_calls) = kept(&env, DuckLakeReadOptions::default(), false).await;
+        let (rewritten, rewritten_calls) = kept(&env, options, true).await;
+        let sql = kept_hist("u0");
+        let (want, _) = run(&plain, &sql).await;
+        let plain_listings = listings(&plain_calls.take());
+        let (got, plan) = run(&rewritten, &sql).await;
+        let rewritten_listings = listings(&rewritten_calls.take());
+        assert!(plan.contains(REWRITTEN), "{plan}");
+        assert_eq!(got, want);
+        assert!(plain_listings > 0);
+        // `run` plans the query twice (plan text, then collect).
+        assert_eq!(rewritten_listings, plain_listings, "{plan}");
+    }
+
+    /// With the listing memo, a kept table lists its files on its first scan and
+    /// never again, for the plain scan and the rewrite alike, and every answer
+    /// equals a table without the memo.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_kept_table_with_the_listing_memo_lists_once() {
+        let env = setup(None).await;
+        populate(&env).await;
+        env.record_counts().await;
+        for counts in [false, true] {
+            let base = DuckLakeReadOptions::default().with_ext_file_index_counts(counts);
+            let (memo, memo_calls) =
+                kept(&env, base.clone().with_listing_memo(1 << 20), counts).await;
+            let (plain, _) = kept(&env, base, counts).await;
+            let queries = [kept_hist("u0"), kept_hist("u2"), KEPT_HITS.to_string()];
+            for round in 0..3 {
+                for sql in &queries {
+                    let (got, _) = run(&memo, sql).await;
+                    let (want, _) = run(&plain, sql).await;
+                    assert_eq!(got, want, "counts={counts} round {round}: {sql}");
+                }
+                let listed = listings(&memo_calls.take());
+                if round == 0 {
+                    assert_eq!(listed, 1, "counts={counts}: one listing fills the memo");
+                } else {
+                    assert_eq!(
+                        listed, 0,
+                        "counts={counts} round {round}: served from the memo"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A listing over the memo's budget is read on every scan, as without it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_listing_over_the_budget_is_read_every_time() {
+        let env = setup(None).await;
+        populate(&env).await;
+        let (ctx, calls) = kept(
+            &env,
+            DuckLakeReadOptions::default().with_listing_memo(1),
+            false,
+        )
+        .await;
+        for _ in 0..3 {
+            run(&ctx, KEPT_HITS).await;
+            assert!(listings(&calls.take()) > 0);
+        }
+    }
+}

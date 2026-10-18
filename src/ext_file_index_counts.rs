@@ -578,9 +578,10 @@ impl BucketCountRule {
         let provider = source_as_provider(&scan.source).ok()?;
         let resolved = (self.resolver)(&provider)?;
         let table = resolved.downcast_ref::<DuckLakeTable>()?;
+        // The rewrite's resolution and both branch scans share one listing.
         table
             .ext_file_index_counts_enabled()
-            .then(|| Arc::new(table.clone()))
+            .then(|| Arc::new(table.with_plan_listing_memo()))
     }
 
     fn try_rewrite(&self, aggregate: &Aggregate) -> Result<Option<LogicalPlan>> {

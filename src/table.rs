@@ -1354,6 +1354,9 @@ pub struct DuckLakeTable {
     /// remembered key stays true; a remembered `None` can only miss a row
     /// recorded later (the verify job), until the table is built again.
     file_order_memo: Arc<std::sync::Mutex<FileOrderMemo>>,
+    /// The table's whole listing at `snapshot_id`, when the read options keep
+    /// it ([`DuckLakeReadOptions::with_listing_memo`]). Shared across clones.
+    listing_memo: Arc<ListingMemo>,
     /// The `ext_file_index` sidecar's rows this table's scans have read, by
     /// `(path, column_id)`. Shared with every clone. A row describes immutable
     /// bytes (it is checked against the listed size on use), so it is kept; an
@@ -1520,6 +1523,7 @@ impl DuckLakeTable {
             inlined_materialized_row_count: Arc::new(AtomicUsize::new(0)),
             inlined_absent_through: Arc::new(AtomicI64::new(i64::MIN)),
             file_order_memo: Arc::default(),
+            listing_memo: Arc::default(),
             file_index_memo: Arc::default(),
             read_options: DuckLakeReadOptions::default(),
             delete_memo: None,
@@ -1553,6 +1557,7 @@ impl DuckLakeTable {
     /// The table starts with an empty memo.
     pub fn with_read_options(mut self, options: DuckLakeReadOptions) -> Self {
         self.delete_memo = DeletePositionMemo::new(options.delete_memo_bytes);
+        self.listing_memo = Arc::new(ListingMemo::new(options.listing_memo_bytes));
         self.read_options = options;
         self
     }
@@ -4765,6 +4770,7 @@ impl DuckLakeTable {
             inlined_materialized_row_count: Arc::clone(&self.inlined_materialized_row_count),
             inlined_absent_through: Arc::clone(&self.inlined_absent_through),
             file_order_memo: Arc::clone(&self.file_order_memo),
+            listing_memo: Arc::clone(&self.listing_memo),
             file_index_memo: Arc::clone(&self.file_index_memo),
             read_options: self.read_options.clone(),
             delete_memo: self.delete_memo.clone(),
@@ -5688,7 +5694,7 @@ impl DuckLakeTable {
             },
         };
         let mut order_recipe = OrderRecipe::new(!rowid_in_proj && self.ext_file_order_enabled());
-        for metadata in self.file_metadata_pages("planning", stats_filter.as_ref()) {
+        for metadata in self.listed_file_pages("planning", stats_filter.as_ref()) {
             let (table_files, file_statistics, summary_statistics) =
                 self.page_files_with_both_statistics(metadata?);
             #[cfg(feature = "encryption")]
@@ -9506,7 +9512,7 @@ impl DuckLakeTable {
     ) -> DataFusionResult<crate::ext_file_index_counts::Resolution> {
         let inlined_deletes = self.inlined_deletes_by_file()?;
         let mut resolution = crate::ext_file_index_counts::Resolution::default();
-        for metadata in self.file_metadata_pages("bucket counts", None) {
+        for metadata in self.listed_file_pages("bucket counts", None) {
             let (table_files, _, _) = self.page_files_with_both_statistics(metadata?);
             // Counts ignore deletes and snapshot filters, and are keyed by
             // column id, so only plain files without deletes qualify.
@@ -9544,3 +9550,88 @@ impl DuckLakeTable {
         Ok(resolution)
     }
 }
+
+/// See [`DuckLakeReadOptions::with_listing_memo`]: one table's whole listing
+/// at its snapshot, read once.
+#[derive(Debug, Default)]
+pub(crate) struct ListingMemo {
+    /// Zero = off.
+    max_bytes: usize,
+    kept: std::sync::Mutex<Option<Arc<Vec<DuckLakeFileMetadata>>>>,
+    /// The listing did not fit: read it on every scan, as without a memo.
+    too_large: std::sync::atomic::AtomicBool,
+}
+
+impl ListingMemo {
+    pub(crate) fn new(max_bytes: usize) -> Self {
+        Self {
+            max_bytes,
+            ..Default::default()
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.max_bytes > 0 && !self.too_large.load(Ordering::Relaxed)
+    }
+
+    fn kept(&self) -> Option<Arc<Vec<DuckLakeFileMetadata>>> {
+        self.kept
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+impl DuckLakeTable {
+    /// The scan's file pages: [`Self::file_metadata_pages`], or the kept
+    /// whole listing as one page when the listing memo is on. A first read
+    /// lists every file, unfiltered, and keeps it if it fits.
+    pub(crate) fn listed_file_pages<'a>(
+        &'a self,
+        page_name: &'static str,
+        filter: Option<&'a StatsFilter>,
+    ) -> Box<dyn Iterator<Item = Result<Vec<DuckLakeFileMetadata>>> + Send + 'a> {
+        let memo = &self.listing_memo;
+        if !memo.enabled() {
+            return Box::new(self.file_metadata_pages(page_name, filter));
+        }
+        if let Some(kept) = memo.kept() {
+            return Box::new(std::iter::once(Ok(kept.as_ref().clone())));
+        }
+        let mut listing = Vec::new();
+        for page in self.file_metadata_pages(page_name, None) {
+            match page {
+                Ok(page) => listing.extend(page),
+                Err(error) => return Box::new(std::iter::once(Err(error))),
+            }
+        }
+        let bytes: usize = listing
+            .iter()
+            .map(crate::catalog_read_memo::file_metadata_bytes)
+            .sum();
+        if bytes > memo.max_bytes {
+            memo.too_large.store(true, Ordering::Relaxed);
+        } else {
+            *memo
+                .kept
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(listing.clone()));
+        }
+        Box::new(std::iter::once(Ok(listing)))
+    }
+
+    /// A clone whose listing memo is its own and on, for one plan whose
+    /// scans should share one listing (the bucket-count rewrite's branches),
+    /// unless this table already keeps its listing.
+    pub(crate) fn with_plan_listing_memo(&self) -> Self {
+        let mut table = self.clone();
+        if !table.listing_memo.enabled() {
+            table.listing_memo = Arc::new(ListingMemo::new(PLAN_LISTING_MEMO_BYTES));
+        }
+        table
+    }
+}
+
+/// Budget of [`DuckLakeTable::with_plan_listing_memo`]: the default of
+/// [`crate::CatalogReadMemo`].
+const PLAN_LISTING_MEMO_BYTES: usize = 64 << 20;
