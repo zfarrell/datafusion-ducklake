@@ -119,7 +119,7 @@ impl Env {
     async fn append(&self, rows: RecordBatch) {
         DuckLakeTableWriter::new(self.writer().await, Arc::new(LocalFileSystem::new()))
             .unwrap()
-            .with_options(&options(index))
+            .with_options(&options())
             .append_table("public", "logs", &[rows])
             .await
             .unwrap();
@@ -198,11 +198,29 @@ async fn backfilled_files_are_recorded_and_read_back() {
     // Before anything is recorded, the sidecar does not exist: no rows.
     assert!(env.metas().await.is_empty());
     env.append(batch(0..350)).await;
+    // Two hot users over 3,000 rows: above the 1,024-row heavy-hitter floor.
+    env.append(
+        RecordBatch::try_new(
+            schema(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..3_000)),
+                Arc::new(StringArray::from_iter_values((0..3_000).map(|i| {
+                    if i % 2 == 0 {
+                        "hot"
+                    } else {
+                        "warm"
+                    }
+                }))),
+            ],
+        )
+        .unwrap(),
+    )
+    .await;
     env.backfill().await;
     let live = env.live().await;
     let metas = env.metas().await;
-    // The creating write (one row) and the append.
-    assert_eq!(metas.len(), 2, "{metas:?}");
+    // The creating write (one row) and the two appends.
+    assert_eq!(metas.len(), 3, "{metas:?}");
     let meta = metas.iter().find(|m| m.row_count == 350).unwrap();
     let (path, size) = live
         .iter()
@@ -219,11 +237,16 @@ async fn backfilled_files_are_recorded_and_read_back() {
         meta.index_path,
         format!("{name}.c{}.v1.pidx", meta.column_id)
     );
-    // 17 users over 350 rows: each is above row_count / 4096.
-    assert_eq!(meta.heavy_hitters.len(), 17);
-    assert!(
-        meta.heavy_hitters
-            .contains(&(IndexKey::Utf8(b"u0".to_vec().into()), 21))
+    // 17 users of about 21 rows each: none is heavy.
+    assert!(meta.heavy_hitters.is_empty());
+    let hot = metas.iter().find(|m| m.row_count == 3_000).unwrap();
+    assert_eq!(
+        hot.heavy_hitters,
+        vec![
+            (IndexKey::Utf8(b"hot".to_vec().into()), 1_500),
+            (IndexKey::Utf8(b"warm".to_vec().into()), 1_500),
+        ],
+        "heavy hitters round-trip through the catalog"
     );
     let key: String =
         sqlx::query_scalar("SELECT index_key FROM ext_ducklake_file_index WHERE path = $1")
