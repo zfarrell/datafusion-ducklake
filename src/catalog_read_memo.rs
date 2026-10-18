@@ -653,6 +653,15 @@ impl MetadataProvider for MemoizedMetadataProvider {
         self.inner.verified_file_orders(table_id, paths)
     }
 
+    fn file_indexes(
+        &self,
+        table_id: i64,
+        paths: &[&str],
+        column_ids: &[i64],
+    ) -> Result<Vec<crate::ext_file_index::FileIndexMeta>> {
+        self.inner.file_indexes(table_id, paths, column_ids)
+    }
+
     fn get_table_statistics(&self, table_id: i64, snapshot_id: i64) -> Result<DuckLakeStatistics> {
         self.inner.get_table_statistics(table_id, snapshot_id)
     }

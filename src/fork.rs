@@ -557,6 +557,7 @@ impl MulticatalogManager {
                             values.is_none(),
                             &mut paths,
                             None,
+                            None,
                         )
                         .await;
                     written.extend(paths);
