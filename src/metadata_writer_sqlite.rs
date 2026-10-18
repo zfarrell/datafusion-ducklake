@@ -4632,6 +4632,109 @@ impl MetadataWriter for SqliteMetadataWriter {
         })
     }
 
+    fn record_file_indexes(
+        &self,
+        table_id: i64,
+        built_by: &str,
+        rows: &[crate::file_indexing::FileIndexRow],
+    ) -> Result<u64> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        self.block_on(async {
+            async fn upsert(
+                pool: &sqlx::SqlitePool,
+                table_id: i64,
+                built_by: &str,
+                rows: &[crate::file_indexing::FileIndexRow],
+            ) -> std::result::Result<u64, sqlx::Error> {
+                use crate::file_indexing::{encode_heavy_hitters, encode_u64_list};
+                let mut tx = pool.begin().await?;
+                let mut written = 0;
+                for row in rows {
+                    let meta = &row.meta;
+                    written += sqlx::query(
+                        "INSERT INTO ext_ducklake_file_index
+                             (table_id, path, file_size_bytes, column_id, index_path, index_key,
+                              index_size_bytes, format_version, value_type, row_count,
+                              row_group_rows, heavy_hitters, built_by)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         ON CONFLICT (table_id, path, column_id) DO UPDATE SET
+                             file_size_bytes = excluded.file_size_bytes,
+                             index_path = excluded.index_path,
+                             index_key = excluded.index_key,
+                             index_size_bytes = excluded.index_size_bytes,
+                             format_version = excluded.format_version,
+                             value_type = excluded.value_type,
+                             row_count = excluded.row_count,
+                             row_group_rows = excluded.row_group_rows,
+                             heavy_hitters = excluded.heavy_hitters,
+                             built_by = excluded.built_by,
+                             built_at = CURRENT_TIMESTAMP",
+                    )
+                    .bind(table_id)
+                    .bind(&meta.path)
+                    .bind(meta.file_size_bytes)
+                    .bind(meta.column_id)
+                    .bind(&meta.index_path)
+                    .bind(&row.index_key)
+                    .bind(meta.index_size_bytes)
+                    .bind(meta.format_version)
+                    .bind(meta.value_type.as_str())
+                    .bind(meta.row_count)
+                    .bind(encode_u64_list(&meta.row_group_rows))
+                    .bind(encode_heavy_hitters(&meta.heavy_hitters))
+                    .bind(built_by)
+                    .execute(&mut *tx)
+                    .await?
+                    .rows_affected();
+                }
+                tx.commit().await?;
+                Ok(written)
+            }
+            match upsert(&self.pool, table_id, built_by, rows).await {
+                Err(e) if crate::ext_file_order::is_missing_table(&e) => {
+                    sqlx::query(crate::file_indexing::SQLITE_DDL)
+                        .execute(&self.pool)
+                        .await?;
+                    Ok(upsert(&self.pool, table_id, built_by, rows).await?)
+                },
+                done => Ok(done?),
+            }
+        })
+    }
+
+    fn prune_file_indexes(&self, min_age: std::time::Duration) -> Result<Vec<String>> {
+        // CURRENT_TIMESTAMP's format, so the comparison is textual and exact.
+        // Second resolution, hence `<=`: a zero `min_age` prunes this second's rows.
+        let cutoff = chrono::Duration::from_std(min_age)
+            .ok()
+            .and_then(|age| chrono::Utc::now().checked_sub_signed(age))
+            .map_or_else(
+                || "0000-01-01 00:00:00".to_string(),
+                |at| at.format("%Y-%m-%d %H:%M:%S").to_string(),
+            );
+        self.block_on(async {
+            match sqlx::query_scalar::<_, String>(
+                "DELETE FROM ext_ducklake_file_index
+                 WHERE built_at <= ?
+                   AND NOT EXISTS (
+                     SELECT 1 FROM ducklake_data_file df
+                     WHERE df.table_id = ext_ducklake_file_index.table_id
+                       AND df.path = ext_ducklake_file_index.path)
+                 RETURNING index_key",
+            )
+            .bind(cutoff)
+            .fetch_all(&self.pool)
+            .await
+            {
+                Ok(keys) => Ok(keys),
+                Err(e) if crate::ext_file_order::is_missing_table(&e) => Ok(Vec::new()),
+                Err(e) => Err(e.into()),
+            }
+        })
+    }
+
     fn live_sort_spec(&self, table_id: i64) -> Result<Option<crate::sort::SortSpec>> {
         self.block_on(async {
             let rows = sqlx::query(

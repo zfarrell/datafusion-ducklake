@@ -2759,9 +2759,10 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
     }
 
     /// EXPERIMENTAL (`ext_file_index`): the sidecar rows of `table_id` for
-    /// `paths` and `column_ids` (see [`crate::ext_file_index`]). A file without
-    /// a row, or whose row does not match its size, is scanned without the
-    /// index, so the default (no rows) is always correct.
+    /// `paths` and `column_ids` (see [`crate::file_indexing`]). A caller
+    /// applies a row only when its size (and format version and value type)
+    /// match the listed file; anything else, including no row, means "scan
+    /// normally", so the default (no rows) is always correct.
     fn file_indexes(
         &self,
         _table_id: i64,

@@ -84,6 +84,7 @@ pub mod ext_file_index;
 pub mod ext_file_order;
 pub(crate) mod field_id_adapter;
 pub mod file_index_scan;
+pub mod file_indexing;
 pub(crate) mod file_ordering;
 pub mod information_schema;
 pub mod inlined_filter;
@@ -208,9 +209,9 @@ pub use metadata_provider_sqlite::SqliteMetadataProvider;
 
 // Re-export write types (feature-gated)
 #[cfg(feature = "write")]
-pub use compaction::{CheckpointResult, CompactionResult, MergeOptions, RewriteOptions};
+pub use compaction::{BuildIndexOptions, BuildIndexResult, VerifyOrderOptions, VerifyOrderResult};
 #[cfg(feature = "write")]
-pub use compaction::{VerifyOrderOptions, VerifyOrderResult};
+pub use compaction::{CheckpointResult, CompactionResult, MergeOptions, RewriteOptions};
 #[cfg(feature = "write")]
 pub use delete_exec::DuckLakeDeleteExec;
 #[cfg(feature = "write-postgres")]

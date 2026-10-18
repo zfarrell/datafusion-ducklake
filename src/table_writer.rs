@@ -22,6 +22,7 @@ use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 use crate::Result;
+use crate::file_indexing::FileIndexRequest;
 use crate::file_ordering::FileOrderRequest;
 use crate::metadata_provider::DuckLakeInlinedData;
 use crate::metadata_writer::{
@@ -219,6 +220,15 @@ pub struct DuckLakeWriteOptions {
     /// [`crate::ext_file_order`]). `None` or `false`: nothing is checked or
     /// recorded.
     pub ext_file_order: Option<bool>,
+    /// EXPERIMENTAL, opt-in: build an `ext_file_index` posting index of each
+    /// written file for the table's declared columns (the table setting
+    /// [`crate::file_indexing::COLUMNS_SETTING`]) and record it in the
+    /// `ext_ducklake_file_index` sidecar (see [`crate::file_indexing`]).
+    /// `None` or `false`: nothing is built or recorded.
+    pub ext_file_index: Option<bool>,
+    /// The declared index columns, as resolved from the catalog's settings
+    /// (table scope first). Used by maintenance writes; `None` = none.
+    pub ext_file_index_columns: Option<Vec<String>>,
     deferred_error: Option<String>,
 }
 
@@ -282,6 +292,11 @@ impl DuckLakeWriteOptions {
             )?,
             inlined_flush_policy: None,
             ext_file_order: None,
+            ext_file_index: None,
+            ext_file_index_columns: settings
+                .get(crate::file_indexing::COLUMNS_SETTING)
+                .map(|value| crate::file_indexing::parse_columns_setting(value))
+                .filter(|columns| !columns.is_empty()),
             deferred_error: None,
         })
     }
@@ -315,6 +330,14 @@ impl DuckLakeWriteOptions {
     #[must_use]
     pub fn with_ext_file_order(mut self, enabled: bool) -> Self {
         self.ext_file_order = Some(enabled);
+        self
+    }
+
+    /// EXPERIMENTAL: build and record an `ext_file_index` for every file
+    /// written; see [`Self::ext_file_index`].
+    #[must_use]
+    pub fn with_ext_file_index(mut self, enabled: bool) -> Self {
+        self.ext_file_index = Some(enabled);
         self
     }
 
@@ -377,6 +400,12 @@ impl DuckLakeWriteOptions {
         }
         if overrides.ext_file_order.is_some() {
             self.ext_file_order = overrides.ext_file_order;
+        }
+        if overrides.ext_file_index.is_some() {
+            self.ext_file_index = overrides.ext_file_index;
+        }
+        if overrides.ext_file_index_columns.is_some() {
+            self.ext_file_index_columns = overrides.ext_file_index_columns.clone();
         }
         self
     }
@@ -726,6 +755,8 @@ pub struct DuckLakeTableWriter {
     hive_file_pattern: bool,
     /// See [`DuckLakeWriteOptions::ext_file_order`].
     ext_file_order: bool,
+    /// See [`DuckLakeWriteOptions::ext_file_index`].
+    ext_file_index: bool,
 }
 
 /// Whether an error came from the metadata database or the object store or
@@ -772,6 +803,7 @@ impl DuckLakeTableWriter {
             flushing_inlined: false,
             hive_file_pattern: true,
             ext_file_order: false,
+            ext_file_index: false,
         })
     }
 
@@ -882,7 +914,54 @@ impl DuckLakeTableWriter {
         if let Some(ext_file_order) = options.ext_file_order {
             self.ext_file_order = ext_file_order;
         }
+        if let Some(ext_file_index) = options.ext_file_index {
+            self.ext_file_index = ext_file_index;
+        }
         self
+    }
+
+    /// What a write to `table_id` asks of each file under the experimental
+    /// `ext_file_index` option: postings for the table's declared columns
+    /// (its [`crate::file_indexing::COLUMNS_SETTING`], resolved table scope
+    /// first), which are fields of `schema`. `None` with the option off or
+    /// nothing declared. A failure to read the setting leaves the write
+    /// unindexed rather than failing it.
+    pub(crate) fn file_index_request(
+        &self,
+        table_id: i64,
+        schema_name: &str,
+        table_name: &str,
+        schema: &Schema,
+    ) -> Option<crate::file_indexing::FileIndexRequest> {
+        if !self.ext_file_index {
+            return None;
+        }
+        let declared = match self.metadata.table_setting(
+            schema_name,
+            table_name,
+            crate::file_indexing::COLUMNS_SETTING,
+        ) {
+            Ok(Some(value)) => crate::file_indexing::parse_columns_setting(&value),
+            Ok(None) => return None,
+            Err(error) => {
+                tracing::warn!(%error, "ext_file_index: columns setting unreadable; not indexing");
+                return None;
+            },
+        };
+        crate::file_indexing::FileIndexRequest::new(
+            Arc::clone(&self.metadata),
+            Arc::clone(&self.object_store),
+            table_id,
+            crate::ext_file_index::BUILT_BY_WRITE,
+            &declared,
+            schema,
+            None,
+        )
+    }
+
+    /// The object store this writer uploads to.
+    pub(crate) fn object_store(&self) -> &Arc<dyn ObjectStore> {
+        &self.object_store
     }
 
     /// What a write to `table_id` asks of each file it writes under the
@@ -1320,6 +1399,13 @@ impl DuckLakeTableWriter {
         let staging = std::io::BufWriter::new(temp.reopen()?);
         let mut writer = RowGroupSampledWriter::new(staging, schema_with_ids.clone(), props);
         writer.set_sort_check(file_order.as_ref().and_then(|o| o.check(&schema_with_ids)));
+        // Same rule as file order: only for a file name this writer mints.
+        let file_index = if path_is_relative {
+            self.file_index_request(setup.table_id, schema_name, table_name, &schema_with_ids)
+        } else {
+            None
+        };
+        writer.set_file_index(file_index.as_ref().map(FileIndexRequest::builders));
 
         // A partitioned target routes rows through a per-partition sink. The
         // single-file writer above is still created: with zero rows the sink
@@ -1346,6 +1432,7 @@ impl DuckLakeTableWriter {
                         schema_with_ids: schema_with_ids.clone(),
                         props: self.build_writer_props(),
                         file_order: file_order.clone(),
+                        file_index: file_index.clone(),
                         target_file_size: self.target_file_size,
                         max_open: self.max_open_partitions,
                         hive_file_pattern: self.hive_file_pattern,
@@ -1374,6 +1461,7 @@ impl DuckLakeTableWriter {
                 Some(catalog_path.clone()),
             );
             roller.set_file_order(file_order.clone());
+            roller.set_file_index(file_index.clone());
             Some(roller)
         } else {
             None
@@ -1897,6 +1985,7 @@ impl DuckLakeTableWriter {
         roll_over: bool,
         written: &mut Vec<ObjectPath>,
         file_order: Option<FileOrderRequest>,
+        file_index: Option<FileIndexRequest>,
     ) -> Result<Vec<DataFileInfo>> {
         self.refuse_encrypted_parquet("write a data file")?;
         let scoped_base = match self.metadata.catalog_id() {
@@ -1927,6 +2016,7 @@ impl DuckLakeTableWriter {
             None,
         );
         roller.set_file_order(file_order);
+        roller.set_file_index(file_index);
         let mut files = Vec::new();
         for batch in batches {
             if let Some(staged) = roller.write(batch)? {
@@ -2034,6 +2124,7 @@ impl DuckLakeTableWriter {
             embed_snapshot_id,
             partition_subpath,
             None,
+            None,
         )
         .await
     }
@@ -2059,6 +2150,7 @@ impl DuckLakeTableWriter {
         embed_snapshot_id: bool,
         partition_subpath: Option<&str>,
         file_order: Option<FileOrderRequest>,
+        file_index: Option<FileIndexRequest>,
     ) -> Result<DataFileInfo> {
         self.refuse_encrypted_parquet("write a compacted data file")?;
         let scoped_base = match self.metadata.catalog_id() {
@@ -2109,6 +2201,7 @@ impl DuckLakeTableWriter {
         let staging = std::io::BufWriter::new(temp.reopen()?);
         let mut writer = RowGroupSampledWriter::new(staging, schema_with_ids.clone(), props);
         writer.set_sort_check(file_order.as_ref().and_then(|o| o.check(&schema_with_ids)));
+        writer.set_file_index(file_index.as_ref().map(FileIndexRequest::builders));
         let mut row_count: i64 = 0;
         let mut leaf_stats = crate::stats_collect::WrittenLeafStats::default();
         while let Some(batch) = batches.next().await {
@@ -2127,9 +2220,13 @@ impl DuckLakeTableWriter {
         }
         // Scoped: a local borrowed before an await stays in the future across
         // it, and the writer is large.
-        let (verified_order, staged) = {
-            let writer = writer;
-            (writer.verified_order(), writer.into_inner()?)
+        let (verified_order, index_builders, (staged, row_group_rows)) = {
+            let mut writer = writer;
+            (
+                writer.verified_order(),
+                writer.take_file_index(),
+                writer.into_inner_with_row_groups()?,
+            )
         };
         let mut file = staged
             .into_inner()
@@ -2142,8 +2239,17 @@ impl DuckLakeTableWriter {
 
         let local = tokio::fs::File::open(temp.path()).await?;
         let mut reader = tokio::io::BufReader::new(local);
-        let mut upload = ObjectBufWriter::new(Arc::clone(&self.object_store), object_path);
+        let mut upload = ObjectBufWriter::new(Arc::clone(&self.object_store), object_path.clone());
         stream_to_upload(&mut reader, &mut upload).await?;
+        if let Some(builders) = index_builders {
+            PendingFileIndex {
+                builders,
+                row_group_rows,
+                file_size_bytes: file_size,
+            }
+            .record(&file_name, &object_path)
+            .await;
+        }
 
         // Collect stats for catalog columns only. NaN presence and string
         // bounds were tracked while consuming the stream: the footer records
@@ -2393,6 +2499,8 @@ impl DuckLakeTableWriter {
             None => groups,
         };
         let file_order = self.file_order_request(setup.table_id, &schema_with_ids)?;
+        let file_index =
+            self.file_index_request(setup.table_id, schema_name, table_name, &schema_with_ids);
         let file_infos = self
             .write_partition_groups(
                 &table_key,
@@ -2402,6 +2510,7 @@ impl DuckLakeTableWriter {
                 key_names,
                 &groups,
                 file_order,
+                file_index,
             )
             .await?;
         let records_written: i64 = file_infos.iter().map(|f| f.record_count).sum();
@@ -2635,6 +2744,8 @@ impl DuckLakeTableWriter {
         };
 
         let file_order = self.file_order_request(setup.table_id, &schema_with_ids)?;
+        let file_index =
+            self.file_index_request(setup.table_id, schema_name, table_name, &schema_with_ids);
         let file_infos = match partition.as_ref() {
             Some(spec) => {
                 let output_schema: SchemaRef = Arc::new(arrow_schema.clone());
@@ -2648,6 +2759,7 @@ impl DuckLakeTableWriter {
                     &spec.key_names(),
                     &groups,
                     file_order,
+                    file_index,
                 )
                 .await?
             },
@@ -2659,6 +2771,7 @@ impl DuckLakeTableWriter {
                     &setup.column_ids,
                     batches,
                     file_order,
+                    file_index,
                 )
                 .await?
             },
@@ -2797,6 +2910,8 @@ impl DuckLakeTableWriter {
             None
         };
         let file_order = self.file_order_request(setup.table_id, &schema_with_ids)?;
+        let file_index =
+            self.file_index_request(setup.table_id, schema_name, table_name, &schema_with_ids);
         let file_infos = match partition.as_ref() {
             Some(spec) => {
                 let output_schema = Arc::new(arrow_schema.clone());
@@ -2810,6 +2925,7 @@ impl DuckLakeTableWriter {
                     &spec.key_names(),
                     &groups,
                     file_order,
+                    file_index,
                 )
                 .await?
             },
@@ -2821,6 +2937,7 @@ impl DuckLakeTableWriter {
                     &setup.column_ids,
                     batches,
                     file_order,
+                    file_index,
                 )
                 .await?
             },
@@ -3221,6 +3338,7 @@ impl DuckLakeTableWriter {
         key_names: &[String],
         groups: &[PartitionGroup],
         file_order: Option<FileOrderRequest>,
+        file_index: Option<FileIndexRequest>,
     ) -> Result<Vec<DataFileInfo>> {
         let mut file_infos: Vec<DataFileInfo> = Vec::with_capacity(groups.len());
         for (values, batches) in groups {
@@ -3244,6 +3362,7 @@ impl DuckLakeTableWriter {
                     column_ids,
                     batches,
                     file_order.clone(),
+                    file_index.clone(),
                 )
                 .await?;
             let partition_values: Vec<(i32, Option<String>)> = values
@@ -3279,6 +3398,7 @@ impl DuckLakeTableWriter {
         column_ids: &[i64],
         batches: &[RecordBatch],
         file_order: Option<FileOrderRequest>,
+        file_index: Option<FileIndexRequest>,
     ) -> Result<Vec<DataFileInfo>> {
         self.refuse_encrypted_parquet("write a data file")?;
         let data_column_count = schema_with_ids.fields().len();
@@ -3292,6 +3412,7 @@ impl DuckLakeTableWriter {
             None,
         );
         roller.set_file_order(file_order);
+        roller.set_file_index(file_index);
         let mut files: Vec<DataFileInfo> = Vec::new();
         for batch in batches {
             if let Some(staged) = roller.write(batch)? {
@@ -4197,6 +4318,30 @@ struct OpenFile {
     file_order: Option<FileOrderRequest>,
 }
 
+/// A finished file's postings, built into index objects at upload.
+#[derive(Debug)]
+struct PendingFileIndex {
+    builders: crate::file_indexing::FileIndexBuilders,
+    row_group_rows: Vec<u64>,
+    file_size_bytes: i64,
+}
+
+impl PendingFileIndex {
+    /// Build, PUT and record after the data object at `object_path` is stored.
+    async fn record(self, catalog_path: &str, object_path: &ObjectPath) {
+        let request = self.builders.request().clone();
+        request
+            .record(
+                catalog_path,
+                object_path,
+                self.file_size_bytes,
+                self.builders,
+                self.row_group_rows,
+            )
+            .await;
+    }
+}
+
 /// A finished parquet whose footer is written and whose staging file is complete on
 /// disk, awaiting upload.
 ///
@@ -4211,6 +4356,8 @@ struct StagedFile {
     object_path: ObjectPath,
     row_count: i64,
     leaf_stats: crate::stats_collect::WrittenLeafStats,
+    /// `ext_file_index` postings, recorded once the file is uploaded.
+    file_index: Option<PendingFileIndex>,
 }
 
 /// Writes batches into a sequence of parquet files, starting a new one whenever the
@@ -4247,6 +4394,8 @@ struct RollingFileWriter {
     first_catalog_path: Option<String>,
     /// Checked, and recorded when it holds, for every file (`ext_file_order`).
     file_order: Option<FileOrderRequest>,
+    /// Postings built and recorded for every file (`ext_file_index`).
+    file_index: Option<FileIndexRequest>,
 }
 
 impl RollingFileWriter {
@@ -4269,7 +4418,13 @@ impl RollingFileWriter {
             target_file_size,
             open: None,
             file_order: None,
+            file_index: None,
         }
+    }
+
+    /// Build an `ext_file_index` for every file, recorded at its upload.
+    fn set_file_index(&mut self, file_index: Option<FileIndexRequest>) {
+        self.file_index = file_index;
     }
 
     /// Check every file's rows for `file_order`, and record the ones that hold.
@@ -4349,6 +4504,7 @@ impl RollingFileWriter {
                 .as_ref()
                 .and_then(|o| o.check(&self.schema_with_ids)),
         );
+        writer.set_file_index(self.file_index.as_ref().map(FileIndexRequest::builders));
         Ok(OpenFile {
             writer,
             temp,
@@ -4364,20 +4520,18 @@ impl RollingFileWriter {
 /// Write the parquet footer and flush the staging file to disk, releasing its
 /// descriptor. Synchronous, so a streaming write needs no await to roll a file.
 #[tracing::instrument(name = "ducklake.finalize_open_file", level = "info", skip_all)]
-fn finalize_open_file(file: OpenFile) -> Result<StagedFile> {
+fn finalize_open_file(mut file: OpenFile) -> Result<StagedFile> {
     let verified_order = file.writer.verified_order();
-    let staged = file.writer.into_inner()?;
+    let builders = file.writer.take_file_index();
+    let (staged, row_group_rows) = file.writer.into_inner_with_row_groups()?;
     // `into_inner` flushes the buffered footer bytes to the OS file; dropping the
     // returned handle closes that descriptor.
     let handle = staged
         .into_inner()
         .map_err(|e| crate::error::DuckLakeError::Io(e.into_error()))?;
+    let file_size = handle.metadata()?.len() as i64;
     if let (Some(file_order), Some(sort_key)) = (&file.file_order, verified_order) {
-        file_order.record(
-            &file.catalog_path,
-            handle.metadata()?.len() as i64,
-            sort_key,
-        );
+        file_order.record(&file.catalog_path, file_size, sort_key);
     }
     drop(handle);
     Ok(StagedFile {
@@ -4386,6 +4540,11 @@ fn finalize_open_file(file: OpenFile) -> Result<StagedFile> {
         object_path: file.object_path,
         row_count: file.row_count,
         leaf_stats: file.leaf_stats,
+        file_index: builders.map(|builders| PendingFileIndex {
+            builders,
+            row_group_rows,
+            file_size_bytes: file_size,
+        }),
     })
 }
 
@@ -4413,6 +4572,11 @@ async fn upload_staged_file(
     let mut reader = tokio::io::BufReader::new(local);
     let mut upload = ObjectBufWriter::new(Arc::clone(object_store), staged.object_path.clone());
     stream_to_upload(&mut reader, &mut upload).await?;
+    if let Some(index) = staged.file_index {
+        index
+            .record(&staged.catalog_path, &staged.object_path)
+            .await;
+    }
 
     let column_stats = crate::stats_collect::collect_own_written_column_stats(
         &staged.temp,
@@ -4467,6 +4631,8 @@ struct PartitionSink {
     props: WriterProperties,
     /// See [`RollingFileWriter::set_file_order`].
     file_order: Option<FileOrderRequest>,
+    /// See [`RollingFileWriter::set_file_index`].
+    file_index: Option<FileIndexRequest>,
     target_file_size: usize,
     max_open: usize,
     hive_file_pattern: bool,
@@ -4533,6 +4699,7 @@ impl PartitionSink {
                     None,
                 );
                 roller.set_file_order(self.file_order.clone());
+                roller.set_file_index(self.file_index.clone());
                 self.open.push((values.to_vec(), roller));
                 self.open.len() - 1
             },
@@ -5772,9 +5939,13 @@ impl TableWriteSession {
         // staging file on disk is the complete parquet.
         // Scoped: a local borrowed before an await stays in the future across
         // it, and the writer is large.
-        let (verified_order, staged) = {
-            let writer = writer;
-            (writer.verified_order(), writer.into_inner()?)
+        let (verified_order, index_builders, (staged, row_group_rows)) = {
+            let mut writer = writer;
+            (
+                writer.verified_order(),
+                writer.take_file_index(),
+                writer.into_inner_with_row_groups()?,
+            )
         };
         let mut file = staged
             .into_inner()
@@ -5801,6 +5972,15 @@ impl TableWriteSession {
                 tracing::warn!(error = %failure, "failed to remove a data file after a failed upload");
             }
             return Err(error.into());
+        }
+        if let Some(builders) = index_builders {
+            PendingFileIndex {
+                builders,
+                row_group_rows,
+                file_size_bytes: file_size,
+            }
+            .record(&self.catalog_path, &self.object_path)
+            .await;
         }
 
         // Harvest per-column statistics from the parquet footer we just wrote

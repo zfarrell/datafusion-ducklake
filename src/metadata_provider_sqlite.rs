@@ -1680,6 +1680,51 @@ impl MetadataProvider for SqliteMetadataProvider {
         })
     }
 
+    fn file_indexes(
+        &self,
+        table_id: i64,
+        paths: &[&str],
+        column_ids: &[i64],
+    ) -> Result<Vec<crate::ext_file_index::FileIndexMeta>> {
+        if paths.is_empty() || column_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        block_on(async {
+            let mut out = Vec::new();
+            let columns = vec!["?"; column_ids.len()].join(",");
+            // Bounded binds per statement (SQLite's limit is 32766).
+            for chunk in paths.chunks(900) {
+                let placeholders = vec!["?"; chunk.len()].join(",");
+                let sql = format!(
+                    "SELECT {} FROM ext_ducklake_file_index \
+                     WHERE table_id = ? AND path IN ({placeholders}) AND column_id IN ({columns})",
+                    crate::file_indexing::SELECT_COLUMNS
+                );
+                let mut query = sqlx::query(AssertSqlSafe(sql)).bind(table_id);
+                for path in chunk {
+                    query = query.bind(*path);
+                }
+                for id in column_ids {
+                    query = query.bind(*id);
+                }
+                match query.fetch_all(&self.pool).await {
+                    Ok(rows) => {
+                        for row in &rows {
+                            if let Some(meta) = crate::file_indexing::decode_file_index_row!(row) {
+                                out.push(meta);
+                            }
+                        }
+                    },
+                    Err(e) if crate::ext_file_order::is_missing_table(&e) => {
+                        return Ok(Vec::new());
+                    },
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            Ok(out)
+        })
+    }
+
     fn get_table_file_metadata_page(
         &self,
         table_id: i64,

@@ -6925,6 +6925,118 @@ impl MetadataWriter for PostgresMetadataWriter {
         })
     }
 
+    fn record_file_indexes(
+        &self,
+        table_id: i64,
+        built_by: &str,
+        rows: &[crate::file_indexing::FileIndexRow],
+    ) -> Result<u64> {
+        use crate::file_indexing::{encode_heavy_hitters, encode_u64_list};
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let paths: Vec<&str> = rows.iter().map(|r| r.meta.path.as_str()).collect();
+        let sizes: Vec<i64> = rows.iter().map(|r| r.meta.file_size_bytes).collect();
+        let columns: Vec<i64> = rows.iter().map(|r| r.meta.column_id).collect();
+        let index_paths: Vec<&str> = rows.iter().map(|r| r.meta.index_path.as_str()).collect();
+        let index_keys: Vec<&str> = rows.iter().map(|r| r.index_key.as_str()).collect();
+        let index_sizes: Vec<i64> = rows.iter().map(|r| r.meta.index_size_bytes).collect();
+        let versions: Vec<i32> = rows.iter().map(|r| r.meta.format_version).collect();
+        let types: Vec<&str> = rows.iter().map(|r| r.meta.value_type.as_str()).collect();
+        let row_counts: Vec<i64> = rows.iter().map(|r| r.meta.row_count).collect();
+        let groups: Vec<String> = rows
+            .iter()
+            .map(|r| encode_u64_list(&r.meta.row_group_rows))
+            .collect();
+        let hitters: Vec<String> = rows
+            .iter()
+            .map(|r| encode_heavy_hitters(&r.meta.heavy_hitters))
+            .collect();
+        self.block_on(async {
+            // A rebuild of the same object wins: same bytes, so only the
+            // builder (a newer format) can differ.
+            let upsert = || {
+                sqlx::query(
+                    "INSERT INTO ext_ducklake_file_index
+                         (table_id, path, file_size_bytes, column_id, index_path, index_key,
+                          index_size_bytes, format_version, value_type, row_count,
+                          row_group_rows, heavy_hitters, built_by)
+                     SELECT $1, u.path, u.size, u.col, u.ipath, u.ikey, u.isize, u.ver, u.vt,
+                            u.rows, u.groups, u.hh, $13
+                     FROM UNNEST($2::text[], $3::bigint[], $4::bigint[], $5::text[], $6::text[],
+                                 $7::bigint[], $8::int[], $9::text[], $10::bigint[], $11::text[],
+                                 $12::text[])
+                          AS u(path, size, col, ipath, ikey, isize, ver, vt, rows, groups, hh)
+                     ON CONFLICT (table_id, path, column_id) DO UPDATE SET
+                         file_size_bytes = EXCLUDED.file_size_bytes,
+                         index_path = EXCLUDED.index_path,
+                         index_key = EXCLUDED.index_key,
+                         index_size_bytes = EXCLUDED.index_size_bytes,
+                         format_version = EXCLUDED.format_version,
+                         value_type = EXCLUDED.value_type,
+                         row_count = EXCLUDED.row_count,
+                         row_group_rows = EXCLUDED.row_group_rows,
+                         heavy_hitters = EXCLUDED.heavy_hitters,
+                         built_by = EXCLUDED.built_by,
+                         built_at = now()",
+                )
+                .bind(table_id)
+                .bind(&paths)
+                .bind(&sizes)
+                .bind(&columns)
+                .bind(&index_paths)
+                .bind(&index_keys)
+                .bind(&index_sizes)
+                .bind(&versions)
+                .bind(&types)
+                .bind(&row_counts)
+                .bind(&groups)
+                .bind(&hitters)
+                .bind(built_by)
+                .execute(&self.pool)
+            };
+            // Created only when missing, as for ext_ducklake_file_order.
+            match upsert().await {
+                Err(e) if crate::ext_file_order::is_missing_table(&e) => {
+                    match sqlx::query(crate::file_indexing::POSTGRES_DDL)
+                        .execute(&self.pool)
+                        .await
+                    {
+                        Ok(_) => {},
+                        Err(sqlx::Error::Database(db)) if db.code().as_deref() == Some("23505") => {
+                        },
+                        Err(e) => return Err(e.into()),
+                    }
+                    Ok(upsert().await?.rows_affected())
+                },
+                done => Ok(done?.rows_affected()),
+            }
+        })
+    }
+
+    fn prune_file_indexes(&self, min_age: std::time::Duration) -> Result<Vec<String>> {
+        let min_age_us = i64::try_from(min_age.as_micros()).unwrap_or(i64::MAX);
+        self.block_on(async {
+            // Any catalog row for the path keeps it: a retired file is still
+            // read by time travel until expiry removes its row.
+            match sqlx::query_scalar::<_, String>(
+                "DELETE FROM ext_ducklake_file_index i
+                 WHERE i.built_at <= now() - make_interval(secs => $1::double precision / 1e6)
+                   AND NOT EXISTS (SELECT 1 FROM ducklake_data_file df
+                                   WHERE df.table_id = i.table_id AND df.path = i.path)
+                 RETURNING i.index_key",
+            )
+            .bind(min_age_us)
+            .fetch_all(&self.pool)
+            .await
+            {
+                Ok(keys) => Ok(keys),
+                Err(e) if crate::ext_file_order::is_missing_table(&e) => Ok(Vec::new()),
+                Err(e) => Err(e.into()),
+            }
+        })
+    }
+
     fn live_sort_spec(&self, table_id: i64) -> Result<Option<crate::sort::SortSpec>> {
         self.block_on(async {
             let rows = sqlx::query(

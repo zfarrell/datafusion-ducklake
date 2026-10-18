@@ -259,6 +259,8 @@ pub(crate) struct RowGroupSampledWriter<W: Write + Send> {
     writer: Option<ArrowWriter<W>>,
     /// Boxed: the writer lives in long-held futures, and is mostly `None`.
     sort_check: Option<Box<crate::file_ordering::SortCheck>>,
+    /// Postings of the `ext_file_index` columns, fed every row in write order.
+    file_index: Option<Box<crate::file_indexing::FileIndexBuilders>>,
 }
 
 impl<W: Write + Send> RowGroupSampledWriter<W> {
@@ -270,6 +272,7 @@ impl<W: Write + Send> RowGroupSampledWriter<W> {
             buffered_bytes: 0,
             writer: None,
             sort_check: None,
+            file_index: None,
         }
     }
 
@@ -279,11 +282,30 @@ impl<W: Write + Send> RowGroupSampledWriter<W> {
         self.sort_check = check.map(Box::new);
     }
 
+    /// Build `ext_file_index` postings from every row written (see
+    /// [`crate::file_indexing`]); take them with [`Self::take_file_index`].
+    pub(crate) fn set_file_index(
+        &mut self,
+        builders: Option<crate::file_indexing::FileIndexBuilders>,
+    ) {
+        self.file_index = builders.map(Box::new);
+    }
+
+    /// The postings built so far. Take before [`Self::into_inner_with_row_groups`].
+    pub(crate) fn take_file_index(&mut self) -> Option<crate::file_indexing::FileIndexBuilders> {
+        self.file_index.take().map(|b| *b)
+    }
+
     /// Write `batch`, which must carry the file's parquet schema. Buffers it while
     /// the first row group is incomplete, and opens the file once it is.
     pub(crate) fn write(&mut self, batch: &RecordBatch) -> Result<()> {
         if let Some(check) = &mut self.sort_check {
             check.observe(batch)?;
+        }
+        if let Some(index) = &mut self.file_index {
+            // Positions are the running row count: rows reach the file in
+            // exactly this order, buffered or not.
+            index.observe(batch);
         }
         if let Some(writer) = &mut self.writer {
             writer.write(batch)?;
@@ -339,7 +361,23 @@ impl<W: Write + Send> RowGroupSampledWriter<W> {
             .and_then(|check| check.attestation())
     }
 
+    /// [`Self::into_inner`], also returning each row group's row count.
+    pub(crate) fn into_inner_with_row_groups(mut self) -> Result<(W, Vec<u64>)> {
+        if self.writer.is_none() {
+            self.open()?;
+        }
+        let mut writer = self.writer.take().expect("writer opened above");
+        writer.flush()?;
+        let groups = writer
+            .flushed_row_groups()
+            .iter()
+            .map(|rg| rg.num_rows().max(0) as u64)
+            .collect();
+        Ok((writer.into_inner()?, groups))
+    }
+
     /// Write the footer and return the sink.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn into_inner(mut self) -> Result<W> {
         if self.writer.is_none() {
             self.open()?;

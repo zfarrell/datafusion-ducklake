@@ -1763,6 +1763,44 @@ impl MetadataProvider for MulticatalogProvider {
         })
     }
 
+    fn file_indexes(
+        &self,
+        table_id: i64,
+        paths: &[&str],
+        column_ids: &[i64],
+    ) -> Result<Vec<crate::ext_file_index::FileIndexMeta>> {
+        if paths.is_empty() || column_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        block_on(async {
+            let sql = format!(
+                "SELECT {} FROM ext_ducklake_file_index
+                 WHERE table_id = $1 AND path = ANY($2) AND column_id = ANY($3)",
+                crate::file_indexing::SELECT_COLUMNS
+            );
+            let rows = match self
+                .read_all(
+                    sqlx::query(sqlx::AssertSqlSafe(sql))
+                        .bind(table_id)
+                        .bind(paths)
+                        .bind(column_ids),
+                )
+                .await
+            {
+                Ok(rows) => rows,
+                Err(e) if crate::ext_file_order::is_missing_table(&e) => return Ok(Vec::new()),
+                Err(e) => return Err(e.into()),
+            };
+            let mut out = Vec::with_capacity(rows.len());
+            for row in &rows {
+                if let Some(meta) = crate::file_indexing::decode_file_index_row!(row) {
+                    out.push(meta);
+                }
+            }
+            Ok(out)
+        })
+    }
+
     fn get_table_file_metadata_page(
         &self,
         table_id: i64,
