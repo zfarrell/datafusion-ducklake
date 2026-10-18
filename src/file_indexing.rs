@@ -287,8 +287,15 @@ pub(crate) fn data_key_of_index(key: &str) -> Option<&str> {
     (digits(version) && digits(column) && !data.is_empty()).then_some(data)
 }
 
+/// The object path a stored `index_key` names. Keys are stored as
+/// `ObjectPath` renders them (already encoded), so parse rather than encode.
+pub fn object_key(index_key: &str) -> object_store::path::Path {
+    object_store::path::Path::parse(index_key)
+        .unwrap_or_else(|_| object_store::path::Path::from(index_key))
+}
+
 #[cfg(feature = "write")]
-pub(crate) use write::{FileIndexBuilders, FileIndexRequest};
+pub(crate) use write::{FileIndexBuilders, FileIndexColumn, FileIndexRequest};
 
 #[cfg(feature = "write")]
 mod write {
@@ -299,7 +306,7 @@ mod write {
     use object_store::path::Path as ObjectPath;
     use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 
-    use super::FileIndexRow;
+    use super::{FileIndexRow, object_key};
     use crate::ext_file_index::{IndexValueType, PostingBuilder, index_object_path};
     use crate::metadata_writer::MetadataWriter;
 
@@ -377,6 +384,24 @@ mod write {
             })
         }
 
+        /// A request for already-resolved `columns` (the backfill, which
+        /// resolves them per file against the file's own schema).
+        pub(crate) fn from_columns(
+            metadata: Arc<dyn MetadataWriter>,
+            store: Arc<dyn ObjectStore>,
+            table_id: i64,
+            built_by: &'static str,
+            columns: Vec<FileIndexColumn>,
+        ) -> Self {
+            Self(Arc::new(Inner {
+                metadata,
+                store,
+                table_id,
+                built_by,
+                columns,
+            }))
+        }
+
         /// Fresh builders for one file.
         pub(crate) fn builders(&self) -> FileIndexBuilders {
             FileIndexBuilders {
@@ -408,7 +433,7 @@ mod write {
                 .try_record(path, data_object, file_size_bytes, builders, row_group_rows)
                 .await
             {
-                Ok(n) => n,
+                Ok(done) => done.rows,
                 Err(error) => {
                     tracing::warn!(
                         %error,
@@ -420,20 +445,23 @@ mod write {
             }
         }
 
-        async fn try_record(
+        /// [`Self::record`], reporting failure to the caller (the backfill).
+        pub(crate) async fn try_record(
             &self,
             path: &str,
             data_object: &ObjectPath,
             file_size_bytes: i64,
             builders: FileIndexBuilders,
             row_group_rows: Vec<u64>,
-        ) -> crate::Result<u64> {
+        ) -> crate::Result<Recorded> {
             if builders.failed {
-                return Ok(0);
+                return Err(crate::DuckLakeError::Internal(
+                    "postings incomplete".to_string(),
+                ));
             }
             let rows_seen = builders.rows_seen();
             if rows_seen == 0 {
-                return Ok(0);
+                return Ok(Recorded::default());
             }
             if row_group_rows.iter().sum::<u64>() != rows_seen {
                 return Err(crate::DuckLakeError::Internal(format!(
@@ -443,6 +471,7 @@ mod write {
             }
             let file_name = path.rsplit('/').next().unwrap_or(path);
             let mut rows = Vec::with_capacity(builders.columns.len());
+            let mut bytes_written = 0u64;
             for (column, builder) in builders.columns {
                 let groups = row_group_rows.clone();
                 // CPU-bound (sort + encode); off the async worker.
@@ -451,10 +480,11 @@ mod write {
                     .map_err(|e| crate::DuckLakeError::Internal(e.to_string()))??;
                 let index_key = index_object_path(data_object.as_ref(), column.column_id);
                 let index_path = index_object_path(file_name, column.column_id);
+                bytes_written += built.bytes.len() as u64;
                 self.0
                     .store
                     .put(
-                        &ObjectPath::from(index_key.as_str()),
+                        &object_key(&index_key),
                         PutPayload::from_bytes(built.bytes.clone()),
                     )
                     .await?;
@@ -469,10 +499,22 @@ mod write {
                     index_key,
                 });
             }
-            self.0
-                .metadata
-                .record_file_indexes(self.0.table_id, self.0.built_by, &rows)
+            let rows =
+                self.0
+                    .metadata
+                    .record_file_indexes(self.0.table_id, self.0.built_by, &rows)?;
+            Ok(Recorded {
+                rows,
+                bytes_written,
+            })
         }
+    }
+
+    /// What [`FileIndexRequest::try_record`] stored.
+    #[derive(Debug, Default, Clone, Copy)]
+    pub(crate) struct Recorded {
+        pub(crate) rows: u64,
+        pub(crate) bytes_written: u64,
     }
 
     /// The top-level `name` of `schema` as an index column: it needs a

@@ -2382,6 +2382,356 @@ impl DuckLakeTable {
     }
 }
 
+/// Options for [`DuckLakeTable::build_file_indexes`].
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct BuildIndexOptions {
+    /// Only these data files; `None` = every live file.
+    pub data_file_ids: Option<Vec<i64>>,
+    /// Stop after indexing this many files (bounds one pass); `None` = all.
+    pub max_files: Option<usize>,
+    /// Index these columns; `None` = the table's
+    /// [`crate::file_indexing::COLUMNS_SETTING`].
+    pub columns: Option<Vec<String>>,
+    /// Files read and indexed at once; 0 is taken as 1.
+    pub parallelism: usize,
+}
+
+impl BuildIndexOptions {
+    /// Index only these data files.
+    #[must_use]
+    pub fn with_data_file_ids(mut self, data_file_ids: Vec<i64>) -> Self {
+        self.data_file_ids = Some(data_file_ids);
+        self
+    }
+
+    /// Stop after indexing `max_files` files.
+    #[must_use]
+    pub fn with_max_files(mut self, max_files: usize) -> Self {
+        self.max_files = Some(max_files);
+        self
+    }
+
+    /// Index these columns instead of the declared ones.
+    #[must_use]
+    pub fn with_columns(mut self, columns: Vec<String>) -> Self {
+        self.columns = Some(columns);
+        self
+    }
+
+    /// Read and index `parallelism` files at once.
+    #[must_use]
+    pub fn with_parallelism(mut self, parallelism: usize) -> Self {
+        self.parallelism = parallelism;
+        self
+    }
+}
+
+/// What [`DuckLakeTable::build_file_indexes`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct BuildIndexResult {
+    /// Files whose missing indexes were built and recorded.
+    pub files_indexed: u64,
+    /// Files not read: every requested column already has a matching row,
+    /// or the file is name-mapped, encrypted, or lacks the columns.
+    pub files_skipped: u64,
+    /// Files whose read, build, upload or record failed (warned; a later
+    /// pass retries them).
+    pub files_failed: u64,
+    /// Compressed bytes of the indexed column chunks read.
+    pub bytes_read: u64,
+    /// Bytes of index objects written.
+    pub bytes_written: u64,
+}
+
+impl DuckLakeTable {
+    /// EXPERIMENTAL (`ext_file_index`): build the missing per-file indexes of
+    /// live data files for the declared (or given) columns: files written
+    /// before the option was on, by another client, or registered as is.
+    /// No file is rewritten and no snapshot is taken.
+    ///
+    /// Per file: read only the indexed columns (by field id, else by name for
+    /// a file without field ids), build the postings, PUT the index object
+    /// next to the data file and record its `ext_ducklake_file_index` row.
+    /// Each file is recorded as soon as it is built, so an interrupted pass
+    /// keeps its progress and the next pass skips what is done: a file whose
+    /// row matches its path, size, column, format version and value type.
+    /// A row for a file compacted away meanwhile matches no live file and is
+    /// dropped by `MetadataWriter::prune_file_indexes`. Idempotent.
+    pub async fn build_file_indexes(
+        &self,
+        state: &dyn Session,
+        opts: BuildIndexOptions,
+    ) -> Result<BuildIndexResult> {
+        use datafusion::datasource::listing::PartitionedFile;
+        use datafusion::datasource::physical_plan::ParquetFileReaderFactory;
+        use datafusion::datasource::physical_plan::parquet::DefaultParquetFileReaderFactory;
+        use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
+        use object_store::path::Path as ObjectPath;
+        use parquet::arrow::ProjectionMask;
+        use parquet::arrow::arrow_reader::ArrowReaderMetadata;
+        use parquet::arrow::async_reader::{AsyncFileReader, ParquetRecordBatchStreamBuilder};
+
+        use crate::ext_file_index::{FILE_INDEX_FORMAT_VERSION, IndexValueType};
+        use crate::file_indexing::{FileIndexColumn, FileIndexRequest};
+
+        let mut result = BuildIndexResult::default();
+        let writer = self.writer().ok_or_else(|| {
+            DuckLakeError::InvalidConfig(
+                "build_file_indexes: table is read-only; open the catalog with a writer"
+                    .to_string(),
+            )
+        })?;
+        let declared = match opts.columns {
+            Some(columns) => columns,
+            None => match self.write_options().ext_file_index_columns.clone() {
+                Some(columns) => columns,
+                None => return Ok(result),
+            },
+        };
+        // (column_id, catalog name, value type of the catalog type).
+        let physical_schema = self.physical_schema();
+        let column_ids = self.top_level_column_ids();
+        let mut wanted: Vec<(i64, String, IndexValueType)> = Vec::new();
+        for name in &declared {
+            let Ok(index) = physical_schema.index_of(name) else {
+                return Err(DuckLakeError::InvalidConfig(format!(
+                    "build_file_indexes: no top-level column '{name}'"
+                )));
+            };
+            let Some(value_type) =
+                IndexValueType::for_arrow(physical_schema.field(index).data_type())
+            else {
+                return Err(DuckLakeError::InvalidConfig(format!(
+                    "build_file_indexes: column '{name}' has a type the index cannot key"
+                )));
+            };
+            if !wanted.iter().any(|(id, _, _)| *id == column_ids[index]) {
+                wanted.push((column_ids[index], name.clone(), value_type));
+            }
+        }
+        if wanted.is_empty() {
+            return Ok(result);
+        }
+        let wanted_ids: Vec<i64> = wanted.iter().map(|(id, _, _)| *id).collect();
+
+        let object_store = state
+            .runtime_env()
+            .object_store(self.object_store_url().as_ref())?;
+        let readers = DefaultParquetFileReaderFactory::new(Arc::clone(&object_store));
+        let reader_metrics = ExecutionPlanMetricsSet::new();
+        let selected = opts
+            .data_file_ids
+            .map(|ids| ids.into_iter().collect::<HashSet<_>>());
+        let mut candidates = Vec::new();
+        for page in self.file_metadata_pages("build_file_indexes", None) {
+            candidates.extend(
+                page?
+                    .into_iter()
+                    .map(|metadata| metadata.file)
+                    .filter(|tf| {
+                        selected
+                            .as_ref()
+                            .is_none_or(|ids| ids.contains(&tf.data_file_id))
+                    }),
+            );
+        }
+        let paths: Vec<&str> = candidates.iter().map(|tf| tf.file.path.as_str()).collect();
+        let done: HashSet<(String, i64, i64)> = self
+            .metadata_provider()
+            .file_indexes(self.table_id(), &paths, &wanted_ids)?
+            .into_iter()
+            .filter(|meta| {
+                meta.format_version == FILE_INDEX_FORMAT_VERSION
+                    && wanted
+                        .iter()
+                        .any(|(id, _, ty)| *id == meta.column_id && *ty == meta.value_type)
+            })
+            .map(|meta| (meta.path, meta.file_size_bytes, meta.column_id))
+            .collect();
+
+        // Per candidate, the columns it still lacks; files lacking none, and
+        // files this reader cannot place columns in, are skipped.
+        let mut work = Vec::new();
+        for tf in candidates {
+            let missing: Vec<(i64, String, IndexValueType)> = wanted
+                .iter()
+                .filter(|(id, _, _)| {
+                    !done.contains(&(tf.file.path.clone(), tf.file.file_size_bytes, *id))
+                })
+                .cloned()
+                .collect();
+            if missing.is_empty()
+                || tf.file.mapping_id.is_some()
+                || tf
+                    .file
+                    .encryption_key
+                    .as_deref()
+                    .is_some_and(|k| !k.is_empty())
+            {
+                result.files_skipped += 1;
+                continue;
+            }
+            work.push((tf, missing));
+        }
+        if let Some(max) = opts.max_files {
+            for _ in work.drain(max.min(work.len())..) {
+                // Left for a later pass; not counted as skipped.
+            }
+        }
+
+        enum Outcome {
+            Indexed {
+                bytes_read: u64,
+                bytes_written: u64,
+            },
+            Skipped,
+        }
+
+        let index_one = |tf: crate::metadata_provider::DuckLakeTableFile,
+                         missing: Vec<(i64, String, IndexValueType)>| {
+            let readers = &readers;
+            let reader_metrics = &reader_metrics;
+            let object_store = &object_store;
+            async move {
+                let source = ObjectPath::from(crate::path_resolver::resolve_path(
+                    self.table_path(),
+                    &tf.file.path,
+                    tf.file.path_is_relative,
+                )?);
+                let size = u64::try_from(tf.file.file_size_bytes).map_err(|_| {
+                    DuckLakeError::Internal(format!("negative file size for {}", tf.file.path))
+                })?;
+                let open = || {
+                    readers.create_reader(
+                        0,
+                        PartitionedFile::new(source.to_string(), size),
+                        crate::table::metadata_size_hint(tf.file.footer_size),
+                        reader_metrics,
+                    )
+                };
+                let footer = open()?.get_metadata(None).await?;
+                let reader_metadata =
+                    ArrowReaderMetadata::try_new(Arc::clone(&footer), Default::default())?;
+                let file_schema = reader_metadata.schema().clone();
+                let field_id = |field: &arrow::datatypes::Field| {
+                    field
+                        .metadata()
+                        .get("PARQUET:field_id")
+                        .and_then(|id| id.parse::<i64>().ok())
+                };
+                let by_name = file_schema.fields().iter().all(|f| field_id(f).is_none());
+                // (root in the file, column id, value type); a column the file
+                // lacks (added later) or stores as an unkeyable or different
+                // key type is left unindexed for this file.
+                let mut roots: Vec<(usize, i64, IndexValueType)> = Vec::new();
+                for (id, name, ty) in &missing {
+                    let root = if by_name {
+                        file_schema.index_of(name).ok()
+                    } else {
+                        file_schema
+                            .fields()
+                            .iter()
+                            .position(|f| field_id(f) == Some(*id))
+                    };
+                    let Some(root) = root else {
+                        continue;
+                    };
+                    if IndexValueType::for_arrow(file_schema.field(root).data_type()) == Some(*ty) {
+                        roots.push((root, *id, *ty));
+                    }
+                }
+                if roots.is_empty() {
+                    return Ok::<_, DuckLakeError>(Outcome::Skipped);
+                }
+                roots.sort_unstable_by_key(|(root, _, _)| *root);
+                let root_indices: Vec<usize> = roots.iter().map(|(r, _, _)| *r).collect();
+                let descr = footer.file_metadata().schema_descr();
+                let bytes_read = footer
+                    .row_groups()
+                    .iter()
+                    .flat_map(|rg| rg.columns().iter().enumerate())
+                    .filter(|(leaf, _)| root_indices.contains(&descr.get_column_root_idx(*leaf)))
+                    .map(|(_, column)| column.compressed_size().max(0) as u64)
+                    .sum::<u64>();
+                let row_group_rows: Vec<u64> = footer
+                    .row_groups()
+                    .iter()
+                    .map(|rg| rg.num_rows().max(0) as u64)
+                    .collect();
+                let mask = ProjectionMask::roots(descr, root_indices);
+                let reader: Box<dyn AsyncFileReader> = open()?;
+                let mut stream =
+                    ParquetRecordBatchStreamBuilder::new_with_metadata(reader, reader_metadata)
+                        .with_projection(mask)
+                        .build()?;
+                // The projected batch holds the roots in ascending order.
+                let columns: Vec<FileIndexColumn> = roots
+                    .iter()
+                    .enumerate()
+                    .map(
+                        |(field_index, (_, column_id, value_type))| FileIndexColumn {
+                            column_id: *column_id,
+                            field_index,
+                            value_type: *value_type,
+                        },
+                    )
+                    .collect();
+                let request = FileIndexRequest::from_columns(
+                    Arc::clone(writer),
+                    Arc::clone(object_store),
+                    self.table_id(),
+                    crate::ext_file_index::BUILT_BY_BACKFILL,
+                    columns,
+                );
+                let mut builders = request.builders();
+                while let Some(batch) = stream.next().await {
+                    builders.observe(&batch?);
+                }
+                let recorded = request
+                    .try_record(
+                        &tf.file.path,
+                        &source,
+                        tf.file.file_size_bytes,
+                        builders,
+                        row_group_rows,
+                    )
+                    .await?;
+                Ok(Outcome::Indexed {
+                    bytes_read,
+                    bytes_written: recorded.bytes_written,
+                })
+            }
+        };
+
+        let mut outcomes = futures::stream::iter(work.into_iter().map(|(tf, missing)| {
+            let path = tf.file.path.clone();
+            let fut = index_one(tf, missing);
+            async move { (path, fut.await) }
+        }))
+        .buffer_unordered(opts.parallelism.max(1));
+        while let Some((path, outcome)) = outcomes.next().await {
+            match outcome {
+                Ok(Outcome::Indexed {
+                    bytes_read,
+                    bytes_written,
+                }) => {
+                    result.files_indexed += 1;
+                    result.bytes_read += bytes_read;
+                    result.bytes_written += bytes_written;
+                },
+                Ok(Outcome::Skipped) => result.files_skipped += 1,
+                Err(error) => {
+                    tracing::warn!(%error, path, "build_file_indexes: file not indexed");
+                    result.files_failed += 1;
+                },
+            }
+        }
+        Ok(result)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
