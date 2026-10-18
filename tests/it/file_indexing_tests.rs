@@ -220,19 +220,27 @@ impl Env {
     }
 
     async fn catalog(&self) -> DuckLakeCatalog {
+        self.catalog_with(options()).await
+    }
+
+    async fn catalog_with(&self, options: DuckLakeWriteOptions) -> DuckLakeCatalog {
         DuckLakeCatalog::with_writer(
             Arc::new(SqliteMetadataProvider::new(&self.url()).await.unwrap()),
             Arc::new(self.writer().await),
         )
         .unwrap()
-        .with_write_options(options())
+        .with_write_options(options)
     }
 
     async fn table(&self) -> (SessionContext, DuckLakeTable) {
+        self.table_with(options()).await
+    }
+
+    async fn table_with(&self, options: DuckLakeWriteOptions) -> (SessionContext, DuckLakeTable) {
         let ctx = SessionContext::new();
         ctx.runtime_env()
             .register_object_store(&url::Url::parse("file://").unwrap(), self.store());
-        ctx.register_catalog("ducklake", Arc::new(self.catalog().await));
+        ctx.register_catalog("ducklake", Arc::new(self.catalog_with(options).await));
         let table = ctx
             .catalog("ducklake")
             .unwrap()
@@ -492,6 +500,11 @@ fn options() -> DuckLakeWriteOptions {
     options
 }
 
+/// [`options`] with the experimental write option on.
+fn index_options() -> DuckLakeWriteOptions {
+    options().with_ext_file_index(true)
+}
+
 async fn setup() -> Env {
     let temp = TempDir::new().unwrap();
     std::fs::create_dir_all(temp.path().join("data")).unwrap();
@@ -668,9 +681,10 @@ async fn backfill_after_merge_and_rewrite() {
     env.assert_indexed(&["user_id", "n"], "backfill").await;
 }
 
-/// Writes and compaction build nothing, with columns declared.
+/// With the write option off (the default), writes and compaction build
+/// nothing, even with columns declared.
 #[tokio::test(flavor = "multi_thread")]
-async fn writes_and_compaction_build_nothing() {
+async fn option_off_writes_and_compaction_build_nothing() {
     let env = indexed_env().await;
     env.append(&[batch(0..500)], &options()).await;
     env.append(&[batch(500..900)], &options()).await;
@@ -1094,4 +1108,139 @@ async fn provider_rows_serve_exact_lookups() {
             assert_eq!(got.rows, want, "{} {column} {key:?}", meta.path);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Write option on: writers and compaction build indexes themselves
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn written_session_and_rolled_files_are_indexed() {
+    let env = indexed_env().await;
+    env.append(&[batch(0..700), batch(700..1_000)], &index_options())
+        .await;
+    let mut rolled = index_options();
+    rolled.target_file_size = Some(4_000);
+    env.append(
+        &(0..10)
+            .map(|i| batch(1_000 + i * 500..1_000 + (i + 1) * 500))
+            .collect::<Vec<_>>(),
+        &rolled,
+    )
+    .await;
+    let files = env.live_files().await.len();
+    assert!(files > 2, "the second write rolled");
+    let rows = env.assert_indexed(&["user_id", "n"], "write").await;
+    assert_eq!(rows.len(), files * 2);
+    // The backfill finds nothing left to do.
+    let result = env.backfill().await;
+    assert_eq!(result.files_indexed, 0, "{result:?}");
+    assert_eq!(result.files_skipped as usize, files);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn written_buffered_and_flushed_files_are_indexed() {
+    let env = indexed_env().await;
+    let mut opts = index_options();
+    opts.target_file_size = Some(4_000);
+    env.table_writer(&opts)
+        .await
+        .append_table(
+            "main",
+            "logs",
+            &(0..6)
+                .map(|i| batch(i * 500..(i + 1) * 500))
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .unwrap();
+    assert!(env.live_files().await.len() > 1, "the write rolled");
+    let mut inline = index_options();
+    inline.data_inlining_row_limit = Some(1_000);
+    let writer = env.table_writer(&inline).await;
+    for i in 0..3 {
+        writer
+            .append_table(
+                "main",
+                "logs",
+                &[batch(5_000 + i * 100..5_000 + (i + 1) * 100)],
+            )
+            .await
+            .unwrap();
+    }
+    let flushed = env
+        .catalog_with(index_options())
+        .await
+        .flush_inlined_data(&SessionContext::new().state(), Some("main"), Some("logs"))
+        .await
+        .unwrap();
+    assert_eq!(flushed.len(), 1, "{flushed:?}");
+    env.assert_indexed(&["user_id", "n"], "write").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn merge_and_rewrite_outputs_are_indexed() {
+    let env = indexed_env().await;
+    for i in 0..3 {
+        env.append(&[batch(i * 400..(i + 1) * 400)], &options())
+            .await;
+    }
+    assert!(env.rows().await.is_empty());
+
+    let (ctx, table) = env.table_with(index_options()).await;
+    let merged = table
+        .merge_adjacent_files(&ctx.state(), MergeOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(merged.files_processed, 3, "{merged:?}");
+    assert_eq!(env.live_files().await.len(), 1);
+    env.assert_indexed(&["user_id", "n"], "compact").await;
+
+    let (ctx, table) = env.table_with(index_options()).await;
+    let ids: Vec<i64> = {
+        use sqlx::Row as _;
+        sqlx::query("SELECT data_file_id FROM ducklake_data_file WHERE end_snapshot IS NULL")
+            .fetch_all(&env.pool().await)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get(0))
+            .collect()
+    };
+    let before = env.live_files().await;
+    let rewritten = table
+        .rewrite_data_files(
+            &ctx.state(),
+            RewriteOptions {
+                data_file_ids: Some(ids),
+                ..RewriteOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(rewritten.files_processed, 1, "{rewritten:?}");
+    assert_ne!(env.live_files().await, before, "a new file was written");
+    env.assert_indexed(&["user_id", "n"], "compact").await;
+}
+
+/// A failed index upload never fails the data write; the file is simply
+/// unindexed until the backfill reaches it.
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_index_upload_keeps_the_data_write() {
+    let env = indexed_env().await;
+    env.store.fail_index_puts.store(true, Ordering::SeqCst);
+    env.append(&[batch(0..500)], &index_options()).await;
+    assert_eq!(env.live_files().await.len(), 1, "the data write committed");
+    assert!(env.rows().await.is_empty(), "no row without its object");
+    env.store.fail_index_puts.store(false, Ordering::SeqCst);
+    assert_eq!(env.backfill().await.files_indexed, 1);
+    env.assert_indexed(&["user_id", "n"], "backfill").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn option_on_with_nothing_declared_writes_nothing() {
+    let env = setup().await;
+    env.append(&[batch(0..500)], &index_options()).await;
+    assert!(!env.has_sidecar().await);
+    assert!(env.pidx_files().is_empty());
 }
