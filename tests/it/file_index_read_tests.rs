@@ -98,6 +98,8 @@ fn batch(range: std::ops::Range<i64>) -> RecordBatch {
 struct Env {
     temp: TempDir,
     table_id: i64,
+    /// Writes (and compaction) build indexes for the declared columns.
+    write_index: bool,
 }
 
 impl Env {
@@ -122,7 +124,7 @@ impl Env {
         let mut options = DuckLakeWriteOptions::default();
         options.ext_file_order = Some(true);
         options.max_row_group_rows = Some(ROW_GROUP_ROWS);
-        options
+        options.with_ext_file_index(self.write_index)
     }
 
     /// One data file per call, rows in the order given.
@@ -336,6 +338,7 @@ async fn setup() -> Env {
     let env = Env {
         temp,
         table_id: 0,
+        write_index: false,
     };
     let writer = env.writer().await;
     writer
@@ -933,4 +936,57 @@ async fn ordered_limit_stops_early_on_selected_files() {
         assert_eq!(rows_top, execute(&off, &top).await.0);
         assert_eq!(rows_all, execute(&off, all).await.0);
     }
+}
+
+/// Indexes the writer and the merge build themselves (not a backfill) serve
+/// the read path the same way.
+#[tokio::test(flavor = "multi_thread")]
+async fn indexes_built_on_write_and_merge_serve_reads() {
+    let mut env = setup().await;
+    env.write_index = true;
+    env.writer()
+        .await
+        .set_table_setting(env.table_id, "ext_file_index_columns", "user_id,shard")
+        .unwrap();
+    for f in 0..FILES {
+        env.append(&[batch(f * FILE_ROWS..(f + 1) * FILE_ROWS)])
+            .await;
+    }
+    assert_eq!(env.index_rows().await.len(), 2 * FILES as usize);
+    assert_differential(&env, &SHAPES).await;
+    let one = rare_user(1);
+    let sql = format!("SELECT * FROM ducklake.main.logs WHERE user_id = '{one}'");
+    let plan = physical_plan(&env.ctx(SHAPES[1], true).await, &sql).await;
+    assert_eq!(scanned_files(&plan), (1, 1), "{}", text(&plan));
+
+    let ctx = env.ctx(SHAPES[0], false).await;
+    let table = ctx
+        .catalog("ducklake")
+        .unwrap()
+        .schema("main")
+        .unwrap()
+        .table("logs")
+        .await
+        .unwrap()
+        .unwrap();
+    let table = (table.as_ref() as &dyn std::any::Any)
+        .downcast_ref::<DuckLakeTable>()
+        .unwrap()
+        .clone();
+    let mut options = MergeOptions::default();
+    options.target_file_size = u64::MAX;
+    table
+        .merge_adjacent_files(&ctx.state(), options)
+        .await
+        .unwrap();
+    // One merged file, indexed by the merge: read through a selection.
+    let plan = physical_plan(&env.ctx(SHAPES[1], true).await, &sql).await;
+    assert_eq!(scanned_files(&plan), (1, 1), "{}", text(&plan));
+    let plan = physical_plan(
+        &env.ctx(SHAPES[1], true).await,
+        "SELECT * FROM ducklake.main.logs WHERE user_id = 'nobody'",
+    )
+    .await;
+    assert_eq!(scanned_files(&plan), (0, 0), "{}", text(&plan));
+    assert_differential(&env, &SHAPES).await;
 }
