@@ -93,6 +93,21 @@ impl DuckLakeReadOptions {
     }
 }
 
+datafusion::common::extensions_options! {
+    /// Per-session overrides of [`DuckLakeReadOptions`], set with
+    /// `SET ducklake.<option> = ...` once registered on the session's
+    /// `SessionConfig` (`with_option_extension`). Unset fields leave the
+    /// table's option as it is.
+    pub struct DuckLakeSessionOptions {
+        /// EXPERIMENTAL: overrides [`DuckLakeReadOptions::ext_file_index`].
+        pub ext_file_index: Option<bool>, default = None
+    }
+}
+
+impl datafusion::common::config::ConfigExtension for DuckLakeSessionOptions {
+    const PREFIX: &'static str = "ducklake";
+}
+
 /// Estimated memory a set of deleted positions holds: the slots of its hash
 /// table, each an `i64` and a control byte, at the table's 7/8 load factor.
 pub(crate) fn positions_bytes(positions: &HashSet<i64>) -> usize {

@@ -5546,6 +5546,14 @@ pub(crate) struct FileUpdateOutput {
 /// key, `None` for no row.
 type FileOrderMemo = HashMap<(String, i64), Option<String>>;
 
+/// A subset of a scan's files: see [`DuckLakeTable::scan_restricted`].
+pub(crate) struct ScanRestriction<'a> {
+    /// Files (after plan-time pruning) the scan keeps.
+    pub(crate) keep: &'a (dyn Fn(&DuckLakeTableFile) -> bool + Send + Sync),
+    /// Whether inlined (catalog-stored) rows are scanned.
+    pub(crate) include_inlined: bool,
+}
+
 /// See `DuckLakeTable::file_index_memo`.
 type FileIndexMemo = HashMap<(String, i64), FileIndexMemoEntry>;
 
@@ -5604,6 +5612,296 @@ impl OrderRecipe {
 }
 
 impl DuckLakeTable {
+    /// [`TableProvider::scan`], optionally over a subset of the listed files
+    /// (`restriction`): the hook a rewrite that answers some files another
+    /// way (EXPERIMENTAL hourly counts) uses to scan the rest.
+    pub(crate) async fn scan_restricted(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        // Filters drive plan-time file pruning below: iterative conjunct pruning drops
+        // files whose catalog statistics prove they cannot match. They are also
+        // pushed down to the parquet scanner by DataFusion's optimizer for row
+        // group / page-level filtering. We declare them Inexact in
+        // `supports_filters_pushdown`, so DataFusion reapplies them after our
+        // scan — pruning here only ever removes provably non-matching files.
+        filters: &[Expr],
+        limit: Option<usize>,
+        restriction: Option<&ScanRestriction<'_>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let inlined_filter = translate_inlined_filters(filters);
+
+        // Row-lineage detour: when the synthetic `rowid` column is projected,
+        // every file needs its own scan because each has a distinct
+        // `row_id_start`. `projection == None` with row lineage on means "all
+        // columns including rowid", which also routes through this path.
+        let rowid_idx = self.rowid_index();
+        let rowid_in_proj = match (rowid_idx, projection) {
+            (Some(r), Some(p)) => p.contains(&r),
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+
+        let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
+        let inlined_deletes = self.inlined_deletes_by_file()?;
+        // One physical form of the filters feeds both pruning paths; see
+        // `physical_conjuncts`, which leaves out any conjunct it cannot convert.
+        // A failure to build the schema they convert against means "prune
+        // nothing", never an error — the filters are re-applied above this scan
+        // regardless (`supports_filters_pushdown` declares them Inexact).
+        let conjuncts = match self.physical_conjuncts(state, filters) {
+            Ok(conjuncts) => conjuncts,
+            Err(error) => {
+                tracing::debug!(%error, "skipping plan-time file pruning");
+                Vec::new()
+            },
+        };
+        // Catalog-side pre-filter: the provider may leave files unlisted whose
+        // statistics prove they cannot match, which is what stops planning cost
+        // scaling with the table. Purely additive — `prune_table_files_iteratively`
+        // still runs on every file that comes back, and a predicate that will
+        // not lower simply yields no filter.
+        let stats_filter = datafusion::physical_expr::conjunction_opt(conjuncts.iter().cloned())
+            .and_then(|predicate| {
+                stats_filter::lower_predicate(&predicate, &self.physical_schema, &self.columns)
+            })
+            .map(|filter| filter.with_partition_prefilters(self.partition_spec.as_ref()));
+        // The same cap the reader applies to row-group pruning
+        // (`session_parquet_source`), so an `IN` list that prunes row groups
+        // prunes files too instead of the two layers disagreeing.
+        let max_in_list_size = state.config_options().execution.parquet.max_in_list_size;
+        let index_predicates = if self.ext_file_index_enabled(state) {
+            let column_ids: Vec<i64> = self.columns.iter().map(|c| c.column_id).collect();
+            crate::file_index_scan::eligible_predicates(
+                &conjuncts,
+                &self.physical_schema,
+                &column_ids,
+            )
+        } else {
+            Vec::new()
+        };
+        let pruning = match self.pruning_predicates(conjuncts, Some(max_in_list_size)) {
+            Ok(pruning) => pruning,
+            Err(error) => {
+                tracing::debug!(%error, "skipping plan-time file pruning");
+                Vec::new()
+            },
+        };
+        let mut order_recipe = OrderRecipe::new(!rowid_in_proj && self.ext_file_order_enabled());
+        for metadata in self.file_metadata_pages("planning", stats_filter.as_ref()) {
+            let (table_files, file_statistics, summary_statistics) =
+                self.page_files_with_both_statistics(metadata?);
+            #[cfg(feature = "encryption")]
+            self.configure_encryption_factory(&table_files)?;
+
+            let table_files =
+                self.prune_table_files_iteratively(&pruning, &table_files, &file_statistics);
+            let table_files: Vec<&DuckLakeTableFile> = match restriction {
+                Some(restriction) => table_files
+                    .into_iter()
+                    .filter(|tf| (restriction.keep)(tf))
+                    .collect(),
+                None => table_files,
+            };
+            // EXPERIMENTAL `ext_file_index`: drop files the index proves hold
+            // no match, before any of them is grouped or chained; only files
+            // without deletes or snapshot filters get a selection (v1).
+            let index_decisions = self
+                .file_index_decisions(state, &index_predicates, &table_files, |tf| {
+                    !rowid_in_proj
+                        && !self.needs_snapshot_filter(tf)
+                        && tf.delete_file.is_none()
+                        && !inlined_deletes.contains_key(&tf.data_file_id)
+                })
+                .await;
+            let table_files: Vec<&DuckLakeTableFile> = table_files
+                .into_iter()
+                .filter(|tf| {
+                    !matches!(
+                        index_decisions.get(&tf.data_file_id),
+                        Some(crate::file_index_scan::FileDecision::Drop)
+                    )
+                })
+                .collect();
+
+            if rowid_in_proj {
+                let rowid_idx = rowid_idx.unwrap();
+                let user_proj: Vec<usize> = projection
+                    .cloned()
+                    .unwrap_or_else(|| (0..self.schema.fields().len()).collect());
+                let (needs_filter, rest): (Vec<_>, Vec<_>) = table_files
+                    .into_iter()
+                    .partition(|table_file| self.needs_snapshot_filter(table_file));
+                if !rest.is_empty() {
+                    execs.push(self.build_exec_for_files_with_rowid(
+                        state,
+                        &rest,
+                        &inlined_deletes,
+                        &file_statistics,
+                        &user_proj,
+                        rowid_idx,
+                        limit,
+                    )?);
+                }
+                let (needs_filter, partial_deletes) = self
+                    .absorb_partial_delete_files(state, needs_filter, &inlined_deletes)
+                    .await?;
+                let (mapped, field_id): (Vec<_>, Vec<_>) = needs_filter
+                    .iter()
+                    .partition(|table_file| table_file.file.mapping_id.is_some());
+                if !field_id.is_empty() {
+                    execs.push(self.build_exec_for_partial_files(
+                        state,
+                        &field_id,
+                        &partial_deletes,
+                        &file_statistics,
+                        &user_proj,
+                        Some(rowid_idx),
+                    )?);
+                }
+                for table_file in mapped {
+                    let output_schema = self.output_schema_for_projection(&user_proj, rowid_idx);
+                    execs.push(
+                        self.build_exec_for_partial_file(
+                            state,
+                            table_file,
+                            partial_deletes.get(&table_file.data_file_id),
+                            output_schema,
+                        )
+                        .await?,
+                    );
+                }
+                continue;
+            }
+
+            let (needs_filter, rest): (Vec<_>, Vec<_>) = table_files
+                .into_iter()
+                .partition(|table_file| self.needs_snapshot_filter(table_file));
+            let (files_with_deletes, files_without_deletes): (Vec<_>, Vec<_>) =
+                rest.into_iter().partition(|table_file| {
+                    table_file.delete_file.is_some()
+                        || inlined_deletes.contains_key(&table_file.data_file_id)
+                });
+
+            if !files_without_deletes.is_empty() {
+                self.add_to_order_recipe(
+                    &mut order_recipe,
+                    &files_without_deletes,
+                    &file_statistics,
+                    &index_decisions,
+                )?;
+                execs.push(self.build_exec_for_files_without_deletes(
+                    state,
+                    &files_without_deletes,
+                    &file_statistics,
+                    &summary_statistics,
+                    projection,
+                    limit,
+                    &index_decisions,
+                )?);
+            }
+            if !files_with_deletes.is_empty() {
+                execs.push(self.build_exec_for_files_with_deletes(
+                    state,
+                    &files_with_deletes,
+                    &inlined_deletes,
+                    &file_statistics,
+                    projection,
+                )?);
+            }
+            let (needs_filter, partial_deletes) = self
+                .absorb_partial_delete_files(state, needs_filter, &inlined_deletes)
+                .await?;
+            let (mapped, field_id): (Vec<_>, Vec<_>) = needs_filter
+                .iter()
+                .partition(|table_file| table_file.file.mapping_id.is_some());
+            if !field_id.is_empty() {
+                let user_proj: Vec<usize> = projection
+                    .cloned()
+                    .unwrap_or_else(|| (0..self.physical_schema.fields().len()).collect());
+                execs.push(self.build_exec_for_partial_files(
+                    state,
+                    &field_id,
+                    &partial_deletes,
+                    &file_statistics,
+                    &user_proj,
+                    None,
+                )?);
+            }
+            for table_file in mapped {
+                let output_schema = match projection {
+                    Some(indices) => Arc::new(self.schema.project(indices)?),
+                    None => self.schema.clone(),
+                };
+                execs.push(
+                    self.build_exec_for_partial_file(
+                        state,
+                        table_file,
+                        partial_deletes.get(&table_file.data_file_id),
+                        output_schema,
+                    )
+                    .await?,
+                );
+            }
+        }
+
+        if rowid_in_proj {
+            let rowid_idx = rowid_idx.unwrap();
+            let user_proj: Vec<usize> = projection
+                .cloned()
+                .unwrap_or_else(|| (0..self.schema.fields().len()).collect());
+            // Inlined rows carry their stable row ids as data, so they join the
+            // row-lineage plan as one more branch with `rowid` filled in.
+            let include_inlined = restriction.is_none_or(|r| r.include_inlined);
+            if include_inlined
+                && let Some(exec) =
+                    self.inlined_rowid_exec(&user_proj, rowid_idx, inlined_filter.as_ref())?
+            {
+                execs.push(exec);
+            }
+            if execs.is_empty() {
+                use datafusion::physical_plan::empty::EmptyExec;
+                let schema = self.output_schema_for_projection(&user_proj, rowid_idx);
+                return Ok(Arc::new(EmptyExec::new(schema)));
+            }
+            return combine_execution_plans(execs);
+        }
+
+        // Inlined data: rows DuckDB's data-inlining optimization stored directly
+        // in the catalog (not in Parquet). Union them in so SELECT / COUNT(*)
+        // include them. Providers without inlined data — or that don't implement
+        // the read — return empty, so this is a no-op for ordinary catalogs.
+        if restriction.is_none_or(|r| r.include_inlined) {
+            let inlined = self.scan_inlined_rows(inlined_filter.as_ref())?;
+            self.inlined_materialized_row_count
+                .store(inlined.materialized_row_count, Ordering::Relaxed);
+            if inlined.batches.iter().any(|b| b.num_rows() > 0) {
+                let exec = MemorySourceConfig::try_new_exec(
+                    &[inlined.batches],
+                    self.physical_schema.clone(),
+                    projection.cloned(),
+                )?;
+                execs.push(exec);
+            }
+        }
+
+        // Handle empty tables (no data files)
+        if execs.is_empty() {
+            use datafusion::physical_plan::empty::EmptyExec;
+            let projected_schema = match projection {
+                Some(indices) => Arc::new(self.schema.project(indices)?),
+                None => self.schema.clone(),
+            };
+            return Ok(Arc::new(EmptyExec::new(projected_schema)));
+        }
+
+        let plan = combine_execution_plans(execs)?;
+        // With verified files the plan is still today's plan; the wrapper only
+        // offers an ordered alternative to a sort that asks for one.
+        let plan = self.offer_order(state, plan, order_recipe);
+        Ok(plan)
+    }
+
     /// Add one page's files without deletes to `recipe`: one sidecar query
     /// for the page, then the files sharing the declarable ordering.
     fn add_to_order_recipe(
@@ -5674,15 +5972,22 @@ impl DuckLakeTable {
 
     /// Whether scans read the `ext_file_index` sidecar (see
     /// [`DuckLakeReadOptions::with_ext_file_index`]).
-    fn ext_file_index_enabled(&self) -> bool {
-        self.read_options.ext_file_index
+    /// A session's `SET ducklake.ext_file_index` (see
+    /// [`crate::DuckLakeSessionOptions`]) overrides the table's option.
+    fn ext_file_index_enabled(&self, state: &dyn Session) -> bool {
+        state
+            .config_options()
+            .extensions
+            .get::<crate::delete_memo::DuckLakeSessionOptions>()
+            .and_then(|options| options.ext_file_index)
+            .unwrap_or(self.read_options.ext_file_index)
     }
 
     /// The `ext_ducklake_file_index` rows for `files` x `column_ids`, by
     /// `(path, column_id)`: one sidecar query for the pairs not yet in
     /// [`Self::file_index_memo`], none once all are. A failed lookup is
     /// remembered as nothing, so the next scan asks again.
-    fn file_index_rows(
+    pub(crate) fn file_index_rows(
         &self,
         files: &[&DuckLakeTableFile],
         column_ids: &[i64],
@@ -6221,266 +6526,8 @@ impl TableProvider for DuckLakeTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let inlined_filter = translate_inlined_filters(filters);
-
-        // Row-lineage detour: when the synthetic `rowid` column is projected,
-        // every file needs its own scan because each has a distinct
-        // `row_id_start`. `projection == None` with row lineage on means "all
-        // columns including rowid", which also routes through this path.
-        let rowid_idx = self.rowid_index();
-        let rowid_in_proj = match (rowid_idx, projection) {
-            (Some(r), Some(p)) => p.contains(&r),
-            (Some(_), None) => true,
-            (None, _) => false,
-        };
-
-        let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
-        let inlined_deletes = self.inlined_deletes_by_file()?;
-        // One physical form of the filters feeds both pruning paths; see
-        // `physical_conjuncts`, which leaves out any conjunct it cannot convert.
-        // A failure to build the schema they convert against means "prune
-        // nothing", never an error — the filters are re-applied above this scan
-        // regardless (`supports_filters_pushdown` declares them Inexact).
-        let conjuncts = match self.physical_conjuncts(state, filters) {
-            Ok(conjuncts) => conjuncts,
-            Err(error) => {
-                tracing::debug!(%error, "skipping plan-time file pruning");
-                Vec::new()
-            },
-        };
-        // Catalog-side pre-filter: the provider may leave files unlisted whose
-        // statistics prove they cannot match, which is what stops planning cost
-        // scaling with the table. Purely additive — `prune_table_files_iteratively`
-        // still runs on every file that comes back, and a predicate that will
-        // not lower simply yields no filter.
-        let stats_filter = datafusion::physical_expr::conjunction_opt(conjuncts.iter().cloned())
-            .and_then(|predicate| {
-                stats_filter::lower_predicate(&predicate, &self.physical_schema, &self.columns)
-            })
-            .map(|filter| filter.with_partition_prefilters(self.partition_spec.as_ref()));
-        // The same cap the reader applies to row-group pruning
-        // (`session_parquet_source`), so an `IN` list that prunes row groups
-        // prunes files too instead of the two layers disagreeing.
-        let max_in_list_size = state.config_options().execution.parquet.max_in_list_size;
-        let index_predicates = if self.ext_file_index_enabled() {
-            let column_ids: Vec<i64> = self.columns.iter().map(|c| c.column_id).collect();
-            crate::file_index_scan::eligible_predicates(
-                &conjuncts,
-                &self.physical_schema,
-                &column_ids,
-            )
-        } else {
-            Vec::new()
-        };
-        let pruning = match self.pruning_predicates(conjuncts, Some(max_in_list_size)) {
-            Ok(pruning) => pruning,
-            Err(error) => {
-                tracing::debug!(%error, "skipping plan-time file pruning");
-                Vec::new()
-            },
-        };
-        let mut order_recipe = OrderRecipe::new(!rowid_in_proj && self.ext_file_order_enabled());
-        for metadata in self.file_metadata_pages("planning", stats_filter.as_ref()) {
-            let (table_files, file_statistics, summary_statistics) =
-                self.page_files_with_both_statistics(metadata?);
-            #[cfg(feature = "encryption")]
-            self.configure_encryption_factory(&table_files)?;
-
-            let table_files =
-                self.prune_table_files_iteratively(&pruning, &table_files, &file_statistics);
-            // EXPERIMENTAL `ext_file_index`: drop files the index proves hold
-            // no match, before any of them is grouped or chained; only files
-            // without deletes or snapshot filters get a selection (v1).
-            let index_decisions = self
-                .file_index_decisions(state, &index_predicates, &table_files, |tf| {
-                    !rowid_in_proj
-                        && !self.needs_snapshot_filter(tf)
-                        && tf.delete_file.is_none()
-                        && !inlined_deletes.contains_key(&tf.data_file_id)
-                })
-                .await;
-            let table_files: Vec<&DuckLakeTableFile> = table_files
-                .into_iter()
-                .filter(|tf| {
-                    !matches!(
-                        index_decisions.get(&tf.data_file_id),
-                        Some(crate::file_index_scan::FileDecision::Drop)
-                    )
-                })
-                .collect();
-
-            if rowid_in_proj {
-                let rowid_idx = rowid_idx.unwrap();
-                let user_proj: Vec<usize> = projection
-                    .cloned()
-                    .unwrap_or_else(|| (0..self.schema.fields().len()).collect());
-                let (needs_filter, rest): (Vec<_>, Vec<_>) = table_files
-                    .into_iter()
-                    .partition(|table_file| self.needs_snapshot_filter(table_file));
-                if !rest.is_empty() {
-                    execs.push(self.build_exec_for_files_with_rowid(
-                        state,
-                        &rest,
-                        &inlined_deletes,
-                        &file_statistics,
-                        &user_proj,
-                        rowid_idx,
-                        limit,
-                    )?);
-                }
-                let (needs_filter, partial_deletes) = self
-                    .absorb_partial_delete_files(state, needs_filter, &inlined_deletes)
-                    .await?;
-                let (mapped, field_id): (Vec<_>, Vec<_>) = needs_filter
-                    .iter()
-                    .partition(|table_file| table_file.file.mapping_id.is_some());
-                if !field_id.is_empty() {
-                    execs.push(self.build_exec_for_partial_files(
-                        state,
-                        &field_id,
-                        &partial_deletes,
-                        &file_statistics,
-                        &user_proj,
-                        Some(rowid_idx),
-                    )?);
-                }
-                for table_file in mapped {
-                    let output_schema = self.output_schema_for_projection(&user_proj, rowid_idx);
-                    execs.push(
-                        self.build_exec_for_partial_file(
-                            state,
-                            table_file,
-                            partial_deletes.get(&table_file.data_file_id),
-                            output_schema,
-                        )
-                        .await?,
-                    );
-                }
-                continue;
-            }
-
-            let (needs_filter, rest): (Vec<_>, Vec<_>) = table_files
-                .into_iter()
-                .partition(|table_file| self.needs_snapshot_filter(table_file));
-            let (files_with_deletes, files_without_deletes): (Vec<_>, Vec<_>) =
-                rest.into_iter().partition(|table_file| {
-                    table_file.delete_file.is_some()
-                        || inlined_deletes.contains_key(&table_file.data_file_id)
-                });
-
-            if !files_without_deletes.is_empty() {
-                self.add_to_order_recipe(
-                    &mut order_recipe,
-                    &files_without_deletes,
-                    &file_statistics,
-                    &index_decisions,
-                )?;
-                execs.push(self.build_exec_for_files_without_deletes(
-                    state,
-                    &files_without_deletes,
-                    &file_statistics,
-                    &summary_statistics,
-                    projection,
-                    limit,
-                    &index_decisions,
-                )?);
-            }
-            if !files_with_deletes.is_empty() {
-                execs.push(self.build_exec_for_files_with_deletes(
-                    state,
-                    &files_with_deletes,
-                    &inlined_deletes,
-                    &file_statistics,
-                    projection,
-                )?);
-            }
-            let (needs_filter, partial_deletes) = self
-                .absorb_partial_delete_files(state, needs_filter, &inlined_deletes)
-                .await?;
-            let (mapped, field_id): (Vec<_>, Vec<_>) = needs_filter
-                .iter()
-                .partition(|table_file| table_file.file.mapping_id.is_some());
-            if !field_id.is_empty() {
-                let user_proj: Vec<usize> = projection
-                    .cloned()
-                    .unwrap_or_else(|| (0..self.physical_schema.fields().len()).collect());
-                execs.push(self.build_exec_for_partial_files(
-                    state,
-                    &field_id,
-                    &partial_deletes,
-                    &file_statistics,
-                    &user_proj,
-                    None,
-                )?);
-            }
-            for table_file in mapped {
-                let output_schema = match projection {
-                    Some(indices) => Arc::new(self.schema.project(indices)?),
-                    None => self.schema.clone(),
-                };
-                execs.push(
-                    self.build_exec_for_partial_file(
-                        state,
-                        table_file,
-                        partial_deletes.get(&table_file.data_file_id),
-                        output_schema,
-                    )
-                    .await?,
-                );
-            }
-        }
-
-        if rowid_in_proj {
-            let rowid_idx = rowid_idx.unwrap();
-            let user_proj: Vec<usize> = projection
-                .cloned()
-                .unwrap_or_else(|| (0..self.schema.fields().len()).collect());
-            // Inlined rows carry their stable row ids as data, so they join the
-            // row-lineage plan as one more branch with `rowid` filled in.
-            if let Some(exec) =
-                self.inlined_rowid_exec(&user_proj, rowid_idx, inlined_filter.as_ref())?
-            {
-                execs.push(exec);
-            }
-            if execs.is_empty() {
-                use datafusion::physical_plan::empty::EmptyExec;
-                let schema = self.output_schema_for_projection(&user_proj, rowid_idx);
-                return Ok(Arc::new(EmptyExec::new(schema)));
-            }
-            return combine_execution_plans(execs);
-        }
-
-        // Inlined data: rows DuckDB's data-inlining optimization stored directly
-        // in the catalog (not in Parquet). Union them in so SELECT / COUNT(*)
-        // include them. Providers without inlined data — or that don't implement
-        // the read — return empty, so this is a no-op for ordinary catalogs.
-        let inlined = self.scan_inlined_rows(inlined_filter.as_ref())?;
-        self.inlined_materialized_row_count
-            .store(inlined.materialized_row_count, Ordering::Relaxed);
-        if inlined.batches.iter().any(|b| b.num_rows() > 0) {
-            let exec = MemorySourceConfig::try_new_exec(
-                &[inlined.batches],
-                self.physical_schema.clone(),
-                projection.cloned(),
-            )?;
-            execs.push(exec);
-        }
-
-        // Handle empty tables (no data files)
-        if execs.is_empty() {
-            use datafusion::physical_plan::empty::EmptyExec;
-            let projected_schema = match projection {
-                Some(indices) => Arc::new(self.schema.project(indices)?),
-                None => self.schema.clone(),
-            };
-            return Ok(Arc::new(EmptyExec::new(projected_schema)));
-        }
-
-        let plan = combine_execution_plans(execs)?;
-        // With verified files the plan is still today's plan; the wrapper only
-        // offers an ordered alternative to a sort that asks for one.
-        let plan = self.offer_order(state, plan, order_recipe);
-        Ok(plan)
+        self.scan_restricted(state, projection, filters, limit, None)
+            .await
     }
 
     #[cfg(feature = "write")]
