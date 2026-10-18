@@ -31,10 +31,11 @@ use tempfile::TempDir;
 use datafusion_ducklake::ext_file_index::{
     FileIndexMeta, IndexValueType, PostingBuilder, index_file_name,
 };
+use datafusion_ducklake::file_indexing::FileIndexRow;
 use datafusion_ducklake::{
-    ColumnDef, DuckLakeCatalog, DuckLakeReadOptions, DuckLakeTable, DuckLakeTableWriter,
-    DuckLakeWriteOptions, MergeOptions, MetadataWriter, NullOrder, SortDirection, SortField,
-    SqliteMetadataProvider, SqliteMetadataWriter, WriteMode,
+    ColumnDef, DuckLakeCatalog, DuckLakeReadOptions, DuckLakeSessionOptions, DuckLakeTable,
+    DuckLakeTableWriter, DuckLakeWriteOptions, MergeOptions, MetadataWriter, NullOrder,
+    SortDirection, SortField, SqliteMetadataProvider, SqliteMetadataWriter, WriteMode,
 };
 
 /// Rows per appended file. Large enough that a key seen a few times in a file
@@ -239,7 +240,15 @@ impl Env {
             let built = postings.finish(row_group_rows).unwrap();
             let index_name = index_file_name(&path, column_id);
             std::fs::write(local.with_file_name(&index_name), &built.bytes).unwrap();
-            metas.push(built.meta(&path, size, column_id, value_type, index_name));
+            let index_local = local.with_file_name(&index_name);
+            metas.push(FileIndexRow {
+                meta: built.meta(&path, size, column_id, value_type, index_name),
+                index_key: index_local
+                    .to_str()
+                    .unwrap()
+                    .trim_start_matches('/')
+                    .to_string(),
+            });
         }
         let n = metas.len();
         self.writer()
@@ -273,9 +282,12 @@ impl Env {
                 .with_read_options(read)
                 .with_write_options(self.write_options()),
         };
-        let mut config = SessionConfig::new().with_target_partitions(shape.partitions);
+        let mut config = SessionConfig::new()
+            .with_target_partitions(shape.partitions)
+            .with_option_extension(DuckLakeSessionOptions::default());
         // Split files into byte ranges whenever there are spare partitions.
         config.options_mut().optimizer.repartition_file_min_size = 1;
+        config.options_mut().execution.parquet.pushdown_filters = shape.pushdown;
         let ctx = SessionContext::new_with_config(config);
         ctx.register_catalog("ducklake", Arc::new(catalog));
         ctx
@@ -291,30 +303,31 @@ impl Env {
 struct Shape {
     partitions: usize,
     order: bool,
+    /// Parquet filter pushdown (RuntimeDB runs with it on): the filter moves
+    /// into the scan instead of a `FilterExec`, which is what lets the
+    /// verified-order path serve a filtered `ORDER BY ... LIMIT`.
+    pushdown: bool,
     snapshot: Option<i64>,
 }
 
-const SHAPES: [Shape; 4] = [
+const fn shape(partitions: usize, order: bool, pushdown: bool) -> Shape {
     Shape {
-        partitions: 1,
-        order: false,
+        partitions,
+        order,
+        pushdown,
         snapshot: None,
-    },
-    Shape {
-        partitions: 7,
-        order: false,
-        snapshot: None,
-    },
-    Shape {
-        partitions: 1,
-        order: true,
-        snapshot: None,
-    },
-    Shape {
-        partitions: 7,
-        order: true,
-        snapshot: None,
-    },
+    }
+}
+
+const SHAPES: [Shape; 8] = [
+    shape(1, false, false),
+    shape(7, false, false),
+    shape(1, true, false),
+    shape(7, true, false),
+    shape(1, false, true),
+    shape(7, false, true),
+    shape(1, true, true),
+    shape(7, true, true),
 ];
 
 async fn setup() -> Env {
@@ -508,6 +521,8 @@ async fn run(ctx: &SessionContext, sql: &str) -> String {
         .collect()
         .await
         .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    // An empty result is empty whether it came as no batch or an empty one.
+    let batches: Vec<RecordBatch> = batches.into_iter().filter(|b| b.num_rows() > 0).collect();
     arrow::util::pretty::pretty_format_batches(&batches)
         .unwrap()
         .to_string()
@@ -601,14 +616,22 @@ async fn on_equals_off_with_deletes_and_inlined_rows() {
 #[tokio::test(flavor = "multi_thread")]
 async fn on_equals_off_across_compaction_and_time_travel() {
     let env = indexed_table().await;
-    let before = env.snapshot().await;
-    let ctx = env.ctx(SHAPES[0], false).await;
-    ctx.sql("DELETE FROM ducklake.main.logs WHERE id % 97 = 0")
+    // Mid-ingest: once the files are merged, reading here needs the merged
+    // file's snapshot filter (a partial file), which only ever prunes.
+    let mid: i64 = {
+        use sqlx::Row;
+        sqlx::query(
+            "SELECT begin_snapshot FROM ducklake_data_file WHERE table_id = ?
+             ORDER BY data_file_id LIMIT 1 OFFSET 3",
+        )
+        .bind(env.table_id)
+        .fetch_one(&env.pool().await)
         .await
         .unwrap()
-        .collect()
-        .await
-        .unwrap();
+        .get(0)
+    };
+    let before = env.snapshot().await;
+    let ctx = env.ctx(SHAPES[0], false).await;
     let table = ctx
         .catalog("ducklake")
         .unwrap()
@@ -624,26 +647,38 @@ async fn on_equals_off_across_compaction_and_time_travel() {
         .clone();
     let mut options = MergeOptions::default();
     options.target_file_size = u64::MAX;
-    table
+    let merged = table
         .merge_adjacent_files(&ctx.state(), options)
         .await
         .unwrap();
     let after = env.snapshot().await;
-    assert!(after > before);
+    assert!(after > before, "{merged:?}");
 
-    // The merged output has no index yet: scanned as before.
-    assert_differential(&env, &SHAPES).await;
-    // Indexed, and read at the head and at the snapshot before the merge.
-    assert!(env.build_indexes("user_id").await > 0);
-    for snapshot in [None, Some(before), Some(after)] {
-        let shapes: Vec<Shape> = SHAPES
+    // The merged output has no index yet: scanned as before, while reads at
+    // the old snapshots still use the old files' indexes.
+    let at = |snapshot| -> Vec<Shape> {
+        SHAPES
             .iter()
             .map(|s| Shape {
                 snapshot,
                 ..*s
             })
-            .collect();
-        assert_differential(&env, &shapes).await;
+            .collect()
+    };
+    assert_differential(&env, &SHAPES).await;
+    assert_differential(&env, &at(Some(before))).await;
+
+    // Index the merged output, then delete from it.
+    assert!(env.build_indexes("user_id").await > 0);
+    let ctx = env.ctx(SHAPES[0], false).await;
+    ctx.sql("DELETE FROM ducklake.main.logs WHERE id % 97 = 0")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    for snapshot in [None, Some(mid), Some(before), Some(after)] {
+        assert_differential(&env, &at(snapshot)).await;
     }
 }
 
@@ -751,16 +786,7 @@ async fn heavy_hitters_and_unindexed_predicates_scan_every_file() {
 async fn ordered_limit_reads_selected_files() {
     let env = indexed_table().await;
     for partitions in [1, 7] {
-        let ctx = env
-            .ctx(
-                Shape {
-                    partitions,
-                    order: true,
-                    snapshot: None,
-                },
-                true,
-            )
-            .await;
+        let ctx = env.ctx(shape(partitions, true, true), true).await;
         let plan = physical_plan(
             &ctx,
             "SELECT * FROM ducklake.main.logs WHERE user_id = 'few' ORDER BY ts DESC LIMIT 3",
@@ -828,4 +854,83 @@ async fn option_off_never_reads_the_sidecar() {
     )
     .await;
     assert_eq!(scanned_files(&plan), (FILES as usize, 0));
+}
+
+/// `SET ducklake.ext_file_index` overrides the table's option per session,
+/// both ways (the spot check compares a query with it off).
+#[tokio::test(flavor = "multi_thread")]
+async fn session_setting_overrides_the_read_option() {
+    let env = indexed_table().await;
+    let one = rare_user(1);
+    let sql = format!("SELECT * FROM ducklake.main.logs WHERE user_id = '{one}'");
+    let on = env.ctx(SHAPES[1], true).await;
+    assert_eq!(scanned_files(&physical_plan(&on, &sql).await), (1, 1));
+    on.sql("SET ducklake.ext_file_index = false").await.unwrap();
+    assert_eq!(
+        scanned_files(&physical_plan(&on, &sql).await),
+        (FILES as usize, 0)
+    );
+    let off = env.ctx(SHAPES[1], false).await;
+    off.sql("SET ducklake.ext_file_index = true").await.unwrap();
+    assert_eq!(scanned_files(&physical_plan(&off, &sql).await), (1, 1));
+    assert_eq!(run(&on, &sql).await, run(&off, &sql).await);
+}
+
+/// Bytes the parquet scans of an executed plan read.
+fn bytes_scanned(plan: &Arc<dyn ExecutionPlan>) -> usize {
+    let mut total = 0;
+    let mut stack = vec![Arc::clone(plan)];
+    while let Some(node) = stack.pop() {
+        if node.downcast_ref::<DataSourceExec>().is_some()
+            && let Some(metrics) = node.metrics()
+            && let Some(bytes) = metrics.sum_by_name("bytes_scanned")
+        {
+            total += bytes.as_usize();
+        }
+        stack.extend(node.children().into_iter().cloned());
+    }
+    total
+}
+
+async fn execute(ctx: &SessionContext, sql: &str) -> (String, Arc<dyn ExecutionPlan>) {
+    let plan = physical_plan(ctx, sql).await;
+    let batches = datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx())
+        .await
+        .unwrap();
+    (
+        arrow::util::pretty::pretty_format_batches(&batches)
+            .unwrap()
+            .to_string(),
+        plan,
+    )
+}
+
+/// The newest rows of a selected key come from the newest files: each
+/// ordered chain stops after its newest file instead of reading every file's
+/// selected rows (the hits query's cost once a key has thousands of
+/// postings). One chain per partition, so a LIMIT reads about one file per
+/// partition: 1 of 8 here at 1 partition, 3 of 8 at 3.
+#[tokio::test(flavor = "multi_thread")]
+async fn ordered_limit_stops_early_on_selected_files() {
+    let env = indexed_table().await;
+    for partitions in [1, 3] {
+        let ctx = env.ctx(shape(partitions, true, true), true).await;
+        let all = "SELECT * FROM ducklake.main.logs WHERE user_id = 'few' ORDER BY ts DESC";
+        let top = format!("{all} LIMIT 3");
+        let (rows_all, plan_all) = execute(&ctx, all).await;
+        let (rows_top, plan_top) = execute(&ctx, &top).await;
+        assert_eq!(scanned_files(&plan_top), (FILES as usize, FILES as usize));
+        assert!(!text(&plan_top).contains("SortExec"), "{}", text(&plan_top));
+        let (read_all, read_top) = (bytes_scanned(&plan_all), bytes_scanned(&plan_top));
+        assert!(read_all > 0, "{}", text(&plan_all));
+        // About `partitions` files of 8, with slack for the merge's buffering.
+        assert!(
+            read_top * 8 <= read_all * (partitions + 1),
+            "partitions={partitions}: LIMIT read {read_top} of {read_all} bytes\n{}",
+            text(&plan_top)
+        );
+        let off = env.ctx(shape(partitions, true, true), false).await;
+        assert_eq!(rows_top, execute(&off, &top).await.0);
+        assert_eq!(rows_all, execute(&off, all).await.0);
+    }
 }
