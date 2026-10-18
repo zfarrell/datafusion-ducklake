@@ -508,10 +508,9 @@ fn queries() -> Vec<String> {
             "SELECT * FROM ducklake.main.logs WHERE user_id <> '{one}' AND shard = 99 ORDER BY id"
         ),
         "SELECT count(*) FROM ducklake.main.logs".into(),
-        format!(
-            "SELECT ts, user_id FROM ducklake.main.logs WHERE user_id = 'few' \
-             ORDER BY ts DESC LIMIT 2 OFFSET 3"
-        ),
+        "SELECT ts, user_id FROM ducklake.main.logs WHERE user_id = 'few' \
+         ORDER BY ts DESC LIMIT 2 OFFSET 3"
+            .into(),
     ]);
     out
 }
@@ -648,8 +647,10 @@ async fn on_equals_off_across_compaction_and_time_travel() {
         .downcast_ref::<DuckLakeTable>()
         .unwrap()
         .clone();
-    let mut options = MergeOptions::default();
-    options.target_file_size = u64::MAX;
+    let options = MergeOptions {
+        target_file_size: u64::MAX,
+        ..MergeOptions::default()
+    };
     let merged = table
         .merge_adjacent_files(&ctx.state(), options)
         .await
@@ -973,8 +974,10 @@ async fn indexes_built_on_write_and_merge_serve_reads() {
         .downcast_ref::<DuckLakeTable>()
         .unwrap()
         .clone();
-    let mut options = MergeOptions::default();
-    options.target_file_size = u64::MAX;
+    let options = MergeOptions {
+        target_file_size: u64::MAX,
+        ..MergeOptions::default()
+    };
     table
         .merge_adjacent_files(&ctx.state(), options)
         .await

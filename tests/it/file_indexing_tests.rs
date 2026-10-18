@@ -412,10 +412,11 @@ impl Env {
     }
 }
 
-/// `column -> key -> sorted positions`, and the file's row-group row counts.
-fn brute_force(
-    file: &std::path::Path,
-) -> (HashMap<String, BTreeMap<IndexKey, Vec<u32>>>, Vec<u64>) {
+/// `column -> key -> sorted positions`.
+type BruteForcePostings = HashMap<String, BTreeMap<IndexKey, Vec<u32>>>;
+
+/// The file's postings by column, and its row-group row counts.
+fn brute_force(file: &std::path::Path) -> (BruteForcePostings, Vec<u64>) {
     let builder =
         ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(file).unwrap()).unwrap();
     let groups = builder

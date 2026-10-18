@@ -3268,6 +3268,7 @@ impl DuckLakeTable {
     /// row. Every other file shares one scan over the table's physical schema whose
     /// [`FieldIdExprAdapterFactory`] resolves the file's columns by field id as the
     /// reader opens it, which is when the file's schema is first known.
+    #[allow(clippy::too_many_arguments)]
     fn build_exec_for_files_without_deletes(
         &self,
         state: &dyn Session,

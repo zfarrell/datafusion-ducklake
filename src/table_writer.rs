@@ -3390,6 +3390,7 @@ impl DuckLakeTableWriter {
     /// Returns one [`DataFileInfo`] per file (relative catalog path set, stats and
     /// footer harvested); empty rows produce no file, and a write below
     /// `target_file_size` yields exactly one.
+    #[allow(clippy::too_many_arguments)]
     async fn write_rolled_files(
         &self,
         table_key: &str,
