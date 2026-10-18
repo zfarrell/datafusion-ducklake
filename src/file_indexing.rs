@@ -107,11 +107,7 @@ pub(crate) fn meta_from_parts(
     row_group_rows: &str,
     heavy_hitters: &str,
 ) -> Option<crate::ext_file_index::FileIndexMeta> {
-    let value_type = match value_type {
-        "utf8" => IndexValueType::Utf8,
-        "int64" => IndexValueType::Int64,
-        _ => return None,
-    };
+    let value_type = IndexValueType::parse(value_type)?;
     Some(crate::ext_file_index::FileIndexMeta {
         path,
         file_size_bytes,
@@ -156,113 +152,24 @@ macro_rules! decode_file_index_row {
 #[cfg(any(feature = "metadata-sqlite", feature = "multicatalog-postgres"))]
 pub(crate) use decode_file_index_row;
 
-/// `[1,2,3]`.
+/// Catalog encodings are the format library's, so every reader agrees.
 pub(crate) fn encode_u64_list(values: &[u64]) -> String {
-    let parts: Vec<String> = values.iter().map(u64::to_string).collect();
-    format!("[{}]", parts.join(","))
+    crate::ext_file_index::row_group_rows_to_json(values)
 }
 
 pub(crate) fn decode_u64_list(text: &str) -> Option<Vec<u64>> {
-    let inner = text.trim().strip_prefix('[')?.strip_suffix(']')?.trim();
-    if inner.is_empty() {
-        return Some(Vec::new());
-    }
-    inner.split(',').map(|v| v.trim().parse().ok()).collect()
+    crate::ext_file_index::row_group_rows_from_json(text).ok()
 }
 
-/// `[["<base64 utf8 bytes>",count],...]` or `[[<i64>,count],...]`.
 pub(crate) fn encode_heavy_hitters(hitters: &[(IndexKey, u64)]) -> String {
-    let parts: Vec<String> = hitters
-        .iter()
-        .map(|(key, count)| match key {
-            IndexKey::Utf8(bytes) => format!("[\"{}\",{count}]", base64_encode(bytes)),
-            IndexKey::Int64(value) => format!("[{value},{count}]"),
-        })
-        .collect();
-    format!("[{}]", parts.join(","))
+    crate::ext_file_index::heavy_hitters_to_json(hitters)
 }
 
 pub(crate) fn decode_heavy_hitters(
     text: &str,
     value_type: IndexValueType,
 ) -> Option<Vec<(IndexKey, u64)>> {
-    let inner = text.trim().strip_prefix('[')?.strip_suffix(']')?.trim();
-    if inner.is_empty() {
-        return Some(Vec::new());
-    }
-    let mut out = Vec::new();
-    let mut rest = inner;
-    loop {
-        rest = rest.trim_start().strip_prefix('[')?;
-        let end = rest.find(']')?;
-        let (pair, tail) = (&rest[..end], &rest[end + 1..]);
-        let (value, count) = pair.rsplit_once(',')?;
-        let count: u64 = count.trim().parse().ok()?;
-        let value = value.trim();
-        let key = match value_type {
-            IndexValueType::Utf8 => {
-                let quoted = value.strip_prefix('"')?.strip_suffix('"')?;
-                IndexKey::Utf8(base64_decode(quoted)?.into_boxed_slice())
-            },
-            IndexValueType::Int64 => IndexKey::Int64(value.parse().ok()?),
-        };
-        out.push((key, count));
-        let tail = tail.trim_start();
-        if tail.is_empty() {
-            return Some(out);
-        }
-        rest = tail.strip_prefix(',')?;
-    }
-}
-
-const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-fn base64_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let n = (u32::from(chunk[0]) << 16)
-            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
-            | u32::from(*chunk.get(2).unwrap_or(&0));
-        for i in 0..4 {
-            if i <= chunk.len() {
-                out.push(B64[((n >> (18 - 6 * i)) & 63) as usize] as char);
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
-}
-
-fn base64_decode(text: &str) -> Option<Vec<u8>> {
-    let text = text.as_bytes();
-    if text.len() % 4 != 0 {
-        return None;
-    }
-    let mut out = Vec::with_capacity(text.len() / 4 * 3);
-    for chunk in text.chunks(4) {
-        let mut n = 0u32;
-        let mut pad = 0;
-        for (i, &c) in chunk.iter().enumerate() {
-            let v = if c == b'=' {
-                // Padding only at the end of the final quantum.
-                if i < 2 {
-                    return None;
-                }
-                pad += 1;
-                0
-            } else {
-                if pad > 0 {
-                    return None;
-                }
-                B64.iter().position(|&b| b == c)? as u32
-            };
-            n = (n << 6) | v;
-        }
-        let bytes = [(n >> 16) as u8, (n >> 8) as u8, n as u8];
-        out.extend_from_slice(&bytes[..3 - pad]);
-    }
-    Some(out)
+    crate::ext_file_index::heavy_hitters_from_json(text, value_type).ok()
 }
 
 /// Parse [`COLUMNS_SETTING`]: trimmed, non-empty, de-duplicated names.
@@ -307,7 +214,9 @@ mod write {
     use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 
     use super::{FileIndexRow, object_key};
-    use crate::ext_file_index::{IndexValueType, PostingBuilder, index_object_path};
+    use crate::ext_file_index::{
+        IndexValueType, PostingBuilder, index_file_name, index_object_path,
+    };
     use crate::metadata_writer::MetadataWriter;
 
     /// One indexed column of a written file's schema.
@@ -469,7 +378,6 @@ mod write {
                     row_group_rows.iter().sum::<u64>()
                 )));
             }
-            let file_name = path.rsplit('/').next().unwrap_or(path);
             let mut rows = Vec::with_capacity(builders.columns.len());
             let mut bytes_written = 0u64;
             for (column, builder) in builders.columns {
@@ -479,7 +387,7 @@ mod write {
                     .await
                     .map_err(|e| crate::DuckLakeError::Internal(e.to_string()))??;
                 let index_key = index_object_path(data_object.as_ref(), column.column_id);
-                let index_path = index_object_path(file_name, column.column_id);
+                let index_path = index_file_name(path, column.column_id);
                 bytes_written += built.bytes.len() as u64;
                 self.0
                     .store
@@ -589,66 +497,6 @@ mod write {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn u64_list_round_trip() {
-        assert_eq!(encode_u64_list(&[]), "[]");
-        assert_eq!(encode_u64_list(&[1, 22, 333]), "[1,22,333]");
-        assert_eq!(decode_u64_list("[1,22,333]"), Some(vec![1, 22, 333]));
-        assert_eq!(decode_u64_list("[]"), Some(vec![]));
-        assert_eq!(decode_u64_list("[1,x]"), None);
-        assert_eq!(decode_u64_list("1,2"), None);
-    }
-
-    #[test]
-    fn heavy_hitters_round_trip() {
-        let utf8 = vec![
-            (IndexKey::Utf8(b"".to_vec().into()), 9),
-            (IndexKey::Utf8(b"a".to_vec().into()), 1),
-            (IndexKey::Utf8(b"ab".to_vec().into()), 2),
-            (IndexKey::Utf8(b"a,b]\"[".to_vec().into()), 3),
-            (IndexKey::Utf8(vec![0xff, 0, 0x80, 7].into()), 4),
-        ];
-        let text = encode_heavy_hitters(&utf8);
-        assert_eq!(
-            decode_heavy_hitters(&text, IndexValueType::Utf8),
-            Some(utf8)
-        );
-        let ints = vec![(IndexKey::Int64(-5), 3), (IndexKey::Int64(i64::MAX), 1)];
-        let text = encode_heavy_hitters(&ints);
-        assert_eq!(text, format!("[[-5,3],[{},1]]", i64::MAX));
-        assert_eq!(
-            decode_heavy_hitters(&text, IndexValueType::Int64),
-            Some(ints)
-        );
-        assert_eq!(
-            decode_heavy_hitters("[]", IndexValueType::Int64),
-            Some(vec![])
-        );
-        assert_eq!(decode_heavy_hitters("[[1,2]", IndexValueType::Int64), None);
-        assert_eq!(
-            decode_heavy_hitters("[[\"!!\",2]]", IndexValueType::Utf8),
-            None
-        );
-    }
-
-    #[test]
-    fn base64_matches_rfc4648() {
-        for (raw, enc) in [
-            ("", ""),
-            ("f", "Zg=="),
-            ("fo", "Zm8="),
-            ("foo", "Zm9v"),
-            ("foob", "Zm9vYg=="),
-            ("fooba", "Zm9vYmE="),
-            ("foobar", "Zm9vYmFy"),
-        ] {
-            assert_eq!(base64_encode(raw.as_bytes()), enc);
-            assert_eq!(base64_decode(enc).as_deref(), Some(raw.as_bytes()));
-        }
-        assert_eq!(base64_decode("Zg="), None);
-        assert_eq!(base64_decode("Z=g="), None);
-    }
 
     #[test]
     fn columns_setting_parses() {
