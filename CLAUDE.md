@@ -77,9 +77,13 @@ The codebase follows a layered architecture with clear separation of concerns:
    - `extension.rs`: the extension API. `DuckLakeExtension` gives a write hook (observers of every
      data file a writer names: insert, update, compaction, inlined flush) and a scan hook (per-file
      skip / row selection, and claimed sort orders). Core keeps the safety rules: which files may
-     take a selection, which orderings may be declared. Hooks are advisory; one that fails is
-     ignored. Extensions live in the `ext/` crate (`datafusion-ducklake-ext`: file order, file
-     index), which uses only the public API
+     take a selection, which orderings may be declared. Hooks are advisory; one that errs or
+     panics is left out. Observers return facts, which core records once per write.
+     `DuckLakeTable::backfill` (`extension_backfill.rs`) replays a write hook over existing files;
+     `DuckLakeCatalog::prune_extension_facts` prunes every registered extension's facts. A scan
+     hook keeps per-instance state in `table_state` and catalog-wide state in `shared_state`.
+     Extensions live in the `ext/` crate (`datafusion-ducklake-ext`: file order, file index),
+     which uses only the public API
    - `file_facts.rs`: `ext_ducklake_file_fact`, the per-file facts extensions record through
      `MetadataWriter::record_file_facts` and read through `MetadataProvider::file_facts`
    - `order_on_request.rs`: `OrderOnRequestExec` offers an ordered plan over files whose order an
