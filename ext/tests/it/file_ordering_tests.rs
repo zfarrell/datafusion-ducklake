@@ -8,7 +8,6 @@
 //! the table, so a declared ordering that is not true fails here as wrong rows,
 //! not just as a different plan.
 
-#![cfg(all(feature = "write-sqlite", feature = "metadata-sqlite"))]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -22,11 +21,13 @@ use datafusion::prelude::*;
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 
-use datafusion_ducklake::ext_file_order::FileOrder;
 use datafusion_ducklake::{
     ColumnDef, DuckLakeCatalog, DuckLakeReadOptions, DuckLakeTable, DuckLakeTableWriter,
     DuckLakeWriteOptions, MergeOptions, MetadataWriter, NullOrder, SortDirection, SortField,
-    SqliteMetadataProvider, SqliteMetadataWriter, VerifyOrderOptions, WriteMode,
+    SqliteMetadataProvider, SqliteMetadataWriter, WriteMode,
+};
+use datafusion_ducklake_ext::file_order::{
+    self, FileOrder, FileOrderTableExt, VerifyOrderOptions, order_fact, prune_file_orders,
 };
 
 const TOP_N: &str = "SELECT ts, level, id FROM ducklake.main.logs ORDER BY ts DESC LIMIT 7";
@@ -129,16 +130,16 @@ impl Env {
         use sqlx::Row;
         let pool = sqlx::SqlitePool::connect(&self.url()).await.unwrap();
         let has_sidecar: bool = sqlx::query(
-            "SELECT count(*) > 0 FROM sqlite_master WHERE name = 'ext_ducklake_file_order'",
+            "SELECT count(*) > 0 FROM sqlite_master WHERE name = 'ext_ducklake_file_fact'",
         )
         .fetch_one(&pool)
         .await
         .unwrap()
         .get(0);
         let sql = if has_sidecar {
-            "SELECT df.path, o.sort_key FROM ducklake_data_file df
-             LEFT JOIN ext_ducklake_file_order o
-               ON o.table_id = df.table_id AND o.path = df.path
+            "SELECT df.path, json_extract(o.value, '$.sort_key') FROM ducklake_data_file df
+             LEFT JOIN ext_ducklake_file_fact o
+               ON o.extension = 'file_order' AND o.table_id = df.table_id AND o.path = df.path
               AND o.file_size_bytes = df.file_size_bytes
              WHERE df.end_snapshot IS NULL"
         } else {
@@ -168,10 +169,8 @@ impl Env {
         let provider = SqliteMetadataProvider::new(&self.url()).await.unwrap();
         let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer))
             .unwrap()
-            .with_read_options(DuckLakeReadOptions::default().with_ext_file_order(ext_file_order))
-            .with_write_options(
-                DuckLakeWriteOptions::default().with_ext_file_order(ext_file_order),
-            );
+            .with_read_options(read_options(ext_file_order))
+            .with_write_options(write_options(ext_file_order));
         let ctx = SessionContext::new_with_config(
             SessionConfig::new()
                 .with_target_partitions(target_partitions)
@@ -182,11 +181,27 @@ impl Env {
     }
 }
 
-/// Writer options with the experimental option on.
+/// Writer options with the extension on.
 fn ext_options() -> DuckLakeWriteOptions {
-    let mut options = DuckLakeWriteOptions::default();
-    options.ext_file_order = Some(true);
-    options
+    write_options(true)
+}
+
+fn write_options(ext_file_order: bool) -> DuckLakeWriteOptions {
+    let options = DuckLakeWriteOptions::default();
+    if ext_file_order {
+        options.with_extension(Arc::new(FileOrder))
+    } else {
+        options
+    }
+}
+
+fn read_options(ext_file_order: bool) -> DuckLakeReadOptions {
+    let options = DuckLakeReadOptions::default();
+    if ext_file_order {
+        options.with_extension(Arc::new(FileOrder))
+    } else {
+        options
+    }
 }
 
 async fn setup() -> Env {
@@ -603,8 +618,7 @@ async fn inlined_rows_mixed_with_verified_files_and_flushed() {
         Arc::new(env.writer().await),
     )
     .unwrap()
-    .with_read_options(DuckLakeReadOptions::default().with_ext_file_order(true))
-    .with_write_options(DuckLakeWriteOptions::default().with_ext_file_order(true));
+    .with_extension(Arc::new(FileOrder));
     let flushed = catalog
         .flush_inlined_data(&SessionContext::new().state(), Some("main"), Some("logs"))
         .await
@@ -944,14 +958,17 @@ async fn verify_racing_compaction_and_prune() {
     }
     env.sort_by_ts_desc(NullOrder::NullsFirst).await;
     let provider = SqliteMetadataProvider::new(&env.url()).await.unwrap();
-    let before: Vec<FileOrder> = provider
+    let before: Vec<_> = provider
         .get_table_files_for_select(env.table_id, provider.get_current_snapshot().unwrap())
         .unwrap()
         .iter()
-        .map(|f| FileOrder {
-            path: f.file.path.clone(),
-            file_size_bytes: f.file.file_size_bytes,
-            sort_key: "1:desc:nulls_first".to_string(),
+        .map(|f| {
+            order_fact(
+                &f.file.path,
+                f.file.file_size_bytes,
+                "1:desc:nulls_first",
+                "verify",
+            )
         })
         .collect();
     assert_eq!(before.len(), 2);
@@ -973,7 +990,7 @@ async fn verify_racing_compaction_and_prune() {
     let writer = env.writer().await;
     assert_eq!(
         writer
-            .record_file_orders(env.table_id, "verify", &before)
+            .record_file_facts(file_order::NAME, env.table_id, &before)
             .unwrap(),
         2
     );
@@ -983,7 +1000,7 @@ async fn verify_racing_compaction_and_prune() {
 
     // Rows for paths no file of the table has are pruned; the merge output's
     // row stays.
-    assert_eq!(writer.prune_file_orders().unwrap(), 2);
+    assert_eq!(prune_file_orders(&writer).unwrap(), 2);
     assert_eq!(sidecar_rows(&env).await, 1);
     assert_eq!(env.orders().await, orders);
 }
@@ -993,7 +1010,7 @@ async fn sidecar_rows(env: &Env) -> i64 {
     use sqlx::Row;
     let pool = sqlx::SqlitePool::connect(&env.url()).await.unwrap();
     let exists: bool = sqlx::query(
-        "SELECT count(*) > 0 FROM sqlite_master WHERE name = 'ext_ducklake_file_order'",
+        "SELECT count(*) > 0 FROM sqlite_master WHERE name = 'ext_ducklake_file_fact'",
     )
     .fetch_one(&pool)
     .await
@@ -1002,7 +1019,7 @@ async fn sidecar_rows(env: &Env) -> i64 {
     if !exists {
         return 0;
     }
-    sqlx::query("SELECT count(*) FROM ext_ducklake_file_order")
+    sqlx::query("SELECT count(*) FROM ext_ducklake_file_fact WHERE extension = 'file_order'")
         .fetch_one(&pool)
         .await
         .unwrap()
@@ -1698,7 +1715,7 @@ async fn top_n_over(table: DuckLakeTable) -> (String, Vec<i64>) {
 
 async fn clear_sidecar(env: &Env) {
     let pool = sqlx::SqlitePool::connect(&env.url()).await.unwrap();
-    sqlx::query("DELETE FROM ext_ducklake_file_order")
+    sqlx::query("DELETE FROM ext_ducklake_file_fact WHERE extension = 'file_order'")
         .execute(&pool)
         .await
         .unwrap();

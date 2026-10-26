@@ -4554,42 +4554,42 @@ impl MetadataWriter for SqliteMetadataWriter {
         })
     }
 
-    fn record_file_orders(
+    fn record_file_facts(
         &self,
+        extension: &str,
         table_id: i64,
-        verified_by: &str,
-        orders: &[crate::ext_file_order::FileOrder],
+        facts: &[crate::extension::FileFact],
     ) -> Result<u64> {
-        if orders.is_empty() {
+        if facts.is_empty() {
             return Ok(0);
         }
         self.block_on(async {
             async fn upsert(
                 pool: &sqlx::SqlitePool,
+                extension: &str,
                 table_id: i64,
-                verified_by: &str,
-                orders: &[crate::ext_file_order::FileOrder],
+                facts: &[crate::extension::FileFact],
             ) -> std::result::Result<u64, sqlx::Error> {
                 let mut tx = pool.begin().await?;
                 let mut written = 0;
-                for order in orders {
-                    // A later verification of the same object wins: same
-                    // bytes, so only the key (a changed sort spec) can differ.
+                for fact in facts {
+                    // A later fact about the same object wins: same bytes, so
+                    // only what the extension derived from them can differ.
                     written += sqlx::query(
-                        "INSERT INTO ext_ducklake_file_order
-                             (table_id, path, file_size_bytes, sort_key, verified_by)
-                         VALUES (?, ?, ?, ?, ?)
-                         ON CONFLICT (table_id, path) DO UPDATE SET
+                        "INSERT INTO ext_ducklake_file_fact
+                             (extension, table_id, path, fact_key, file_size_bytes, value)
+                         VALUES (?, ?, ?, ?, ?, ?)
+                         ON CONFLICT (extension, table_id, path, fact_key) DO UPDATE SET
                              file_size_bytes = excluded.file_size_bytes,
-                             sort_key = excluded.sort_key,
-                             verified_by = excluded.verified_by,
-                             verified_at = CURRENT_TIMESTAMP",
+                             value = excluded.value,
+                             recorded_at = CURRENT_TIMESTAMP",
                     )
+                    .bind(extension)
                     .bind(table_id)
-                    .bind(&order.path)
-                    .bind(order.file_size_bytes)
-                    .bind(&order.sort_key)
-                    .bind(verified_by)
+                    .bind(&fact.path)
+                    .bind(fact.key)
+                    .bind(fact.file_size_bytes)
+                    .bind(&fact.value)
                     .execute(&mut *tx)
                     .await?
                     .rows_affected();
@@ -4599,118 +4599,23 @@ impl MetadataWriter for SqliteMetadataWriter {
             }
             // The table is created on first use, so a catalog that never
             // records anything never gets it.
-            match upsert(&self.pool, table_id, verified_by, orders).await {
-                Err(e) if crate::ext_file_order::is_missing_table(&e) => {
-                    sqlx::query(crate::ext_file_order::SQLITE_DDL)
+            match upsert(&self.pool, extension, table_id, facts).await {
+                Err(e) if crate::file_facts::is_missing_table(&e) => {
+                    sqlx::query(crate::file_facts::SQLITE_DDL)
                         .execute(&self.pool)
                         .await?;
-                    Ok(upsert(&self.pool, table_id, verified_by, orders).await?)
+                    Ok(upsert(&self.pool, extension, table_id, facts).await?)
                 },
                 done => Ok(done?),
             }
         })
     }
 
-    fn prune_file_orders(&self) -> Result<u64> {
-        self.block_on(async {
-            // Any catalog row for the path keeps it: a retired file is still
-            // read by time travel until expiry removes its row.
-            match sqlx::query(
-                "DELETE FROM ext_ducklake_file_order
-                 WHERE NOT EXISTS (
-                     SELECT 1 FROM ducklake_data_file df
-                     WHERE df.table_id = ext_ducklake_file_order.table_id
-                       AND df.path = ext_ducklake_file_order.path)",
-            )
-            .execute(&self.pool)
-            .await
-            {
-                Ok(done) => Ok(done.rows_affected()),
-                Err(e) if crate::ext_file_order::is_missing_table(&e) => Ok(0),
-                Err(e) => Err(e.into()),
-            }
-        })
-    }
-
-    fn record_file_indexes(
+    fn prune_file_facts(
         &self,
-        table_id: i64,
-        built_by: &str,
-        rows: &[crate::file_indexing::FileIndexRow],
-    ) -> Result<u64> {
-        if rows.is_empty() {
-            return Ok(0);
-        }
-        self.block_on(async {
-            async fn upsert(
-                pool: &sqlx::SqlitePool,
-                table_id: i64,
-                built_by: &str,
-                rows: &[crate::file_indexing::FileIndexRow],
-            ) -> std::result::Result<u64, sqlx::Error> {
-                use crate::file_indexing::{encode_heavy_hitters, encode_u64_list};
-                let mut tx = pool.begin().await?;
-                let mut written = 0;
-                for row in rows {
-                    let meta = &row.meta;
-                    written += sqlx::query(
-                        "INSERT INTO ext_ducklake_file_index
-                             (table_id, path, file_size_bytes, column_id, index_path, index_key,
-                              index_size_bytes, format_version, value_type, row_count,
-                              row_group_rows, heavy_hitters, built_by, bucket_counts)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                         ON CONFLICT (table_id, path, column_id) DO UPDATE SET
-                             file_size_bytes = excluded.file_size_bytes,
-                             index_path = excluded.index_path,
-                             index_key = excluded.index_key,
-                             index_size_bytes = excluded.index_size_bytes,
-                             format_version = excluded.format_version,
-                             value_type = excluded.value_type,
-                             row_count = excluded.row_count,
-                             row_group_rows = excluded.row_group_rows,
-                             heavy_hitters = excluded.heavy_hitters,
-                             built_by = excluded.built_by,
-                             bucket_counts = excluded.bucket_counts,
-                             built_at = CURRENT_TIMESTAMP",
-                    )
-                    .bind(table_id)
-                    .bind(&meta.path)
-                    .bind(meta.file_size_bytes)
-                    .bind(meta.column_id)
-                    .bind(&meta.index_path)
-                    .bind(&row.index_key)
-                    .bind(meta.index_size_bytes)
-                    .bind(meta.format_version)
-                    .bind(meta.value_type.as_str())
-                    .bind(meta.row_count)
-                    .bind(encode_u64_list(&meta.row_group_rows))
-                    .bind(encode_heavy_hitters(&meta.heavy_hitters))
-                    .bind(built_by)
-                    .bind(
-                        meta.bucket_counts
-                            .as_ref()
-                            .map(crate::ext_file_index_counts::bucket_counts_to_json),
-                    )
-                    .execute(&mut *tx)
-                    .await?
-                    .rows_affected();
-                }
-                tx.commit().await?;
-                Ok(written)
-            }
-            match upsert(&self.pool, table_id, built_by, rows).await {
-                Err(e) if crate::ext_file_order::is_missing_table(&e) => {
-                    sqlx::query(crate::file_indexing::SQLITE_DDL)
-                        .execute(&self.pool)
-                        .await?;
-                    Ok(upsert(&self.pool, table_id, built_by, rows).await?)
-                },
-                done => Ok(done?),
-            }
-        })
-    }
-
-    fn prune_file_indexes(&self, min_age: std::time::Duration) -> Result<Vec<String>> {
+        extension: &str,
+        min_age: std::time::Duration,
+    ) -> Result<Vec<crate::extension::FileFact>> {
         // CURRENT_TIMESTAMP's format, so the comparison is textual and exact.
         // Second resolution, hence `<=`: a zero `min_age` prunes this second's rows.
         let cutoff = chrono::Duration::from_std(min_age)
@@ -4721,21 +4626,35 @@ impl MetadataWriter for SqliteMetadataWriter {
                 |at| at.format("%Y-%m-%d %H:%M:%S").to_string(),
             );
         self.block_on(async {
-            match sqlx::query_scalar::<_, String>(
-                "DELETE FROM ext_ducklake_file_index
-                 WHERE built_at <= ?
+            // Any catalog row for the path keeps it: a retired file is still
+            // read by time travel until expiry removes its row.
+            match sqlx::query(
+                "DELETE FROM ext_ducklake_file_fact
+                 WHERE extension = ?
+                   AND recorded_at <= ?
                    AND NOT EXISTS (
                      SELECT 1 FROM ducklake_data_file df
-                     WHERE df.table_id = ext_ducklake_file_index.table_id
-                       AND df.path = ext_ducklake_file_index.path)
-                 RETURNING index_key",
+                     WHERE df.table_id = ext_ducklake_file_fact.table_id
+                       AND df.path = ext_ducklake_file_fact.path)
+                 RETURNING path, file_size_bytes, fact_key, value",
             )
+            .bind(extension)
             .bind(cutoff)
             .fetch_all(&self.pool)
             .await
             {
-                Ok(keys) => Ok(keys),
-                Err(e) if crate::ext_file_order::is_missing_table(&e) => Ok(Vec::new()),
+                Ok(rows) => rows
+                    .iter()
+                    .map(|row| {
+                        Ok(crate::extension::FileFact {
+                            path: row.try_get(0)?,
+                            file_size_bytes: row.try_get(1)?,
+                            key: row.try_get(2)?,
+                            value: row.try_get(3)?,
+                        })
+                    })
+                    .collect(),
+                Err(e) if crate::file_facts::is_missing_table(&e) => Ok(Vec::new()),
                 Err(e) => Err(e.into()),
             }
         })

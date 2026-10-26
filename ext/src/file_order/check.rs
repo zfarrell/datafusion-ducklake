@@ -1,8 +1,5 @@
-//! Per-file sort attestation: the writer checks that the rows it writes
-//! really are ordered by the table's sort key, the result is recorded per data
-//! file (the experimental `ext_ducklake_file_order` sidecar, see
-//! `crate::ext_file_order`), and a scan declares that ordering to DataFusion
-//! only for files with a record.
+//! The check behind a recorded order: it observes every row written to a
+//! file and attests the sort key only if all of them followed it.
 //!
 //! Why not the catalog's sort spec: in DuckLake `SET SORTED BY` is a
 //! write-time hint. No catalog row records which spec (if any) a data file was
@@ -31,7 +28,6 @@ pub(crate) struct AttestedKey {
 }
 
 /// `field_id:asc|desc:nulls_first|nulls_last`, comma-separated, primary key first.
-#[cfg(feature = "write")]
 pub(crate) fn encode(keys: &[AttestedKey]) -> String {
     keys.iter()
         .map(|key| {
@@ -88,103 +84,17 @@ pub(crate) fn decode(value: &str) -> Option<Vec<AttestedKey>> {
     (!keys.is_empty()).then_some(keys)
 }
 
-#[cfg(feature = "write")]
-pub(crate) use write::{FileOrderRequest, SortCheck};
+pub(crate) use write::SortCheck;
 
-#[cfg(feature = "write")]
 mod write {
-    use std::sync::Arc;
-
     use arrow::array::ArrayRef;
     use arrow::datatypes::Schema;
     use arrow::record_batch::RecordBatch;
     use arrow::row::{OwnedRow, RowConverter, SortField};
+    use datafusion_ducklake::Result;
     use parquet::file::metadata::SortingColumn;
 
     use super::{AttestedKey, encode};
-    use crate::Result;
-    use crate::ext_file_order::{BY_WRITE, FileOrder};
-    use crate::metadata_writer::MetadataWriter;
-    use crate::sort::{NullOrder, SortDirection, SortSpec};
-
-    /// What a write asks of each file it writes under the `ext_file_order`
-    /// option: check the rows against the table's sort key and, when they
-    /// follow it, record that in the sidecar as soon as the file is finished.
-    /// That can precede the upload: a row for a path whose upload then fails
-    /// matches no catalog file and is pruned like any other.
-    ///
-    /// One pointer wide: writers and sessions holding it live in long-held
-    /// futures.
-    #[derive(Debug, Clone)]
-    pub(crate) struct FileOrderRequest(Arc<RequestInner>);
-
-    #[derive(Debug)]
-    struct RequestInner {
-        metadata: Arc<dyn MetadataWriter>,
-        table_id: i64,
-        /// Top-level field indices of the written schema, with the key's
-        /// direction and null order.
-        columns: Vec<SortingColumn>,
-    }
-
-    impl FileOrderRequest {
-        /// The request for `spec`'s keys over `schema`'s top-level fields;
-        /// `None` when the table is unsorted, a key is an expression this
-        /// crate cannot evaluate, or a key is not a field of `schema`.
-        pub(crate) fn new(
-            metadata: Arc<dyn MetadataWriter>,
-            table_id: i64,
-            spec: Option<&SortSpec>,
-            schema: &Schema,
-        ) -> Option<Self> {
-            let columns = spec?
-                .producible_columns()?
-                .into_iter()
-                .map(|(name, direction, nulls)| {
-                    let (index, _) = schema.column_with_name(&name)?;
-                    Some(SortingColumn {
-                        column_idx: i32::try_from(index).ok()?,
-                        descending: direction == SortDirection::Desc,
-                        nulls_first: nulls == NullOrder::NullsFirst,
-                    })
-                })
-                .collect::<Option<Vec<_>>>()
-                .filter(|columns| !columns.is_empty())?;
-            Some(Self(Arc::new(RequestInner {
-                metadata,
-                table_id,
-                columns,
-            })))
-        }
-
-        /// A fresh check for one file written with `schema`, which carries
-        /// the request's columns at the same indices plus their field ids.
-        pub(crate) fn check(&self, schema: &Schema) -> Option<SortCheck> {
-            SortCheck::new(schema, &self.0.columns)
-        }
-
-        /// Record that the finished file at catalog `path` follows `sort_key`.
-        /// Best effort: the data write never fails over its sidecar row, and a
-        /// file without one reads as unordered, as it always did.
-        pub(crate) fn record(&self, path: &str, file_size_bytes: i64, sort_key: String) {
-            let order = FileOrder {
-                path: path.to_string(),
-                file_size_bytes,
-                sort_key,
-            };
-            if let Err(error) =
-                self.0
-                    .metadata
-                    .record_file_orders(self.0.table_id, BY_WRITE, &[order])
-            {
-                tracing::warn!(
-                    %error,
-                    path,
-                    "ext_file_order: not recorded; the file reads as unordered"
-                );
-            }
-        }
-    }
 
     /// Watches the rows written to one file and reports, at close, whether they
     /// were in order on the requested key.
@@ -300,7 +210,6 @@ mod write {
 mod tests {
     use super::*;
 
-    #[cfg(feature = "write")]
     #[test]
     fn encode_decode_round_trip() {
         let keys = vec![
@@ -338,7 +247,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "write")]
     mod check {
         use std::collections::HashMap;
         use std::sync::Arc;

@@ -3,7 +3,7 @@
 //! `MulticatalogProvider`, including a writer role without DDL rights.
 //! Docker-gated (testcontainers Postgres).
 
-#![cfg(feature = "write-postgres")]
+#![cfg(not(feature = "skip-tests-with-docker"))]
 
 use std::sync::Arc;
 
@@ -14,9 +14,12 @@ use datafusion::execution::context::SessionConfig;
 use datafusion::physical_plan::displayable;
 use datafusion::prelude::*;
 use datafusion_ducklake::{
-    DuckLakeCatalog, DuckLakeReadOptions, DuckLakeTable, DuckLakeTableWriter, DuckLakeWriteOptions,
+    DuckLakeCatalog, DuckLakeTable, DuckLakeTableWriter, DuckLakeWriteOptions,
     MetadataWriter, MulticatalogManager, MulticatalogProvider, NullOrder, PostgresMetadataWriter,
-    SortDirection, SortField, VerifyOrderOptions,
+    SortDirection, SortField,
+};
+use datafusion_ducklake_ext::file_order::{
+    FileOrder, FileOrderTableExt, VerifyOrderOptions, prune_file_orders,
 };
 use object_store::local::LocalFileSystem;
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -59,7 +62,9 @@ fn batch(ts: impl IntoIterator<Item = i64>) -> RecordBatch {
 
 fn ext_options(enabled: bool) -> DuckLakeWriteOptions {
     let mut options = DuckLakeWriteOptions::default().with_data_inlining_row_limit(0);
-    options.ext_file_order = Some(enabled);
+    if enabled {
+        options = options.with_extension(Arc::new(FileOrder));
+    }
     // Rows land in the order given, so a test decides which files are sorted.
     options.sort_on_insert = Some(false);
     options
@@ -132,8 +137,7 @@ impl Env {
         let catalog =
             DuckLakeCatalog::with_writer(Arc::new(provider), self.writer(&self.pool).await)
                 .unwrap()
-                .with_read_options(DuckLakeReadOptions::default().with_ext_file_order(true))
-                .with_write_options(DuckLakeWriteOptions::default().with_ext_file_order(true));
+                .with_extension(Arc::new(FileOrder));
         let ctx = SessionContext::new_with_config(
             SessionConfig::new()
                 .with_target_partitions(partitions)
@@ -145,14 +149,14 @@ impl Env {
 
     async fn sidecar_rows(&self) -> i64 {
         let exists: bool =
-            sqlx::query_scalar("SELECT to_regclass('ext_ducklake_file_order') IS NOT NULL")
+            sqlx::query_scalar("SELECT to_regclass('ext_ducklake_file_fact') IS NOT NULL")
                 .fetch_one(&self.pool)
                 .await
                 .unwrap();
         if !exists {
             return -1;
         }
-        sqlx::query_scalar("SELECT count(*) FROM ext_ducklake_file_order")
+        sqlx::query_scalar("SELECT count(*) FROM ext_ducklake_file_fact WHERE extension = 'file_order'")
             .fetch_one(&self.pool)
             .await
             .unwrap()
@@ -305,7 +309,10 @@ async fn multicatalog_records_verifies_and_declares() {
         assert_matches_reference(&env.ctx(partitions).await, TOP_N).await;
     }
     // Every row's file is listed: nothing to prune.
-    assert_eq!(env.writer(&env.pool).await.prune_file_orders().unwrap(), 0);
+    assert_eq!(
+        prune_file_orders(env.writer(&env.pool).await.as_ref()).unwrap(),
+        0
+    );
 }
 
 /// The sidecar never fails a data write: a writer that may not write it (here:
@@ -323,7 +330,7 @@ async fn sidecar_it_cannot_write_never_fails_a_write() {
         "GRANT USAGE, CREATE ON SCHEMA public TO w",
         "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO w",
         "GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO w",
-        "REVOKE ALL ON ext_ducklake_file_order FROM w",
+        "REVOKE ALL ON ext_ducklake_file_fact FROM w",
     ] {
         sqlx::query(sql).execute(&env.pool).await.unwrap();
     }
@@ -335,7 +342,7 @@ async fn sidecar_it_cannot_write_never_fails_a_write() {
         assert_matches_reference(&env.ctx(partitions).await, TOP_N).await;
     }
 
-    sqlx::query("GRANT SELECT, INSERT, UPDATE ON ext_ducklake_file_order TO w")
+    sqlx::query("GRANT SELECT, INSERT, UPDATE ON ext_ducklake_file_fact TO w")
         .execute(&env.pool)
         .await
         .unwrap();

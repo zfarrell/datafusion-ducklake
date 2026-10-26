@@ -257,10 +257,8 @@ pub(crate) struct RowGroupSampledWriter<W: Write + Send> {
     buffered_rows: usize,
     buffered_bytes: usize,
     writer: Option<ArrowWriter<W>>,
-    /// Boxed: the writer lives in long-held futures, and is mostly `None`.
-    sort_check: Option<Box<crate::file_ordering::SortCheck>>,
-    /// Postings of the `ext_file_index` columns, fed every row in write order.
-    file_index: Option<Box<crate::file_indexing::FileIndexBuilders>>,
+    /// Extension observers of this file, fed every row in write order.
+    observers: crate::extension::FileObservers,
 }
 
 impl<W: Write + Send> RowGroupSampledWriter<W> {
@@ -271,41 +269,28 @@ impl<W: Write + Send> RowGroupSampledWriter<W> {
             buffered_rows: 0,
             buffered_bytes: 0,
             writer: None,
-            sort_check: None,
-            file_index: None,
+            observers: Default::default(),
         }
     }
 
-    /// Check every row written against `check` (see [`crate::file_ordering`]);
-    /// [`Self::verified_order`] then reports whether all of them followed it.
-    pub(crate) fn set_sort_check(&mut self, check: Option<crate::file_ordering::SortCheck>) {
-        self.sort_check = check.map(Box::new);
+    /// Feed every row written to `observers` (see [`crate::extension`]);
+    /// take them back with [`Self::take_observers`].
+    pub(crate) fn set_observers(&mut self, observers: crate::extension::FileObservers) {
+        self.observers = observers;
     }
 
-    /// Build `ext_file_index` postings from every row written (see
-    /// [`crate::file_indexing`]); take them with [`Self::take_file_index`].
-    pub(crate) fn set_file_index(
-        &mut self,
-        builders: Option<crate::file_indexing::FileIndexBuilders>,
-    ) {
-        self.file_index = builders.map(Box::new);
-    }
-
-    /// The postings built so far. Take before [`Self::into_inner_with_row_groups`].
-    pub(crate) fn take_file_index(&mut self) -> Option<crate::file_indexing::FileIndexBuilders> {
-        self.file_index.take().map(|b| *b)
+    /// The observers fed so far. Take before [`Self::into_inner_with_row_groups`].
+    pub(crate) fn take_observers(&mut self) -> crate::extension::FileObservers {
+        std::mem::take(&mut self.observers)
     }
 
     /// Write `batch`, which must carry the file's parquet schema. Buffers it while
     /// the first row group is incomplete, and opens the file once it is.
     pub(crate) fn write(&mut self, batch: &RecordBatch) -> Result<()> {
-        if let Some(check) = &mut self.sort_check {
-            check.observe(batch)?;
-        }
-        if let Some(index) = &mut self.file_index {
+        if !self.observers.is_empty() {
             // Positions are the running row count: rows reach the file in
             // exactly this order, buffered or not.
-            index.observe(batch);
+            self.observers.observe(batch);
         }
         if let Some(writer) = &mut self.writer {
             writer.write(batch)?;
@@ -350,15 +335,6 @@ impl<W: Write + Send> RowGroupSampledWriter<W> {
         self.writer
             .as_ref()
             .map_or(0, ArrowWriter::in_progress_size)
-    }
-
-    /// The sort key every row written so far was verified to follow (see
-    /// [`crate::file_ordering`]), for the sidecar to record. Read before
-    /// [`Self::into_inner`].
-    pub(crate) fn verified_order(&self) -> Option<String> {
-        self.sort_check
-            .as_ref()
-            .and_then(|check| check.attestation())
     }
 
     /// [`Self::into_inner`], also returning each row group's row count.

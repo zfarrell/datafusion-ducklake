@@ -179,22 +179,15 @@ impl MetadataProvider for CountingProvider {
         self.inner
             .get_table_summary_statistics(table_id, snapshot_id)
     }
-    fn verified_file_orders(
+    fn file_facts(
         &self,
+        extension: &str,
         table_id: i64,
         paths: &[&str],
-    ) -> Result<Vec<datafusion_ducklake::ext_file_order::FileOrder>> {
-        self.count("verified_file_orders");
-        self.inner.verified_file_orders(table_id, paths)
-    }
-    fn file_indexes(
-        &self,
-        table_id: i64,
-        paths: &[&str],
-        column_ids: &[i64],
-    ) -> Result<Vec<datafusion_ducklake::ext_file_index::FileIndexMeta>> {
-        self.count("file_indexes");
-        self.inner.file_indexes(table_id, paths, column_ids)
+        keys: Option<&[i64]>,
+    ) -> Result<Vec<datafusion_ducklake::FileFact>> {
+        self.count("file_facts");
+        self.inner.file_facts(extension, table_id, paths, keys)
     }
     fn get_table_file_metadata_page(
         &self,

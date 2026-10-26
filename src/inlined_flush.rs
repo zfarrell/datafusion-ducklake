@@ -859,13 +859,11 @@ async fn write_inlined_table(
     // 1.5.6, ducklake 664400c5); an encrypted catalog is refused before this,
     // so the setting alone decides.
     let hive = table.write_options().hive_file_pattern.unwrap_or(true);
-    // EXPERIMENTAL `ext_file_order`: verify the flushed files like any write.
-    let file_order = table.ext_file_order_request(data_schema.as_ref())?;
-    let file_index = table.ext_file_index_request(
-        table_writer.object_store(),
-        data_schema.as_ref(),
-        &top_level_ids,
-        crate::ext_file_index::BUILT_BY_WRITE,
+    let hooks = table_writer.file_hooks(
+        table.table_id(),
+        schema_name,
+        table.table_name(),
+        crate::extension::WriteOrigin::InlinedFlush,
     );
     let mut files = Vec::new();
     for (partition, group) in groups {
@@ -898,8 +896,7 @@ async fn write_inlined_table(
                 // unpartitioned one (`DuckLakeInsert::GetCopyOptions`).
                 partition.is_none(),
                 written,
-                file_order.clone(),
-                file_index.clone(),
+                hooks.clone(),
             )
             .await?;
 

@@ -63,11 +63,12 @@ use datafusion::optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_datasource::memory::MemorySourceConfig;
 
-use crate::metadata_provider::DuckLakeTableFile;
-use crate::table::{DuckLakeTable, ScanRestriction};
+use datafusion_ducklake::DuckLakeTable;
+use datafusion_ducklake::metadata_provider::DuckLakeTableFile;
+use datafusion_ducklake::table::ScanRestriction;
 
-pub use crate::ext_file_index::{BUCKET_GRAIN_HOUR_US, BucketCounts, MAX_BUCKET_COUNT_ENTRIES};
-use crate::ext_file_index::{IndexKey, IndexValueType};
+pub use super::format::{BUCKET_GRAIN_HOUR_US, BucketCounts, MAX_BUCKET_COUNT_ENTRIES};
+use super::format::{FILE_INDEX_FORMAT_VERSION, IndexKey, IndexValueType};
 
 /// Version of the `bucket_counts` JSON.
 pub const BUCKET_COUNTS_VERSION: i64 = 1;
@@ -404,7 +405,7 @@ impl SharedResolution {
     pub fn get(&self) -> Arc<Resolution> {
         Arc::clone(
             self.cell
-                .get_or_init(|| Arc::new(self.table.resolve_bucket_counts(&self.request))),
+                .get_or_init(|| Arc::new(resolve_bucket_counts(&self.table, &self.request))),
         )
     }
 }
@@ -580,7 +581,10 @@ impl BucketCountRule {
         let table = resolved.downcast_ref::<DuckLakeTable>()?;
         // The rewrite's resolution and both branch scans share one listing.
         table
-            .ext_file_index_counts_enabled()
+            .read_options()
+            .extensions
+            .get::<super::FileIndex>()
+            .is_some_and(super::FileIndex::counts)
             .then(|| Arc::new(table.with_plan_listing_memo()))
     }
 
@@ -835,15 +839,9 @@ impl OptimizerRule for BucketCountRule {
         let LogicalPlan::Aggregate(aggregate) = &plan else {
             return Ok(Transformed::no(plan));
         };
-        // `SET ducklake.ext_file_index = false` (the on/off spot check) turns
-        // the counts off with the rest of the index.
-        if config
-            .options()
-            .extensions
-            .get::<crate::delete_memo::DuckLakeSessionOptions>()
-            .and_then(|options| options.ext_file_index)
-            == Some(false)
-        {
+        // `SET ducklake_file_index.enabled = false` (the on/off spot check)
+        // turns the counts off with the rest of the index.
+        if !super::scans_enabled(&config.options(), true) {
             return Ok(Transformed::no(plan));
         }
         match self.try_rewrite(aggregate) {
@@ -1026,6 +1024,56 @@ fn key_equality(expr: &Expr) -> Option<(Column, Vec<ScalarValue>)> {
     }
 }
 
+/// The files whose rows in `[req.lo, req.hi)` their recorded counts serve,
+/// at `table`'s pinned snapshot. A failure counts no file.
+fn resolve_bucket_counts(table: &DuckLakeTable, req: &BucketCountRequest) -> Resolution {
+    match try_resolve_bucket_counts(table, req) {
+        Ok(resolution) => resolution,
+        Err(error) => {
+            tracing::debug!(%error, "bucket counts unavailable; scanning every file");
+            Default::default()
+        },
+    }
+}
+
+fn try_resolve_bucket_counts(table: &DuckLakeTable, req: &BucketCountRequest) -> Result<Resolution> {
+    // Counts ignore deletes and snapshot filters, and are keyed by column id,
+    // so only files read exactly as stored qualify.
+    let eligible = table.plain_files()?;
+    let paths: Vec<&str> = eligible.iter().map(|tf| tf.file.path.as_str()).collect();
+    let rows = table
+        .extension_state()
+        .get_or_default::<super::scan::IndexMemo>()
+        .rows(
+            table.metadata_provider().as_ref(),
+            table.table_id(),
+            &paths,
+            &[req.key_column_id],
+        );
+    let mut resolution = Resolution::default();
+    for tf in &eligible {
+        let Some(meta) = rows.get(&(tf.file.path.clone(), req.key_column_id)) else {
+            continue;
+        };
+        // A fact applies only to the file it was built from.
+        if meta.file_size_bytes != tf.file.file_size_bytes
+            || meta.format_version != FILE_INDEX_FORMAT_VERSION
+            || meta.value_type != req.value_type
+        {
+            continue;
+        }
+        if let Some(counts) = &meta.bucket_counts {
+            resolution.add_file(tf, counts, req);
+        }
+    }
+    tracing::debug!(
+        counted_files = resolution.counted.len(),
+        buckets = resolution.buckets.len(),
+        "bucket counts resolved"
+    );
+    Ok(resolution)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1120,7 +1168,7 @@ mod tests {
     /// per-hour counts against a brute force; light keys and NULL keys none.
     #[test]
     fn posting_builder_counts_match_brute_force() {
-        use crate::ext_file_index::PostingBuilder;
+        use crate::file_index::format::PostingBuilder;
         use arrow::array::StringArray;
         let h = BUCKET_GRAIN_HOUR_US;
         let mut b = PostingBuilder::new(2, IndexValueType::Utf8).with_bucket_counts(1, h);
@@ -1184,7 +1232,7 @@ mod tests {
     /// A batch whose time column was not fed leaves the file without counts.
     #[test]
     fn posting_builder_without_every_ts_batch_has_no_counts() {
-        use crate::ext_file_index::PostingBuilder;
+        use crate::file_index::format::PostingBuilder;
         let mut b = PostingBuilder::new(2, IndexValueType::Int64)
             .with_bucket_counts(1, BUCKET_GRAIN_HOUR_US);
         let keys: ArrayRef = Arc::new(Int64Array::from(vec![7; 2000]));

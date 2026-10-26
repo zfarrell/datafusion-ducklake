@@ -45,21 +45,9 @@ pub struct DuckLakeReadOptions {
     /// Bytes of delete-file positions a table can keep across scans. Zero, the
     /// default, turns the delete memo off.
     pub delete_memo_bytes: usize,
-    /// EXPERIMENTAL: whether scans read the `ext_ducklake_file_order` table
-    /// (see [`crate::ext_file_order`]) and serve `ORDER BY <sort key> LIMIT n`
-    /// from the files it records, in order and without a sort. Off by default:
-    /// the table is never read, and scans plan as without this option.
-    pub ext_file_order: bool,
-    /// EXPERIMENTAL: whether scans read the `ext_ducklake_file_index` table
-    /// (see [`crate::ext_file_index`]) to skip files, and rows within files,
-    /// that an equality or `IN` filter on an indexed column cannot match. Off
-    /// by default: the table is never read, and scans plan as without it.
-    pub ext_file_index: bool,
-    /// EXPERIMENTAL: whether [`crate::ext_file_index_counts::BucketCountRule`]
-    /// may answer `count(*) GROUP BY date_trunc('hour', ts)` for this table
-    /// from the per-file bucket counts in `ext_ducklake_file_index`. Off by
-    /// default: the rule leaves the table's plans alone.
-    pub ext_file_index_counts: bool,
+    /// Extensions whose scan hooks decide how this table's scans read each
+    /// file (see [`crate::extension`]). Empty by default.
+    pub extensions: crate::extension::DuckLakeExtensions,
     /// Bytes of file listing a table may keep for the life of the table (and
     /// its clones). Zero, the default, reads the listing on every scan. See
     /// [`Self::with_listing_memo`].
@@ -85,27 +73,13 @@ impl DuckLakeReadOptions {
         self
     }
 
-    /// EXPERIMENTAL: declare the verified sort order of recorded files to a
-    /// sort that asks for it; see [`Self::ext_file_order`].
+    /// Register `extension`'s scan hook (see [`crate::extension`]).
     #[must_use]
-    pub fn with_ext_file_order(mut self, enabled: bool) -> Self {
-        self.ext_file_order = enabled;
-        self
-    }
-
-    /// EXPERIMENTAL: prune files and rows by the per-file secondary index; see
-    /// [`Self::ext_file_index`].
-    #[must_use]
-    pub fn with_ext_file_index(mut self, enabled: bool) -> Self {
-        self.ext_file_index = enabled;
-        self
-    }
-
-    /// EXPERIMENTAL: let [`crate::ext_file_index_counts::BucketCountRule`]
-    /// serve whole hours from recorded per-file bucket counts. Off by default.
-    #[must_use]
-    pub fn with_ext_file_index_counts(mut self, enabled: bool) -> Self {
-        self.ext_file_index_counts = enabled;
+    pub fn with_extension(
+        mut self,
+        extension: Arc<dyn crate::extension::DuckLakeExtension>,
+    ) -> Self {
+        self.extensions = self.extensions.with(extension);
         self
     }
 
@@ -130,21 +104,6 @@ impl DuckLakeReadOptions {
         self.listing_memo_bytes = max_bytes;
         self
     }
-}
-
-datafusion::common::extensions_options! {
-    /// Per-session overrides of [`DuckLakeReadOptions`], set with
-    /// `SET ducklake.<option> = ...` once registered on the session's
-    /// `SessionConfig` (`with_option_extension`). Unset fields leave the
-    /// table's option as it is.
-    pub struct DuckLakeSessionOptions {
-        /// EXPERIMENTAL: overrides [`DuckLakeReadOptions::ext_file_index`].
-        pub ext_file_index: Option<bool>, default = None
-    }
-}
-
-impl datafusion::common::config::ConfigExtension for DuckLakeSessionOptions {
-    const PREFIX: &'static str = "ducklake";
 }
 
 /// Estimated memory a set of deleted positions holds: the slots of its hash

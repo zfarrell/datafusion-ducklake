@@ -10,7 +10,6 @@
 //! on and off). Index objects are built here from the committed data files,
 //! the way the backfill does, so the read path is tested on its own.
 
-#![cfg(all(feature = "write-sqlite", feature = "metadata-sqlite"))]
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -28,15 +27,18 @@ use object_store::local::LocalFileSystem;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tempfile::TempDir;
 
-use datafusion_ducklake::ext_file_index::{
+use datafusion_ducklake::{
+    ColumnDef, DuckLakeCatalog, DuckLakeReadOptions, DuckLakeTable, DuckLakeTableWriter,
+    DuckLakeWriteOptions, MergeOptions, MetadataWriter, NullOrder, SortDirection, SortField,
+    SqliteMetadataProvider, SqliteMetadataWriter, WriteMode,
+};
+use datafusion_ducklake_ext::file_index::format::{
     FileIndexMeta, IndexValueType, PostingBuilder, index_file_name,
 };
-use datafusion_ducklake::file_indexing::FileIndexRow;
-use datafusion_ducklake::{
-    ColumnDef, DuckLakeCatalog, DuckLakeReadOptions, DuckLakeSessionOptions, DuckLakeTable,
-    DuckLakeTableWriter, DuckLakeWriteOptions, MergeOptions, MetadataWriter, NullOrder,
-    SortDirection, SortField, SqliteMetadataProvider, SqliteMetadataWriter, WriteMode,
+use datafusion_ducklake_ext::file_index::{
+    self, FileIndex, FileIndexRow, FileIndexSessionOptions, file_index_rows,
 };
+use datafusion_ducklake_ext::file_order::FileOrder;
 
 /// Rows per appended file. Large enough that a key seen a few times in a file
 /// is not a heavy hitter (`count > rows / 4096`), so it gets a selection.
@@ -121,10 +123,12 @@ impl Env {
     }
 
     fn write_options(&self) -> DuckLakeWriteOptions {
-        let mut options = DuckLakeWriteOptions::default();
-        options.ext_file_order = Some(true);
+        let mut options = DuckLakeWriteOptions::default().with_extension(Arc::new(FileOrder));
         options.max_row_group_rows = Some(ROW_GROUP_ROWS);
-        options.with_ext_file_index(self.write_index)
+        if self.write_index {
+            options = options.with_extension(Arc::new(FileIndex::new()));
+        }
+        options
     }
 
     /// One data file per call, rows in the order given.
@@ -202,7 +206,10 @@ impl Env {
         let column_id = self.column_id(column).await;
         let indexed: std::collections::HashSet<String> = {
             use sqlx::Row;
-            sqlx::query("SELECT path FROM ext_ducklake_file_index WHERE column_id = ?")
+            sqlx::query(
+                "SELECT path FROM ext_ducklake_file_fact
+                 WHERE extension = 'file_index' AND fact_key = ?",
+            )
                 .bind(column_id)
                 .fetch_all(&self.pool().await)
                 .await
@@ -250,12 +257,17 @@ impl Env {
                     .unwrap()
                     .trim_start_matches('/')
                     .to_string(),
+                built_by: "backfill".to_string(),
             });
         }
         let n = metas.len();
         self.writer()
             .await
-            .record_file_indexes(self.table_id, "backfill", &metas)
+            .record_file_facts(
+                file_index::NAME,
+                self.table_id,
+                &metas.iter().map(FileIndexRow::to_fact).collect::<Vec<_>>(),
+            )
             .unwrap();
         n
     }
@@ -265,16 +277,23 @@ impl Env {
         let paths: Vec<String> = self.data_files().await.into_iter().map(|f| f.0).collect();
         let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
         let ids = [self.column_id("user_id").await, self.column_id("shard").await];
-        datafusion_ducklake::MetadataProvider::file_indexes(&provider, self.table_id, &paths, &ids)
+        file_index_rows(&provider, self.table_id, &paths, &ids)
             .unwrap()
+            .into_iter()
+            .map(|row| row.meta)
+            .collect()
     }
 
     async fn ctx(&self, shape: Shape, index: bool) -> SessionContext {
         let writer = self.writer().await;
         let provider = SqliteMetadataProvider::new(&self.url()).await.unwrap();
-        let read = DuckLakeReadOptions::default()
-            .with_ext_file_order(shape.order)
-            .with_ext_file_index(index);
+        // Registered with scans off rather than left out, so a session's
+        // `SET ducklake_file_index.enabled = true` can still turn it on.
+        let mut read = DuckLakeReadOptions::default()
+            .with_extension(Arc::new(FileIndex::new().with_scans(index)));
+        if shape.order {
+            read = read.with_extension(Arc::new(FileOrder));
+        }
         let catalog = match shape.snapshot {
             Some(snapshot) => DuckLakeCatalog::with_snapshot(Arc::new(provider), snapshot)
                 .unwrap()
@@ -286,7 +305,7 @@ impl Env {
         };
         let mut config = SessionConfig::new()
             .with_target_partitions(shape.partitions)
-            .with_option_extension(DuckLakeSessionOptions::default());
+            .with_option_extension(FileIndexSessionOptions::default());
         // Split files into byte ranges whenever there are spare partitions.
         config.options_mut().optimizer.repartition_file_min_size = 1;
         config.options_mut().execution.parquet.pushdown_filters = shape.pushdown;
@@ -694,7 +713,8 @@ async fn broken_indexes_fall_back() {
     let pool = env.pool().await;
     let files = env.data_files().await;
     sqlx::query(
-        "UPDATE ext_ducklake_file_index SET file_size_bytes = file_size_bytes + 1 WHERE path = ?",
+        "UPDATE ext_ducklake_file_fact SET file_size_bytes = file_size_bytes + 1
+         WHERE extension = 'file_index' AND path = ?",
     )
     .bind(&files[1].0)
     .execute(&pool)
@@ -722,7 +742,11 @@ async fn broken_indexes_fall_back() {
         std::fs::write(o, b"not an index").unwrap();
     }
     // A row claiming a different row count than the catalog's.
-    sqlx::query("UPDATE ext_ducklake_file_index SET row_count = row_count + 1 WHERE path = ?")
+    sqlx::query(
+        "UPDATE ext_ducklake_file_fact
+         SET value = json_set(value, '$.row_count', json_extract(value, '$.row_count') + 1)
+         WHERE extension = 'file_index' AND path = ?",
+    )
         .bind(&files[4].0)
         .execute(&pool)
         .await
@@ -869,13 +893,17 @@ async fn session_setting_overrides_the_read_option() {
     let sql = format!("SELECT * FROM ducklake.main.logs WHERE user_id = '{one}'");
     let on = env.ctx(SHAPES[1], true).await;
     assert_eq!(scanned_files(&physical_plan(&on, &sql).await), (1, 1));
-    on.sql("SET ducklake.ext_file_index = false").await.unwrap();
+    on.sql("SET ducklake_file_index.enabled = false")
+        .await
+        .unwrap();
     assert_eq!(
         scanned_files(&physical_plan(&on, &sql).await),
         (FILES as usize, 0)
     );
     let off = env.ctx(SHAPES[1], false).await;
-    off.sql("SET ducklake.ext_file_index = true").await.unwrap();
+    off.sql("SET ducklake_file_index.enabled = true")
+        .await
+        .unwrap();
     assert_eq!(scanned_files(&physical_plan(&off, &sql).await), (1, 1));
     assert_eq!(run(&on, &sql).await, run(&off, &sql).await);
 }

@@ -2061,7 +2061,6 @@ dependencies = [
  "futures",
  "hex",
  "hyper-util",
- "moka",
  "object_store",
  "parquet",
  "percent-encoding",
@@ -2069,7 +2068,6 @@ dependencies = [
  "rstest",
  "s3s",
  "s3s-fs",
- "serde_json",
  "sqllogictest",
  "sqlx",
  "tempfile",
@@ -2080,6 +2078,35 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "datafusion-ducklake-ext"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow 59.2.0",
+ "async-trait",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "datafusion",
+ "datafusion-datasource",
+ "datafusion-datasource-parquet",
+ "datafusion-ducklake",
+ "duckdb",
+ "futures",
+ "moka",
+ "object_store",
+ "parquet",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "testcontainers",
+ "testcontainers-modules",
+ "tokio",
+ "tracing",
+ "url",
 ]
 
 [[package]]

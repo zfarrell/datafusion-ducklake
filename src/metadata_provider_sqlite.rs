@@ -1639,83 +1639,50 @@ impl MetadataProvider for SqliteMetadataProvider {
         })
     }
 
-    fn verified_file_orders(
+    fn file_facts(
         &self,
+        extension: &str,
         table_id: i64,
         paths: &[&str],
-    ) -> Result<Vec<crate::ext_file_order::FileOrder>> {
-        if paths.is_empty() {
+        keys: Option<&[i64]>,
+    ) -> Result<Vec<crate::extension::FileFact>> {
+        if paths.is_empty() || keys.is_some_and(<[i64]>::is_empty) {
             return Ok(Vec::new());
         }
         block_on(async {
             let mut out = Vec::new();
+            let key_filter = match keys {
+                Some(keys) => format!(" AND fact_key IN ({})", vec!["?"; keys.len()].join(",")),
+                None => String::new(),
+            };
             // Bounded binds per statement (SQLite's limit is 32766).
             for chunk in paths.chunks(900) {
                 let placeholders = vec!["?"; chunk.len()].join(",");
                 let sql = format!(
-                    "SELECT path, file_size_bytes, sort_key FROM ext_ducklake_file_order \
-                     WHERE table_id = ? AND path IN ({placeholders})"
+                    "SELECT path, file_size_bytes, fact_key, value FROM ext_ducklake_file_fact \
+                     WHERE extension = ? AND table_id = ? AND path IN ({placeholders}){key_filter}"
                 );
-                let mut query = sqlx::query(AssertSqlSafe(sql)).bind(table_id);
+                let mut query = sqlx::query(AssertSqlSafe(sql))
+                    .bind(extension)
+                    .bind(table_id);
                 for path in chunk {
                     query = query.bind(*path);
+                }
+                for key in keys.unwrap_or_default() {
+                    query = query.bind(*key);
                 }
                 match query.fetch_all(&self.pool).await {
                     Ok(rows) => {
                         for row in rows {
-                            out.push(crate::ext_file_order::FileOrder {
+                            out.push(crate::extension::FileFact {
                                 path: row.try_get(0)?,
                                 file_size_bytes: row.try_get(1)?,
-                                sort_key: row.try_get(2)?,
+                                key: row.try_get(2)?,
+                                value: row.try_get(3)?,
                             });
                         }
                     },
-                    Err(e) if crate::ext_file_order::is_missing_table(&e) => {
-                        return Ok(Vec::new());
-                    },
-                    Err(e) => return Err(e.into()),
-                }
-            }
-            Ok(out)
-        })
-    }
-
-    fn file_indexes(
-        &self,
-        table_id: i64,
-        paths: &[&str],
-        column_ids: &[i64],
-    ) -> Result<Vec<crate::ext_file_index::FileIndexMeta>> {
-        if paths.is_empty() || column_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        block_on(async {
-            let mut out = Vec::new();
-            let columns = vec!["?"; column_ids.len()].join(",");
-            // Bounded binds per statement (SQLite's limit is 32766).
-            for chunk in paths.chunks(900) {
-                let placeholders = vec!["?"; chunk.len()].join(",");
-                let sql = format!(
-                    "SELECT {} FROM ext_ducklake_file_index \
-                     WHERE table_id = ? AND path IN ({placeholders}) AND column_id IN ({columns})",
-                    crate::file_indexing::SELECT_COLUMNS
-                );
-                let mut query = sqlx::query(AssertSqlSafe(sql)).bind(table_id);
-                for path in chunk {
-                    query = query.bind(*path);
-                }
-                for id in column_ids {
-                    query = query.bind(*id);
-                }
-                match query.fetch_all(&self.pool).await {
-                    Ok(rows) => {
-                        for row in &rows {
-                            if let Some(meta) = crate::file_indexing::decode_file_index_row!(row) {
-                                out.push(meta);
-                            }
-                        }
-                    },
-                    Err(e) if crate::ext_file_order::is_missing_table(&e) => {
+                    Err(e) if crate::file_facts::is_missing_table(&e) => {
                         return Ok(Vec::new());
                     },
                     Err(e) => return Err(e.into()),

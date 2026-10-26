@@ -2746,29 +2746,17 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         Ok(statistics)
     }
 
-    /// EXPERIMENTAL (`ext_file_order`): the sidecar rows of `table_id` for
-    /// `paths` (see [`crate::ext_file_order`]). A file without a row, or whose
-    /// row does not match its size, is "unknown" and is scanned unordered, so
-    /// the default (no rows) is always correct.
-    fn verified_file_orders(
+    /// The [`FileFact`](crate::extension::FileFact)s `extension` recorded
+    /// for `table_id`'s files at `paths`, all keys or only `keys`. A fact
+    /// applies to a listed file only when its size matches too, so the
+    /// default (no facts) is always correct: every file reads as unknown.
+    fn file_facts(
         &self,
+        _extension: &str,
         _table_id: i64,
         _paths: &[&str],
-    ) -> Result<Vec<crate::ext_file_order::FileOrder>> {
-        Ok(Vec::new())
-    }
-
-    /// EXPERIMENTAL (`ext_file_index`): the sidecar rows of `table_id` for
-    /// `paths` and `column_ids` (see [`crate::file_indexing`]). A caller
-    /// applies a row only when its size (and format version and value type)
-    /// match the listed file; anything else, including no row, means "scan
-    /// normally", so the default (no rows) is always correct.
-    fn file_indexes(
-        &self,
-        _table_id: i64,
-        _paths: &[&str],
-        _column_ids: &[i64],
-    ) -> Result<Vec<crate::ext_file_index::FileIndexMeta>> {
+        _keys: Option<&[i64]>,
+    ) -> Result<Vec<crate::extension::FileFact>> {
         Ok(Vec::new())
     }
 

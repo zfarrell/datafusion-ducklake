@@ -2,7 +2,7 @@
 //! `ext_ducklake_file_index` sidecar through `PostgresMetadataWriter` and
 //! `MulticatalogProvider`. Docker-gated (testcontainers Postgres).
 
-#![cfg(all(feature = "write-postgres", not(feature = "skip-tests-with-docker")))]
+#![cfg(not(feature = "skip-tests-with-docker"))]
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,12 +10,14 @@ use std::time::Duration;
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::prelude::*;
-use datafusion_ducklake::ext_file_index::{FileIndexMeta, IndexKey, IndexValueType};
-use datafusion_ducklake::file_indexing::FileIndexRow;
-use datafusion_ducklake::metadata_provider::MetadataProvider;
 use datafusion_ducklake::{
-    BuildIndexOptions, DuckLakeCatalog, DuckLakeTable, DuckLakeTableWriter, DuckLakeWriteOptions,
-    MetadataWriter, MulticatalogManager, MulticatalogProvider, PostgresMetadataWriter,
+    DuckLakeCatalog, DuckLakeTable, DuckLakeTableWriter, DuckLakeWriteOptions, MetadataWriter,
+    MulticatalogManager, MulticatalogProvider, PostgresMetadataWriter,
+};
+use datafusion_ducklake_ext::file_index::format::{FileIndexMeta, IndexKey, IndexValueType};
+use datafusion_ducklake_ext::file_index::{
+    self, BuildIndexOptions, BuildIndexResult, FileIndexRow, FileIndexTableExt, file_index_rows,
+    prune_file_indexes,
 };
 use object_store::local::LocalFileSystem;
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -148,7 +150,7 @@ impl Env {
         (ctx, table)
     }
 
-    async fn backfill(&self) -> datafusion_ducklake::BuildIndexResult {
+    async fn backfill(&self) -> BuildIndexResult {
         let (ctx, table) = self.table().await;
         table
             .build_file_indexes(&ctx.state(), BuildIndexOptions::default())
@@ -184,9 +186,12 @@ impl Env {
         let paths: Vec<&str> = live.iter().map(|(p, _)| p.as_str()).collect();
         let column = self.user_id_column().await;
         let provider = self.provider().await;
-        let mut metas = provider
-            .file_indexes(self.table_id, &paths, &[column])
-            .unwrap();
+        let mut metas: Vec<FileIndexMeta> =
+            file_index_rows(&provider, self.table_id, &paths, &[column])
+                .unwrap()
+                .into_iter()
+                .map(|row| row.meta)
+                .collect();
         metas.sort_by(|a, b| a.path.cmp(&b.path));
         metas
     }
@@ -249,7 +254,10 @@ async fn backfilled_files_are_recorded_and_read_back() {
         "heavy hitters round-trip through the catalog"
     );
     let key: String =
-        sqlx::query_scalar("SELECT index_key FROM ext_ducklake_file_index WHERE path = $1")
+        sqlx::query_scalar(
+            "SELECT value::json->>'index_key' FROM ext_ducklake_file_fact
+             WHERE extension = 'file_index' AND path = $1",
+        )
             .bind(&meta.path)
             .fetch_one(&env.pool)
             .await
@@ -282,23 +290,28 @@ async fn backfill_then_prune() {
     let mut ghost = env.metas().await[0].clone();
     ghost.path = "never-committed.parquet".to_string();
     writer
-        .record_file_indexes(
+        .record_file_facts(
+            file_index::NAME,
             env.table_id,
-            "write",
             &[FileIndexRow {
                 meta: ghost,
                 index_key: "ghost/key.pidx".to_string(),
-            }],
+                built_by: "write".to_string(),
+            }
+            .to_fact()],
         )
         .unwrap();
+    let store = Arc::new(LocalFileSystem::new());
     assert!(
-        writer
-            .prune_file_indexes(Duration::from_secs(3_600))
+        prune_file_indexes(writer.as_ref(), store.clone(), Duration::from_secs(3_600))
+            .await
             .unwrap()
             .is_empty()
     );
     assert_eq!(
-        writer.prune_file_indexes(Duration::ZERO).unwrap(),
+        prune_file_indexes(writer.as_ref(), store, Duration::ZERO)
+            .await
+            .unwrap(),
         vec!["ghost/key.pidx".to_string()]
     );
     assert_eq!(env.metas().await.len(), 2, "live files keep their rows");
@@ -308,7 +321,7 @@ async fn backfill_then_prune() {
 /// multicatalog reader, and a row without counts reads back without them.
 #[tokio::test(flavor = "multi_thread")]
 async fn bucket_counts_round_trip() {
-    use datafusion_ducklake::ext_file_index::{BUCKET_GRAIN_HOUR_US, BucketCounts};
+    use datafusion_ducklake_ext::file_index::format::{BUCKET_GRAIN_HOUR_US, BucketCounts};
     let env = Env::new().await;
     env.append(batch(0..350)).await;
     env.backfill().await;
@@ -330,13 +343,15 @@ async fn bucket_counts_round_trip() {
     let path = metas[0].path.clone();
     env.writer()
         .await
-        .record_file_indexes(
+        .record_file_facts(
+            file_index::NAME,
             env.table_id,
-            "backfill",
             &[FileIndexRow {
                 meta: metas[0].clone(),
                 index_key: "unused/key.pidx".to_string(),
-            }],
+                built_by: "backfill".to_string(),
+            }
+            .to_fact()],
         )
         .unwrap();
     let back = env.metas().await;

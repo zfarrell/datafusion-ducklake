@@ -9,7 +9,6 @@
 //! file and compares them with the stored index object, so an index that
 //! misses or misplaces a row fails here.
 
-#![cfg(all(feature = "write-sqlite", feature = "metadata-sqlite"))]
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -28,12 +27,16 @@ use object_store::path::Path as ObjectPath;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tempfile::TempDir;
 
-use datafusion_ducklake::ext_file_index::IndexKey;
 use datafusion_ducklake::maintenance::{CleanupCriteria, ExpireCriteria};
 use datafusion_ducklake::{
-    BuildIndexOptions, BuildIndexResult, ColumnDef, DuckLakeCatalog, DuckLakeTable,
-    DuckLakeTableWriter, DuckLakeWriteOptions, MergeOptions, MetadataWriter, RewriteOptions,
-    SqliteMetadataProvider, SqliteMetadataWriter, WriteMode,
+    ColumnDef, DuckLakeCatalog, DuckLakeTable, DuckLakeTableWriter, DuckLakeWriteOptions,
+    MergeOptions, MetadataWriter, RewriteOptions, SqliteMetadataProvider, SqliteMetadataWriter,
+    WriteMode,
+};
+use datafusion_ducklake_ext::file_index::format::{FileIndexMeta, IndexKey, IndexValueType};
+use datafusion_ducklake_ext::file_index::{
+    self, BuildIndexOptions, BuildIndexResult, FileIndex, FileIndexRow, FileIndexTableExt,
+    file_index_rows, prune_file_indexes,
 };
 
 fn schema() -> SchemaRef {
@@ -263,7 +266,7 @@ impl Env {
 
     async fn has_sidecar(&self) -> bool {
         use sqlx::Row as _;
-        sqlx::query("SELECT count(*) > 0 FROM sqlite_master WHERE name = 'ext_ducklake_file_index'")
+        sqlx::query("SELECT count(*) > 0 FROM sqlite_master WHERE name = 'ext_ducklake_file_fact'")
             .fetch_one(&self.pool().await)
             .await
             .unwrap()
@@ -276,9 +279,12 @@ impl Env {
             return Vec::new();
         }
         sqlx::query(
-            "SELECT path, file_size_bytes, column_id, index_path, index_key, index_size_bytes,
-                    value_type, row_count, row_group_rows, built_by
-             FROM ext_ducklake_file_index ORDER BY path, column_id",
+            "SELECT path, file_size_bytes, fact_key, json_extract(value, '$.index_path'),
+                    json_extract(value, '$.index_key'), json_extract(value, '$.index_size_bytes'),
+                    json_extract(value, '$.value_type'), json_extract(value, '$.row_count'),
+                    json_extract(value, '$.row_group_rows'), json_extract(value, '$.built_by')
+             FROM ext_ducklake_file_fact WHERE extension = 'file_index'
+             ORDER BY path, fact_key",
         )
         .fetch_all(&self.pool().await)
         .await
@@ -503,7 +509,7 @@ fn options() -> DuckLakeWriteOptions {
 
 /// [`options`] with the experimental write option on.
 fn index_options() -> DuckLakeWriteOptions {
-    options().with_ext_file_index(true)
+    options().with_extension(Arc::new(FileIndex::new()))
 }
 
 async fn setup() -> Env {
@@ -740,23 +746,25 @@ async fn unlisted_row_is_pruned_after_grace() {
     std::fs::write(format!("/{ghost}"), b"x").unwrap();
     env.writer()
         .await
-        .record_file_indexes(
+        .record_file_facts(
+            file_index::NAME,
             env.table_id,
-            "backfill",
-            &[datafusion_ducklake::file_indexing::FileIndexRow {
-                meta: datafusion_ducklake::ext_file_index::FileIndexMeta {
+            &[FileIndexRow {
+                meta: FileIndexMeta {
                     path: "never-committed.parquet".to_string(),
                     ..sample_meta()
                 },
                 index_key: ghost.clone(),
-            }],
+                built_by: "backfill".to_string(),
+            }
+            .to_fact()],
         )
         .unwrap();
     assert_eq!(env.rows().await.len(), 3);
 
     let writer = env.writer().await;
     // Inside the grace period: kept.
-    let kept = datafusion_ducklake::maintenance::prune_file_indexes(
+    let kept = prune_file_indexes(
         &writer,
         env.store(),
         Duration::from_secs(3_600),
@@ -767,7 +775,7 @@ async fn unlisted_row_is_pruned_after_grace() {
     assert_eq!(env.rows().await.len(), 3);
 
     let pruned =
-        datafusion_ducklake::maintenance::prune_file_indexes(&writer, env.store(), Duration::ZERO)
+        prune_file_indexes(&writer, env.store(), Duration::ZERO)
             .await
             .unwrap();
     assert_eq!(pruned, vec![ghost.clone()]);
@@ -776,15 +784,15 @@ async fn unlisted_row_is_pruned_after_grace() {
     env.assert_indexed(&["user_id", "n"], "backfill").await;
 }
 
-fn sample_meta() -> datafusion_ducklake::ext_file_index::FileIndexMeta {
-    datafusion_ducklake::ext_file_index::FileIndexMeta {
+fn sample_meta() -> FileIndexMeta {
+    FileIndexMeta {
         path: String::new(),
         file_size_bytes: 1,
         column_id: 1,
         index_path: "x.pidx".to_string(),
         index_size_bytes: 1,
         format_version: 1,
-        value_type: datafusion_ducklake::ext_file_index::IndexValueType::Utf8,
+        value_type: IndexValueType::Utf8,
         row_count: 1,
         row_group_rows: vec![1],
         heavy_hitters: vec![],
@@ -822,7 +830,7 @@ async fn prune_after_expiry_removes_index_with_file() {
             .get::<i64, _>(0) as usize
     };
     let mut pruned =
-        datafusion_ducklake::maintenance::prune_file_indexes(&writer, env.store(), Duration::ZERO)
+        prune_file_indexes(&writer, env.store(), Duration::ZERO)
             .await
             .unwrap();
     if listed > 1 {
@@ -843,7 +851,7 @@ async fn prune_after_expiry_removes_index_with_file() {
     .await
     .unwrap();
     pruned.extend(
-        datafusion_ducklake::maintenance::prune_file_indexes(&writer, env.store(), Duration::ZERO)
+        prune_file_indexes(&writer, env.store(), Duration::ZERO)
             .await
             .unwrap(),
     );
@@ -935,14 +943,18 @@ async fn backfill_rebuilds_a_mismatched_row() {
     env.backfill().await;
     let n_id = env.column_ids().await["n"];
     sqlx::query(
-        "UPDATE ext_ducklake_file_index SET file_size_bytes = 1, built_by = 'stale'
-         WHERE column_id = ?",
+        "UPDATE ext_ducklake_file_fact
+         SET file_size_bytes = 1, value = json_set(value, '$.built_by', 'stale')
+         WHERE extension = 'file_index' AND fact_key = ?",
     )
     .bind(n_id)
     .execute(&env.pool().await)
     .await
     .unwrap();
-    sqlx::query("UPDATE ext_ducklake_file_index SET built_by = 'kept' WHERE column_id != ?")
+    sqlx::query(
+        "UPDATE ext_ducklake_file_fact SET value = json_set(value, '$.built_by', 'kept')
+         WHERE extension = 'file_index' AND fact_key != ?",
+    )
         .bind(n_id)
         .execute(&env.pool().await)
         .await
@@ -1062,7 +1074,7 @@ async fn renamed_column_keeps_its_rows() {
 /// the positions of each key, including keys the file lacks.
 #[tokio::test(flavor = "multi_thread")]
 async fn provider_rows_serve_exact_lookups() {
-    use datafusion_ducklake::metadata_provider::MetadataProvider;
+    
     let env = indexed_env().await;
     env.append(&[batch(0..700), batch(700..1_000)], &options())
         .await;
@@ -1073,9 +1085,12 @@ async fn provider_rows_serve_exact_lookups() {
     let live = env.live_files().await;
     let paths: Vec<&str> = live.iter().map(|(p, _)| p.as_str()).collect();
     let provider = SqliteMetadataProvider::new(&env.url()).await.unwrap();
-    let metas = provider
-        .file_indexes(env.table_id, &paths, &[ids["user_id"], ids["n"]])
-        .unwrap();
+    let metas: Vec<FileIndexMeta> =
+        file_index_rows(&provider, env.table_id, &paths, &[ids["user_id"], ids["n"]])
+            .unwrap()
+            .into_iter()
+            .map(|row| row.meta)
+            .collect();
     assert_eq!(metas.len(), live.len() * 2);
     for meta in &metas {
         let (_, size) = live.iter().find(|(p, _)| *p == meta.path).unwrap();
@@ -1092,11 +1107,11 @@ async fn provider_rows_serve_exact_lookups() {
         };
         let mut keys: Vec<IndexKey> = postings[column].keys().cloned().collect();
         keys.push(match meta.value_type {
-            datafusion_ducklake::ext_file_index::IndexValueType::Int64 => IndexKey::Int64(-99),
+            IndexValueType::Int64 => IndexKey::Int64(-99),
             _ => IndexKey::Utf8(b"absent".to_vec().into()),
         });
         for key in &keys {
-            let got = datafusion_ducklake::ext_file_index::lookup_postings(
+            let got = datafusion_ducklake_ext::file_index::format::lookup_postings(
                 env.store(),
                 &location,
                 meta,

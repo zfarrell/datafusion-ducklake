@@ -2,8 +2,8 @@
 //!
 //! One sidecar object per (data file, indexed column): a parquet-encoded
 //! posting list of `(value, row)` sorted by `(value, row)`, where `row` is the
-//! row's position in the data file. The catalog row (`ext_ducklake_file_index`,
-//! see [`FileIndexMeta`]) carries the per-row-group row counts and the
+//! row's position in the data file. The file's fact (see [`FileIndexMeta`])
+//! carries the per-row-group row counts and the
 //! heavy-hitter list so the read side can decide per file without touching
 //! the object.
 //!
@@ -176,7 +176,7 @@ impl IndexKey {
     }
 }
 
-/// One `ext_ducklake_file_index` row.
+/// One file index fact, as read.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FileIndexMeta {
     /// As in `ducklake_data_file.path`.
@@ -290,7 +290,7 @@ pub struct PostingBuilder {
     map: PostingMap,
     /// Opt-in (W7): per-row time buckets, histogrammed per heavy hitter at
     /// `finish` into [`BuiltIndex::bucket_counts`].
-    buckets: Option<crate::ext_file_index_counts::BucketCountBuilder>,
+    buckets: Option<crate::file_index::counts::BucketCountBuilder>,
 }
 
 impl std::fmt::Debug for PostingBuilder {
@@ -328,7 +328,7 @@ impl PostingBuilder {
     /// every batch given to [`Self::observe`]. Costs 4 B per row.
     #[must_use]
     pub fn with_bucket_counts(mut self, ts_column_id: i64, grain_us: i64) -> Self {
-        self.buckets = Some(crate::ext_file_index_counts::BucketCountBuilder::new(
+        self.buckets = Some(crate::file_index::counts::BucketCountBuilder::new(
             ts_column_id,
             grain_us,
         ));
@@ -1278,5 +1278,5 @@ impl PostingCache {
 }
 
 #[cfg(test)]
-#[path = "ext_file_index_tests.rs"]
+#[path = "format_tests.rs"]
 mod tests;

@@ -1,5 +1,4 @@
-//! EXPERIMENTAL, opt-in: the read side of the per-file secondary index (see
-//! [`crate::ext_file_index`]).
+//! The read side of the per-file secondary index (see [`super::format`]).
 //!
 //! A scan whose filters hold `col = lit` or `col IN (lit, ...)` on an indexed
 //! column looks up the value's postings in each file's index object, then:
@@ -10,29 +9,34 @@
 //!
 //! The filter always stays in the plan (the provider declares it `Inexact`),
 //! so a selection only has to cover every match, never exactly them. Anything
-//! unexpected (no catalog row, a stale size, an unreadable object, a mismatched
+//! unexpected (no fact, a stale size, an unreadable object, a mismatched
 //! row count) means "scan the file as before".
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::Schema;
+use async_trait::async_trait;
 use datafusion::logical_expr::Operator;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::{BinaryExpr, Column, InListExpr, Literal};
 use datafusion_datasource_parquet::ParquetAccessPlan;
+use datafusion_ducklake::extension::{FileSelection, ScanContext, ScanFile, ScanHook};
+use datafusion_ducklake::metadata_provider::MetadataProvider;
+use futures::StreamExt;
+use object_store::path::Path as ObjectPath;
 
-use crate::ext_file_index::{FileIndexCoverage, FileIndexMeta, IndexKey, IndexValueType};
+use super::format::{
+    FILE_INDEX_FORMAT_VERSION, FileIndexMeta, HEAVY_HITTER_DIVISOR, IndexKey, IndexValueType,
+    PostingCache, access_plan, lookup_postings_cached,
+};
 
 /// Longest `IN` list the index answers; longer lists scan as before.
 pub(crate) const MAX_IN_LIST: usize = 64;
 
 /// Lookups in flight per scan.
 pub(crate) const LOOKUP_CONCURRENCY: usize = 32;
-
-/// Entries the per-table catalog memo keeps before it starts over.
-pub(crate) const MEMO_MAX_ENTRIES: usize = 200_000;
 
 /// An eligible conjunct: `column IN keys` (an equality is a one-key list).
 #[derive(Clone, Debug, PartialEq)]
@@ -113,7 +117,7 @@ fn eligible_predicate(
 /// Why a file is scanned without its index.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum FallbackReason {
-    /// No catalog row for (path, column).
+    /// No fact for (path, column).
     NoRow,
     /// A row whose `file_size_bytes` is not the listed file's.
     StaleSize,
@@ -164,7 +168,6 @@ pub(crate) enum FileDecision {
     /// Read only these rows (a file without deletes).
     Select {
         plan: Arc<ParquetAccessPlan>,
-        coverage: Arc<FileIndexCoverage>,
         rows_selected: u64,
     },
     /// Scan as before.
@@ -185,7 +188,7 @@ pub(crate) fn usable_meta<'a>(
     }
     let rows_agree = meta.row_group_rows.iter().sum::<u64>() == meta.row_count as u64
         && record_count.is_none_or(|n| n == meta.row_count);
-    if meta.format_version != crate::ext_file_index::FILE_INDEX_FORMAT_VERSION
+    if meta.format_version != FILE_INDEX_FORMAT_VERSION
         || meta.value_type != predicate.value_type
         || meta.column_id != predicate.column_id
         || meta.row_count < 0
@@ -199,7 +202,7 @@ pub(crate) fn usable_meta<'a>(
 /// Upper bound on `predicate`'s postings in a file: a heavy hitter's count, or
 /// the heavy-hitter threshold for any other key (absent keys cost that too).
 pub(crate) fn estimated_postings(meta: &FileIndexMeta, predicate: &IndexPredicate) -> u64 {
-    let threshold = meta.row_count.max(0) as u64 / crate::ext_file_index::HEAVY_HITTER_DIVISOR;
+    let threshold = meta.row_count.max(0) as u64 / HEAVY_HITTER_DIVISOR;
     predicate
         .keys
         .iter()
@@ -306,6 +309,313 @@ impl ScanSummary {
             FileDecision::Scan(reason) => *self.fallback.entry(*reason).or_default() += 1,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The scan hook
+// ---------------------------------------------------------------------------
+
+/// Entries a table's fact memo keeps before it starts over.
+pub(crate) const MEMO_MAX_ENTRIES: usize = 200_000;
+
+/// How long a remembered absence of a fact holds, so a backfill is picked up.
+const ABSENT_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The index facts a table's scans have read, by `(path, column_id)`. A fact
+/// describes immutable bytes (it is checked against the listed size on use),
+/// so it is kept; an absence is kept only briefly.
+#[derive(Debug, Default)]
+pub(crate) struct IndexMemo(Mutex<HashMap<(String, i64), MemoEntry>>);
+
+#[derive(Clone, Debug)]
+enum MemoEntry {
+    Row(Arc<FileIndexMeta>),
+    /// No fact when asked at this instant.
+    Absent(std::time::Instant),
+}
+
+impl IndexMemo {
+    /// The facts for `paths` x `column_ids`, by `(path, column_id)`: one query
+    /// for the pairs not yet known, none once all are. A failed lookup is
+    /// remembered as nothing, so the next scan asks again.
+    pub(crate) fn rows(
+        &self,
+        provider: &dyn MetadataProvider,
+        table_id: i64,
+        paths: &[&str],
+        column_ids: &[i64],
+    ) -> HashMap<(String, i64), Arc<FileIndexMeta>> {
+        let lock = || self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let known = |entry: Option<&MemoEntry>| match entry {
+            Some(MemoEntry::Row(_)) => true,
+            Some(MemoEntry::Absent(at)) => at.elapsed() < ABSENT_TTL,
+            None => false,
+        };
+        let unknown: Vec<&str> = {
+            let memo = lock();
+            paths
+                .iter()
+                .copied()
+                .filter(|path| {
+                    column_ids
+                        .iter()
+                        .any(|&c| !known(memo.get(&(path.to_string(), c))))
+                })
+                .collect()
+        };
+        // The lock is not held across the query: a concurrent scan may ask
+        // too, and both store the same answer.
+        if !unknown.is_empty() {
+            match super::file_index_rows(provider, table_id, &unknown, column_ids) {
+                Ok(rows) => {
+                    let now = std::time::Instant::now();
+                    let mut memo = lock();
+                    if memo.len() + unknown.len() * column_ids.len() > MEMO_MAX_ENTRIES {
+                        memo.clear();
+                    }
+                    for &path in &unknown {
+                        for &c in column_ids {
+                            memo.insert((path.to_string(), c), MemoEntry::Absent(now));
+                        }
+                    }
+                    for row in rows {
+                        if column_ids.contains(&row.meta.column_id) {
+                            memo.insert(
+                                (row.meta.path.clone(), row.meta.column_id),
+                                MemoEntry::Row(Arc::new(row.meta)),
+                            );
+                        }
+                    }
+                },
+                Err(error) => {
+                    tracing::debug!(%error, "file_index lookup failed; scanning without it");
+                },
+            }
+        }
+        let memo = lock();
+        let mut out = HashMap::new();
+        for &path in paths {
+            for &c in column_ids {
+                let key = (path.to_string(), c);
+                if let Some(MemoEntry::Row(row)) = memo.get(&key) {
+                    out.insert(key, Arc::clone(row));
+                }
+            }
+        }
+        out
+    }
+}
+
+/// One scan's use of the index: the conjuncts it can answer.
+#[derive(Debug)]
+pub(crate) struct IndexScanHook {
+    pub(crate) predicates: Vec<IndexPredicate>,
+}
+
+#[async_trait]
+impl ScanHook for IndexScanHook {
+    /// Under the cheapest eligible conjunct: skip a file with no posting
+    /// (whatever deletes or snapshot filters apply, since the index is exact
+    /// for the file's rows), and give a selectable file an access plan that
+    /// skips row groups and rows without postings.
+    async fn select(
+        &self,
+        ctx: &ScanContext<'_>,
+        files: &[ScanFile<'_>],
+    ) -> HashMap<i64, FileSelection> {
+        let decisions = self.decide(ctx, files).await;
+        decisions
+            .into_iter()
+            .filter_map(|(id, decision)| match decision {
+                FileDecision::Drop => Some((id, FileSelection::Skip)),
+                FileDecision::Select {
+                    plan, ..
+                } => Some((id, FileSelection::Select(plan))),
+                FileDecision::Scan(_) => None,
+            })
+            .collect()
+    }
+}
+
+impl IndexScanHook {
+    async fn decide(
+        &self,
+        ctx: &ScanContext<'_>,
+        files: &[ScanFile<'_>],
+    ) -> HashMap<i64, FileDecision> {
+        if self.predicates.is_empty() || files.is_empty() {
+            return HashMap::new();
+        }
+        let started = std::time::Instant::now();
+        let mut column_ids: Vec<i64> = self.predicates.iter().map(|p| p.column_id).collect();
+        column_ids.sort_unstable();
+        column_ids.dedup();
+        let paths: Vec<&str> = files.iter().map(|f| f.file.file.path.as_str()).collect();
+        let rows = ctx.table_state.get_or_default::<IndexMemo>().rows(
+            ctx.metadata.as_ref(),
+            ctx.table_id,
+            &paths,
+            &column_ids,
+        );
+
+        let meta_for = |f: &ScanFile<'_>, p: &IndexPredicate| {
+            usable_meta(
+                rows.get(&(f.file.file.path.clone(), p.column_id))
+                    .map(Arc::as_ref),
+                f.file.file.file_size_bytes,
+                f.file.max_row_count,
+                p,
+            )
+        };
+        // The conjunct predicted to leave the fewest rows; a file it cannot
+        // answer counts as all its rows.
+        let Some(predicate) = self.predicates.iter().min_by_key(|p| {
+            files
+                .iter()
+                .map(|f| match meta_for(f, p) {
+                    Ok(meta) => estimated_postings(meta, p),
+                    Err(_) => f.file.max_row_count.unwrap_or(i64::MAX).max(0) as u64,
+                })
+                .fold(0u64, u64::saturating_add)
+        }) else {
+            return HashMap::new();
+        };
+
+        let mut decisions = HashMap::new();
+        let mut lookups = Vec::new();
+        for f in files {
+            match meta_for(f, predicate) {
+                Err(reason) => {
+                    decisions.insert(f.file.data_file_id, FileDecision::Scan(reason));
+                },
+                // Its postings are certainly not empty, and while the filter
+                // stays, a selection over every page buys nothing.
+                Ok(meta)
+                    if predicate
+                        .keys
+                        .iter()
+                        .any(|k| meta.heavy_hitter_count(k).is_some()) =>
+                {
+                    decisions.insert(
+                        f.file.data_file_id,
+                        FileDecision::Scan(FallbackReason::HeavyHitter),
+                    );
+                },
+                Ok(_) => {
+                    let meta = Arc::clone(&rows[&(f.file.file.path.clone(), predicate.column_id)]);
+                    lookups.push((
+                        f.file.data_file_id,
+                        index_location(f.location, &meta),
+                        meta,
+                        f.selectable,
+                    ));
+                },
+            }
+        }
+        if !lookups.is_empty() {
+            let store = match ctx.session.runtime_env().object_store(ctx.object_store_url) {
+                Ok(store) => store,
+                Err(error) => {
+                    tracing::debug!(%error, "file_index: no object store; scanning without it");
+                    return HashMap::new();
+                },
+            };
+            let metadata_cache = Some(
+                ctx.session
+                    .runtime_env()
+                    .cache_manager
+                    .get_file_metadata_cache(),
+            );
+            let cache = PostingCache::global();
+            let keys: Arc<[IndexKey]> = predicate.keys.clone().into();
+            // Owned inputs only: the futures must not borrow the scan's
+            // locals (the scan future is `Send` for any lifetime).
+            let results: Vec<(i64, FileDecision)> = futures::stream::iter(lookups)
+                .map(move |(data_file_id, location, meta, selectable)| {
+                    let store = Arc::clone(&store);
+                    let metadata_cache = metadata_cache.clone();
+                    let keys = Arc::clone(&keys);
+                    async move {
+                        let Some(location) = location else {
+                            return (
+                                data_file_id,
+                                FileDecision::Scan(FallbackReason::LookupError),
+                            );
+                        };
+                        let decision = match lookup_postings_cached(
+                            cache,
+                            store,
+                            &location,
+                            &meta,
+                            &keys,
+                            metadata_cache,
+                        )
+                        .await
+                        {
+                            Err(error) => {
+                                tracing::debug!(%error, %location, "file_index lookup failed");
+                                FileDecision::Scan(FallbackReason::LookupError)
+                            },
+                            Ok(postings) if postings.rows.is_empty() => FileDecision::Drop,
+                            Ok(_) if !selectable => {
+                                FileDecision::Scan(FallbackReason::NotSelectable)
+                            },
+                            Ok(postings) => match access_plan(&postings, &meta.row_group_rows) {
+                                Some(plan) => FileDecision::Select {
+                                    plan: Arc::new(plan),
+                                    rows_selected: postings.rows.len() as u64,
+                                },
+                                None => FileDecision::Scan(FallbackReason::NoAccessPlan),
+                            },
+                        };
+                        (data_file_id, decision)
+                    }
+                })
+                .buffer_unordered(LOOKUP_CONCURRENCY)
+                .collect()
+                .await;
+            decisions.extend(results);
+        }
+
+        let mut summary = ScanSummary {
+            column_id: predicate.column_id,
+            keys: predicate.keys.len(),
+            lookup_micros: started.elapsed().as_micros() as u64,
+            ..ScanSummary::default()
+        };
+        decisions.values().for_each(|d| summary.add(d));
+        FileIndexReadStats::global().record(&summary);
+        tracing::debug!(
+            table_id = ctx.table_id,
+            column_id = summary.column_id,
+            keys = summary.keys,
+            files = files.len(),
+            files_pruned = summary.files_pruned,
+            files_selected = summary.files_selected,
+            rows_selected = summary.rows_selected,
+            lookup_us = summary.lookup_micros,
+            fallback = ?summary.fallback,
+            "file_index"
+        );
+        decisions
+    }
+}
+
+/// Where `meta`'s index object lives: `index_path` in the directory of the
+/// data file at `data`.
+fn index_location(data: &ObjectPath, meta: &FileIndexMeta) -> Option<ObjectPath> {
+    let parts: Vec<_> = data.parts().collect();
+    let (_, dir) = parts.split_last()?;
+    let mut index_parts = Vec::new();
+    for segment in meta.index_path.split('/') {
+        // `index_path` names a file beside the data file; anything that
+        // climbs out of the directory is not ours to read.
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return None;
+        }
+        index_parts.push(object_store::path::PathPart::from(segment));
+    }
+    Some(ObjectPath::from_iter(dir.iter().cloned().chain(index_parts)))
 }
 
 #[cfg(test)]
@@ -432,7 +742,7 @@ mod tests {
             column_id: 11,
             index_path: "a.parquet.c11.v1.pidx".into(),
             index_size_bytes: 1,
-            format_version: crate::ext_file_index::FILE_INDEX_FORMAT_VERSION,
+            format_version: FILE_INDEX_FORMAT_VERSION,
             value_type: IndexValueType::Int64,
             row_count: 10,
             row_group_rows: vec![4, 6],

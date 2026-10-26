@@ -80,13 +80,9 @@ pub mod delete_filter;
 mod delete_memo;
 pub mod encryption;
 pub mod error;
-pub mod ext_file_index;
-pub mod ext_file_index_counts;
-pub mod ext_file_order;
+pub mod extension;
 pub(crate) mod field_id_adapter;
-pub mod file_index_scan;
-pub mod file_indexing;
-pub(crate) mod file_ordering;
+pub mod file_facts;
 pub mod information_schema;
 pub mod inlined_filter;
 pub(crate) mod lazy_delete_filter;
@@ -181,7 +177,8 @@ pub type Result<T> = std::result::Result<T, DuckLakeError>;
 // Re-export main types for convenience
 pub use catalog::DuckLakeCatalog;
 pub use catalog_read_memo::{CatalogReadMemo, MemoizedMetadataProvider};
-pub use delete_memo::{DuckLakeReadOptions, DuckLakeSessionOptions};
+pub use delete_memo::DuckLakeReadOptions;
+pub use extension::{DuckLakeExtension, DuckLakeExtensions, FileFact};
 pub use error::{DuckLakeError, TypeChangeOperation, TypeChangeWriteMode};
 pub use metadata_provider::{
     ColumnTag, DuckLakeFileData, DuckLakeInlinedFileDeleteForFlush, DuckLakeInlinedFlushData,
@@ -209,8 +206,6 @@ pub use metadata_provider_postgres::PostgresMetadataProvider;
 pub use metadata_provider_sqlite::SqliteMetadataProvider;
 
 // Re-export write types (feature-gated)
-#[cfg(feature = "write")]
-pub use compaction::{BuildIndexOptions, BuildIndexResult, VerifyOrderOptions, VerifyOrderResult};
 #[cfg(feature = "write")]
 pub use compaction::{CheckpointResult, CompactionResult, MergeOptions, RewriteOptions};
 #[cfg(feature = "write")]

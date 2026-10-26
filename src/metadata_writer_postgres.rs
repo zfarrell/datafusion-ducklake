@@ -6849,46 +6849,48 @@ impl MetadataWriter for PostgresMetadataWriter {
         })
     }
 
-    fn record_file_orders(
+    fn record_file_facts(
         &self,
+        extension: &str,
         table_id: i64,
-        verified_by: &str,
-        orders: &[crate::ext_file_order::FileOrder],
+        facts: &[crate::extension::FileFact],
     ) -> Result<u64> {
-        if orders.is_empty() {
+        if facts.is_empty() {
             return Ok(0);
         }
-        let paths: Vec<&str> = orders.iter().map(|o| o.path.as_str()).collect();
-        let sizes: Vec<i64> = orders.iter().map(|o| o.file_size_bytes).collect();
-        let keys: Vec<&str> = orders.iter().map(|o| o.sort_key.as_str()).collect();
+        let paths: Vec<&str> = facts.iter().map(|f| f.path.as_str()).collect();
+        let keys: Vec<i64> = facts.iter().map(|f| f.key).collect();
+        let sizes: Vec<i64> = facts.iter().map(|f| f.file_size_bytes).collect();
+        let values: Vec<&str> = facts.iter().map(|f| f.value.as_str()).collect();
         self.block_on(async {
-            // A later verification of the same object wins: same bytes, so
-            // only the key (a changed sort spec) can differ.
+            // A later fact about the same object wins: same bytes, so only
+            // what the extension derived from them can differ.
             let upsert = || {
                 sqlx::query(
-                    "INSERT INTO ext_ducklake_file_order
-                         (table_id, path, file_size_bytes, sort_key, verified_by)
-                     SELECT $1, u.path, u.size, u.key, $5
-                     FROM UNNEST($2::text[], $3::bigint[], $4::text[]) AS u(path, size, key)
-                     ON CONFLICT (table_id, path) DO UPDATE SET
+                    "INSERT INTO ext_ducklake_file_fact
+                         (extension, table_id, path, fact_key, file_size_bytes, value)
+                     SELECT $1, $2, u.path, u.key, u.size, u.value
+                     FROM UNNEST($3::text[], $4::bigint[], $5::bigint[], $6::text[])
+                          AS u(path, key, size, value)
+                     ON CONFLICT (extension, table_id, path, fact_key) DO UPDATE SET
                          file_size_bytes = EXCLUDED.file_size_bytes,
-                         sort_key = EXCLUDED.sort_key,
-                         verified_by = EXCLUDED.verified_by,
-                         verified_at = now()",
+                         value = EXCLUDED.value,
+                         recorded_at = now()",
                 )
+                .bind(extension)
                 .bind(table_id)
                 .bind(&paths)
-                .bind(&sizes)
                 .bind(&keys)
-                .bind(verified_by)
+                .bind(&sizes)
+                .bind(&values)
                 .execute(&self.pool)
             };
             // The table is created only when missing: Postgres checks CREATE
             // privilege before IF NOT EXISTS, so a role without DDL rights can
             // still record once an administrator has created it.
             match upsert().await {
-                Err(e) if crate::ext_file_order::is_missing_table(&e) => {
-                    match sqlx::query(crate::ext_file_order::POSTGRES_DDL)
+                Err(e) if crate::file_facts::is_missing_table(&e) => {
+                    match sqlx::query(crate::file_facts::POSTGRES_DDL)
                         .execute(&self.pool)
                         .await
                     {
@@ -6906,143 +6908,40 @@ impl MetadataWriter for PostgresMetadataWriter {
         })
     }
 
-    fn prune_file_orders(&self) -> Result<u64> {
-        self.block_on(async {
-            // Any catalog row for the path keeps it: a retired file is still
-            // read by time travel until expiry removes its row.
-            match sqlx::query(
-                "DELETE FROM ext_ducklake_file_order o
-                 WHERE NOT EXISTS (SELECT 1 FROM ducklake_data_file df
-                                   WHERE df.table_id = o.table_id AND df.path = o.path)",
-            )
-            .execute(&self.pool)
-            .await
-            {
-                Ok(done) => Ok(done.rows_affected()),
-                Err(e) if crate::ext_file_order::is_missing_table(&e) => Ok(0),
-                Err(e) => Err(e.into()),
-            }
-        })
-    }
-
-    fn record_file_indexes(
+    fn prune_file_facts(
         &self,
-        table_id: i64,
-        built_by: &str,
-        rows: &[crate::file_indexing::FileIndexRow],
-    ) -> Result<u64> {
-        use crate::file_indexing::{encode_heavy_hitters, encode_u64_list};
-        if rows.is_empty() {
-            return Ok(0);
-        }
-        let paths: Vec<&str> = rows.iter().map(|r| r.meta.path.as_str()).collect();
-        let sizes: Vec<i64> = rows.iter().map(|r| r.meta.file_size_bytes).collect();
-        let columns: Vec<i64> = rows.iter().map(|r| r.meta.column_id).collect();
-        let index_paths: Vec<&str> = rows.iter().map(|r| r.meta.index_path.as_str()).collect();
-        let index_keys: Vec<&str> = rows.iter().map(|r| r.index_key.as_str()).collect();
-        let index_sizes: Vec<i64> = rows.iter().map(|r| r.meta.index_size_bytes).collect();
-        let versions: Vec<i32> = rows.iter().map(|r| r.meta.format_version).collect();
-        let types: Vec<&str> = rows.iter().map(|r| r.meta.value_type.as_str()).collect();
-        let row_counts: Vec<i64> = rows.iter().map(|r| r.meta.row_count).collect();
-        let groups: Vec<String> = rows
-            .iter()
-            .map(|r| encode_u64_list(&r.meta.row_group_rows))
-            .collect();
-        let hitters: Vec<String> = rows
-            .iter()
-            .map(|r| encode_heavy_hitters(&r.meta.heavy_hitters))
-            .collect();
-        let bucket_counts: Vec<Option<String>> = rows
-            .iter()
-            .map(|r| {
-                r.meta
-                    .bucket_counts
-                    .as_ref()
-                    .map(crate::ext_file_index_counts::bucket_counts_to_json)
-            })
-            .collect();
-        self.block_on(async {
-            // A rebuild of the same object wins: same bytes, so only the
-            // builder (a newer format) can differ.
-            let upsert = || {
-                sqlx::query(
-                    "INSERT INTO ext_ducklake_file_index
-                         (table_id, path, file_size_bytes, column_id, index_path, index_key,
-                          index_size_bytes, format_version, value_type, row_count,
-                          row_group_rows, heavy_hitters, built_by, bucket_counts)
-                     SELECT $1, u.path, u.size, u.col, u.ipath, u.ikey, u.isize, u.ver, u.vt,
-                            u.rows, u.groups, u.hh, $13, u.bc
-                     FROM UNNEST($2::text[], $3::bigint[], $4::bigint[], $5::text[], $6::text[],
-                                 $7::bigint[], $8::int[], $9::text[], $10::bigint[], $11::text[],
-                                 $12::text[], $14::text[])
-                          AS u(path, size, col, ipath, ikey, isize, ver, vt, rows, groups, hh, bc)
-                     ON CONFLICT (table_id, path, column_id) DO UPDATE SET
-                         file_size_bytes = EXCLUDED.file_size_bytes,
-                         index_path = EXCLUDED.index_path,
-                         index_key = EXCLUDED.index_key,
-                         index_size_bytes = EXCLUDED.index_size_bytes,
-                         format_version = EXCLUDED.format_version,
-                         value_type = EXCLUDED.value_type,
-                         row_count = EXCLUDED.row_count,
-                         row_group_rows = EXCLUDED.row_group_rows,
-                         heavy_hitters = EXCLUDED.heavy_hitters,
-                         built_by = EXCLUDED.built_by,
-                         bucket_counts = EXCLUDED.bucket_counts,
-                         built_at = now()",
-                )
-                .bind(table_id)
-                .bind(&paths)
-                .bind(&sizes)
-                .bind(&columns)
-                .bind(&index_paths)
-                .bind(&index_keys)
-                .bind(&index_sizes)
-                .bind(&versions)
-                .bind(&types)
-                .bind(&row_counts)
-                .bind(&groups)
-                .bind(&hitters)
-                .bind(built_by)
-                .bind(&bucket_counts)
-                .execute(&self.pool)
-            };
-            // Created only when missing, as for ext_ducklake_file_order.
-            match upsert().await {
-                Err(e) if crate::ext_file_order::is_missing_table(&e) => {
-                    match sqlx::query(crate::file_indexing::POSTGRES_DDL)
-                        .execute(&self.pool)
-                        .await
-                    {
-                        Ok(_) => {},
-                        Err(sqlx::Error::Database(db)) if db.code().as_deref() == Some("23505") => {
-                        },
-                        Err(e) => return Err(e.into()),
-                    }
-                    Ok(upsert().await?.rows_affected())
-                },
-                done => Ok(done?.rows_affected()),
-            }
-        })
-    }
-
-    fn prune_file_indexes(&self, min_age: std::time::Duration) -> Result<Vec<String>> {
+        extension: &str,
+        min_age: std::time::Duration,
+    ) -> Result<Vec<crate::extension::FileFact>> {
         let min_age_us = i64::try_from(min_age.as_micros()).unwrap_or(i64::MAX);
         self.block_on(async {
             // Any catalog row for the path keeps it: a retired file is still
             // read by time travel until expiry removes its row.
-            match sqlx::query_scalar::<_, String>(
-                "DELETE FROM ext_ducklake_file_index i
-                 WHERE i.built_at <= now() - make_interval(secs => $1::double precision / 1e6)
+            match sqlx::query(
+                "DELETE FROM ext_ducklake_file_fact f
+                 WHERE f.extension = $1
+                   AND f.recorded_at <= now() - make_interval(secs => $2::double precision / 1e6)
                    AND NOT EXISTS (SELECT 1 FROM ducklake_data_file df
-                                   WHERE df.table_id = i.table_id AND df.path = i.path)
-                 RETURNING i.index_key",
+                                   WHERE df.table_id = f.table_id AND df.path = f.path)
+                 RETURNING f.path, f.file_size_bytes, f.fact_key, f.value",
             )
+            .bind(extension)
             .bind(min_age_us)
             .fetch_all(&self.pool)
             .await
             {
-                Ok(keys) => Ok(keys),
-                Err(e) if crate::ext_file_order::is_missing_table(&e) => Ok(Vec::new()),
+                Ok(rows) => rows
+                    .iter()
+                    .map(|row| {
+                        Ok(crate::extension::FileFact {
+                            path: row.try_get(0)?,
+                            file_size_bytes: row.try_get(1)?,
+                            key: row.try_get(2)?,
+                            value: row.try_get(3)?,
+                        })
+                    })
+                    .collect(),
+                Err(e) if crate::file_facts::is_missing_table(&e) => Ok(Vec::new()),
                 Err(e) => Err(e.into()),
             }
         })

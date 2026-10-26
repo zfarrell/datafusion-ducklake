@@ -170,15 +170,9 @@ pub(crate) fn normalize_setting_value(key: &str, value: &str) -> Result<String> 
                 },
             }
         },
-        // EXPERIMENTAL, this crate's own (official refuses it): the columns
-        // `ext_file_index` builds postings for, stored trimmed and de-duplicated.
-        crate::file_indexing::COLUMNS_SETTING => {
-            let columns = crate::file_indexing::parse_columns_setting(value);
-            for column in &columns {
-                validate_name(column, "File index column")?;
-            }
-            columns.join(",")
-        },
+        // This crate's own (official refuses them): an extension's settings,
+        // stored as given for the extension to read (see `crate::extension`).
+        key if key.starts_with("ext_") => value.to_string(),
         "delete_older_than" | "expire_older_than" => {
             if !value.is_empty() && crate::maintenance::parse_duckdb_interval(value).is_none() {
                 return Err(invalid(format!("{key} is not a valid interval value.")));
@@ -3566,53 +3560,31 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         Ok(None)
     }
 
-    /// EXPERIMENTAL (`ext_file_order`): upsert sidecar rows for `table_id`'s
-    /// files (see [`crate::ext_file_order`]), creating the sidecar table if it
-    /// is missing. `verified_by` says what checked them. A row is a fact about
-    /// the object at its path, so it needs no snapshot and may land before the
-    /// file's commit. It is a claim readers act on: record only orders checked
-    /// against every row of the file. Returns the rows written.
+    /// Record [`FileFact`](crate::extension::FileFact)s of `extension` about
+    /// `table_id`'s files, replacing any with the same path and key. A fact
+    /// describes the object at its path, so it needs no snapshot and may land
+    /// before the file's commit. Returns the facts written.
     ///
-    /// Default: the backend keeps no sidecar; nothing is recorded.
-    fn record_file_orders(
+    /// Default: the backend keeps no facts; nothing is recorded.
+    fn record_file_facts(
         &self,
+        _extension: &str,
         _table_id: i64,
-        _verified_by: &str,
-        _orders: &[crate::ext_file_order::FileOrder],
+        _facts: &[crate::extension::FileFact],
     ) -> Result<u64> {
         Ok(0)
     }
 
-    /// EXPERIMENTAL (`ext_file_order`): drop sidecar rows whose path no data
-    /// file of their table has any more (expired, or never committed).
-    /// Optional; such rows are harmless. A row recorded for a write still in
-    /// flight can be dropped too, which leaves that file unknown, not wrong.
-    fn prune_file_orders(&self) -> Result<u64> {
-        Ok(0)
-    }
-
-    /// EXPERIMENTAL (`ext_file_index`): upsert sidecar rows for `table_id`'s
-    /// files (see [`crate::file_indexing`]), creating the sidecar table if it
-    /// is missing. Like [`Self::record_file_orders`], a row is a fact about the
-    /// object at its path and may land before the file's commit. Record only
-    /// after the index object is stored. Returns the rows written.
-    ///
-    /// Default: the backend keeps no sidecar; nothing is recorded.
-    fn record_file_indexes(
+    /// Drop the facts of `extension` whose path no data file of their table
+    /// lists any more (expired, or never committed) and that were recorded at
+    /// least `min_age` ago, and return them. `min_age` spares the facts of
+    /// writes still in flight, whose files are not committed yet. Optional:
+    /// such facts are harmless.
+    fn prune_file_facts(
         &self,
-        _table_id: i64,
-        _built_by: &str,
-        _rows: &[crate::file_indexing::FileIndexRow],
-    ) -> Result<u64> {
-        Ok(0)
-    }
-
-    /// EXPERIMENTAL (`ext_file_index`): drop sidecar rows whose path no data
-    /// file of their table has any more (expired, or never committed) and
-    /// that were built more than `min_age` ago, returning their index objects'
-    /// store keys for the caller to delete. `min_age` spares the rows of
-    /// writes still in flight, whose files are not committed yet.
-    fn prune_file_indexes(&self, _min_age: std::time::Duration) -> Result<Vec<String>> {
+        _extension: &str,
+        _min_age: std::time::Duration,
+    ) -> Result<Vec<crate::extension::FileFact>> {
         Ok(Vec::new())
     }
 

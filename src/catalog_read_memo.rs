@@ -643,23 +643,16 @@ impl MetadataProvider for MemoizedMetadataProvider {
         self.inner.get_sort_spec(table_id, snapshot_id)
     }
 
-    // Not memoized here: `DuckLakeTable` remembers the answers itself (its
-    // `file_order_memo`), shared across its clones and rebinds.
-    fn verified_file_orders(
+    // Not memoized: a fact describes immutable bytes, so an extension that
+    // wants to remember facts can do so itself.
+    fn file_facts(
         &self,
+        extension: &str,
         table_id: i64,
         paths: &[&str],
-    ) -> Result<Vec<crate::ext_file_order::FileOrder>> {
-        self.inner.verified_file_orders(table_id, paths)
-    }
-
-    fn file_indexes(
-        &self,
-        table_id: i64,
-        paths: &[&str],
-        column_ids: &[i64],
-    ) -> Result<Vec<crate::ext_file_index::FileIndexMeta>> {
-        self.inner.file_indexes(table_id, paths, column_ids)
+        keys: Option<&[i64]>,
+    ) -> Result<Vec<crate::extension::FileFact>> {
+        self.inner.file_facts(extension, table_id, paths, keys)
     }
 
     fn get_table_statistics(&self, table_id: i64, snapshot_id: i64) -> Result<DuckLakeStatistics> {
