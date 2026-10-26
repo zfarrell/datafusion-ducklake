@@ -72,6 +72,9 @@ pub struct DuckLakeCatalog {
     /// Extensions every table's reads and writes run (see
     /// [`Self::with_extension`]).
     extensions: crate::extension::DuckLakeExtensions,
+    /// What extensions keep about each table across queries (see
+    /// [`crate::extension::ScanContext::shared_state`]).
+    extension_states: Arc<crate::extension::SharedExtensionStates>,
     /// Write configuration (when write feature is enabled)
     #[cfg(feature = "write")]
     write_config: Option<WriteConfig>,
@@ -96,6 +99,7 @@ impl DuckLakeCatalog {
             row_lineage: false,
             read_options: DuckLakeReadOptions::default(),
             extensions: Default::default(),
+            extension_states: Default::default(),
             #[cfg(feature = "write")]
             write_config: None,
         })
@@ -119,6 +123,7 @@ impl DuckLakeCatalog {
             row_lineage: false,
             read_options: DuckLakeReadOptions::default(),
             extensions: Default::default(),
+            extension_states: Default::default(),
             #[cfg(feature = "write")]
             write_config: None,
         })
@@ -180,6 +185,7 @@ impl DuckLakeCatalog {
             row_lineage: false,
             read_options: DuckLakeReadOptions::default(),
             extensions: Default::default(),
+            extension_states: Default::default(),
             write_config: Some(WriteConfig {
                 writer,
                 options: crate::table_writer::DuckLakeWriteOptions::default(),
@@ -279,6 +285,48 @@ impl DuckLakeCatalog {
             .map(|config| Arc::clone(&config.writer))
     }
 
+    /// Drop the facts every extension registered on this catalog (and its read
+    /// and write options) keeps about files no catalog row lists any more and
+    /// that were recorded at least `min_age` ago, and return them by
+    /// extension. Run it after expiry and cleanup; `min_age` must exceed the
+    /// longest write still running. Companion objects of those files are left
+    /// to the orphan sweep (`crate::maintenance`), which deletes them with
+    /// their data file.
+    #[cfg(feature = "write")]
+    pub fn prune_extension_facts(
+        &self,
+        min_age: std::time::Duration,
+    ) -> crate::Result<Vec<(String, crate::extension::FileFact)>> {
+        let Some(writer) = self.writer() else {
+            return Ok(Vec::new());
+        };
+        let mut names: Vec<String> = Vec::new();
+        let registered = self
+            .extensions
+            .iter()
+            .chain(self.read_options.extensions.iter())
+            .chain(
+                self.write_config
+                    .iter()
+                    .flat_map(|config| config.options.extensions.iter()),
+            );
+        for extension in registered {
+            if !names.iter().any(|name| name == extension.name()) {
+                names.push(extension.name().to_string());
+            }
+        }
+        let mut pruned = Vec::new();
+        for name in names {
+            pruned.extend(
+                writer
+                    .prune_file_facts(&name, min_age)?
+                    .into_iter()
+                    .map(|fact| (name.clone(), fact)),
+            );
+        }
+        Ok(pruned)
+    }
+
     /// The `data_inlining_row_limit` set through
     /// [`DuckLakeCatalog::with_write_options`], if any.
     #[cfg(feature = "write")]
@@ -353,6 +401,7 @@ impl CatalogProvider for DuckLakeCatalog {
                 )
                 .with_snapshot_selection(self.snapshot, self.view_guards.clone())
                 .with_row_lineage(self.row_lineage)
+                .with_extension_states(Arc::clone(&self.extension_states))
                 .with_read_options(
                     self.extensions
                         .iter()

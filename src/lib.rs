@@ -81,6 +81,8 @@ mod delete_memo;
 pub mod encryption;
 pub mod error;
 pub mod extension;
+#[cfg(feature = "write")]
+mod extension_backfill;
 pub(crate) mod field_id_adapter;
 pub mod file_facts;
 pub mod information_schema;
@@ -180,6 +182,8 @@ pub use catalog_read_memo::{CatalogReadMemo, MemoizedMetadataProvider};
 pub use delete_memo::DuckLakeReadOptions;
 pub use error::{DuckLakeError, TypeChangeOperation, TypeChangeWriteMode};
 pub use extension::{DuckLakeExtension, DuckLakeExtensions, FileFact};
+#[cfg(feature = "write")]
+pub use extension_backfill::{BackfillOptions, BackfillResult};
 pub use metadata_provider::{
     ColumnTag, DuckLakeFileData, DuckLakeInlinedFileDeleteForFlush, DuckLakeInlinedFlushData,
     DuckLakeTableFile, DuckLakeTag, MetadataProvider, ObjectTag, SnapshotChangeMetadata,

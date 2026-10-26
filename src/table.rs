@@ -1355,6 +1355,9 @@ pub struct DuckLakeTable {
     /// What extensions keep for this table (see
     /// [`crate::extension::ExtensionState`]). Shared with every clone.
     extension_state: Arc<crate::extension::ExtensionState>,
+    /// What extensions keep for this table across the tables one catalog
+    /// builds for it (see [`crate::extension::ScanContext::shared_state`]).
+    shared_extension_state: Arc<crate::extension::ExtensionState>,
     /// How this table reuses what its scans read. The delete memo is off by
     /// default.
     read_options: DuckLakeReadOptions,
@@ -1517,6 +1520,7 @@ impl DuckLakeTable {
             inlined_absent_through: Arc::new(AtomicI64::new(i64::MIN)),
             listing_memo: Arc::default(),
             extension_state: Arc::default(),
+            shared_extension_state: Arc::default(),
             read_options: DuckLakeReadOptions::default(),
             delete_memo: None,
             #[cfg(feature = "write")]
@@ -4764,6 +4768,7 @@ impl DuckLakeTable {
             inlined_absent_through: Arc::clone(&self.inlined_absent_through),
             listing_memo: Arc::clone(&self.listing_memo),
             extension_state: Arc::clone(&self.extension_state),
+            shared_extension_state: Arc::clone(&self.shared_extension_state),
             read_options: self.read_options.clone(),
             delete_memo: self.delete_memo.clone(),
             #[cfg(feature = "encryption")]
@@ -5647,6 +5652,7 @@ impl DuckLakeTable {
             metadata: &self.provider,
             object_store_url: &self.object_store_url,
             table_state: &self.extension_state,
+            shared_state: &self.shared_extension_state,
         };
         let hooks = ScanHooks::begin(&self.read_options.extensions, &hook_ctx);
         let pruning = match self.pruning_predicates(conjuncts, Some(max_in_list_size)) {
@@ -6814,10 +6820,26 @@ impl DuckLakeTable {
         &self.read_options
     }
 
-    /// What extensions keep for this table; see
-    /// [`crate::extension::ExtensionState`].
+    /// What extensions keep for this table instance; see
+    /// [`crate::extension::ScanContext::table_state`].
     pub fn extension_state(&self) -> &Arc<crate::extension::ExtensionState> {
         &self.extension_state
+    }
+
+    /// What extensions keep for this table across queries; see
+    /// [`crate::extension::ScanContext::shared_state`].
+    pub fn shared_extension_state(&self) -> &Arc<crate::extension::ExtensionState> {
+        &self.shared_extension_state
+    }
+
+    /// Share `state` as this table's
+    /// [`crate::extension::ScanContext::shared_state`].
+    pub(crate) fn with_shared_extension_state(
+        mut self,
+        state: Arc<crate::extension::ExtensionState>,
+    ) -> Self {
+        self.shared_extension_state = state;
+        self
     }
 
     /// The table's data files at its snapshot that a scan reads exactly as

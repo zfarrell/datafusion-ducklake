@@ -15,6 +15,7 @@
 //! after the index object, so a fact never normally points at a missing
 //! object. Any failure warns and leaves the file unindexed.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow::datatypes::{Schema, SchemaRef};
@@ -23,14 +24,14 @@ use async_trait::async_trait;
 use datafusion_ducklake::extension::{
     FileFact, FileObserver, FileWriteHook, StoredFile, WriteContext, WriteOrigin,
 };
-use datafusion_ducklake::metadata_writer::MetadataWriter;
+use datafusion_ducklake::metadata_provider::DuckLakeTableFile;
 use datafusion_ducklake::{DuckLakeError, Result};
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 
 use super::format::{
-    BUCKET_GRAIN_HOUR_US, BUILT_BY_COMPACT, BUILT_BY_WRITE, FileIndexMeta, IndexValueType,
-    PostingBuilder, index_file_name, index_object_path,
+    BUCKET_GRAIN_HOUR_US, BUILT_BY_BACKFILL, BUILT_BY_COMPACT, BUILT_BY_WRITE, FileIndexMeta,
+    IndexValueType, PostingBuilder, index_file_name, index_object_path,
 };
 
 /// Table setting: comma-separated top-level column names whose files get an
@@ -127,53 +128,112 @@ pub fn object_key(index_key: &str) -> ObjectPath {
     ObjectPath::parse(index_key).unwrap_or_else(|_| ObjectPath::from(index_key))
 }
 
-/// The write hook: postings for the table's declared columns. `None` when
-/// none is declared. A setting that cannot be read leaves the write
-/// unindexed rather than failing it.
-pub(crate) fn write_hook(ctx: &WriteContext<'_>) -> Result<Option<Arc<dyn FileWriteHook>>> {
-    let declared = match ctx.setting(COLUMNS_SETTING) {
-        Ok(Some(value)) => parse_columns_setting(&value),
-        Ok(None) => return Ok(None),
+/// What a backfill asks of the write hook, beyond the table's settings.
+#[derive(Debug, Default)]
+pub(crate) struct BackfillConfig {
+    /// Index these columns instead of the declared ones.
+    pub(crate) columns: Option<Vec<String>>,
+    /// Count heavy hitters per hour over this column instead of the table's
+    /// [`COUNT_COLUMN_SETTING`].
+    pub(crate) count_column: Option<String>,
+    /// `(path, size, column)` already indexed: a file is read only for the
+    /// columns it lacks, and not at all when it lacks none.
+    pub(crate) done: HashSet<(String, i64, String)>,
+}
+
+/// The write hook: postings for the table's declared columns, and on a
+/// backfill hourly counts over the count column. `None` when no column is
+/// declared. A setting that cannot be read leaves the write unindexed rather
+/// than failing it.
+pub(crate) fn write_hook(
+    ctx: &WriteContext<'_>,
+    backfill: Option<&Arc<BackfillConfig>>,
+) -> Result<Option<Arc<dyn FileWriteHook>>> {
+    let setting = |key: &str| match ctx.setting(key) {
+        Ok(value) => value,
         Err(error) => {
-            tracing::warn!(%error, "file_index: columns setting unreadable; not indexing");
-            return Ok(None);
+            tracing::warn!(%error, key, "file_index: setting unreadable; not indexing");
+            None
+        },
+    };
+    let declared = match backfill.and_then(|config| config.columns.clone()) {
+        Some(columns) => columns,
+        None => match setting(COLUMNS_SETTING) {
+            Some(value) => parse_columns_setting(&value),
+            None => return Ok(None),
         },
     };
     if declared.is_empty() {
         return Ok(None);
     }
+    // Writes build postings only; hourly counts come from the backfill.
+    let ts_column = match ctx.origin {
+        WriteOrigin::Backfill => backfill
+            .and_then(|config| config.count_column.clone())
+            .or_else(|| setting(COUNT_COLUMN_SETTING))
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty()),
+        _ => None,
+    };
     Ok(Some(Arc::new(IndexWriteHook {
-        metadata: Arc::clone(ctx.metadata),
         store: Arc::clone(ctx.object_store),
-        table_id: ctx.table_id,
         built_by: match ctx.origin {
             WriteOrigin::Compaction => BUILT_BY_COMPACT,
+            WriteOrigin::Backfill => BUILT_BY_BACKFILL,
             _ => BUILT_BY_WRITE,
         },
         declared,
+        ts_column,
+        backfill: backfill.cloned(),
     })))
 }
 
 #[derive(Debug)]
 struct IndexWriteHook {
-    metadata: Arc<dyn MetadataWriter>,
     store: Arc<dyn ObjectStore>,
-    table_id: i64,
     built_by: &'static str,
     declared: Vec<String>,
+    ts_column: Option<String>,
+    backfill: Option<Arc<BackfillConfig>>,
 }
 
 impl FileWriteHook for IndexWriteHook {
     fn open_file(&self, file_schema: &SchemaRef) -> Option<Box<dyn FileObserver>> {
         let request = FileIndexRequest::new(
-            Arc::clone(&self.metadata),
             Arc::clone(&self.store),
-            self.table_id,
             self.built_by,
             &self.declared,
+            self.ts_column.as_deref(),
             file_schema,
         )?;
         Some(Box::new(IndexObserver(request.builders())))
+    }
+
+    /// The declared columns `file` has no index of yet, and the count column
+    /// with them.
+    fn backfill_columns(&self, file: &DuckLakeTableFile) -> Option<Vec<String>> {
+        let done = |name: &String| {
+            self.backfill.as_ref().is_some_and(|config| {
+                config.done.contains(&(
+                    file.file.path.clone(),
+                    file.file.file_size_bytes,
+                    name.clone(),
+                ))
+            })
+        };
+        let mut columns: Vec<String> = self
+            .declared
+            .iter()
+            .filter(|name| !done(name))
+            .cloned()
+            .collect();
+        if !columns.is_empty()
+            && let Some(ts) = &self.ts_column
+            && !columns.contains(ts)
+        {
+            columns.push(ts.clone());
+        }
+        Some(columns)
     }
 }
 
@@ -187,18 +247,19 @@ impl FileObserver for IndexObserver {
         Ok(())
     }
 
-    async fn stored(self: Box<Self>, file: &StoredFile) {
+    /// Build and PUT the index objects; their facts, once stored.
+    async fn stored(self: Box<Self>, file: &StoredFile) -> Result<Vec<FileFact>> {
         let builders = self.0;
         let request = builders.request.clone();
         request
-            .record(
+            .build(
                 &file.catalog_path,
                 &file.object_path,
                 file.file_size_bytes,
                 builders,
                 file.row_group_rows.clone(),
             )
-            .await;
+            .await
     }
 }
 
@@ -219,15 +280,13 @@ pub(crate) struct FileIndexTs {
     pub(crate) field_index: usize,
 }
 
-/// What one file's index needs: build postings for its columns, PUT the
-/// index objects next to the data object, and record their facts.
+/// What one file's index needs: build postings for its columns and PUT the
+/// index objects next to the data object.
 #[derive(Clone)]
 pub(crate) struct FileIndexRequest(Arc<Inner>);
 
 struct Inner {
-    metadata: Arc<dyn MetadataWriter>,
     store: Arc<dyn ObjectStore>,
-    table_id: i64,
     built_by: &'static str,
     columns: Vec<FileIndexColumn>,
     ts: Option<FileIndexTs>,
@@ -236,7 +295,6 @@ struct Inner {
 impl std::fmt::Debug for FileIndexRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FileIndexRequest")
-            .field("table_id", &self.0.table_id)
             .field("built_by", &self.0.built_by)
             .field("columns", &self.0.columns)
             .finish()
@@ -244,16 +302,16 @@ impl std::fmt::Debug for FileIndexRequest {
 }
 
 impl FileIndexRequest {
-    /// The request for `declared` column names over `schema`, the written
-    /// file's schema, whose fields carry `PARQUET:field_id`. A name that is
+    /// The request for `declared` column names over `schema`, the file's
+    /// schema, whose fields carry `PARQUET:field_id`, with hourly counts over
+    /// `ts_column` when it is a timestamp field of `schema`. A name that is
     /// missing, without an id, or of a type the index cannot key is skipped
     /// with a debug log. `None` when nothing is left.
     pub(crate) fn new(
-        metadata: Arc<dyn MetadataWriter>,
         store: Arc<dyn ObjectStore>,
-        table_id: i64,
         built_by: &'static str,
         declared: &[String],
+        ts_column: Option<&str>,
         schema: &Schema,
     ) -> Option<Self> {
         let columns: Vec<FileIndexColumn> = declared
@@ -263,44 +321,30 @@ impl FileIndexRequest {
                 if column.is_none() {
                     tracing::debug!(
                         column = name.as_str(),
-                        "file_index: declared column not indexable in this write"
+                        "file_index: declared column not indexable in this file"
                     );
                 }
                 column
             })
             .collect();
+        let ts = ts_column.and_then(|name| {
+            let (field_index, field) = schema.column_with_name(name)?;
+            if !matches!(field.data_type(), arrow::datatypes::DataType::Timestamp(..)) {
+                return None;
+            }
+            Some(FileIndexTs {
+                column_id: field.metadata().get("PARQUET:field_id")?.parse().ok()?,
+                field_index,
+            })
+        });
         (!columns.is_empty()).then(|| {
             Self(Arc::new(Inner {
-                metadata,
                 store,
-                table_id,
                 built_by,
                 columns,
-                // Writes build postings only; bucket counts come from the
-                // backfill (`with_count_column`).
-                ts: None,
+                ts,
             }))
         })
-    }
-
-    /// A request for already-resolved `columns` (the backfill, which
-    /// resolves them per file against the file's own schema).
-    pub(crate) fn from_columns(
-        metadata: Arc<dyn MetadataWriter>,
-        store: Arc<dyn ObjectStore>,
-        table_id: i64,
-        built_by: &'static str,
-        columns: Vec<FileIndexColumn>,
-        ts: Option<FileIndexTs>,
-    ) -> Self {
-        Self(Arc::new(Inner {
-            metadata,
-            store,
-            table_id,
-            built_by,
-            columns,
-            ts,
-        }))
     }
 
     /// Fresh builders for one file.
@@ -325,50 +369,24 @@ impl FileIndexRequest {
         }
     }
 
-    /// Build, PUT and record the indexes of the finished file at catalog
-    /// `path` (relative to the table directory, as committed), stored at
-    /// `data_object`. Call after the data object is uploaded and before the
-    /// commit. Best effort: never fails the write. Returns the facts
-    /// recorded.
-    pub(crate) async fn record(
+    /// Build and PUT the indexes of the finished file at catalog `path`
+    /// (relative to the table directory, as committed), stored at
+    /// `data_object`, and return their facts for core to record. Called after
+    /// the data object is stored.
+    pub(crate) async fn build(
         &self,
         path: &str,
         data_object: &ObjectPath,
         file_size_bytes: i64,
         builders: FileIndexBuilders,
         row_group_rows: Vec<u64>,
-    ) -> u64 {
-        match self
-            .try_record(path, data_object, file_size_bytes, builders, row_group_rows)
-            .await
-        {
-            Ok(done) => done.rows,
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    path,
-                    "file_index: not recorded; the file scans unindexed"
-                );
-                0
-            },
-        }
-    }
-
-    /// [`Self::record`], reporting failure to the caller (the backfill).
-    pub(crate) async fn try_record(
-        &self,
-        path: &str,
-        data_object: &ObjectPath,
-        file_size_bytes: i64,
-        builders: FileIndexBuilders,
-        row_group_rows: Vec<u64>,
-    ) -> Result<Recorded> {
+    ) -> Result<Vec<FileFact>> {
         if builders.failed {
             return Err(DuckLakeError::Internal("postings incomplete".to_string()));
         }
         let rows_seen = builders.rows_seen();
         if rows_seen == 0 {
-            return Ok(Recorded::default());
+            return Ok(Vec::new());
         }
         if row_group_rows.iter().sum::<u64>() != rows_seen {
             return Err(DuckLakeError::Internal(format!(
@@ -377,7 +395,6 @@ impl FileIndexRequest {
             )));
         }
         let mut facts = Vec::with_capacity(builders.columns.len());
-        let mut bytes_written = 0u64;
         for (column, builder) in builders.columns {
             let groups = row_group_rows.clone();
             // CPU-bound (sort + encode); off the async worker.
@@ -387,7 +404,6 @@ impl FileIndexRequest {
                 .map_err(|e| DuckLakeError::Internal(e.to_string()))?;
             let index_key = index_object_path(data_object.as_ref(), column.column_id);
             let index_path = index_file_name(path, column.column_id);
-            bytes_written += built.bytes.len() as u64;
             self.0
                 .store
                 .put(
@@ -411,22 +427,8 @@ impl FileIndexRequest {
                 .to_fact(),
             );
         }
-        let rows = self
-            .0
-            .metadata
-            .record_file_facts(super::NAME, self.0.table_id, &facts)?;
-        Ok(Recorded {
-            rows,
-            bytes_written,
-        })
+        Ok(facts)
     }
-}
-
-/// What [`FileIndexRequest::try_record`] stored.
-#[derive(Debug, Default, Clone, Copy)]
-pub(crate) struct Recorded {
-    pub(crate) rows: u64,
-    pub(crate) bytes_written: u64,
 }
 
 /// The top-level `name` of `schema` as an index column: it needs a

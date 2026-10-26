@@ -22,7 +22,9 @@ use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 use crate::Result;
-use crate::extension::{FileHooks, FileObservers, StoredFile, WriteContext, WriteOrigin};
+use crate::extension::{
+    FileHooks, FileObservers, StoredFile, WriteContext, WriteLookups, WriteOrigin,
+};
 use crate::metadata_provider::DuckLakeInlinedData;
 use crate::metadata_writer::{
     ColumnDef, DataFileInfo, DeleteFileEntry, DeleteFileInfo, InlinedRowRef, MetadataWriter,
@@ -216,6 +218,9 @@ pub struct DuckLakeWriteOptions {
     /// Extensions whose write hooks see every data file written (see
     /// [`crate::extension`]). Empty by default.
     pub extensions: crate::extension::DuckLakeExtensions,
+    /// The table's `ext_` settings, when these options were read from the
+    /// catalog, so a write hook reads them without a query.
+    ext_settings: Option<Arc<HashMap<String, String>>>,
     deferred_error: Option<String>,
 }
 
@@ -279,6 +284,13 @@ impl DuckLakeWriteOptions {
             )?,
             inlined_flush_policy: None,
             extensions: Default::default(),
+            ext_settings: Some(Arc::new(
+                settings
+                    .iter()
+                    .filter(|(key, _)| key.starts_with("ext_"))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            )),
             deferred_error: None,
         })
     }
@@ -323,6 +335,11 @@ impl DuckLakeWriteOptions {
     pub fn with_inlined_flush_policy(mut self, policy: InlinedFlushPolicy) -> Self {
         self.inlined_flush_policy = Some(policy);
         self
+    }
+
+    /// See `Self::ext_settings`.
+    pub(crate) fn ext_settings(&self) -> Option<Arc<HashMap<String, String>>> {
+        self.ext_settings.clone()
     }
 
     pub(crate) fn validate(&self) -> Result<()> {
@@ -376,6 +393,9 @@ impl DuckLakeWriteOptions {
         }
         for extension in overrides.extensions.iter() {
             self.extensions = self.extensions.with(Arc::clone(extension));
+        }
+        if overrides.ext_settings.is_some() {
+            self.ext_settings = overrides.ext_settings.clone();
         }
         self
     }
@@ -725,6 +745,8 @@ pub struct DuckLakeTableWriter {
     hive_file_pattern: bool,
     /// See [`DuckLakeWriteOptions::extensions`].
     extensions: crate::extension::DuckLakeExtensions,
+    /// See `DuckLakeWriteOptions::ext_settings`.
+    ext_settings: Option<Arc<HashMap<String, String>>>,
 }
 
 /// Whether an error came from the metadata database or the object store or
@@ -771,6 +793,7 @@ impl DuckLakeTableWriter {
             flushing_inlined: false,
             hive_file_pattern: true,
             extensions: Default::default(),
+            ext_settings: None,
         })
     }
 
@@ -881,6 +904,9 @@ impl DuckLakeTableWriter {
         for extension in options.extensions.iter() {
             self.extensions = self.extensions.with(Arc::clone(extension));
         }
+        if options.ext_settings.is_some() {
+            self.ext_settings = options.ext_settings.clone();
+        }
         self
     }
 
@@ -896,16 +922,18 @@ impl DuckLakeTableWriter {
         if self.extensions.is_empty() {
             return None;
         }
+        let lookups = WriteLookups::new(self.ext_settings.clone());
         FileHooks::begin(
             &self.extensions,
-            &WriteContext {
+            &WriteContext::new(
                 table_id,
                 schema_name,
                 table_name,
                 origin,
-                metadata: &self.metadata,
-                object_store: &self.object_store,
-            },
+                &self.metadata,
+                &self.object_store,
+                &lookups,
+            ),
         )
     }
 

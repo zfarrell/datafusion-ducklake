@@ -90,7 +90,7 @@ impl DuckLakeExtension for FileIndex {
         &self,
         ctx: &WriteContext<'_>,
     ) -> datafusion_ducklake::Result<Option<Arc<dyn FileWriteHook>>> {
-        write::write_hook(ctx)
+        write::write_hook(ctx, None)
     }
 
     /// `None` when scans are off, for the table or for the session

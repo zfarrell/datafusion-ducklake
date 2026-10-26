@@ -1045,7 +1045,7 @@ fn try_resolve_bucket_counts(
     let eligible = table.plain_files()?;
     let paths: Vec<&str> = eligible.iter().map(|tf| tf.file.path.as_str()).collect();
     let rows = table
-        .extension_state()
+        .shared_extension_state()
         .get_or_default::<super::scan::IndexMemo>()
         .rows(
             table.metadata_provider().as_ref(),

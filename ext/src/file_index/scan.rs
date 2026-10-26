@@ -321,9 +321,10 @@ pub(crate) const MEMO_MAX_ENTRIES: usize = 200_000;
 /// How long a remembered absence of a fact holds, so a backfill is picked up.
 const ABSENT_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// The index facts a table's scans have read, by `(path, column_id)`. A fact
+/// The index facts a catalog's scans of one table have read, by `(path,
+/// column_id)`, kept across queries ([`ScanContext::shared_state`]). A fact
 /// describes immutable bytes (it is checked against the listed size on use),
-/// so it is kept; an absence is kept only briefly.
+/// so it is kept; an absence is kept only briefly, so a backfill is picked up.
 #[derive(Debug, Default)]
 pub(crate) struct IndexMemo(Mutex<HashMap<(String, i64), MemoEntry>>);
 
@@ -456,7 +457,7 @@ impl IndexScanHook {
         column_ids.sort_unstable();
         column_ids.dedup();
         let paths: Vec<&str> = files.iter().map(|f| f.file.file.path.as_str()).collect();
-        let rows = ctx.table_state.get_or_default::<IndexMemo>().rows(
+        let rows = ctx.shared_state.get_or_default::<IndexMemo>().rows(
             ctx.metadata.as_ref(),
             ctx.table_id,
             &paths,
