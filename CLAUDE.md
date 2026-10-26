@@ -74,11 +74,16 @@ The codebase follows a layered architecture with clear separation of concerns:
      default without notice. A unit test checks this
    - `delete_memo.rs`: `DuckLakeReadOptions` (opt-in) lets a table keep the delete positions its scans read.
      A delete file never changes after it is written, so this memo needs no catalog check
-   - `file_ordering.rs`, `ext_file_order.rs`, `order_on_request.rs`: experimental verified file order,
-     opt-in through `DuckLakeWriteOptions::ext_file_order` (check and record each written file in the
-     non-spec `ext_ducklake_file_order` table, keyed by table, path and size) and
-     `DuckLakeReadOptions::ext_file_order` (`OrderOnRequestExec` offers an ordered plan over recorded
-     files only when a sort asks for it). Both off by default: no table is created, read or written
+   - `extension.rs`: the extension API. `DuckLakeExtension` gives a write hook (observers of every
+     data file a writer names: insert, update, compaction, inlined flush) and a scan hook (per-file
+     skip / row selection, and claimed sort orders). Core keeps the safety rules: which files may
+     take a selection, which orderings may be declared. Hooks are advisory; one that fails is
+     ignored. Extensions live in the `ext/` crate (`datafusion-ducklake-ext`: file order, file
+     index), which uses only the public API
+   - `file_facts.rs`: `ext_ducklake_file_fact`, the per-file facts extensions record through
+     `MetadataWriter::record_file_facts` and read through `MetadataProvider::file_facts`
+   - `order_on_request.rs`: `OrderOnRequestExec` offers an ordered plan over files whose order an
+     extension claims, only when a sort asks for it
    - `table_functions.rs`: `ducklake_snapshots()`, `ducklake_table_info()`, `ducklake_list_files()`, `ducklake_table_changes()`, `ducklake_table_deletions()`, `ducklake_table_insertions()`; registered via `register_ducklake_functions()`
    - `row_id.rs`: DuckLake row lineage (`rowid` virtual column), opt-in via `DuckLakeCatalog::with_row_lineage(true)`
    - `encryption.rs`: Parquet Modular Encryption (PME) reads (feature `encryption`)
