@@ -345,7 +345,11 @@ impl IndexMemo {
         paths: &[&str],
         column_ids: &[i64],
     ) -> HashMap<(String, i64), Arc<FileIndexMeta>> {
-        let lock = || self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let lock = || {
+            self.0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        };
         let known = |entry: Option<&MemoEntry>| match entry {
             Some(MemoEntry::Row(_)) => true,
             Some(MemoEntry::Absent(at)) => at.elapsed() < ABSENT_TTL,
@@ -429,7 +433,8 @@ impl ScanHook for IndexScanHook {
             .filter_map(|(id, decision)| match decision {
                 FileDecision::Drop => Some((id, FileSelection::Skip)),
                 FileDecision::Select {
-                    plan, ..
+                    plan,
+                    ..
                 } => Some((id, FileSelection::Select(plan))),
                 FileDecision::Scan(_) => None,
             })
@@ -615,7 +620,9 @@ fn index_location(data: &ObjectPath, meta: &FileIndexMeta) -> Option<ObjectPath>
         }
         index_parts.push(object_store::path::PathPart::from(segment));
     }
-    Some(ObjectPath::from_iter(dir.iter().cloned().chain(index_parts)))
+    Some(ObjectPath::from_iter(
+        dir.iter().cloned().chain(index_parts),
+    ))
 }
 
 #[cfg(test)]

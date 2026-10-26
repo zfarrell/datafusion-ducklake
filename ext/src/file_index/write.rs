@@ -101,9 +101,8 @@ impl FileIndexRow {
                 )
                 .ok()?,
                 // Malformed counts lose only the counts, never the index.
-                bucket_counts: text("bucket_counts").and_then(|counts| {
-                    super::counts::bucket_counts_from_json(counts, value_type)
-                }),
+                bucket_counts: text("bucket_counts")
+                    .and_then(|counts| super::counts::bucket_counts_from_json(counts, value_type)),
             },
             index_key: text("index_key")?.to_string(),
             built_by: text("built_by").unwrap_or_default().to_string(),

@@ -178,8 +178,8 @@ pub type Result<T> = std::result::Result<T, DuckLakeError>;
 pub use catalog::DuckLakeCatalog;
 pub use catalog_read_memo::{CatalogReadMemo, MemoizedMetadataProvider};
 pub use delete_memo::DuckLakeReadOptions;
-pub use extension::{DuckLakeExtension, DuckLakeExtensions, FileFact};
 pub use error::{DuckLakeError, TypeChangeOperation, TypeChangeWriteMode};
+pub use extension::{DuckLakeExtension, DuckLakeExtensions, FileFact};
 pub use metadata_provider::{
     ColumnTag, DuckLakeFileData, DuckLakeInlinedFileDeleteForFlush, DuckLakeInlinedFlushData,
     DuckLakeTableFile, DuckLakeTag, MetadataProvider, ObjectTag, SnapshotChangeMetadata,

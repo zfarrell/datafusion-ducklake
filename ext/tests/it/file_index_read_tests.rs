@@ -10,7 +10,6 @@
 //! on and off). Index objects are built here from the committed data files,
 //! the way the backfill does, so the read path is tested on its own.
 
-
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -210,11 +209,11 @@ impl Env {
                 "SELECT path FROM ext_ducklake_file_fact
                  WHERE extension = 'file_index' AND fact_key = ?",
             )
-                .bind(column_id)
-                .fetch_all(&self.pool().await)
-                .await
-                .map(|rows| rows.iter().map(|r| r.get::<String, _>(0)).collect())
-                .unwrap_or_default()
+            .bind(column_id)
+            .fetch_all(&self.pool().await)
+            .await
+            .map(|rows| rows.iter().map(|r| r.get::<String, _>(0)).collect())
+            .unwrap_or_default()
         };
         let on_disk = parquet_files(&self.data_path());
         let mut metas = Vec::new();
@@ -747,10 +746,10 @@ async fn broken_indexes_fall_back() {
          SET value = json_set(value, '$.row_count', json_extract(value, '$.row_count') + 1)
          WHERE extension = 'file_index' AND path = ?",
     )
-        .bind(&files[4].0)
-        .execute(&pool)
-        .await
-        .unwrap();
+    .bind(&files[4].0)
+    .execute(&pool)
+    .await
+    .unwrap();
     assert_differential(&env, &SHAPES).await;
 }
 

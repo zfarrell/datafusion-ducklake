@@ -14,9 +14,9 @@ use datafusion::execution::context::SessionConfig;
 use datafusion::physical_plan::displayable;
 use datafusion::prelude::*;
 use datafusion_ducklake::{
-    DuckLakeCatalog, DuckLakeTable, DuckLakeTableWriter, DuckLakeWriteOptions,
-    MetadataWriter, MulticatalogManager, MulticatalogProvider, NullOrder, PostgresMetadataWriter,
-    SortDirection, SortField,
+    DuckLakeCatalog, DuckLakeTable, DuckLakeTableWriter, DuckLakeWriteOptions, MetadataWriter,
+    MulticatalogManager, MulticatalogProvider, NullOrder, PostgresMetadataWriter, SortDirection,
+    SortField,
 };
 use datafusion_ducklake_ext::file_order::{
     FileOrder, FileOrderTableExt, VerifyOrderOptions, prune_file_orders,
@@ -156,10 +156,12 @@ impl Env {
         if !exists {
             return -1;
         }
-        sqlx::query_scalar("SELECT count(*) FROM ext_ducklake_file_fact WHERE extension = 'file_order'")
-            .fetch_one(&self.pool)
-            .await
-            .unwrap()
+        sqlx::query_scalar(
+            "SELECT count(*) FROM ext_ducklake_file_fact WHERE extension = 'file_order'",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .unwrap()
     }
 }
 

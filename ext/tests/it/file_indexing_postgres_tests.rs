@@ -253,15 +253,14 @@ async fn backfilled_files_are_recorded_and_read_back() {
         ],
         "heavy hitters round-trip through the catalog"
     );
-    let key: String =
-        sqlx::query_scalar(
-            "SELECT value::json->>'index_key' FROM ext_ducklake_file_fact
+    let key: String = sqlx::query_scalar(
+        "SELECT value::json->>'index_key' FROM ext_ducklake_file_fact
              WHERE extension = 'file_index' AND path = $1",
-        )
-            .bind(&meta.path)
-            .fetch_one(&env.pool)
-            .await
-            .unwrap();
+    )
+    .bind(&meta.path)
+    .fetch_one(&env.pool)
+    .await
+    .unwrap();
     let bytes = std::fs::read(format!("/{key}")).unwrap();
     assert_eq!(meta.index_size_bytes, bytes.len() as i64);
 }

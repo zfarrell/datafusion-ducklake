@@ -8,7 +8,6 @@
 //! the table, so a declared ordering that is not true fails here as wrong rows,
 //! not just as a different plan.
 
-
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -1009,13 +1008,12 @@ async fn verify_racing_compaction_and_prune() {
 async fn sidecar_rows(env: &Env) -> i64 {
     use sqlx::Row;
     let pool = sqlx::SqlitePool::connect(&env.url()).await.unwrap();
-    let exists: bool = sqlx::query(
-        "SELECT count(*) > 0 FROM sqlite_master WHERE name = 'ext_ducklake_file_fact'",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap()
-    .get(0);
+    let exists: bool =
+        sqlx::query("SELECT count(*) > 0 FROM sqlite_master WHERE name = 'ext_ducklake_file_fact'")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .get(0);
     if !exists {
         return 0;
     }

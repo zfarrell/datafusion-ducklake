@@ -1036,7 +1036,10 @@ fn resolve_bucket_counts(table: &DuckLakeTable, req: &BucketCountRequest) -> Res
     }
 }
 
-fn try_resolve_bucket_counts(table: &DuckLakeTable, req: &BucketCountRequest) -> Result<Resolution> {
+fn try_resolve_bucket_counts(
+    table: &DuckLakeTable,
+    req: &BucketCountRequest,
+) -> Result<Resolution> {
     // Counts ignore deletes and snapshot filters, and are keyed by column id,
     // so only files read exactly as stored qualify.
     let eligible = table.plain_files()?;

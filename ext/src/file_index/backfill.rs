@@ -121,7 +121,10 @@ pub trait FileIndexTableExt {
 }
 
 enum Outcome {
-    Indexed { bytes_read: u64, bytes_written: u64 },
+    Indexed {
+        bytes_read: u64,
+        bytes_written: u64,
+    },
     Skipped,
 }
 

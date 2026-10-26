@@ -3,23 +3,22 @@
 
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, HashMap};
 use arrow::record_batch::RecordBatch;
-use std::sync::{Arc, Mutex};
 use datafusion_ducklake::inlined_filter::{InlinedDataScan, InlinedFilter};
 use datafusion_ducklake::metadata_provider::{
     ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileMetadata, DuckLakeInlinedData,
     DuckLakeInlinedDelete, DuckLakeInlinedRows, DuckLakeNameMapping, DuckLakeStatistics,
-    DuckLakeTableColumn, DuckLakeTableField, DuckLakeTableFile,
-    FileWithTable, InlinedFileDeleteChange, InlinedRowSelection, SchemaMetadata, SnapshotMetadata,
-    TableMetadata, TableWithSchema, ViewMetadata, ViewWithSchema,
+    DuckLakeTableColumn, DuckLakeTableField, DuckLakeTableFile, FileWithTable,
+    InlinedFileDeleteChange, InlinedRowSelection, SchemaMetadata, SnapshotMetadata, TableMetadata,
+    TableWithSchema, ViewMetadata, ViewWithSchema,
 };
 use datafusion_ducklake::stats_filter::StatsFilter;
 use datafusion_ducklake::{
-    ColumnTag, DuckLakeInlinedFileDeleteForFlush,
-    DuckLakeInlinedFlushData, DuckLakeTag, MetadataProvider, ObjectTag, Result, SnapshotChangeMetadata, TagTarget,
+    ColumnTag, DuckLakeInlinedFileDeleteForFlush, DuckLakeInlinedFlushData, DuckLakeTag,
+    MetadataProvider, ObjectTag, Result, SnapshotChangeMetadata, TagTarget,
 };
-
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
 
 /// Something to run once, just before the next call of a provider method.
 type Hook = (&'static str, Box<dyn FnOnce() + Send>);

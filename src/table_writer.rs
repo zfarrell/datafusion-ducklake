@@ -2134,7 +2134,10 @@ impl DuckLakeTableWriter {
         // it, and the writer is large.
         let (observers, (staged, row_group_rows)) = {
             let mut writer = writer;
-            (writer.take_observers(), writer.into_inner_with_row_groups()?)
+            (
+                writer.take_observers(),
+                writer.into_inner_with_row_groups()?,
+            )
         };
         let mut file = staged
             .into_inner()
@@ -5809,7 +5812,10 @@ impl TableWriteSession {
         // it, and the writer is large.
         let (observers, (staged, row_group_rows)) = {
             let mut writer = writer;
-            (writer.take_observers(), writer.into_inner_with_row_groups()?)
+            (
+                writer.take_observers(),
+                writer.into_inner_with_row_groups()?,
+            )
         };
         let mut file = staged
             .into_inner()

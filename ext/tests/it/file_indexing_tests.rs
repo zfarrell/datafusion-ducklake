@@ -9,7 +9,6 @@
 //! file and compares them with the stored index object, so an index that
 //! misses or misplaces a row fails here.
 
-
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -764,20 +763,15 @@ async fn unlisted_row_is_pruned_after_grace() {
 
     let writer = env.writer().await;
     // Inside the grace period: kept.
-    let kept = prune_file_indexes(
-        &writer,
-        env.store(),
-        Duration::from_secs(3_600),
-    )
-    .await
-    .unwrap();
+    let kept = prune_file_indexes(&writer, env.store(), Duration::from_secs(3_600))
+        .await
+        .unwrap();
     assert!(kept.is_empty());
     assert_eq!(env.rows().await.len(), 3);
 
-    let pruned =
-        prune_file_indexes(&writer, env.store(), Duration::ZERO)
-            .await
-            .unwrap();
+    let pruned = prune_file_indexes(&writer, env.store(), Duration::ZERO)
+        .await
+        .unwrap();
     assert_eq!(pruned, vec![ghost.clone()]);
     assert!(!std::path::Path::new(&format!("/{ghost}")).exists());
     assert_eq!(env.rows().await.len(), 2, "the live file's rows stay");
@@ -829,10 +823,9 @@ async fn prune_after_expiry_removes_index_with_file() {
             .unwrap()
             .get::<i64, _>(0) as usize
     };
-    let mut pruned =
-        prune_file_indexes(&writer, env.store(), Duration::ZERO)
-            .await
-            .unwrap();
+    let mut pruned = prune_file_indexes(&writer, env.store(), Duration::ZERO)
+        .await
+        .unwrap();
     if listed > 1 {
         assert!(pruned.is_empty(), "{pruned:?}");
     }
@@ -955,10 +948,10 @@ async fn backfill_rebuilds_a_mismatched_row() {
         "UPDATE ext_ducklake_file_fact SET value = json_set(value, '$.built_by', 'kept')
          WHERE extension = 'file_index' AND fact_key != ?",
     )
-        .bind(n_id)
-        .execute(&env.pool().await)
-        .await
-        .unwrap();
+    .bind(n_id)
+    .execute(&env.pool().await)
+    .await
+    .unwrap();
     let result = env.backfill().await;
     assert_eq!(result.files_indexed, 1, "{result:?}");
     let rows = env.rows().await;
@@ -1074,7 +1067,6 @@ async fn renamed_column_keeps_its_rows() {
 /// the positions of each key, including keys the file lacks.
 #[tokio::test(flavor = "multi_thread")]
 async fn provider_rows_serve_exact_lookups() {
-    
     let env = indexed_env().await;
     env.append(&[batch(0..700), batch(700..1_000)], &options())
         .await;

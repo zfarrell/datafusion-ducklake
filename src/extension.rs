@@ -122,7 +122,9 @@ impl DuckLakeExtensions {
 
 impl fmt::Debug for DuckLakeExtensions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_list().entries(self.0.iter().map(|e| e.name())).finish()
+        f.debug_list()
+            .entries(self.0.iter().map(|e| e.name()))
+            .finish()
     }
 }
 
@@ -402,7 +404,11 @@ pub trait ScanHook: Send + Sync + fmt::Debug {
     /// claim must hold for every row of the file: core declares it to the
     /// planner, which may then skip a sort. Offered only files the scan reads
     /// without deletes or a snapshot filter, in a scan without `rowid`.
-    fn orderings(&self, _ctx: &ScanContext<'_>, _files: &[ScanFile<'_>]) -> HashMap<i64, Vec<FieldSort>> {
+    fn orderings(
+        &self,
+        _ctx: &ScanContext<'_>,
+        _files: &[ScanFile<'_>],
+    ) -> HashMap<i64, Vec<FieldSort>> {
         HashMap::new()
     }
 }
@@ -511,6 +517,9 @@ mod tests {
         assert_eq!(companion_data_key("t/a.parquet.b.parquet"), None);
         assert_eq!(companion_data_key("t/.parquet.x"), None);
         assert_eq!(companion_data_key("t/a.parquet.x/y"), None);
-        assert_eq!(companion_data_key("t/a.parquet.x/y.parquet.z"), Some("t/a.parquet.x/y.parquet"));
+        assert_eq!(
+            companion_data_key("t/a.parquet.x/y.parquet.z"),
+            Some("t/a.parquet.x/y.parquet")
+        );
     }
 }

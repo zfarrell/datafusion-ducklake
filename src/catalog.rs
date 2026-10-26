@@ -253,7 +253,10 @@ impl DuckLakeCatalog {
     /// Run `extension` in every table's scans and, on a writable catalog,
     /// writes (see [`crate::extension`]), in addition to any registered
     /// through [`Self::with_read_options`] or `with_write_options`.
-    pub fn with_extension(mut self, extension: Arc<dyn crate::extension::DuckLakeExtension>) -> Self {
+    pub fn with_extension(
+        mut self,
+        extension: Arc<dyn crate::extension::DuckLakeExtension>,
+    ) -> Self {
         self.extensions = self.extensions.with(extension);
         self
     }
@@ -350,20 +353,26 @@ impl CatalogProvider for DuckLakeCatalog {
                 )
                 .with_snapshot_selection(self.snapshot, self.view_guards.clone())
                 .with_row_lineage(self.row_lineage)
-                .with_read_options(self.extensions.iter().fold(
-                    self.read_options.clone(),
-                    |options, extension| options.with_extension(Arc::clone(extension)),
-                ));
+                .with_read_options(
+                    self.extensions
+                        .iter()
+                        .fold(self.read_options.clone(), |options, extension| {
+                            options.with_extension(Arc::clone(extension))
+                        }),
+                );
 
                 // Configure writer if this catalog is writable
                 #[cfg(feature = "write")]
                 let schema = if let Some(ref config) = self.write_config {
                     schema
                         .with_writer(Arc::clone(&config.writer))
-                        .with_write_options(self.extensions.iter().fold(
-                            config.options.clone(),
-                            |options, extension| options.with_extension(Arc::clone(extension)),
-                        ))
+                        .with_write_options(
+                            self.extensions
+                                .iter()
+                                .fold(config.options.clone(), |options, extension| {
+                                    options.with_extension(Arc::clone(extension))
+                                }),
+                        )
                 } else {
                     schema
                 };

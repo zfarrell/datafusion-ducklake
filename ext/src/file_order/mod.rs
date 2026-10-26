@@ -165,8 +165,7 @@ pub fn order_fact(path: &str, file_size_bytes: i64, sort_key: &str, verified_by:
         path: path.to_string(),
         file_size_bytes,
         key: 0,
-        value: serde_json::json!({ "sort_key": sort_key, "verified_by": verified_by })
-            .to_string(),
+        value: serde_json::json!({ "sort_key": sort_key, "verified_by": verified_by }).to_string(),
     }
 }
 
@@ -226,10 +225,17 @@ impl ScanHook for OrderScanHook {
     ) -> HashMap<i64, Vec<FieldSort>> {
         let memo = ctx.table_state.get_or_default::<OrderMemo>();
         let key = |f: &ScanFile<'_>| (f.file.file.path.clone(), f.file.file.file_size_bytes);
-        let lock = || memo.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let lock = || {
+            memo.0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        };
         let unknown: Vec<&ScanFile<'_>> = {
             let memo = lock();
-            files.iter().filter(|f| !memo.contains_key(&key(f))).collect()
+            files
+                .iter()
+                .filter(|f| !memo.contains_key(&key(f)))
+                .collect()
         };
         // The lock is not held across the query: a concurrent scan may ask
         // too, and both store the same answer.

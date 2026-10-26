@@ -5697,12 +5697,7 @@ impl DuckLakeTable {
             };
             let table_files: Vec<&DuckLakeTableFile> = table_files
                 .into_iter()
-                .filter(|tf| {
-                    !matches!(
-                        selections.get(&tf.data_file_id),
-                        Some(FileSelection::Skip)
-                    )
-                })
+                .filter(|tf| !matches!(selections.get(&tf.data_file_id), Some(FileSelection::Skip)))
                 .collect();
 
             if rowid_in_proj {
@@ -5965,7 +5960,12 @@ impl DuckLakeTable {
         files: &[&'f DuckLakeTableFile],
         file_statistics: &'f HashMap<i64, Arc<Statistics>>,
         selectable: impl Fn(&DuckLakeTableFile) -> bool,
-    ) -> Vec<(&'f DuckLakeTableFile, ObjectPath, Option<&'f Arc<Statistics>>, bool)> {
+    ) -> Vec<(
+        &'f DuckLakeTableFile,
+        ObjectPath,
+        Option<&'f Arc<Statistics>>,
+        bool,
+    )> {
         files
             .iter()
             .copied()

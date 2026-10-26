@@ -6,7 +6,6 @@
 //! counts are recorded by the backfill (`build_file_indexes` with a count
 //! column), so the test covers the whole path from parquet to answer.
 
-
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -20,15 +19,15 @@ use datafusion::prelude::*;
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 
+use datafusion_ducklake::{
+    ColumnDef, DuckLakeCatalog, DuckLakeReadOptions, DuckLakeTable, DuckLakeTableWriter,
+    DuckLakeWriteOptions, MetadataWriter, SqliteMetadataProvider, SqliteMetadataWriter, WriteMode,
+};
 use datafusion_ducklake_ext::file_index::counts::{
     BUCKET_GRAIN_HOUR_US, BucketCountRule, bucket_counts_from_json, bucket_counts_to_json,
 };
 use datafusion_ducklake_ext::file_index::format::{IndexKey, IndexValueType};
 use datafusion_ducklake_ext::file_index::{BuildIndexOptions, FileIndex, FileIndexTableExt};
-use datafusion_ducklake::{
-    ColumnDef, DuckLakeCatalog, DuckLakeReadOptions, DuckLakeTable, DuckLakeTableWriter,
-    DuckLakeWriteOptions, MetadataWriter, SqliteMetadataProvider, SqliteMetadataWriter, WriteMode,
-};
 
 const H: i64 = BUCKET_GRAIN_HOUR_US;
 
@@ -188,16 +187,15 @@ impl Env {
         let pool = self.pool().await;
         let mut out = Vec::new();
         for (path, _) in self.live_files().await {
-            let json: Option<String> =
-                sqlx::query(
-                    "SELECT json_extract(value, '$.bucket_counts') FROM ext_ducklake_file_fact
+            let json: Option<String> = sqlx::query(
+                "SELECT json_extract(value, '$.bucket_counts') FROM ext_ducklake_file_fact
                      WHERE extension = 'file_index' AND path = ?",
-                )
-                    .bind(&path)
-                    .fetch_optional(&pool)
-                    .await
-                    .unwrap()
-                    .and_then(|row| row.get(0));
+            )
+            .bind(&path)
+            .fetch_optional(&pool)
+            .await
+            .unwrap()
+            .and_then(|row| row.get(0));
             let users = json
                 .and_then(|j| bucket_counts_from_json(&j, IndexValueType::Utf8))
                 .map(|c| {
@@ -476,7 +474,10 @@ async fn deletes_inlined_rows_and_bad_rows_scan() {
     let pool = env.pool().await;
     for (file, set) in [
         (&files[1].0, "file_size_bytes = file_size_bytes + 1"),
-        (&files[3].0, "value = json_set(value, '$.value_type', 'int64')"),
+        (
+            &files[3].0,
+            "value = json_set(value, '$.value_type', 'int64')",
+        ),
     ] {
         inflate_counts(&pool, file).await;
         sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -491,10 +492,10 @@ async fn deletes_inlined_rows_and_bad_rows_scan() {
         "UPDATE ext_ducklake_file_fact SET value = json_set(value, '$.bucket_counts', '{\"v\":1')
          WHERE extension = 'file_index' AND path = ?",
     )
-        .bind(&files[2].0)
-        .execute(&pool)
-        .await
-        .unwrap();
+    .bind(&files[2].0)
+    .execute(&pool)
+    .await
+    .unwrap();
     assert_matrix(&env, PREDS).await;
 }
 
@@ -550,16 +551,15 @@ async fn recorded_counts_are_what_serves_whole_hours() {
     env.record_counts().await;
     let files = env.live_files().await;
     let pool = env.pool().await;
-    let json: String =
-        sqlx::query(
-            "SELECT json_extract(value, '$.bucket_counts') FROM ext_ducklake_file_fact
+    let json: String = sqlx::query(
+        "SELECT json_extract(value, '$.bucket_counts') FROM ext_ducklake_file_fact
              WHERE extension = 'file_index' AND path = ?",
-        )
-            .bind(&files[0].0)
-            .fetch_one(&pool)
-            .await
-            .unwrap()
-            .get(0);
+    )
+    .bind(&files[0].0)
+    .fetch_one(&pool)
+    .await
+    .unwrap()
+    .get(0);
     let mut counts = bucket_counts_from_json(&json, IndexValueType::Utf8).unwrap();
     // keys[0] is u0.
     let bucket = &mut counts.keys[0].1[1];
@@ -569,11 +569,11 @@ async fn recorded_counts_are_what_serves_whole_hours() {
         "UPDATE ext_ducklake_file_fact SET value = json_set(value, '$.bucket_counts', ?)
          WHERE extension = 'file_index' AND path = ?",
     )
-        .bind(bucket_counts_to_json(&counts))
-        .bind(&files[0].0)
-        .execute(&pool)
-        .await
-        .unwrap();
+    .bind(bucket_counts_to_json(&counts))
+    .bind(&files[0].0)
+    .execute(&pool)
+    .await
+    .unwrap();
     let sql = format!(
         "SELECT date_trunc('hour', ts) AS key, count(1) AS c FROM ducklake.main.logs \
          WHERE ts >= {} AND ts <= {} AND user_id = 'u0' GROUP BY key ORDER BY key",
@@ -608,16 +608,15 @@ async fn recorded_counts_are_what_serves_whole_hours() {
 /// Adds 1000 to every recorded bucket of `path`.
 async fn inflate_counts(pool: &sqlx::SqlitePool, path: &str) {
     use sqlx::Row;
-    let json: String =
-        sqlx::query(
-            "SELECT json_extract(value, '$.bucket_counts') FROM ext_ducklake_file_fact
+    let json: String = sqlx::query(
+        "SELECT json_extract(value, '$.bucket_counts') FROM ext_ducklake_file_fact
              WHERE extension = 'file_index' AND path = ?",
-        )
-            .bind(path)
-            .fetch_one(pool)
-            .await
-            .unwrap()
-            .get(0);
+    )
+    .bind(path)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+    .get(0);
     let mut counts = bucket_counts_from_json(&json, IndexValueType::Utf8).unwrap();
     for (_, buckets) in &mut counts.keys {
         for bucket in buckets {
@@ -628,11 +627,11 @@ async fn inflate_counts(pool: &sqlx::SqlitePool, path: &str) {
         "UPDATE ext_ducklake_file_fact SET value = json_set(value, '$.bucket_counts', ?)
          WHERE extension = 'file_index' AND path = ?",
     )
-        .bind(bucket_counts_to_json(&counts))
-        .bind(path)
-        .execute(pool)
-        .await
-        .unwrap();
+    .bind(bucket_counts_to_json(&counts))
+    .bind(path)
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 // ---------------------------------------------------------------------------
