@@ -183,15 +183,22 @@ records the files that follow the key. Scans then read those files in order and 
 Nothing is checked or recorded unless the extension is registered:
 
 ```rust,ignore
+use datafusion_ducklake_ext::db::ExtensionDb;
 use datafusion_ducklake_ext::file_order::{FileOrder, FileOrderTableExt, VerifyOrderOptions};
 
-let catalog = DuckLakeCatalog::with_writer(provider, writer)?.with_extension(Arc::new(FileOrder));
+// One pool for core and the extension: the extension opens no connection of its own.
+let pool = SqlitePool::connect("sqlite:catalog.db").await?;
+let writer = Arc::new(SqliteMetadataWriter::from_pool(pool.clone()).await?);
+let provider = Arc::new(SqliteMetadataProvider::from_pool(pool.clone()));
+let order = FileOrder::new(ExtensionDb::sqlite(pool));
+let catalog = DuckLakeCatalog::with_writer(provider, writer)?.with_extension(Arc::new(order));
 // Files written before, or by another client: record them without rewriting.
 table.verify_file_orders(&state, VerifyOrderOptions::default()).await?;
 ```
 
-Extensions use the hooks in `datafusion_ducklake::extension`. What they record is not part of the
-DuckLake spec, and DuckDB's extension ignores it. See `COMPATIBILITY.md`.
+Extensions use the hooks in `datafusion_ducklake::extension` (feature `unstable-extensions`, with
+no semver promise). What they record is not part of the DuckLake spec, and DuckDB's extension
+ignores it. See `COMPATIBILITY.md`.
 
 ---
 

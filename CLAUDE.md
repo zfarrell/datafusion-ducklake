@@ -78,14 +78,14 @@ The codebase follows a layered architecture with clear separation of concerns:
      data file a writer names: insert, update, compaction, inlined flush) and a scan hook (per-file
      skip / row selection, and claimed sort orders). Core keeps the safety rules: which files may
      take a selection, which orderings may be declared. Hooks are advisory; one that errs or
-     panics is left out. Observers return facts, which core records once per write.
-     `DuckLakeTable::backfill` (`extension_backfill.rs`) replays a write hook over existing files;
-     `DuckLakeCatalog::prune_extension_facts` prunes every registered extension's facts. A scan
-     hook keeps per-instance state in `table_state` and catalog-wide state in `shared_state`.
-     Extensions live in the `ext/` crate (`datafusion-ducklake-ext`: file order, file index),
-     which uses only the public API
-   - `file_facts.rs`: `ext_ducklake_file_fact`, the per-file facts extensions record through
-     `MetadataWriter::record_file_facts` and read through `MetadataProvider::file_facts`
+     panics is left out. Core stores nothing for an extension: an observer keeps what it learns
+     itself, in `FileObserver::stored`, which every write path calls after upload and before
+     commit. `DuckLakeTable::backfill` (`extension_backfill.rs`) replays a write hook over
+     existing files. Public only with the `unstable-extensions` feature
+     (`unstable_extension_api!` in `lib.rs` gates the `DuckLakeTable` accessors extensions use),
+     with no semver promise. Extensions live in the `ext/` crate (`datafusion-ducklake-ext`:
+     file order, file index), which uses only that API and keeps its own tables through a pool
+     the caller shares with core (`ExtensionDb`)
    - `order_on_request.rs`: `OrderOnRequestExec` offers an ordered plan over files whose order an
      extension claims, only when a sort asks for it
    - `table_functions.rs`: `ducklake_snapshots()`, `ducklake_table_info()`, `ducklake_list_files()`, `ducklake_table_changes()`, `ducklake_table_deletions()`, `ducklake_table_insertions()`; registered via `register_ducklake_functions()`

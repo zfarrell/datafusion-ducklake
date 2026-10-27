@@ -1041,36 +1041,38 @@ written, no extra catalog query runs, and plans are unchanged.
 
 DuckLake's `SET SORTED BY` is a write-time hint: no catalog row says which files follow
 it, so a reader cannot rely on it. This feature proves the order per file instead and
-records it as a file fact (see "Extensions" below) holding the sort key by field id:
+records it in `ext_ducklake_file_order` (see "Extensions" below), holding the sort key by
+field id:
 
 - The writer checks every row it writes, and records the file only if all of them were
   in order. Files written by DuckDB or another client, uploads and files from before the
   option was on are recorded by `DuckLakeTable::verify_file_orders`, which reads only the
   key columns, in the catalog's types, and rewrites nothing.
-- A fact applies to a file only when its table, path and size match. A file without one is
+- A record applies to a file only when its table, path and size match. A file without one is
   scanned as usual.
 - A scan declares the order only when an `ORDER BY` on the key asks for it and every file
   it reads is recorded, has no deletes and no NULL key; anything else plans as before.
 
-**Divergence.** The fact is not part of the DuckLake spec. Compaction and expiry by DuckDB
-leave facts that match no file, which `prune_file_orders` removes. Converging would need a
+**Divergence.** The record is not part of the DuckLake spec. Compaction and expiry by DuckDB
+leave records that match no file, which `prune_file_orders` removes. Converging would need a
 per-file sort record in the spec itself.
 
 ## Experimental: extensions
 
-Extensions (`datafusion_ducklake::extension`) add per-file work to writes and scans. What
-they keep is outside the spec:
+Extensions (`datafusion_ducklake::extension`, behind the `unstable-extensions` feature, with no
+semver promise) add per-file work to writes and scans. Core stores nothing for them. The
+extensions of `datafusion-ducklake-ext` keep outside the spec:
 
-- **File facts**, in `ext_ducklake_file_fact` (extension, table id, file path, key, file
-  size, value), created on the first record. DuckDB's extension names the tables it reads and
-  never enumerates the catalog, so it neither sees nor disturbs it. Facts are stored on SQLite
-  and multicatalog PostgreSQL; on other backends nothing is recorded and every file reads as
-  unknown.
+- **Their own tables** in the catalog's database: `ext_ducklake_file_index` and
+  `ext_ducklake_file_order`, created on the first record. The caller hands each extension the
+  pool it gave core (`ExtensionDb`), so an extension opens no connection of its own. DuckDB's
+  extension names the tables it reads and never enumerates the catalog, so it neither sees nor
+  disturbs them. SQLite and PostgreSQL only.
 - **Companion objects** beside a data file, named `<data file>.parquet.<suffix>`. The orphan
   sweep deletes one once its data file is unreferenced. DuckDB's sweep ignores them, since they
   do not end in `.parquet`.
 
-A file written by another client has no facts and is read as without the extension.
+A file written by another client has no record and is read as without the extension.
 
 ---
 
