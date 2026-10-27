@@ -109,13 +109,22 @@ pub(crate) fn sqlite_cutoff(min_age: Duration) -> String {
 /// while an earlier write to the same table is still running: under
 /// concurrent uploads, one transaction serves many files rather than each
 /// taking a connection and, on SQLite, the write lock.
+///
+/// A task of its own writes, not any caller: a caller returns once its rows
+/// are written, and one that is dropped (its query cancelled) loses no
+/// other caller's rows. Rows are grouped per pool, never per database: two
+/// pools on one database can see different tables (a role's `search_path`).
 pub(crate) struct GroupCommit<R> {
-    queues: Mutex<HashMap<(u64, i64), Queue<R>>>,
+    queues: Arc<Mutex<Queues<R>>>,
 }
+
+type Queues<R> = HashMap<(usize, i64), Queue<R>>;
+
+type Waiter = tokio::sync::oneshot::Sender<std::result::Result<(), String>>;
 
 struct Queue<R> {
     rows: Vec<R>,
-    waiting: Vec<tokio::sync::oneshot::Sender<std::result::Result<(), String>>>,
+    waiting: Vec<Waiter>,
 }
 
 impl<R> fmt::Debug for GroupCommit<R> {
@@ -127,16 +136,14 @@ impl<R> fmt::Debug for GroupCommit<R> {
 impl<R> Default for GroupCommit<R> {
     fn default() -> Self {
         Self {
-            queues: Mutex::new(HashMap::new()),
+            queues: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
 
 impl<R: Send + 'static> GroupCommit<R> {
-    /// Record `rows` of `table_id` with `write`, and return once they are
-    /// recorded. The call that finds no write running writes, its own rows
-    /// and then whatever arrived meanwhile, until none are left; the others
-    /// wait for it.
+    /// Record `rows` of `table_id` through `db` with `write`, and return once
+    /// they are recorded.
     pub(crate) async fn record<W, Fut>(
         &self,
         db: &CatalogDb,
@@ -145,83 +152,116 @@ impl<R: Send + 'static> GroupCommit<R> {
         write: W,
     ) -> Result<()>
     where
-        W: Fn(CatalogDb, i64, Vec<R>) -> Fut,
-        Fut: Future<Output = Result<()>>,
+        W: Fn(CatalogDb, i64, Vec<R>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
     {
-        let key = (db.id(), table_id);
+        let key = (db.pool_id(), table_id);
         let (done, recorded) = tokio::sync::oneshot::channel();
-        let leads = {
-            let mut queues = self.lock();
-            let leads = !queues.contains_key(&key);
+        let starts = {
+            let mut queues = lock(&self.queues);
+            let starts = !queues.contains_key(&key);
             let queue = queues.entry(key).or_insert_with(|| Queue {
                 rows: Vec::new(),
                 waiting: Vec::new(),
             });
             queue.rows.extend(rows);
             queue.waiting.push(done);
-            leads
+            starts
         };
-        if leads {
-            // Dropped mid-write, the guard fails every waiter, so none hangs.
-            let lead = Lead {
-                commit: self,
-                key,
-            };
-            loop {
-                let (rows, waiting) = {
-                    let mut queues = self.lock();
-                    let Some(queue) = queues.get_mut(&key) else {
-                        break;
-                    };
-                    if queue.waiting.is_empty() {
-                        queues.remove(&key);
-                        break;
-                    }
-                    (
-                        std::mem::take(&mut queue.rows),
-                        std::mem::take(&mut queue.waiting),
-                    )
-                };
-                let written = write(db.clone(), table_id, rows)
-                    .await
-                    .map_err(|error| error.to_string());
-                for waiter in waiting {
-                    let _ = waiter.send(written.clone());
-                }
+        if starts {
+            let flush = flush(Arc::clone(&self.queues), key, db.clone(), table_id, write);
+            match tokio::runtime::Handle::try_current() {
+                Ok(runtime) => {
+                    runtime.spawn(flush);
+                },
+                // Not on a tokio runtime: write here.
+                Err(_) => flush.await,
             }
-            std::mem::forget(lead);
         }
         match recorded.await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(error)) => Err(DuckLakeError::Internal(error)),
             Err(_) => Err(DuckLakeError::Internal(
-                "extension rows not recorded: the write recording them was dropped".into(),
+                "extension rows not recorded: the task writing them stopped".into(),
             )),
         }
     }
+}
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<(u64, i64), Queue<R>>> {
-        self.queues
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+/// Write the queue at `key` batch by batch until it is empty.
+async fn flush<R, W, Fut>(
+    queues: Arc<Mutex<Queues<R>>>,
+    key: (usize, i64),
+    db: CatalogDb,
+    table_id: i64,
+    write: W,
+) where
+    W: Fn(CatalogDb, i64, Vec<R>) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    // Stopped early (a panic, its runtime shutting down), the guard drops
+    // the queue, which fails its callers rather than leaving them waiting.
+    let mut guard = Flushing {
+        queues: Arc::clone(&queues),
+        key,
+        finished: false,
+    };
+    loop {
+        let (rows, waiting) = {
+            let mut queues = lock(&queues);
+            let Some(queue) = queues.get_mut(&key) else {
+                break;
+            };
+            if queue.waiting.is_empty() {
+                queues.remove(&key);
+                break;
+            }
+            (
+                std::mem::take(&mut queue.rows),
+                std::mem::take(&mut queue.waiting),
+            )
+        };
+        let written = write(db.clone(), table_id, rows)
+            .await
+            .map_err(|error| error.to_string());
+        for waiter in waiting {
+            let _ = waiter.send(written.clone());
+        }
     }
+    guard.finished = true;
 }
 
-/// Held by the call writing for a key. Dropped before it finishes (its
-/// future cancelled), it removes the key's queue, which fails its waiters.
-struct Lead<'a, R> {
-    commit: &'a GroupCommit<R>,
-    key: (u64, i64),
+fn lock<R>(queues: &Mutex<Queues<R>>) -> std::sync::MutexGuard<'_, Queues<R>> {
+    queues
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-impl<R> Drop for Lead<'_, R> {
+struct Flushing<R> {
+    queues: Arc<Mutex<Queues<R>>>,
+    key: (usize, i64),
+    finished: bool,
+}
+
+impl<R> Drop for Flushing<R> {
     fn drop(&mut self) {
-        self.commit
-            .queues
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&self.key);
+        if !self.finished {
+            lock(&self.queues).remove(&self.key);
+        }
     }
+}
+
+/// `rows` with only the last of those sharing a key: one statement may not
+/// upsert a key twice (PostgreSQL), and the later row is the newer record.
+pub(crate) fn last_per_key<R, K: std::hash::Hash + Eq>(
+    mut rows: Vec<R>,
+    key: impl Fn(&R) -> K,
+) -> Vec<R> {
+    let mut seen = std::collections::HashSet::new();
+    rows.reverse();
+    rows.retain(|row| seen.insert(key(row)));
+    rows.reverse();
+    rows
 }
 
 // ---------------------------------------------------------------------------
@@ -498,40 +538,150 @@ mod tests {
         commit.record(&db, 1, vec![2], ok).await.unwrap();
     }
 
-    #[tokio::test]
-    async fn a_dropped_leader_fails_its_waiters_instead_of_leaving_them() {
-        let db = db().await;
-        let commit = Arc::new(GroupCommit::<i32>::default());
-        let (started, wait_started) = tokio::sync::oneshot::channel::<()>();
-        let started = Arc::new(Mutex::new(Some(started)));
-        let hang = move |_: CatalogDb, _: i64, _: Vec<i32>| {
-            let started = started.clone();
-            async move {
-                if let Some(started) = started.lock().unwrap().take() {
-                    let _ = started.send(());
-                }
-                std::future::pending::<Result<()>>().await
+    /// A write whose calls each wait for a gate the test opens, and that
+    /// keeps what each call was given.
+    #[derive(Clone, Default)]
+    struct Gated {
+        gates: Arc<Mutex<Vec<tokio::sync::oneshot::Receiver<()>>>>,
+        started: Arc<tokio::sync::Notify>,
+        written: Arc<Mutex<Vec<Batch>>>,
+    }
+
+    /// A row and the pool it came from.
+    type Row = (usize, i32);
+
+    /// The pool a batch was written through, and its rows.
+    type Batch = (usize, Vec<Row>);
+
+    type Written = std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send>>;
+
+    impl Gated {
+        /// Gates for the next `n` calls, in call order.
+        fn gates(&self, n: usize) -> Vec<tokio::sync::oneshot::Sender<()>> {
+            let (open, gates): (Vec<_>, Vec<_>) =
+                (0..n).map(|_| tokio::sync::oneshot::channel()).unzip();
+            *self.gates.lock().unwrap() = gates;
+            open
+        }
+
+        fn write(&self) -> impl Fn(CatalogDb, i64, Vec<Row>) -> Written + Send + Sync + 'static {
+            let this = self.clone();
+            move |db, _, rows| {
+                let this = this.clone();
+                Box::pin(async move {
+                    let gate = {
+                        let mut gates = this.gates.lock().unwrap();
+                        (!gates.is_empty()).then(|| gates.remove(0))
+                    };
+                    this.started.notify_one();
+                    if let Some(gate) = gate {
+                        let _ = gate.await;
+                    }
+                    this.written.lock().unwrap().push((db.pool_id(), rows));
+                    Ok(())
+                })
             }
+        }
+    }
+
+    async fn record(
+        commit: &Arc<GroupCommit<(usize, i32)>>,
+        db: &CatalogDb,
+        gated: &Gated,
+        row: i32,
+    ) -> tokio::task::JoinHandle<Result<()>> {
+        let (commit, db, write) = (commit.clone(), db.clone(), gated.write());
+        tokio::spawn(async move {
+            let rows = vec![(db.pool_id(), row)];
+            commit.record(&db, 1, rows, write).await
+        })
+    }
+
+    #[tokio::test]
+    async fn rows_through_another_pool_are_never_written_through_this_one() {
+        // Two pools on one database: the same `id`, as two tenants' pools on
+        // one PostgreSQL database with different search paths would have.
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("c.db").display());
+        let open = || async {
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .connect(&url)
+                .await
+                .unwrap();
+            datafusion_ducklake::SqliteMetadataProvider::from_pool(pool)
+                .catalog_db()
+                .unwrap()
         };
-        let leader = tokio::spawn({
-            let (commit, db, hang) = (commit.clone(), db.clone(), hang.clone());
-            async move { commit.record(&db, 1, vec![1], hang).await }
+        let (a, b) = (open().await, open().await);
+        assert_eq!(a.id(), b.id());
+        let commit = Arc::new(GroupCommit::default());
+        let gated = Gated::default();
+        let open = gated.gates(1);
+        let first = record(&commit, &a, &gated, 1).await;
+        gated.started.notified().await;
+        let others = [record(&commit, &a, &gated, 2).await, record(&commit, &b, &gated, 3).await];
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        open.into_iter().for_each(|gate| gate.send(()).unwrap());
+        first.await.unwrap().unwrap();
+        for other in others {
+            other.await.unwrap().unwrap();
+        }
+        for (through, rows) in gated.written.lock().unwrap().iter() {
+            assert!(
+                rows.iter().all(|(from, _)| from == through),
+                "rows written through a pool they did not come from: {rows:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_call_returns_once_its_rows_are_written_while_others_keep_coming() {
+        let db = db().await;
+        let commit = Arc::new(GroupCommit::default());
+        let gated = Gated::default();
+        let mut open = gated.gates(2).into_iter();
+        let first = record(&commit, &db, &gated, 1).await;
+        gated.started.notified().await;
+        let second = record(&commit, &db, &gated, 2).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The first write finishes; the second, holding row 2, does not.
+        open.next().unwrap().send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), first)
+            .await
+            .expect("the first call must not wait for rows it did not bring")
+            .unwrap()
+            .unwrap();
+        open.next().unwrap().send(()).unwrap();
+        second.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn rows_still_queued_are_written_when_the_call_writing_drops() {
+        let db = db().await;
+        let commit = Arc::new(GroupCommit::default());
+        let gated = Gated::default();
+        let open = gated.gates(1);
+        let first = record(&commit, &db, &gated, 1).await;
+        gated.started.notified().await;
+        let second = record(&commit, &db, &gated, 2).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        first.abort();
+        let _ = first.await;
+        open.into_iter().for_each(|gate| {
+            let _ = gate.send(());
         });
-        wait_started.await.unwrap();
-        let waiter = tokio::spawn({
-            let (commit, db, hang) = (commit.clone(), db.clone(), hang.clone());
-            async move { commit.record(&db, 1, vec![2], hang).await }
-        });
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        leader.abort();
-        let waited = tokio::time::timeout(Duration::from_secs(5), waiter)
+        tokio::time::timeout(Duration::from_secs(5), second)
             .await
             .expect("the waiter must not hang")
-            .unwrap();
-        assert!(waited.is_err());
-        // The table can be recorded again.
-        let ok = |_: CatalogDb, _: i64, _: Vec<i32>| async { Ok(()) };
-        commit.record(&db, 1, vec![3], ok).await.unwrap();
+            .unwrap()
+            .expect("another query's cancel must not lose this call's rows");
+        let written = gated.written.lock().unwrap();
+        assert!(
+            written
+                .iter()
+                .any(|(_, rows)| rows.iter().any(|(_, row)| *row == 2)),
+            "{written:?}"
+        );
     }
 
     #[tokio::test]

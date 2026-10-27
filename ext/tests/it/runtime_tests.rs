@@ -66,3 +66,38 @@ async fn a_blocking_catalog_call_after_an_extension_query_on_a_current_thread_ru
         "the call must reach PostgreSQL, not time out waiting on the connection: {error}"
     );
 }
+
+/// One batch can hold two rows for one file (two verify passes of a table
+/// stored together); PostgreSQL's multi-row upsert refuses a key twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_batch_with_two_rows_for_one_file_records_the_later() {
+    use datafusion_ducklake_ext::file_order::table::{self as order_table, OrderRow};
+
+    let container = Postgres::default().start().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let pool = PgPoolOptions::new()
+        .connect(&format!(
+            "postgresql://postgres:postgres@127.0.0.1:{port}/postgres"
+        ))
+        .await
+        .unwrap();
+    let db = crate::postgres_db(&pool);
+    let row = |sort_key: &str| OrderRow {
+        path: "a.parquet".to_string(),
+        file_size_bytes: 10,
+        sort_key: sort_key.to_string(),
+    };
+    order_table::record(
+        &db,
+        1,
+        vec![(row("1:asc:nulls_last"), "verify"), (row("1:desc:nulls_first"), "verify")],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        order_table::read(&db, 1, vec!["a.parquet".to_string()])
+            .await
+            .unwrap(),
+        vec![row("1:desc:nulls_first")]
+    );
+}

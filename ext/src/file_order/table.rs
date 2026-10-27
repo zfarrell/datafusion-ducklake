@@ -67,6 +67,7 @@ pub async fn record(
     table_id: i64,
     rows: Vec<(OrderRow, &'static str)>,
 ) -> Result<()> {
+    let rows = crate::db::last_per_key(rows, |(row, _)| row.path.clone());
     if rows.is_empty() {
         return Ok(());
     }

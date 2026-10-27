@@ -37,6 +37,7 @@ pub enum CatalogPool {
 #[derive(Clone)]
 pub struct CatalogDb {
     pool: CatalogPool,
+    id: u64,
 }
 
 impl fmt::Debug for CatalogDb {
@@ -50,14 +51,24 @@ impl fmt::Debug for CatalogDb {
 impl CatalogDb {
     #[cfg(feature = "metadata-sqlite")]
     pub(crate) fn sqlite(pool: &sqlx::SqlitePool) -> Self {
+        let file = pool.connect_options().get_filename().to_path_buf();
         Self {
+            id: hash(&("sqlite", std::fs::canonicalize(&file).unwrap_or(file))),
             pool: CatalogPool::Sqlite(pool.clone()),
         }
     }
 
     #[cfg(feature = "metadata-postgres")]
     pub(crate) fn postgres(pool: &sqlx::PgPool) -> Self {
+        let options = pool.connect_options();
         Self {
+            id: hash(&(
+                "postgres",
+                options.get_host(),
+                options.get_port(),
+                options.get_database(),
+                options.get_username(),
+            )),
             pool: CatalogPool::Postgres(pool.clone()),
         }
     }
@@ -75,30 +86,24 @@ impl CatalogDb {
     /// Names the database: the same for every handle on it, whichever pool
     /// (a provider and a writer opened separately share it), and different
     /// for another database. For keying what an extension remembers per
-    /// catalog. The SQLite file, or PostgreSQL's host, port and database, so
-    /// two in-memory SQLite databases share one.
+    /// catalog. The SQLite file, or PostgreSQL's host, port, database and
+    /// user. Two pools with one `id` can still differ in what they see (a
+    /// role's `search_path`), so write through the pool the work came from:
+    /// see [`pool_id`](Self::pool_id).
     pub fn id(&self) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.id
+    }
+
+    /// The same for every clone of one pool, and different for two pools
+    /// open at once. For grouping work that must go through the pool it came
+    /// from.
+    pub fn pool_id(&self) -> usize {
         match &self.pool {
             #[cfg(feature = "metadata-sqlite")]
-            CatalogPool::Sqlite(pool) => {
-                let file = pool.connect_options().get_filename().to_path_buf();
-                ("sqlite", std::fs::canonicalize(&file).unwrap_or(file)).hash(&mut hasher);
-            },
+            CatalogPool::Sqlite(pool) => std::ptr::from_ref(pool.options()).addr(),
             #[cfg(feature = "metadata-postgres")]
-            CatalogPool::Postgres(pool) => {
-                let options = pool.connect_options();
-                (
-                    "postgres",
-                    options.get_host(),
-                    options.get_port(),
-                    options.get_database(),
-                )
-                    .hash(&mut hasher);
-            },
+            CatalogPool::Postgres(pool) => std::ptr::from_ref(pool.options()).addr(),
         }
-        hasher.finish()
     }
 
     /// Run `work` on the catalog runtime and return its output. Run a
@@ -123,6 +128,13 @@ impl CatalogDb {
     {
         block_on(self.run(work))
     }
+}
+
+fn hash(value: &impl std::hash::Hash) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// A spawned task, aborted when its handle is dropped.

@@ -169,6 +169,7 @@ fn counts_json(row: &FileIndexRow) -> Option<String> {
 /// Record `rows` of `table_id`'s files, in one transaction (SQLite) or one
 /// statement (PostgreSQL).
 pub async fn record(db: &CatalogDb, table_id: i64, rows: Vec<FileIndexRow>) -> Result<()> {
+    let rows = crate::db::last_per_key(rows, |row| (row.meta.path.clone(), row.meta.column_id));
     if rows.is_empty() {
         return Ok(());
     }
