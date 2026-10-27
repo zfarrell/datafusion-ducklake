@@ -40,8 +40,10 @@
 //! # Storing what an extension learns
 //!
 //! Core stores nothing for an extension. An extension keeps what it learns
-//! about a file where it chooses, from [`FileObserver::stored`], which every
-//! write path calls once the file is uploaded and before its commit. Key it by
+//! about a file in its own tables in the catalog's database ([`CatalogDb`],
+//! from [`WriteContext::db`] and [`ScanContext::db`]), from
+//! [`FileObserver::stored`], which every write path calls once the file is
+//! uploaded and before its commit. Key it by
 //! the file's catalog path and size: DuckLake never rewrites a data file in
 //! place, so a record about the object at that path stays true for as long as
 //! the catalog lists it, at every snapshot. A record of a file whose write
@@ -68,6 +70,17 @@ use datafusion_datasource_parquet::ParquetAccessPlan;
 use object_store::path::Path as ObjectPath;
 
 use crate::metadata_provider::{DuckLakeTableFile, MetadataProvider};
+
+#[cfg(all(
+    feature = "unstable-extensions",
+    any(feature = "metadata-sqlite", feature = "metadata-postgres")
+))]
+mod db;
+#[cfg(all(
+    feature = "unstable-extensions",
+    any(feature = "metadata-sqlite", feature = "metadata-postgres")
+))]
+pub use db::{CatalogDb, CatalogPool};
 
 /// Code that adds work to a table's writes and scans. See the module docs for
 /// the contract every hook follows.
@@ -249,6 +262,16 @@ impl<'a> WriteContext<'a> {
         }
         let spec = self.metadata.live_sort_spec(self.table_id)?;
         Ok(self.lookups.sort_spec.get_or_init(|| spec).clone())
+    }
+
+    /// The database of the catalog the write commits to, or `None` for a
+    /// backend that does not offer one.
+    #[cfg(all(
+        feature = "unstable-extensions",
+        any(feature = "metadata-sqlite", feature = "metadata-postgres")
+    ))]
+    pub fn db(&self) -> Option<CatalogDb> {
+        self.metadata.catalog_db()
     }
 }
 
@@ -491,6 +514,18 @@ pub struct ScanContext<'a> {
     pub metadata: &'a Arc<dyn MetadataProvider>,
     /// The session object store the table's files are read from.
     pub object_store_url: &'a ObjectStoreUrl,
+}
+
+impl ScanContext<'_> {
+    /// The database of the catalog the scan reads, or `None` for a backend
+    /// that does not offer one.
+    #[cfg(all(
+        feature = "unstable-extensions",
+        any(feature = "metadata-sqlite", feature = "metadata-postgres")
+    ))]
+    pub fn db(&self) -> Option<CatalogDb> {
+        self.metadata.catalog_db()
+    }
 }
 
 /// One data file a scan may read, as offered to a [`ScanHook`].

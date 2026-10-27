@@ -571,6 +571,14 @@ fn file_data_heap_bytes(file: &DuckLakeFileData) -> usize {
 }
 
 impl MetadataProvider for MemoizedMetadataProvider {
+    #[cfg(all(
+        feature = "unstable-extensions",
+        any(feature = "metadata-sqlite", feature = "metadata-postgres")
+    ))]
+    fn catalog_db(&self) -> Option<crate::extension::CatalogDb> {
+        self.inner.catalog_db()
+    }
+
     fn get_current_snapshot(&self) -> Result<i64> {
         self.inner.get_current_snapshot()
     }

@@ -3248,6 +3248,18 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         start_snapshot: i64,
         end_snapshot: i64,
     ) -> Result<Vec<DeleteFileChange>>;
+
+    /// The catalog's database, for an extension to keep its own tables in
+    /// (see [`CatalogDb`](crate::extension::CatalogDb)). `None` for a backend
+    /// that does not offer it (DuckDB, MySQL). A provider that wraps another
+    /// forwards it.
+    #[cfg(all(
+        feature = "unstable-extensions",
+        any(feature = "metadata-sqlite", feature = "metadata-postgres")
+    ))]
+    fn catalog_db(&self) -> Option<crate::extension::CatalogDb> {
+        None
+    }
 }
 
 #[cfg(any(feature = "metadata-postgres", feature = "metadata-mysql", feature = "metadata-sqlite"))]

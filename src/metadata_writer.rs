@@ -4734,6 +4734,17 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     fn supports_inlined_row_mutations(&self) -> bool {
         false
     }
+
+    /// The catalog's database, for an extension to keep its own tables in
+    /// (see [`CatalogDb`](crate::extension::CatalogDb)). `None` for a backend
+    /// that does not offer it (DuckDB, MySQL).
+    #[cfg(all(
+        feature = "unstable-extensions",
+        any(feature = "metadata-sqlite", feature = "metadata-postgres")
+    ))]
+    fn catalog_db(&self) -> Option<crate::extension::CatalogDb> {
+        None
+    }
 }
 
 #[cfg(test)]

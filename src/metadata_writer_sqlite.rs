@@ -3723,6 +3723,11 @@ impl SqliteMetadataWriter {
 }
 
 impl MetadataWriter for SqliteMetadataWriter {
+    #[cfg(feature = "unstable-extensions")]
+    fn catalog_db(&self) -> Option<crate::extension::CatalogDb> {
+        Some(crate::extension::CatalogDb::sqlite(&self.pool))
+    }
+
     fn maintenance(&self) -> Option<&dyn crate::maintenance::CatalogMaintenance> {
         Some(self)
     }

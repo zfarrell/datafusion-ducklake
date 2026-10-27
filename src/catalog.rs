@@ -250,6 +250,7 @@ impl DuckLakeCatalog {
         self
     }
 
+    unstable_extension_api! {
     /// Run `extension` in every table's scans and, on a writable catalog,
     /// writes (see [`crate::extension`]), in addition to any registered
     /// through [`Self::with_read_options`] or `with_write_options`.
@@ -259,6 +260,7 @@ impl DuckLakeCatalog {
     ) -> Self {
         self.extensions = self.extensions.with(extension);
         self
+    }
     }
 
     /// Get the metadata provider for this catalog

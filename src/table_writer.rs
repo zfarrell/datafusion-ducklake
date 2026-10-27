@@ -216,8 +216,8 @@ pub struct DuckLakeWriteOptions {
     /// takes [`InlinedFlushPolicy::default`], which never does.
     pub inlined_flush_policy: Option<InlinedFlushPolicy>,
     /// Extensions whose write hooks see every data file written (see
-    /// [`crate::extension`]). Empty by default.
-    pub extensions: crate::extension::DuckLakeExtensions,
+    /// `crate::extension`). Empty by default.
+    pub(crate) extensions: crate::extension::DuckLakeExtensions,
     /// The table's `ext_` settings, when these options were read from the
     /// catalog, so a write hook reads them without a query.
     ext_settings: Option<Arc<HashMap<String, String>>>,
@@ -319,6 +319,7 @@ impl DuckLakeWriteOptions {
         self
     }
 
+    unstable_extension_api! {
     /// Register `extension`'s write hook (see [`crate::extension`]).
     #[must_use]
     pub fn with_extension(
@@ -327,6 +328,14 @@ impl DuckLakeWriteOptions {
     ) -> Self {
         self.extensions = self.extensions.with(extension);
         self
+    }
+    }
+
+    unstable_extension_api! {
+    /// The extensions whose write hooks see every data file written.
+    pub fn extensions(&self) -> &crate::extension::DuckLakeExtensions {
+        &self.extensions
+    }
     }
 
     /// Sets when merge and rewrite first flush a table's inlined data

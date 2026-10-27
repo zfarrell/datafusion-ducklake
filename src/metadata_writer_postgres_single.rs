@@ -1129,6 +1129,11 @@ async fn finalize_table_snapshot(
 }
 
 impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
+    #[cfg(feature = "unstable-extensions")]
+    fn catalog_db(&self) -> Option<crate::extension::CatalogDb> {
+        Some(crate::extension::CatalogDb::postgres(&self.pool))
+    }
+
     fn drop_empty_superseded_inlined_tables(&self) -> Result<()> {
         self.block_on(async {
             // Staged commits create the registry on demand; without it there is
