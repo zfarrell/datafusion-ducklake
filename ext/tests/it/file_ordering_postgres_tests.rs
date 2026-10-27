@@ -18,6 +18,7 @@ use datafusion_ducklake::{
     MulticatalogManager, MulticatalogProvider, NullOrder, PostgresMetadataWriter, SortDirection,
     SortField,
 };
+use datafusion_ducklake_ext::db::ExtensionDb;
 use datafusion_ducklake_ext::file_order::{
     FileOrder, FileOrderTableExt, VerifyOrderOptions, prune_file_orders,
 };
@@ -60,10 +61,12 @@ fn batch(ts: impl IntoIterator<Item = i64>) -> RecordBatch {
     .unwrap()
 }
 
-fn ext_options(enabled: bool) -> DuckLakeWriteOptions {
+fn ext_options(pool: &PgPool, enabled: bool) -> DuckLakeWriteOptions {
     let mut options = DuckLakeWriteOptions::default().with_data_inlining_row_limit(0);
     if enabled {
-        options = options.with_extension(Arc::new(FileOrder));
+        options = options.with_extension(Arc::new(FileOrder::new(ExtensionDb::postgres(
+            pool.clone(),
+        ))));
     }
     // Rows land in the order given, so a test decides which files are sorted.
     options.sort_on_insert = Some(false);
@@ -98,7 +101,7 @@ impl Env {
             .unwrap();
         let created = DuckLakeTableWriter::new(writer.clone(), Arc::new(LocalFileSystem::new()))
             .unwrap()
-            .with_options(&ext_options(false))
+            .with_options(&ext_options(&env.pool, false))
             .write_table("public", "logs", &[batch([0])])
             .await
             .unwrap();
@@ -124,7 +127,7 @@ impl Env {
     async fn append(&self, pool: &PgPool, rows: RecordBatch, ext_file_order: bool) {
         DuckLakeTableWriter::new(self.writer(pool).await, Arc::new(LocalFileSystem::new()))
             .unwrap()
-            .with_options(&ext_options(ext_file_order))
+            .with_options(&ext_options(pool, ext_file_order))
             .append_table("public", "logs", &[rows])
             .await
             .unwrap();
@@ -137,7 +140,9 @@ impl Env {
         let catalog =
             DuckLakeCatalog::with_writer(Arc::new(provider), self.writer(&self.pool).await)
                 .unwrap()
-                .with_extension(Arc::new(FileOrder));
+                .with_extension(Arc::new(FileOrder::new(ExtensionDb::postgres(
+                    self.pool.clone(),
+                ))));
         let ctx = SessionContext::new_with_config(
             SessionConfig::new()
                 .with_target_partitions(partitions)
@@ -149,19 +154,17 @@ impl Env {
 
     async fn sidecar_rows(&self) -> i64 {
         let exists: bool =
-            sqlx::query_scalar("SELECT to_regclass('ext_ducklake_file_fact') IS NOT NULL")
+            sqlx::query_scalar("SELECT to_regclass('ext_ducklake_file_order') IS NOT NULL")
                 .fetch_one(&self.pool)
                 .await
                 .unwrap();
         if !exists {
             return -1;
         }
-        sqlx::query_scalar(
-            "SELECT count(*) FROM ext_ducklake_file_fact WHERE extension = 'file_order'",
-        )
-        .fetch_one(&self.pool)
-        .await
-        .unwrap()
+        sqlx::query_scalar("SELECT count(*) FROM ext_ducklake_file_order")
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
     }
 }
 
@@ -312,7 +315,9 @@ async fn multicatalog_records_verifies_and_declares() {
     }
     // Every row's file is listed: nothing to prune.
     assert_eq!(
-        prune_file_orders(env.writer(&env.pool).await.as_ref()).unwrap(),
+        prune_file_orders(&ExtensionDb::postgres(env.pool.clone()))
+            .await
+            .unwrap(),
         0
     );
 }
@@ -332,7 +337,7 @@ async fn sidecar_it_cannot_write_never_fails_a_write() {
         "GRANT USAGE, CREATE ON SCHEMA public TO w",
         "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO w",
         "GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO w",
-        "REVOKE ALL ON ext_ducklake_file_fact FROM w",
+        "REVOKE ALL ON ext_ducklake_file_order FROM w",
     ] {
         sqlx::query(sql).execute(&env.pool).await.unwrap();
     }
@@ -344,7 +349,7 @@ async fn sidecar_it_cannot_write_never_fails_a_write() {
         assert_matches_reference(&env.ctx(partitions).await, TOP_N).await;
     }
 
-    sqlx::query("GRANT SELECT, INSERT, UPDATE ON ext_ducklake_file_fact TO w")
+    sqlx::query("GRANT SELECT, INSERT, UPDATE ON ext_ducklake_file_order TO w")
         .execute(&env.pool)
         .await
         .unwrap();

@@ -1,28 +1,23 @@
 //! The write side of the file index: postings built from every row a write
-//! puts in a file, stored as an object beside it, and recorded as a fact.
-//!
-//! One fact per (data file, indexed column): extension [`super::NAME`], key
-//! the column id, value a JSON object holding the [`FileIndexMeta`] fields
-//! that are not the fact's own (path, size, key), plus the object's full
-//! store key (`index_key`, kept because prune runs after expiry, when the
-//! table's path chain may no longer resolve) and who built it (`built_by`).
-//! `row_group_rows`, `heavy_hitters` and `bucket_counts` hold their own JSON
-//! encodings as strings, so malformed counts lose only the counts.
+//! puts in a file, stored as an object beside it, and recorded as a row of
+//! [`super::table`].
 //!
 //! Indexes come from writes and compaction outputs and from
 //! [`super::FileIndexTableExt::build_file_indexes`]. Writes are best effort:
-//! the index object is PUT after the data object, and the fact is recorded
-//! after the index object, so a fact never normally points at a missing
-//! object. Any failure warns and leaves the file unindexed.
+//! the index object is PUT after the data object, and its row is recorded
+//! after the index object and before the data file's commit, so a row never
+//! normally points at a missing object. Any failure warns and leaves the file
+//! unindexed.
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion_ducklake::extension::{
-    FileFact, FileObserver, FileWriteHook, StoredFile, WriteContext, WriteOrigin,
+    FileObserver, FileWriteHook, StoredFile, WriteContext, WriteOrigin,
 };
 use datafusion_ducklake::metadata_provider::DuckLakeTableFile;
 use datafusion_ducklake::{DuckLakeError, Result};
@@ -42,8 +37,8 @@ pub const COLUMNS_SETTING: &str = "ext_file_index_columns";
 /// heavy-hitter counts over ([`super::counts`]). Unset = no counts.
 pub const COUNT_COLUMN_SETTING: &str = "ext_file_index_count_column";
 
-/// One fact to record: the reader-facing meta, the object's store key, and
-/// what built it.
+/// One row of [`super::table`]: the reader-facing meta, the object's store
+/// key, and what built it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileIndexRow {
     pub meta: FileIndexMeta,
@@ -51,64 +46,6 @@ pub struct FileIndexRow {
     pub index_key: String,
     /// `write`, `compact` or `backfill`.
     pub built_by: String,
-}
-
-impl FileIndexRow {
-    /// This row as a [`FileFact`].
-    pub fn to_fact(&self) -> FileFact {
-        let meta = &self.meta;
-        FileFact {
-            path: meta.path.clone(),
-            file_size_bytes: meta.file_size_bytes,
-            key: meta.column_id,
-            value: serde_json::json!({
-                "index_path": meta.index_path,
-                "index_key": self.index_key,
-                "index_size_bytes": meta.index_size_bytes,
-                "format_version": meta.format_version,
-                "value_type": meta.value_type.as_str(),
-                "row_count": meta.row_count,
-                "row_group_rows": super::format::row_group_rows_to_json(&meta.row_group_rows),
-                "heavy_hitters": super::format::heavy_hitters_to_json(&meta.heavy_hitters),
-                "built_by": self.built_by,
-                "bucket_counts": meta.bucket_counts.as_ref().map(super::counts::bucket_counts_to_json),
-            })
-            .to_string(),
-        }
-    }
-
-    /// A [`FileFact`] read back. `None` for one this build cannot interpret
-    /// (unknown value type, malformed JSON), which a reader treats like a
-    /// missing fact.
-    pub fn from_fact(fact: &FileFact) -> Option<Self> {
-        let value: serde_json::Value = serde_json::from_str(&fact.value).ok()?;
-        let text = |name: &str| value.get(name)?.as_str();
-        let value_type = IndexValueType::parse(text("value_type")?)?;
-        Some(Self {
-            meta: FileIndexMeta {
-                path: fact.path.clone(),
-                file_size_bytes: fact.file_size_bytes,
-                column_id: fact.key,
-                index_path: text("index_path")?.to_string(),
-                index_size_bytes: value.get("index_size_bytes")?.as_i64()?,
-                format_version: i32::try_from(value.get("format_version")?.as_i64()?).ok()?,
-                value_type,
-                row_count: value.get("row_count")?.as_i64()?,
-                row_group_rows: super::format::row_group_rows_from_json(text("row_group_rows")?)
-                    .ok()?,
-                heavy_hitters: super::format::heavy_hitters_from_json(
-                    text("heavy_hitters")?,
-                    value_type,
-                )
-                .ok()?,
-                // Malformed counts lose only the counts, never the index.
-                bucket_counts: text("bucket_counts")
-                    .and_then(|counts| super::counts::bucket_counts_from_json(counts, value_type)),
-            },
-            index_key: text("index_key")?.to_string(),
-            built_by: text("built_by").unwrap_or_default().to_string(),
-        })
-    }
 }
 
 /// Parse [`COLUMNS_SETTING`]: trimmed, non-empty, de-duplicated names.
@@ -139,6 +76,8 @@ pub(crate) struct BackfillConfig {
     /// `(path, size, column)` already indexed: a file is read only for the
     /// columns it lacks, and not at all when it lacks none.
     pub(crate) done: HashSet<(String, i64, String)>,
+    /// Bytes of the index objects this backfill wrote.
+    pub(crate) bytes_written: AtomicU64,
 }
 
 /// The write hook: postings for the table's declared columns, and on a
@@ -147,6 +86,7 @@ pub(crate) struct BackfillConfig {
 /// than failing it.
 pub(crate) fn write_hook(
     ctx: &WriteContext<'_>,
+    shared: &Arc<super::Shared>,
     backfill: Option<&Arc<BackfillConfig>>,
 ) -> Result<Option<Arc<dyn FileWriteHook>>> {
     let setting = |key: &str| match ctx.setting(key) {
@@ -176,6 +116,8 @@ pub(crate) fn write_hook(
         _ => None,
     };
     Ok(Some(Arc::new(IndexWriteHook {
+        shared: Arc::clone(shared),
+        table_id: ctx.table_id,
         store: Arc::clone(ctx.object_store),
         built_by: match ctx.origin {
             WriteOrigin::Compaction => BUILT_BY_COMPACT,
@@ -190,6 +132,8 @@ pub(crate) fn write_hook(
 
 #[derive(Debug)]
 struct IndexWriteHook {
+    shared: Arc<super::Shared>,
+    table_id: i64,
     store: Arc<dyn ObjectStore>,
     built_by: &'static str,
     declared: Vec<String>,
@@ -206,7 +150,12 @@ impl FileWriteHook for IndexWriteHook {
             self.ts_column.as_deref(),
             file_schema,
         )?;
-        Some(Box::new(IndexObserver(request.builders())))
+        Some(Box::new(IndexObserver {
+            builders: request.builders(),
+            shared: Arc::clone(&self.shared),
+            table_id: self.table_id,
+            backfill: self.backfill.clone(),
+        }))
     }
 
     /// The declared columns `file` has no index of yet, and the count column
@@ -238,20 +187,30 @@ impl FileWriteHook for IndexWriteHook {
 }
 
 #[derive(Debug)]
-struct IndexObserver(FileIndexBuilders);
+struct IndexObserver {
+    builders: FileIndexBuilders,
+    shared: Arc<super::Shared>,
+    table_id: i64,
+    backfill: Option<Arc<BackfillConfig>>,
+}
 
 #[async_trait]
 impl FileObserver for IndexObserver {
     fn observe(&mut self, batch: &RecordBatch) -> Result<()> {
-        self.0.observe(batch);
+        self.builders.observe(batch);
         Ok(())
     }
 
-    /// Build and PUT the index objects; their facts, once stored.
-    async fn stored(self: Box<Self>, file: &StoredFile) -> Result<Vec<FileFact>> {
-        let builders = self.0;
+    /// Build and PUT the index objects, then record their rows.
+    async fn stored(self: Box<Self>, file: &StoredFile) -> Result<()> {
+        let Self {
+            builders,
+            shared,
+            table_id,
+            backfill,
+        } = *self;
         let request = builders.request.clone();
-        request
+        let rows = request
             .build(
                 &file.catalog_path,
                 &file.object_path,
@@ -259,7 +218,18 @@ impl FileObserver for IndexObserver {
                 builders,
                 file.row_group_rows.clone(),
             )
-            .await
+            .await?;
+        super::table::record(&shared.db, table_id, &rows).await?;
+        for row in rows {
+            if let Some(backfill) = &backfill {
+                backfill
+                    .bytes_written
+                    .fetch_add(row.meta.index_size_bytes.max(0) as u64, Ordering::Relaxed);
+            }
+            let (path, column_id) = (row.meta.path.clone(), row.meta.column_id);
+            shared.memo.put(table_id, &path, column_id, row.meta);
+        }
+        Ok(())
     }
 }
 
@@ -371,8 +341,8 @@ impl FileIndexRequest {
 
     /// Build and PUT the indexes of the finished file at catalog `path`
     /// (relative to the table directory, as committed), stored at
-    /// `data_object`, and return their facts for core to record. Called after
-    /// the data object is stored.
+    /// `data_object`, and return their rows to record. Called after the data
+    /// object is stored.
     pub(crate) async fn build(
         &self,
         path: &str,
@@ -380,7 +350,7 @@ impl FileIndexRequest {
         file_size_bytes: i64,
         builders: FileIndexBuilders,
         row_group_rows: Vec<u64>,
-    ) -> Result<Vec<FileFact>> {
+    ) -> Result<Vec<FileIndexRow>> {
         if builders.failed {
             return Err(DuckLakeError::Internal("postings incomplete".to_string()));
         }
@@ -394,7 +364,7 @@ impl FileIndexRequest {
                 row_group_rows.iter().sum::<u64>()
             )));
         }
-        let mut facts = Vec::with_capacity(builders.columns.len());
+        let mut rows = Vec::with_capacity(builders.columns.len());
         for (column, builder) in builders.columns {
             let groups = row_group_rows.clone();
             // CPU-bound (sort + encode); off the async worker.
@@ -412,22 +382,19 @@ impl FileIndexRequest {
                 )
                 .await
                 .map_err(|e| DuckLakeError::Internal(e.to_string()))?;
-            facts.push(
-                FileIndexRow {
-                    meta: built.meta(
-                        path,
-                        file_size_bytes,
-                        column.column_id,
-                        column.value_type,
-                        index_path,
-                    ),
-                    index_key,
-                    built_by: self.0.built_by.to_string(),
-                }
-                .to_fact(),
-            );
+            rows.push(FileIndexRow {
+                meta: built.meta(
+                    path,
+                    file_size_bytes,
+                    column.column_id,
+                    column.value_type,
+                    index_path,
+                ),
+                index_key,
+                built_by: self.0.built_by.to_string(),
+            });
         }
-        Ok(facts)
+        Ok(rows)
     }
 }
 
@@ -500,64 +467,10 @@ impl FileIndexBuilders {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::file_index::format::IndexKey;
 
     #[test]
     fn columns_setting_parses() {
         assert_eq!(parse_columns_setting(" a, b ,,a,c "), vec!["a", "b", "c"]);
         assert!(parse_columns_setting("").is_empty());
-    }
-
-    #[test]
-    fn a_row_survives_its_fact() {
-        let row = FileIndexRow {
-            meta: FileIndexMeta {
-                path: "a/b.parquet".into(),
-                file_size_bytes: 42,
-                column_id: 7,
-                index_path: "b.parquet.c7.v1.pidx".into(),
-                index_size_bytes: 9,
-                format_version: 1,
-                value_type: IndexValueType::Utf8,
-                row_count: 3,
-                row_group_rows: vec![2, 1],
-                heavy_hitters: vec![(IndexKey::Utf8(b"x".to_vec().into()), 2)],
-                bucket_counts: None,
-            },
-            index_key: "t/a/b.parquet.c7.v1.pidx".into(),
-            built_by: "write".into(),
-        };
-        let fact = row.to_fact();
-        assert_eq!((fact.key, fact.file_size_bytes), (7, 42));
-        assert_eq!(FileIndexRow::from_fact(&fact), Some(row));
-    }
-
-    #[test]
-    fn malformed_counts_lose_only_the_counts() {
-        let mut fact = FileIndexRow {
-            meta: FileIndexMeta {
-                path: "p".into(),
-                file_size_bytes: 1,
-                column_id: 1,
-                index_path: "i".into(),
-                index_size_bytes: 1,
-                format_version: 1,
-                value_type: IndexValueType::Int64,
-                row_count: 1,
-                row_group_rows: vec![1],
-                heavy_hitters: vec![],
-                bucket_counts: None,
-            },
-            index_key: "k".into(),
-            built_by: "write".into(),
-        }
-        .to_fact();
-        let mut value: serde_json::Value = serde_json::from_str(&fact.value).unwrap();
-        value["bucket_counts"] = serde_json::Value::String("{\"v\":1".into());
-        fact.value = value.to_string();
-        let row = FileIndexRow::from_fact(&fact).unwrap();
-        assert_eq!(row.meta.bucket_counts, None);
-        fact.value = "{".into();
-        assert_eq!(FileIndexRow::from_fact(&fact), None);
     }
 }

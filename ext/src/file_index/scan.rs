@@ -13,8 +13,8 @@
 //! row count) means "scan the file as before".
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::Schema;
 use async_trait::async_trait;
@@ -23,7 +23,6 @@ use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::{BinaryExpr, Column, InListExpr, Literal};
 use datafusion_datasource_parquet::ParquetAccessPlan;
 use datafusion_ducklake::extension::{FileSelection, ScanContext, ScanFile, ScanHook};
-use datafusion_ducklake::metadata_provider::MetadataProvider;
 use futures::StreamExt;
 use object_store::path::Path as ObjectPath;
 
@@ -315,105 +314,10 @@ impl ScanSummary {
 // The scan hook
 // ---------------------------------------------------------------------------
 
-/// Entries a table's fact memo keeps before it starts over.
-pub(crate) const MEMO_MAX_ENTRIES: usize = 200_000;
-
-/// How long a remembered absence of a fact holds, so a backfill is picked up.
-const ABSENT_TTL: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// The index facts a catalog's scans of one table have read, by `(path,
-/// column_id)`, kept across queries ([`ScanContext::shared_state`]). A fact
-/// describes immutable bytes (it is checked against the listed size on use),
-/// so it is kept; an absence is kept only briefly, so a backfill is picked up.
-#[derive(Debug, Default)]
-pub(crate) struct IndexMemo(Mutex<HashMap<(String, i64), MemoEntry>>);
-
-#[derive(Clone, Debug)]
-enum MemoEntry {
-    Row(Arc<FileIndexMeta>),
-    /// No fact when asked at this instant.
-    Absent(std::time::Instant),
-}
-
-impl IndexMemo {
-    /// The facts for `paths` x `column_ids`, by `(path, column_id)`: one query
-    /// for the pairs not yet known, none once all are. A failed lookup is
-    /// remembered as nothing, so the next scan asks again.
-    pub(crate) fn rows(
-        &self,
-        provider: &dyn MetadataProvider,
-        table_id: i64,
-        paths: &[&str],
-        column_ids: &[i64],
-    ) -> HashMap<(String, i64), Arc<FileIndexMeta>> {
-        let lock = || {
-            self.0
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-        };
-        let known = |entry: Option<&MemoEntry>| match entry {
-            Some(MemoEntry::Row(_)) => true,
-            Some(MemoEntry::Absent(at)) => at.elapsed() < ABSENT_TTL,
-            None => false,
-        };
-        let unknown: Vec<&str> = {
-            let memo = lock();
-            paths
-                .iter()
-                .copied()
-                .filter(|path| {
-                    column_ids
-                        .iter()
-                        .any(|&c| !known(memo.get(&(path.to_string(), c))))
-                })
-                .collect()
-        };
-        // The lock is not held across the query: a concurrent scan may ask
-        // too, and both store the same answer.
-        if !unknown.is_empty() {
-            match super::file_index_rows(provider, table_id, &unknown, column_ids) {
-                Ok(rows) => {
-                    let now = std::time::Instant::now();
-                    let mut memo = lock();
-                    if memo.len() + unknown.len() * column_ids.len() > MEMO_MAX_ENTRIES {
-                        memo.clear();
-                    }
-                    for &path in &unknown {
-                        for &c in column_ids {
-                            memo.insert((path.to_string(), c), MemoEntry::Absent(now));
-                        }
-                    }
-                    for row in rows {
-                        if column_ids.contains(&row.meta.column_id) {
-                            memo.insert(
-                                (row.meta.path.clone(), row.meta.column_id),
-                                MemoEntry::Row(Arc::new(row.meta)),
-                            );
-                        }
-                    }
-                },
-                Err(error) => {
-                    tracing::debug!(%error, "file_index lookup failed; scanning without it");
-                },
-            }
-        }
-        let memo = lock();
-        let mut out = HashMap::new();
-        for &path in paths {
-            for &c in column_ids {
-                let key = (path.to_string(), c);
-                if let Some(MemoEntry::Row(row)) = memo.get(&key) {
-                    out.insert(key, Arc::clone(row));
-                }
-            }
-        }
-        out
-    }
-}
-
 /// One scan's use of the index: the conjuncts it can answer.
 #[derive(Debug)]
 pub(crate) struct IndexScanHook {
+    pub(crate) shared: Arc<super::Shared>,
     pub(crate) predicates: Vec<IndexPredicate>,
 }
 
@@ -457,12 +361,7 @@ impl IndexScanHook {
         column_ids.sort_unstable();
         column_ids.dedup();
         let paths: Vec<&str> = files.iter().map(|f| f.file.file.path.as_str()).collect();
-        let rows = ctx.shared_state.get_or_default::<IndexMemo>().rows(
-            ctx.metadata.as_ref(),
-            ctx.table_id,
-            &paths,
-            &column_ids,
-        );
+        let rows = self.shared.rows(ctx.table_id, &paths, &column_ids).await;
 
         let meta_for = |f: &ScanFile<'_>, p: &IndexPredicate| {
             usable_meta(
@@ -511,7 +410,9 @@ impl IndexScanHook {
                     let meta = Arc::clone(&rows[&(f.file.file.path.clone(), predicate.column_id)]);
                     lookups.push((
                         f.file.data_file_id,
-                        index_location(f.location, &meta),
+                        f.location()
+                            .ok()
+                            .and_then(|location| index_location(&location, &meta)),
                         meta,
                         f.selectable,
                     ));

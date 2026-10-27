@@ -31,11 +31,13 @@ use datafusion_ducklake::{
     DuckLakeWriteOptions, MergeOptions, MetadataWriter, NullOrder, SortDirection, SortField,
     SqliteMetadataProvider, SqliteMetadataWriter, WriteMode,
 };
+use datafusion_ducklake_ext::db::ExtensionDb;
 use datafusion_ducklake_ext::file_index::format::{
     FileIndexMeta, IndexValueType, PostingBuilder, index_file_name,
 };
+use datafusion_ducklake_ext::file_index::table as index_table;
 use datafusion_ducklake_ext::file_index::{
-    self, FileIndex, FileIndexRow, FileIndexSessionOptions, file_index_rows,
+    FileIndex, FileIndexRow, FileIndexSessionOptions, file_index_rows,
 };
 use datafusion_ducklake_ext::file_order::FileOrder;
 
@@ -101,6 +103,8 @@ struct Env {
     table_id: i64,
     /// Writes (and compaction) build indexes for the declared columns.
     write_index: bool,
+    /// The catalog database's pool: the extensions', and the test's own SQL.
+    pool: sqlx::SqlitePool,
 }
 
 impl Env {
@@ -121,11 +125,16 @@ impl Env {
             .unwrap()
     }
 
+    fn db(&self) -> ExtensionDb {
+        ExtensionDb::sqlite(self.pool.clone())
+    }
+
     fn write_options(&self) -> DuckLakeWriteOptions {
-        let mut options = DuckLakeWriteOptions::default().with_extension(Arc::new(FileOrder));
+        let mut options =
+            DuckLakeWriteOptions::default().with_extension(Arc::new(FileOrder::new(self.db())));
         options.max_row_group_rows = Some(ROW_GROUP_ROWS);
         if self.write_index {
-            options = options.with_extension(Arc::new(FileIndex::new()));
+            options = options.with_extension(Arc::new(FileIndex::new(self.db())));
         }
         options
     }
@@ -163,7 +172,7 @@ impl Env {
     }
 
     async fn pool(&self) -> sqlx::SqlitePool {
-        sqlx::SqlitePool::connect(&self.url()).await.unwrap()
+        self.pool.clone()
     }
 
     /// DuckLake column id of `name`.
@@ -205,15 +214,12 @@ impl Env {
         let column_id = self.column_id(column).await;
         let indexed: std::collections::HashSet<String> = {
             use sqlx::Row;
-            sqlx::query(
-                "SELECT path FROM ext_ducklake_file_fact
-                 WHERE extension = 'file_index' AND fact_key = ?",
-            )
-            .bind(column_id)
-            .fetch_all(&self.pool().await)
-            .await
-            .map(|rows| rows.iter().map(|r| r.get::<String, _>(0)).collect())
-            .unwrap_or_default()
+            sqlx::query("SELECT path FROM ext_ducklake_file_index WHERE column_id = ?")
+                .bind(column_id)
+                .fetch_all(&self.pool().await)
+                .await
+                .map(|rows| rows.iter().map(|r| r.get::<String, _>(0)).collect())
+                .unwrap_or_default()
         };
         let on_disk = parquet_files(&self.data_path());
         let mut metas = Vec::new();
@@ -260,23 +266,18 @@ impl Env {
             });
         }
         let n = metas.len();
-        self.writer()
+        index_table::record(&self.db(), self.table_id, &metas)
             .await
-            .record_file_facts(
-                file_index::NAME,
-                self.table_id,
-                &metas.iter().map(FileIndexRow::to_fact).collect::<Vec<_>>(),
-            )
             .unwrap();
         n
     }
 
     async fn index_rows(&self) -> Vec<FileIndexMeta> {
-        let provider = SqliteMetadataProvider::new(&self.url()).await.unwrap();
         let paths: Vec<String> = self.data_files().await.into_iter().map(|f| f.0).collect();
         let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
         let ids = [self.column_id("user_id").await, self.column_id("shard").await];
-        file_index_rows(&provider, self.table_id, &paths, &ids)
+        file_index_rows(&self.db(), self.table_id, &paths, &ids)
+            .await
             .unwrap()
             .into_iter()
             .map(|row| row.meta)
@@ -289,9 +290,9 @@ impl Env {
         // Registered with scans off rather than left out, so a session's
         // `SET ducklake_file_index.enabled = true` can still turn it on.
         let mut read = DuckLakeReadOptions::default()
-            .with_extension(Arc::new(FileIndex::new().with_scans(index)));
+            .with_extension(Arc::new(FileIndex::new(self.db()).with_scans(index)));
         if shape.order {
-            read = read.with_extension(Arc::new(FileOrder));
+            read = read.with_extension(Arc::new(FileOrder::new(self.db())));
         }
         let catalog = match shape.snapshot {
             Some(snapshot) => DuckLakeCatalog::with_snapshot(Arc::new(provider), snapshot)
@@ -353,10 +354,13 @@ const SHAPES: [Shape; 8] = [
 async fn setup() -> Env {
     let temp = TempDir::new().unwrap();
     std::fs::create_dir_all(temp.path().join("data")).unwrap();
+    let url = format!("sqlite:{}?mode=rwc", temp.path().join("test.db").display());
+    let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
     let env = Env {
         temp,
         table_id: 0,
         write_index: false,
+        pool,
     };
     let writer = env.writer().await;
     writer
@@ -712,8 +716,8 @@ async fn broken_indexes_fall_back() {
     let pool = env.pool().await;
     let files = env.data_files().await;
     sqlx::query(
-        "UPDATE ext_ducklake_file_fact SET file_size_bytes = file_size_bytes + 1
-         WHERE extension = 'file_index' AND path = ?",
+        "UPDATE ext_ducklake_file_index SET file_size_bytes = file_size_bytes + 1
+         WHERE path = ?",
     )
     .bind(&files[1].0)
     .execute(&pool)
@@ -741,15 +745,11 @@ async fn broken_indexes_fall_back() {
         std::fs::write(o, b"not an index").unwrap();
     }
     // A row claiming a different row count than the catalog's.
-    sqlx::query(
-        "UPDATE ext_ducklake_file_fact
-         SET value = json_set(value, '$.row_count', json_extract(value, '$.row_count') + 1)
-         WHERE extension = 'file_index' AND path = ?",
-    )
-    .bind(&files[4].0)
-    .execute(&pool)
-    .await
-    .unwrap();
+    sqlx::query("UPDATE ext_ducklake_file_index SET row_count = row_count + 1 WHERE path = ?")
+        .bind(&files[4].0)
+        .execute(&pool)
+        .await
+        .unwrap();
     assert_differential(&env, &SHAPES).await;
 }
 

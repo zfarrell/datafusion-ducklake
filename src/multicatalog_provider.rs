@@ -1727,48 +1727,6 @@ impl MetadataProvider for MulticatalogProvider {
         })
     }
 
-    fn file_facts(
-        &self,
-        extension: &str,
-        table_id: i64,
-        paths: &[&str],
-        keys: Option<&[i64]>,
-    ) -> Result<Vec<crate::extension::FileFact>> {
-        if paths.is_empty() || keys.is_some_and(<[i64]>::is_empty) {
-            return Ok(Vec::new());
-        }
-        block_on(async {
-            let rows = match self
-                .read_all(
-                    sqlx::query(
-                        "SELECT path, file_size_bytes, fact_key, value FROM ext_ducklake_file_fact
-                         WHERE extension = $1 AND table_id = $2 AND path = ANY($3)
-                           AND ($4::bigint[] IS NULL OR fact_key = ANY($4))",
-                    )
-                    .bind(extension)
-                    .bind(table_id)
-                    .bind(paths)
-                    .bind(keys),
-                )
-                .await
-            {
-                Ok(rows) => rows,
-                Err(e) if crate::file_facts::is_missing_table(&e) => return Ok(Vec::new()),
-                Err(e) => return Err(e.into()),
-            };
-            rows.iter()
-                .map(|row| {
-                    Ok(crate::extension::FileFact {
-                        path: row.try_get(0)?,
-                        file_size_bytes: row.try_get(1)?,
-                        key: row.try_get(2)?,
-                        value: row.try_get(3)?,
-                    })
-                })
-                .collect()
-        })
-    }
-
     fn get_table_file_metadata_page(
         &self,
         table_id: i64,

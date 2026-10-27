@@ -9,7 +9,6 @@ use datafusion::catalog::Session;
 use datafusion_ducklake::extension::{DuckLakeExtension, FileWriteHook, WriteContext};
 use datafusion_ducklake::{BackfillOptions, DuckLakeError, DuckLakeTable, Result};
 
-use super::FileIndexRow;
 use super::format::{BUCKET_GRAIN_HOUR_US, FILE_INDEX_FORMAT_VERSION, IndexValueType};
 use super::write::{BackfillConfig, COLUMNS_SETTING, COUNT_COLUMN_SETTING, parse_columns_setting};
 
@@ -102,6 +101,9 @@ pub trait FileIndexTableExt {
     /// size, column, format version and value type. A fact for a file
     /// compacted away meanwhile matches no live file and is dropped by
     /// [`super::prune_file_indexes`]. Idempotent.
+    ///
+    /// Facts go to the [`super::FileIndex`] registered in the table's read
+    /// options (`DuckLakeCatalog::with_extension` registers it there).
     async fn build_file_indexes(
         &self,
         state: &dyn Session,
@@ -112,7 +114,10 @@ pub trait FileIndexTableExt {
 /// [`FileIndex`]'s write hook for a backfill, with its overrides and the
 /// columns each file already has.
 #[derive(Debug)]
-struct IndexBackfill(Arc<BackfillConfig>);
+struct IndexBackfill {
+    shared: Arc<super::Shared>,
+    config: Arc<BackfillConfig>,
+}
 
 impl DuckLakeExtension for IndexBackfill {
     fn name(&self) -> &str {
@@ -120,7 +125,7 @@ impl DuckLakeExtension for IndexBackfill {
     }
 
     fn write_hook(&self, ctx: &WriteContext<'_>) -> Result<Option<Arc<dyn FileWriteHook>>> {
-        super::write::write_hook(ctx, Some(&self.0))
+        super::write::write_hook(ctx, &self.shared, Some(&self.config))
     }
 }
 
@@ -137,6 +142,12 @@ impl FileIndexTableExt for DuckLakeTable {
                     .to_string(),
             )
         })?;
+        let Some(index) = self.read_options().extensions.get::<super::FileIndex>() else {
+            return Err(DuckLakeError::InvalidConfig(
+                "build_file_indexes: no FileIndex registered on the table's read options"
+                    .to_string(),
+            ));
+        };
         let setting = |key: &str| match self.schema_name() {
             Some(schema_name) => writer.table_setting(schema_name, self.table_name(), key),
             None => Ok(None),
@@ -203,29 +214,26 @@ impl FileIndexTableExt for DuckLakeTable {
         // The columns each file already has a usable index of.
         let files = self.data_files()?;
         let paths: Vec<&str> = files.iter().map(|tf| tf.file.path.as_str()).collect();
-        let done: HashSet<(String, i64, String)> = super::file_index_rows(
-            self.metadata_provider().as_ref(),
-            self.table_id(),
-            &paths,
-            &wanted_ids,
-        )?
-        .into_iter()
-        .map(|row| row.meta)
-        .filter_map(|meta| {
-            let (_, name, _) = wanted.iter().find(|(id, _, ty)| {
-                *id == meta.column_id
-                    && *ty == meta.value_type
-                    && meta.format_version == FILE_INDEX_FORMAT_VERSION
-            })?;
-            // With counts asked for, an index without them is rebuilt.
-            let counted = ts_wanted.is_none_or(|ts_id| {
-                meta.bucket_counts
-                    .as_ref()
-                    .is_some_and(|c| c.ts_column_id == ts_id && c.grain_us == BUCKET_GRAIN_HOUR_US)
-            });
-            counted.then(|| (meta.path, meta.file_size_bytes, name.clone()))
-        })
-        .collect();
+        let done: HashSet<(String, i64, String)> =
+            super::file_index_rows(index.db(), self.table_id(), &paths, &wanted_ids)
+                .await?
+                .into_iter()
+                .map(|row| row.meta)
+                .filter_map(|meta| {
+                    let (_, name, _) = wanted.iter().find(|(id, _, ty)| {
+                        *id == meta.column_id
+                            && *ty == meta.value_type
+                            && meta.format_version == FILE_INDEX_FORMAT_VERSION
+                    })?;
+                    // With counts asked for, an index without them is rebuilt.
+                    let counted = ts_wanted.is_none_or(|ts_id| {
+                        meta.bucket_counts.as_ref().is_some_and(|c| {
+                            c.ts_column_id == ts_id && c.grain_us == BUCKET_GRAIN_HOUR_US
+                        })
+                    });
+                    counted.then(|| (meta.path, meta.file_size_bytes, name.clone()))
+                })
+                .collect();
 
         let mut backfill = BackfillOptions::default().with_parallelism(opts.parallelism);
         if let Some(ids) = opts.data_file_ids {
@@ -234,25 +242,30 @@ impl FileIndexTableExt for DuckLakeTable {
         if let Some(max) = opts.max_files {
             backfill = backfill.with_max_files(max);
         }
-        let config = BackfillConfig {
+        let config = Arc::new(BackfillConfig {
             columns: Some(wanted.iter().map(|(_, name, _)| name.clone()).collect()),
             count_column,
             done,
-        };
+            bytes_written: Default::default(),
+        });
         let result = self
-            .backfill(state, Arc::new(IndexBackfill(Arc::new(config))), backfill)
+            .backfill(
+                state,
+                Arc::new(IndexBackfill {
+                    shared: Arc::clone(&index.shared),
+                    config: Arc::clone(&config),
+                }),
+                backfill,
+            )
             .await?;
         Ok(BuildIndexResult {
             files_indexed: result.files_read,
             files_skipped: result.files_skipped,
             files_failed: result.files_failed,
             bytes_read: result.bytes_read,
-            bytes_written: result
-                .facts
-                .iter()
-                .filter_map(FileIndexRow::from_fact)
-                .map(|row| row.meta.index_size_bytes.max(0) as u64)
-                .sum(),
+            bytes_written: config
+                .bytes_written
+                .load(std::sync::atomic::Ordering::Relaxed),
         })
     }
 }

@@ -17,8 +17,8 @@ use parquet::arrow::arrow_reader::ArrowReaderMetadata;
 use parquet::arrow::async_reader::{AsyncFileReader, ParquetRecordBatchStreamBuilder};
 
 use crate::extension::{
-    DuckLakeExtension, DuckLakeExtensions, FileFact, FileHooks, StoredFile, WriteContext,
-    WriteLookups, WriteOrigin,
+    DuckLakeExtension, DuckLakeExtensions, FileHooks, StoredFile, WriteContext, WriteLookups,
+    WriteOrigin,
 };
 use crate::metadata_provider::DuckLakeTableFile;
 use crate::table::DuckLakeTable;
@@ -74,8 +74,6 @@ pub struct BackfillResult {
     pub files_failed: u64,
     /// Compressed bytes of the column chunks read.
     pub bytes_read: u64,
-    /// The facts recorded, in the order their files finished.
-    pub facts: Vec<FileFact>,
 }
 
 enum Outcome {
@@ -87,6 +85,7 @@ enum Outcome {
 }
 
 impl DuckLakeTable {
+    unstable_extension_api! {
     /// Run `extension`'s write hook over live data files as if they were being
     /// written now ([`WriteOrigin::Backfill`]): files written before the
     /// extension was on, by another DuckLake client, or registered as is. No
@@ -96,9 +95,9 @@ impl DuckLakeTable {
     /// ([`FileWriteHook::backfill_columns`](crate::extension::FileWriteHook::backfill_columns))
     /// are read, located by field id (by name in a file without field ids),
     /// cast to the catalog's types and fed to the observers in file order,
-    /// as the reader sees them. A column the file lacks is left out. A file's
-    /// facts are recorded as soon as it is done, so an interrupted pass keeps
-    /// its progress.
+    /// as the reader sees them. A column the file lacks, or whose type does
+    /// not cast to the catalog's, is left out. Each observer keeps what it
+    /// learns as its file finishes, so an interrupted pass keeps its progress.
     pub async fn backfill(
         &self,
         state: &dyn Session,
@@ -212,9 +211,9 @@ impl DuckLakeTable {
                     result.files_failed += 1;
                 },
             }
-            result.facts.extend(hooks.record());
         }
         Ok(result)
+    }
     }
 
     /// Read `tf`'s `wanted` columns (`None` = all) and feed them to the
@@ -273,7 +272,14 @@ impl DuckLakeTable {
                     .iter()
                     .position(|f| field_id(f) == Some(column_ids[index]))
             };
-            if let Some(root) = root {
+            // A type the cast cannot take fails every batch: left out, as the
+            // column of a file that lacks it.
+            if let Some(root) = root
+                && arrow::compute::can_cast_types(
+                    file_schema.field(root).data_type(),
+                    field.data_type(),
+                )
+            {
                 columns.push((index, root));
             }
         }

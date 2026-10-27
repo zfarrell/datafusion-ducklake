@@ -10,7 +10,8 @@
 //! hourly counts from the index's per-file bucket counts.
 //!
 //! - [`format`]: the index object and its metadata (no catalog or scan logic).
-//! - `write`: the write hook and the facts it records.
+//! - `write`: the write hook.
+//! - [`table`]: the catalog table that records each index object.
 //! - [`scan`]: the scan hook.
 //! - [`counts`]: hourly counts.
 
@@ -18,8 +19,10 @@ mod backfill;
 pub mod counts;
 pub mod format;
 pub mod scan;
+pub mod table;
 mod write;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,36 +30,101 @@ use datafusion::common::config::ConfigExtension;
 use datafusion_ducklake::extension::{
     DuckLakeExtension, FileWriteHook, ScanContext, ScanHook, WriteContext,
 };
-use datafusion_ducklake::metadata_provider::MetadataProvider;
-use datafusion_ducklake::metadata_writer::MetadataWriter;
 use object_store::{ObjectStore, ObjectStoreExt};
+
+use crate::db::{ExtensionDb, Found, RowMemo};
+use format::FileIndexMeta;
 
 pub use backfill::{BuildIndexOptions, BuildIndexResult, FileIndexTableExt};
 pub use write::{COLUMNS_SETTING, COUNT_COLUMN_SETTING, FileIndexRow, object_key};
 
-/// The extension's name, which namespaces its facts.
+/// The extension's name.
 pub const NAME: &str = "file_index";
+
+/// Index rows a [`FileIndex`] keeps in memory, across its tables.
+const MEMO_MAX_ENTRIES: u64 = 200_000;
 
 /// The file index extension. See the module docs.
 #[derive(Debug, Clone)]
 pub struct FileIndex {
     scans: bool,
     counts: bool,
+    shared: Arc<Shared>,
 }
 
-impl Default for FileIndex {
-    fn default() -> Self {
-        Self {
-            scans: true,
-            counts: false,
-        }
+/// What every clone of one [`FileIndex`] shares: its database, and what it
+/// has read from it.
+#[derive(Debug)]
+pub(crate) struct Shared {
+    pub(crate) db: ExtensionDb,
+    pub(crate) memo: RowMemo<FileIndexMeta>,
+}
+
+/// `read`'s rows as the memo keeps them.
+async fn found(
+    db: &ExtensionDb,
+    table_id: i64,
+    paths: Vec<String>,
+    column_ids: &[i64],
+) -> datafusion_ducklake::Result<Found<FileIndexMeta>> {
+    Ok(table::read(db, table_id, &paths, column_ids)
+        .await?
+        .into_iter()
+        .map(|row| ((row.meta.path.clone(), row.meta.column_id), row.meta))
+        .collect())
+}
+
+impl Shared {
+    /// The index metas of `table_id`'s files at `paths` for `column_ids`, by
+    /// `(path, column_id)`. A caller applies one only when its size (and
+    /// format version and value type) match the listed file.
+    pub(crate) async fn rows(
+        &self,
+        table_id: i64,
+        paths: &[&str],
+        column_ids: &[i64],
+    ) -> HashMap<(String, i64), Arc<FileIndexMeta>> {
+        self.memo
+            .get(table_id, paths, column_ids, |missing| {
+                found(&self.db, table_id, missing, column_ids)
+            })
+            .await
+    }
+
+    /// [`Self::rows`] from synchronous code: without a multi-threaded runtime
+    /// to block on, only the rows already in memory.
+    pub(crate) fn rows_blocking(
+        &self,
+        table_id: i64,
+        paths: &[&str],
+        column_ids: &[i64],
+    ) -> HashMap<(String, i64), Arc<FileIndexMeta>> {
+        self.memo
+            .get_blocking(table_id, paths, column_ids, |missing| {
+                found(&self.db, table_id, missing, column_ids)
+            })
     }
 }
 
 impl FileIndex {
-    /// Scans use the index; [`counts::BucketCountRule`] leaves the table alone.
-    pub fn new() -> Self {
-        Self::default()
+    /// Index rows kept in `db`, the catalog's database (the pool given to
+    /// core); scans use the index, and [`counts::BucketCountRule`] leaves the
+    /// table alone. Register one instance per catalog: rows are keyed by
+    /// table id.
+    pub fn new(db: ExtensionDb) -> Self {
+        Self {
+            scans: true,
+            counts: false,
+            shared: Arc::new(Shared {
+                db,
+                memo: RowMemo::new(NAME, MEMO_MAX_ENTRIES),
+            }),
+        }
+    }
+
+    /// Where the index rows are kept.
+    pub fn db(&self) -> &ExtensionDb {
+        &self.shared.db
     }
 
     /// Whether scans read the index to skip files and rows. On by default.
@@ -90,12 +158,12 @@ impl DuckLakeExtension for FileIndex {
         &self,
         ctx: &WriteContext<'_>,
     ) -> datafusion_ducklake::Result<Option<Arc<dyn FileWriteHook>>> {
-        write::write_hook(ctx, None)
+        write::write_hook(ctx, &self.shared, None)
     }
 
     /// `None` when scans are off, for the table or for the session
     /// ([`FileIndexSessionOptions`]), or when no filter is one the index
-    /// answers: the facts are then never read.
+    /// answers: the table is then never read.
     fn scan_hook(&self, ctx: &ScanContext<'_>) -> Option<Arc<dyn ScanHook>> {
         if !scans_enabled(ctx.session.config_options(), self.scans) {
             return None;
@@ -104,6 +172,7 @@ impl DuckLakeExtension for FileIndex {
             scan::eligible_predicates(ctx.filters, ctx.physical_schema, ctx.column_ids);
         (!predicates.is_empty()).then(|| {
             Arc::new(scan::IndexScanHook {
+                shared: Arc::clone(&self.shared),
                 predicates,
             }) as Arc<dyn ScanHook>
         })
@@ -134,51 +203,42 @@ impl ConfigExtension for FileIndexSessionOptions {
     const PREFIX: &'static str = "ducklake_file_index";
 }
 
-/// The index facts of `table_id`'s files at `paths` for `column_ids`. A
-/// caller applies one only when its size (and format version and value
-/// type) match the listed file; anything else, including no fact, means
-/// "scan normally". A fact this build cannot read is left out.
-pub fn file_index_rows(
-    provider: &dyn MetadataProvider,
+/// The index rows in `db` of `table_id`'s files at `paths` for `column_ids`,
+/// read now. A caller applies one only when its size (and format version and
+/// value type) match the listed file; anything else, including no row, means
+/// "scan normally". A row this build cannot read is left out.
+pub async fn file_index_rows(
+    db: &ExtensionDb,
     table_id: i64,
     paths: &[&str],
     column_ids: &[i64],
 ) -> datafusion_ducklake::Result<Vec<FileIndexRow>> {
-    if column_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    Ok(provider
-        .file_facts(NAME, table_id, paths, Some(column_ids))?
-        .iter()
-        .filter_map(FileIndexRow::from_fact)
-        .collect())
+    let paths: Vec<String> = paths.iter().map(|path| path.to_string()).collect();
+    table::read(db, table_id, &paths, column_ids).await
 }
 
-/// Drop the facts of index objects whose data file no catalog row lists any
-/// more and that are older than `min_age`, then delete those objects from
-/// `object_store`. Run it after expiry and cleanup; `min_age` must exceed the
-/// longest write still running, as for the orphan sweep's cutoff. Returns the
-/// keys deleted. An object already gone counts as deleted; any other delete
-/// failure is warned and left for the orphan sweep, since its fact is
-/// already gone.
+/// Drop the rows in `db` of index objects whose data file no catalog row
+/// lists any more and that are older than `min_age`, then delete those
+/// objects from `object_store`. Run it after expiry and cleanup; `min_age`
+/// must exceed the longest write still running, as for the orphan sweep's
+/// cutoff. Returns the keys deleted. An object already gone counts as
+/// deleted; any other delete failure is warned and left for the orphan
+/// sweep, since its row is already gone.
 pub async fn prune_file_indexes(
-    writer: &dyn MetadataWriter,
+    db: &ExtensionDb,
     object_store: Arc<dyn ObjectStore>,
     min_age: Duration,
 ) -> datafusion_ducklake::Result<Vec<String>> {
-    let pruned = writer.prune_file_facts(NAME, min_age)?;
+    let pruned = table::prune(db, min_age).await?;
     let mut deleted = Vec::with_capacity(pruned.len());
-    for fact in pruned {
-        let Some(row) = FileIndexRow::from_fact(&fact) else {
-            continue;
-        };
-        match object_store.delete(&object_key(&row.index_key)).await {
+    for index_key in pruned {
+        match object_store.delete(&object_key(&index_key)).await {
             Ok(())
             | Err(object_store::Error::NotFound {
                 ..
-            }) => deleted.push(row.index_key),
+            }) => deleted.push(index_key),
             Err(error) => {
-                tracing::warn!(%error, key = row.index_key, "file_index: pruned fact's object not deleted");
+                tracing::warn!(%error, key = index_key, "file_index: pruned row's object not deleted");
             },
         }
     }

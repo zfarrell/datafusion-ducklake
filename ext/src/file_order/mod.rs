@@ -7,36 +7,38 @@
 //! `DuckLakeCatalog::with_extension`). [`FileOrderTableExt::verify_file_orders`]
 //! records files written without it.
 //!
-//! A record is a [`FileFact`] of extension [`NAME`], key `0`, whose value is
-//! `{"sort_key": "<field_id>:<asc|desc>:<nulls_first|nulls_last>,...",
-//! "verified_by": "write" | "verify"}`. It describes the object at its path,
-//! which DuckLake never rewrites in place, so it holds at every snapshot that
-//! lists the file. A file without a record is scanned as it always was.
-//! [`prune_file_orders`] drops records whose file has left the catalog.
+//! A record is a row of [`table`], in the catalog's database. It describes
+//! the object at its path, which DuckLake never rewrites in place, so it
+//! holds at every snapshot that lists the file. A file without a record is
+//! scanned as it always was. [`prune_file_orders`] drops records whose file
+//! has left the catalog.
 
 mod check;
+pub mod table;
 mod verify;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow::compute::SortOptions;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion_ducklake::extension::{
-    DuckLakeExtension, FieldSort, FileFact, FileObserver, FileWriteHook, ScanContext, ScanFile,
-    ScanHook, StoredFile, WriteContext, WriteOrigin,
+    DuckLakeExtension, FieldSort, FileObserver, FileWriteHook, ScanContext, ScanFile, ScanHook,
+    StoredFile, WriteContext, WriteOrigin,
 };
 use datafusion_ducklake::metadata_provider::DuckLakeTableFile;
-use datafusion_ducklake::metadata_writer::MetadataWriter;
 use datafusion_ducklake::sort::{NullOrder, SortDirection};
 use parquet::file::metadata::SortingColumn;
 
+use crate::db::{ExtensionDb, Found, RowMemo};
 use check::{AttestedKey, SortCheck};
+use table::OrderRow;
 pub use verify::{FileOrderTableExt, VerifyOrderOptions, VerifyOrderResult};
 
-/// The extension's name, which namespaces its facts.
+/// The extension's name.
 pub const NAME: &str = "file_order";
 
 /// Recorded by the writer, for a file it wrote.
@@ -44,13 +46,38 @@ const BY_WRITE: &str = "write";
 /// Recorded by [`FileOrderTableExt::verify_file_orders`], after reading the file.
 const BY_VERIFY: &str = "verify";
 
-/// Recorded sort keys a catalog's tables keep across queries, by `(path,
-/// size)`: a record describes immutable bytes, so it never goes stale.
-const KNOWN_MAX_ENTRIES: usize = 200_000;
+/// Records a [`FileOrder`] keeps in memory, across its tables.
+const MEMO_MAX_ENTRIES: u64 = 200_000;
+
+/// A recorded file's size and sort key.
+type Recorded = (i64, String);
 
 /// The verified file order extension. See the module docs.
-#[derive(Debug, Default)]
-pub struct FileOrder;
+#[derive(Debug, Clone)]
+pub struct FileOrder(Arc<Shared>);
+
+#[derive(Debug)]
+struct Shared {
+    db: ExtensionDb,
+    memo: RowMemo<Recorded>,
+}
+
+impl FileOrder {
+    /// Records kept in `db`, the catalog's database (the pool given to
+    /// core). Register one instance per catalog: records are keyed by table
+    /// id.
+    pub fn new(db: ExtensionDb) -> Self {
+        Self(Arc::new(Shared {
+            db,
+            memo: RowMemo::new(NAME, MEMO_MAX_ENTRIES),
+        }))
+    }
+
+    /// Where the records are kept.
+    pub fn db(&self) -> &ExtensionDb {
+        &self.0.db
+    }
+}
 
 impl DuckLakeExtension for FileOrder {
     fn name(&self) -> &str {
@@ -65,19 +92,27 @@ impl DuckLakeExtension for FileOrder {
         &self,
         ctx: &WriteContext<'_>,
     ) -> datafusion_ducklake::Result<Option<Arc<dyn FileWriteHook>>> {
-        order_write_hook(ctx, None)
+        order_write_hook(ctx, &self.0, None)
     }
 
     fn scan_hook(&self, _ctx: &ScanContext<'_>) -> Option<Arc<dyn ScanHook>> {
-        Some(Arc::new(OrderScanHook))
+        Some(Arc::new(OrderScanHook(Arc::clone(&self.0))))
     }
 }
 
-/// The write hook for the table's live sort key. `skip` lists the files a
-/// backfill passes over: already recorded under that key.
+/// What a backfill adds to the write hook: the files to pass over (already
+/// recorded under the current key) and a count of the files it records.
+#[derive(Debug, Default)]
+struct VerifyPass {
+    recorded: HashSet<(String, i64)>,
+    files_recorded: AtomicU64,
+}
+
+/// The write hook for the table's live sort key.
 fn order_write_hook(
     ctx: &WriteContext<'_>,
-    skip: Option<Arc<HashSet<(String, i64)>>>,
+    shared: &Arc<Shared>,
+    verify: Option<Arc<VerifyPass>>,
 ) -> datafusion_ducklake::Result<Option<Arc<dyn FileWriteHook>>> {
     let Some(spec) = ctx.live_sort_spec()? else {
         return Ok(None);
@@ -86,6 +121,8 @@ fn order_write_hook(
         return Ok(None);
     };
     Ok(Some(Arc::new(OrderWriteHook {
+        shared: Arc::clone(shared),
+        table_id: ctx.table_id,
         verified_by: match ctx.origin {
             WriteOrigin::Backfill => BY_VERIFY,
             _ => BY_WRITE,
@@ -102,16 +139,18 @@ fn order_write_hook(
                 )
             })
             .collect(),
-        skip,
+        verify,
     })))
 }
 
 /// One write's check: the table's sort key, by column name.
 #[derive(Debug)]
 struct OrderWriteHook {
+    shared: Arc<Shared>,
+    table_id: i64,
     verified_by: &'static str,
     keys: Vec<(String, SortOptions)>,
-    skip: Option<Arc<HashSet<(String, i64)>>>,
+    verify: Option<Arc<VerifyPass>>,
 }
 
 impl FileWriteHook for OrderWriteHook {
@@ -130,15 +169,20 @@ impl FileWriteHook for OrderWriteHook {
             .collect::<Option<Vec<_>>>()?;
         let check = SortCheck::new(file_schema, &columns)?;
         Some(Box::new(OrderObserver {
+            shared: Arc::clone(&self.shared),
+            table_id: self.table_id,
             verified_by: self.verified_by,
             check,
+            verify: self.verify.clone(),
         }))
     }
 
     /// Only the key columns, and nothing of a file already recorded.
     fn backfill_columns(&self, file: &DuckLakeTableFile) -> Option<Vec<String>> {
-        let done = self.skip.as_ref().is_some_and(|skip| {
-            skip.contains(&(file.file.path.clone(), file.file.file_size_bytes))
+        let done = self.verify.as_ref().is_some_and(|verify| {
+            verify
+                .recorded
+                .contains(&(file.file.path.clone(), file.file.file_size_bytes))
         });
         Some(if done {
             Vec::new()
@@ -150,8 +194,11 @@ impl FileWriteHook for OrderWriteHook {
 
 #[derive(Debug)]
 struct OrderObserver {
+    shared: Arc<Shared>,
+    table_id: i64,
     verified_by: &'static str,
     check: SortCheck,
+    verify: Option<Arc<VerifyPass>>,
 }
 
 #[async_trait]
@@ -162,58 +209,39 @@ impl FileObserver for OrderObserver {
 
     /// A record when every row was in order; nothing otherwise, and the file
     /// reads as unordered, as it always did.
-    async fn stored(
-        self: Box<Self>,
-        file: &StoredFile,
-    ) -> datafusion_ducklake::Result<Vec<FileFact>> {
-        Ok(self
-            .check
-            .attestation()
-            .map(|sort_key| {
-                order_fact(
-                    &file.catalog_path,
-                    file.file_size_bytes,
-                    &sort_key,
-                    self.verified_by,
-                )
-            })
-            .into_iter()
-            .collect())
+    async fn stored(self: Box<Self>, file: &StoredFile) -> datafusion_ducklake::Result<()> {
+        let Some(sort_key) = self.check.attestation() else {
+            return Ok(());
+        };
+        let row = OrderRow {
+            path: file.catalog_path.clone(),
+            file_size_bytes: file.file_size_bytes,
+            sort_key: sort_key.clone(),
+        };
+        table::record(&self.shared.db, self.table_id, &row, self.verified_by).await?;
+        self.shared.memo.put(
+            self.table_id,
+            &file.catalog_path,
+            0,
+            (file.file_size_bytes, sort_key),
+        );
+        if let Some(verify) = &self.verify {
+            verify.files_recorded.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
     }
 }
 
-/// A record of `path` (of `file_size_bytes`) following `sort_key`, as a
-/// [`FileFact`] to record under [`NAME`].
-pub fn order_fact(path: &str, file_size_bytes: i64, sort_key: &str, verified_by: &str) -> FileFact {
-    FileFact {
-        path: path.to_string(),
-        file_size_bytes,
-        key: 0,
-        value: serde_json::json!({ "sort_key": sort_key, "verified_by": verified_by }).to_string(),
-    }
-}
-
-/// The sort key a record's value states; `None` for a value this build
-/// cannot read, which reads as no record.
-fn sort_key_of(value: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(value).ok()?;
-    Some(value.get("sort_key")?.as_str()?.to_string())
-}
-
-/// The records of `table_id`'s files at `paths`: each recorded file's path
-/// and size, with its sort key.
-fn recorded_orders(
-    provider: &dyn datafusion_ducklake::metadata_provider::MetadataProvider,
+/// The records of `table_id`'s files at `paths`, as the memo keeps them.
+async fn found(
+    db: &ExtensionDb,
     table_id: i64,
-    paths: &[&str],
-) -> datafusion_ducklake::Result<Vec<(String, i64, String)>> {
-    Ok(provider
-        .file_facts(NAME, table_id, paths, Some(&[0]))?
+    paths: Vec<String>,
+) -> datafusion_ducklake::Result<Found<Recorded>> {
+    Ok(table::read(db, table_id, &paths)
+        .await?
         .into_iter()
-        .filter_map(|fact| {
-            let sort_key = sort_key_of(&fact.value)?;
-            Some((fact.path, fact.file_size_bytes, sort_key))
-        })
+        .map(|row| ((row.path, 0), (row.file_size_bytes, row.sort_key)))
         .collect())
 }
 
@@ -221,102 +249,38 @@ fn recorded_orders(
 /// (expired, or never committed). Optional: such records are harmless. A
 /// record of a write still in flight can be dropped too, which leaves that
 /// file unknown, not wrong. Returns how many were dropped.
-/// `DuckLakeCatalog::prune_extension_facts` does this for every registered
-/// extension at once.
-pub fn prune_file_orders(writer: &dyn MetadataWriter) -> datafusion_ducklake::Result<u64> {
-    Ok(writer
-        .prune_file_facts(NAME, std::time::Duration::ZERO)?
-        .len() as u64)
+pub async fn prune_file_orders(db: &ExtensionDb) -> datafusion_ducklake::Result<u64> {
+    table::prune(db).await
 }
 
-/// Recorded sort keys by `(path, size)`, shared across a catalog's tables
-/// ([`ScanContext::shared_state`]). Only records: a record never goes stale.
-#[derive(Debug, Default)]
-struct KnownOrders(Mutex<HashMap<(String, i64), String>>);
-
-/// Files a table instance found without a record
-/// ([`ScanContext::table_state`]). Kept per instance, since the verify job
-/// may record them later: a table built for the next query asks again.
-#[derive(Debug, Default)]
-struct UnknownOrders(Mutex<HashSet<(String, i64)>>);
-
 #[derive(Debug)]
-struct OrderScanHook;
+struct OrderScanHook(Arc<Shared>);
 
 #[async_trait]
 impl ScanHook for OrderScanHook {
-    /// One query for the files neither memo knows, none once all are. A
-    /// failed lookup is remembered as nothing, so the next scan asks again.
-    fn orderings(
+    /// One read for the files the memo does not know, none once it knows
+    /// them all.
+    async fn orderings(
         &self,
         ctx: &ScanContext<'_>,
         files: &[ScanFile<'_>],
     ) -> HashMap<i64, Vec<FieldSort>> {
-        let known = ctx.shared_state.get_or_default::<KnownOrders>();
-        let unknown_memo = ctx.table_state.get_or_default::<UnknownOrders>();
-        let key = |f: &ScanFile<'_>| (f.file.file.path.clone(), f.file.file.file_size_bytes);
-        let known_lock = || {
-            known
-                .0
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-        };
-        let unknown_lock = || {
-            unknown_memo
-                .0
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-        };
-        let unknown: Vec<&ScanFile<'_>> = {
-            let known = known_lock();
-            let absent = unknown_lock();
-            files
-                .iter()
-                .filter(|f| {
-                    let key = key(f);
-                    !known.contains_key(&key) && !absent.contains(&key)
-                })
-                .collect()
-        };
-        // No lock is held across the query: a concurrent scan may ask too,
-        // and both store the same answer.
-        if !unknown.is_empty() {
-            let paths: Vec<&str> = unknown.iter().map(|f| f.file.file.path.as_str()).collect();
-            match recorded_orders(ctx.metadata.as_ref(), ctx.table_id, &paths) {
-                Ok(recorded) => {
-                    let mut recorded: HashMap<String, (i64, String)> = recorded
-                        .into_iter()
-                        .map(|(path, size, sort_key)| (path, (size, sort_key)))
-                        .collect();
-                    let mut known = known_lock();
-                    let mut absent = unknown_lock();
-                    if known.len() + unknown.len() > KNOWN_MAX_ENTRIES {
-                        known.clear();
-                    }
-                    for f in unknown {
-                        match recorded
-                            .remove(&f.file.file.path)
-                            .filter(|(size, _)| *size == f.file.file.file_size_bytes)
-                        {
-                            Some((_, sort_key)) => {
-                                known.insert(key(f), sort_key);
-                            },
-                            None => {
-                                absent.insert(key(f));
-                            },
-                        }
-                    }
-                },
-                Err(error) => {
-                    tracing::debug!(%error, "file_order lookup failed; scanning unordered");
-                },
-            }
-        }
-        let known = known_lock();
+        let paths: Vec<&str> = files.iter().map(|f| f.file.file.path.as_str()).collect();
+        let recorded = self
+            .0
+            .memo
+            .get(ctx.table_id, &paths, &[0], |missing| {
+                found(&self.0.db, ctx.table_id, missing)
+            })
+            .await;
         files
             .iter()
             .filter_map(|f| {
-                let keys = check::decode(known.get(&key(f))?)?;
+                let (size, sort_key) = recorded.get(&(f.file.file.path.clone(), 0))?.as_ref();
+                if *size != f.file.file.file_size_bytes {
+                    return None;
+                }
+                let keys = check::decode(sort_key)?;
                 Some((
                     f.file.data_file_id,
                     keys.iter()
@@ -331,10 +295,11 @@ impl ScanHook for OrderScanHook {
     }
 }
 
-/// [`FileOrder`]'s write hook for a backfill, passing over `recorded` files.
+/// [`FileOrder`]'s write hook for a backfill.
 #[derive(Debug)]
 struct VerifyOrder {
-    recorded: Arc<HashSet<(String, i64)>>,
+    shared: Arc<Shared>,
+    pass: Arc<VerifyPass>,
 }
 
 impl DuckLakeExtension for VerifyOrder {
@@ -346,6 +311,6 @@ impl DuckLakeExtension for VerifyOrder {
         &self,
         ctx: &WriteContext<'_>,
     ) -> datafusion_ducklake::Result<Option<Arc<dyn FileWriteHook>>> {
-        order_write_hook(ctx, Some(Arc::clone(&self.recorded)))
+        order_write_hook(ctx, &self.shared, Some(Arc::clone(&self.pass)))
     }
 }

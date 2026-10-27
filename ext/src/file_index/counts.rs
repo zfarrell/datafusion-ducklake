@@ -1042,17 +1042,14 @@ fn try_resolve_bucket_counts(
 ) -> Result<Resolution> {
     // Counts ignore deletes and snapshot filters, and are keyed by column id,
     // so only files read exactly as stored qualify.
+    let Some(index) = table.read_options().extensions.get::<super::FileIndex>() else {
+        return Ok(Resolution::default());
+    };
     let eligible = table.plain_files()?;
     let paths: Vec<&str> = eligible.iter().map(|tf| tf.file.path.as_str()).collect();
-    let rows = table
-        .shared_extension_state()
-        .get_or_default::<super::scan::IndexMemo>()
-        .rows(
-            table.metadata_provider().as_ref(),
-            table.table_id(),
-            &paths,
-            &[req.key_column_id],
-        );
+    let rows = index
+        .shared
+        .rows_blocking(table.table_id(), &paths, &[req.key_column_id]);
     let mut resolution = Resolution::default();
     for tf in &eligible {
         let Some(meta) = rows.get(&(tf.file.path.clone(), req.key_column_id)) else {

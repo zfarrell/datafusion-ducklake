@@ -39,14 +39,13 @@
 //!
 //! # Storing what an extension learns
 //!
-//! An extension returns facts about each written file from
-//! [`FileObserver::stored`], and core records a write's facts together
-//! ([`MetadataWriter::record_file_facts`](crate::metadata_writer::MetadataWriter::record_file_facts)).
-//! It reads them back with
-//! [`MetadataProvider::file_facts`](crate::metadata_provider::MetadataProvider::file_facts).
-//! A fact is keyed by table, path and size. DuckLake never rewrites a data file
-//! in place, so a fact stays true for as long as its file is listed. It needs
-//! no snapshot, and it may be recorded before the file's commit.
+//! Core stores nothing for an extension. An extension keeps what it learns
+//! about a file where it chooses, from [`FileObserver::stored`], which every
+//! write path calls once the file is uploaded and before its commit. Key it by
+//! the file's catalog path and size: DuckLake never rewrites a data file in
+//! place, so a record about the object at that path stays true for as long as
+//! the catalog lists it, at every snapshot. A record of a file whose write
+//! never commits matches no listed file.
 //!
 //! An extension may also store objects beside a data file. Name them
 //! `<data file key>.<suffix>`, where the data file key ends in `.parquet` and
@@ -73,7 +72,8 @@ use crate::metadata_provider::{DuckLakeTableFile, MetadataProvider};
 /// Code that adds work to a table's writes and scans. See the module docs for
 /// the contract every hook follows.
 pub trait DuckLakeExtension: std::any::Any + Send + Sync + fmt::Debug {
-    /// A stable name. It namespaces the extension's file facts.
+    /// A stable name. Registering a second extension of the same name
+    /// replaces the first.
     fn name(&self) -> &str;
 
     /// The per-file work for one write of a table, or `None` for none. Called
@@ -128,28 +128,6 @@ impl fmt::Debug for DuckLakeExtensions {
         f.debug_list()
             .entries(self.0.iter().map(|e| e.name()))
             .finish()
-    }
-}
-
-/// One record an extension keeps about a data file. See the module docs.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileFact {
-    /// The data file's catalog path (`ducklake_data_file.path`).
-    pub path: String,
-    /// The data file's size. A file of another size at `path` is another
-    /// file, and the fact does not apply to it.
-    pub file_size_bytes: i64,
-    /// Distinguishes several facts about one file, such as one per column.
-    /// Use `0` when there is one.
-    pub key: i64,
-    /// The extension's own encoding.
-    pub value: String,
-}
-
-impl FileFact {
-    /// Whether this fact describes `file`: same path and same size.
-    pub fn applies_to(&self, file: &DuckLakeTableFile) -> bool {
-        self.path == file.file.path && self.file_size_bytes == file.file.file_size_bytes
     }
 }
 
@@ -300,15 +278,12 @@ pub trait FileObserver: Send + fmt::Debug {
     /// observer for the rest of the file; the write goes on.
     fn observe(&mut self, batch: &arrow::record_batch::RecordBatch) -> crate::Result<()>;
 
-    /// The file is complete and stored at `file.object_path`, and the facts
-    /// to record about it. Core records the facts of a write together, one
-    /// call per extension, once the write's files are stored: usually after
-    /// its commit, and never as part of it. A fact describes the object, not
-    /// the catalog, so a file that never commits leaves facts that prune
-    /// drops.
-    /// An error means the observer could not finish its work for the file
-    /// (warned; a backfill counts the file as failed and retries it).
-    async fn stored(self: Box<Self>, file: &StoredFile) -> crate::Result<Vec<FileFact>>;
+    /// The file is complete and stored at `file.object_path`, and its commit
+    /// has not happened yet; it may never happen. Keep what was learned about
+    /// the file here (see the module docs). An error means the observer could
+    /// not finish its work for the file (warned; a backfill counts the file as
+    /// failed).
+    async fn stored(self: Box<Self>, file: &StoredFile) -> crate::Result<()>;
 }
 
 /// A data file written and stored, before its commit.
@@ -352,75 +327,11 @@ async fn guarded_async<T>(
     }
 }
 
-/// The write hooks of one write, from every extension that returned one, and
-/// the facts their observers produced, recorded together.
+/// The write hooks of one write, from every extension that returned one, as
+/// `(extension name, hook)`.
 #[cfg(feature = "write")]
 #[derive(Clone, Debug)]
-pub(crate) struct FileHooks(Arc<HooksInner>);
-
-#[cfg(feature = "write")]
-#[derive(Debug)]
-struct HooksInner {
-    /// `(extension name, hook)`.
-    hooks: Vec<(String, Arc<dyn FileWriteHook>)>,
-    metadata: Arc<dyn crate::metadata_writer::MetadataWriter>,
-    table_id: i64,
-    /// Facts not yet recorded, by extension name.
-    pending: std::sync::Mutex<Vec<(String, FileFact)>>,
-}
-
-#[cfg(feature = "write")]
-impl HooksInner {
-    /// Record the pending facts, one call per extension; returns those
-    /// recorded.
-    fn record(&self) -> Vec<FileFact> {
-        let pending = std::mem::take(
-            &mut *self
-                .pending
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        );
-        let mut by_extension: Vec<(String, Vec<FileFact>)> = Vec::new();
-        for (name, fact) in pending {
-            match by_extension.iter_mut().find(|(n, _)| *n == name) {
-                Some((_, facts)) => facts.push(fact),
-                None => by_extension.push((name, vec![fact])),
-            }
-        }
-        let mut recorded = Vec::new();
-        for (name, facts) in by_extension {
-            match self
-                .metadata
-                .record_file_facts(&name, self.table_id, &facts)
-            {
-                Ok(_) => recorded.extend(facts),
-                Err(error) => tracing::warn!(
-                    %error,
-                    extension = name,
-                    facts = facts.len(),
-                    "extension facts not recorded; their files read as unknown"
-                ),
-            }
-        }
-        recorded
-    }
-}
-
-/// Whatever the write did not record yet is recorded when its last hook
-/// handle and observer go.
-#[cfg(feature = "write")]
-impl Drop for HooksInner {
-    fn drop(&mut self) {
-        if !self
-            .pending
-            .get_mut()
-            .map(|pending| pending.is_empty())
-            .unwrap_or(true)
-        {
-            self.record();
-        }
-    }
-}
+pub(crate) struct FileHooks(Arc<Vec<(String, Arc<dyn FileWriteHook>)>>);
 
 #[cfg(feature = "write")]
 impl FileHooks {
@@ -444,14 +355,7 @@ impl FileHooks {
                 }
             })
             .collect();
-        (!hooks.is_empty()).then(|| {
-            Self(Arc::new(HooksInner {
-                hooks,
-                metadata: Arc::clone(ctx.metadata),
-                table_id: ctx.table_id,
-                pending: Default::default(),
-            }))
-        })
+        (!hooks.is_empty()).then(|| Self(Arc::new(hooks)))
     }
 
     /// The observers of one file written with `file_schema`.
@@ -468,7 +372,6 @@ impl FileHooks {
         FileObservers {
             observers: self
                 .0
-                .hooks
                 .iter()
                 .enumerate()
                 .filter(|(i, _)| include.is_none_or(|include| include[*i]))
@@ -477,7 +380,6 @@ impl FileHooks {
                     Some((name.clone(), observer))
                 })
                 .collect(),
-            sink: Some(Arc::clone(&self.0)),
         }
     }
 
@@ -489,8 +391,8 @@ impl FileHooks {
     ) -> (Option<Vec<String>>, Vec<bool>) {
         let mut all = false;
         let mut columns: Vec<String> = Vec::new();
-        let mut wants = Vec::with_capacity(self.0.hooks.len());
-        for (name, hook) in &self.0.hooks {
+        let mut wants = Vec::with_capacity(self.0.len());
+        for (name, hook) in self.0.iter() {
             match guarded("backfill_columns", name, || hook.backfill_columns(file)) {
                 // A hook that panics wants nothing.
                 None => wants.push(false),
@@ -515,12 +417,6 @@ impl FileHooks {
         };
         (columns, wants)
     }
-
-    /// Record the facts produced so far, one call per extension. Returns those
-    /// recorded.
-    pub(crate) fn record(&self) -> Vec<FileFact> {
-        self.0.record()
-    }
 }
 
 /// The observers of one data file.
@@ -528,9 +424,6 @@ impl FileHooks {
 #[derive(Debug, Default)]
 pub(crate) struct FileObservers {
     observers: Vec<(String, Box<dyn FileObserver>)>,
-    /// Where their facts go; holding it keeps the write's facts from being
-    /// recorded before this file's are in.
-    sink: Option<Arc<HooksInner>>,
 }
 
 #[cfg(feature = "write")]
@@ -553,20 +446,13 @@ impl FileObservers {
         });
     }
 
-    /// Tell every observer the file is stored, and keep their facts for the
-    /// write to record. Returns whether every observer finished.
+    /// Tell every observer the file is stored. Returns whether every observer
+    /// finished.
     pub(crate) async fn stored(self, file: &StoredFile) -> bool {
-        let Some(sink) = self.sink else {
-            return true;
-        };
         let mut finished = true;
         for (name, observer) in self.observers {
             match guarded_async("stored", &name, observer.stored(file)).await {
-                Some(Ok(facts)) => sink
-                    .pending
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .extend(facts.into_iter().map(|fact| (name.clone(), fact))),
+                Some(Ok(())) => {},
                 Some(Err(error)) => {
                     tracing::warn!(
                         %error,
@@ -601,66 +487,10 @@ pub struct ScanContext<'a> {
     /// in the plan above the scan, so a hook only has to keep every row that
     /// can match, never drop exactly the rows that do not.
     pub filters: &'a [Arc<dyn PhysicalExpr>],
-    /// The catalog the scan reads. Use it for [`FileFact`]s.
+    /// The catalog the scan reads.
     pub metadata: &'a Arc<dyn MetadataProvider>,
     /// The session object store the table's files are read from.
     pub object_store_url: &'a ObjectStoreUrl,
-    /// State the extension keeps for this table instance: shared by its
-    /// clones and rebinds, and new for a table built again. A catalog builds a
-    /// table for every statement, so this lasts one query. Keep here what may
-    /// change, such as "no fact yet".
-    pub table_state: &'a ExtensionState,
-    /// State shared by every table the same catalog builds for this table id,
-    /// across queries. Keep here what never changes, such as a fact about an
-    /// immutable file, which is keyed by path and size.
-    pub shared_state: &'a ExtensionState,
-}
-
-/// State extensions keep about one table, one value per type: see
-/// [`ScanContext::table_state`] and [`ScanContext::shared_state`] for how long
-/// each lasts.
-#[derive(Default)]
-pub struct ExtensionState(
-    std::sync::Mutex<HashMap<std::any::TypeId, Arc<dyn std::any::Any + Send + Sync>>>,
-);
-
-impl ExtensionState {
-    /// The table's `T`, created with `T::default()` on first use.
-    pub fn get_or_default<T: Default + Send + Sync + 'static>(&self) -> Arc<T> {
-        let mut map = self
-            .0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let value = map
-            .entry(std::any::TypeId::of::<T>())
-            .or_insert_with(|| Arc::new(T::default()));
-        Arc::clone(value)
-            .downcast::<T>()
-            .expect("keyed by its own type id")
-    }
-}
-
-/// The [`ScanContext::shared_state`] of each table of one catalog, by table
-/// id.
-#[derive(Debug, Default)]
-pub(crate) struct SharedExtensionStates(std::sync::Mutex<HashMap<i64, Arc<ExtensionState>>>);
-
-impl SharedExtensionStates {
-    pub(crate) fn for_table(&self, table_id: i64) -> Arc<ExtensionState> {
-        Arc::clone(
-            self.0
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .entry(table_id)
-                .or_default(),
-        )
-    }
-}
-
-impl fmt::Debug for ExtensionState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ExtensionState").finish_non_exhaustive()
-    }
 }
 
 /// One data file a scan may read, as offered to a [`ScanHook`].
@@ -668,13 +498,20 @@ impl fmt::Debug for ExtensionState {
 #[non_exhaustive]
 pub struct ScanFile<'a> {
     pub file: &'a DuckLakeTableFile,
-    /// Where the file is stored, in the session's object store for the table.
-    pub location: &'a ObjectPath,
     /// The file's catalog statistics over `physical_schema`, when known.
     pub statistics: Option<&'a Arc<Statistics>>,
     /// Whether a [`FileSelection::Select`] would be applied to this file.
     /// Skipping is always applied.
     pub selectable: bool,
+    pub(crate) table: &'a crate::DuckLakeTable,
+}
+
+impl ScanFile<'_> {
+    /// Where the file is stored, in the session's object store for the table.
+    /// Resolved on each call, so a hook pays only for the files it reads.
+    pub fn location(&self) -> crate::Result<ObjectPath> {
+        Ok(self.table.scan_location(&self.file.file)?)
+    }
 }
 
 /// How a scan reads one file, as a [`ScanHook`] decides.
@@ -713,7 +550,7 @@ pub trait ScanHook: Send + Sync + fmt::Debug {
     /// claim must hold for every row of the file: core declares it to the
     /// planner, which may then skip a sort. Offered only files the scan reads
     /// without deletes or a snapshot filter, in a scan without `rowid`.
-    fn orderings(
+    async fn orderings(
         &self,
         _ctx: &ScanContext<'_>,
         _files: &[ScanFile<'_>],
@@ -786,7 +623,7 @@ impl ScanHooks {
     }
 
     /// Every hook's orderings: the first claim for a file wins.
-    pub(crate) fn orderings(
+    pub(crate) async fn orderings(
         &self,
         ctx: &ScanContext<'_>,
         files: &[ScanFile<'_>],
@@ -796,7 +633,9 @@ impl ScanHooks {
             return out;
         }
         for (name, hook) in &self.0 {
-            let Some(orderings) = guarded("orderings", name, || hook.orderings(ctx, files)) else {
+            let Some(orderings) =
+                guarded_async("orderings", name, hook.orderings(ctx, files)).await
+            else {
                 continue;
             };
             for (id, keys) in orderings {

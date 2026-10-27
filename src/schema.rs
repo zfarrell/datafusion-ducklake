@@ -69,8 +69,6 @@ pub struct DuckLakeSchema {
     row_lineage: bool,
     /// Propagated from the catalog: how each table reuses its scans' reads.
     read_options: DuckLakeReadOptions,
-    /// See `DuckLakeCatalog::extension_states`; empty for a schema built alone.
-    extension_states: Arc<crate::extension::SharedExtensionStates>,
     /// Metadata writer for write operations (when write feature is enabled)
     #[cfg(feature = "write")]
     writer: Option<Arc<dyn MetadataWriter>>,
@@ -99,7 +97,6 @@ impl DuckLakeSchema {
             schema_path,
             row_lineage: false,
             read_options: DuckLakeReadOptions::default(),
-            extension_states: Default::default(),
             #[cfg(feature = "write")]
             writer: None,
             #[cfg(feature = "write")]
@@ -132,15 +129,6 @@ impl DuckLakeSchema {
     /// parent catalog (see `DuckLakeCatalog::with_read_options`).
     pub fn with_read_options(mut self, options: DuckLakeReadOptions) -> Self {
         self.read_options = options;
-        self
-    }
-
-    /// Share the catalog's per-table extension state with this schema's tables.
-    pub(crate) fn with_extension_states(
-        mut self,
-        states: Arc<crate::extension::SharedExtensionStates>,
-    ) -> Self {
-        self.extension_states = states;
         self
     }
 
@@ -235,8 +223,7 @@ impl DuckLakeSchema {
         )
         .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?
         .with_row_lineage(self.row_lineage)
-        .with_read_options(self.read_options.clone())
-        .with_shared_extension_state(self.extension_states.for_table(meta.table_id));
+        .with_read_options(self.read_options.clone());
 
         // Configure writer if this schema is writable
         #[cfg(feature = "write")]
@@ -538,7 +525,6 @@ impl SchemaProvider for DuckLakeSchema {
         )
         .map_err(|e| DataFusionError::External(Box::new(e)))?
         .with_read_options(self.read_options.clone())
-        .with_shared_extension_state(self.extension_states.for_table(committed.table_id))
         .with_writer(self.schema_name.clone(), Arc::clone(writer))
         .with_write_options(options);
 

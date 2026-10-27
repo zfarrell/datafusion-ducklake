@@ -11,8 +11,8 @@ publish = false
 autotests = false
 
 [dependencies]
-# Only the public API, through `datafusion_ducklake::extension`.
-datafusion-ducklake = { path = "..", default-features = false, features = ["write"] }
+# Only the public API, through `datafusion_ducklake::extension` (unstable).
+datafusion-ducklake = { path = "..", default-features = false, features = ["write", "unstable-extensions"] }
 datafusion = { version = "55", default-features = false, features = ["parquet", "sql"] }
 datafusion-datasource-parquet = { version = "55", default-features = false }
 arrow = "59.2"
@@ -20,7 +20,7 @@ parquet = { version = "59.2", features = ["async"] }
 object_store = { version = "0.13", default-features = false }
 async-trait = "0.1"
 futures = "0.3"
-tokio = { version = "1", features = ["rt"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 datafusion-datasource = { version = "55", default-features = false }
 tracing = "0.1"
@@ -28,6 +28,7 @@ bytes = "1"
 moka = { version = "0.12", features = ["sync"] }
 serde_json = "1"
 base64 = "0.22"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio"] }
 
 [dev-dependencies]
 datafusion-ducklake = { path = "..", features = ["duckdb-bundled", "write-sqlite", "write-postgres"] }
@@ -46,6 +47,10 @@ url = "2.5"
 [features]
 # Skip the PostgreSQL tests, which need Docker.
 skip-tests-with-docker = []
+# Fact stores in a SQLite or PostgreSQL database (`facts::FactStore`).
+default = ["sqlite", "postgres"]
+sqlite = ["sqlx/sqlite"]
+postgres = ["sqlx/postgres"]
 
 [[test]]
 name = "it"

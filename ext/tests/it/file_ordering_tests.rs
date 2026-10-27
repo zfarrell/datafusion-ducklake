@@ -25,8 +25,10 @@ use datafusion_ducklake::{
     DuckLakeWriteOptions, MergeOptions, MetadataWriter, NullOrder, SortDirection, SortField,
     SqliteMetadataProvider, SqliteMetadataWriter, WriteMode,
 };
+use datafusion_ducklake_ext::db::ExtensionDb;
+use datafusion_ducklake_ext::file_order::table::{self as order_table, OrderRow};
 use datafusion_ducklake_ext::file_order::{
-    self, FileOrder, FileOrderTableExt, VerifyOrderOptions, order_fact, prune_file_orders,
+    FileOrder, FileOrderTableExt, VerifyOrderOptions, prune_file_orders,
 };
 
 const TOP_N: &str = "SELECT ts, level, id FROM ducklake.main.logs ORDER BY ts DESC LIMIT 7";
@@ -66,9 +68,43 @@ fn desc(range: std::ops::Range<i64>) -> Vec<Option<i64>> {
 struct Env {
     temp: TempDir,
     table_id: i64,
+    /// The catalog database's pool: the extension's, and the test's own SQL.
+    pool: sqlx::SqlitePool,
 }
 
 impl Env {
+    fn db(&self) -> ExtensionDb {
+        ExtensionDb::sqlite(self.pool.clone())
+    }
+
+    /// A fresh extension instance (nothing read yet) over the catalog's pool.
+    fn order(&self) -> Arc<FileOrder> {
+        Arc::new(FileOrder::new(self.db()))
+    }
+
+    /// Writer options with the extension on.
+    fn ext_options(&self) -> DuckLakeWriteOptions {
+        self.write_options(true)
+    }
+
+    fn write_options(&self, ext_file_order: bool) -> DuckLakeWriteOptions {
+        let options = DuckLakeWriteOptions::default();
+        if ext_file_order {
+            options.with_extension(self.order())
+        } else {
+            options
+        }
+    }
+
+    fn read_options(&self, ext_file_order: bool) -> DuckLakeReadOptions {
+        let options = DuckLakeReadOptions::default();
+        if ext_file_order {
+            options.with_extension(self.order())
+        } else {
+            options
+        }
+    }
+
     fn url(&self) -> String {
         format!(
             "sqlite:{}?mode=rwc",
@@ -100,7 +136,7 @@ impl Env {
     /// Append `batches` through the streaming session RuntimeDB ingests with:
     /// rows land in the order given, the sort is the caller's job.
     async fn append(&self, batches: &[RecordBatch]) {
-        self.append_with(batches, ext_options()).await;
+        self.append_with(batches, self.ext_options()).await;
     }
 
     async fn append_with(&self, batches: &[RecordBatch], options: DuckLakeWriteOptions) {
@@ -127,25 +163,25 @@ impl Env {
     /// each, `None` when the sidecar has no row (or does not exist).
     async fn orders(&self) -> std::collections::HashMap<String, Option<String>> {
         use sqlx::Row;
-        let pool = sqlx::SqlitePool::connect(&self.url()).await.unwrap();
+        let pool = &self.pool;
         let has_sidecar: bool = sqlx::query(
-            "SELECT count(*) > 0 FROM sqlite_master WHERE name = 'ext_ducklake_file_fact'",
+            "SELECT count(*) > 0 FROM sqlite_master WHERE name = 'ext_ducklake_file_order'",
         )
-        .fetch_one(&pool)
+        .fetch_one(pool)
         .await
         .unwrap()
         .get(0);
         let sql = if has_sidecar {
-            "SELECT df.path, json_extract(o.value, '$.sort_key') FROM ducklake_data_file df
-             LEFT JOIN ext_ducklake_file_fact o
-               ON o.extension = 'file_order' AND o.table_id = df.table_id AND o.path = df.path
+            "SELECT df.path, o.sort_key FROM ducklake_data_file df
+             LEFT JOIN ext_ducklake_file_order o
+               ON o.table_id = df.table_id AND o.path = df.path
               AND o.file_size_bytes = df.file_size_bytes
              WHERE df.end_snapshot IS NULL"
         } else {
             "SELECT path, NULL FROM ducklake_data_file WHERE end_snapshot IS NULL"
         };
         sqlx::query(sql)
-            .fetch_all(&pool)
+            .fetch_all(pool)
             .await
             .unwrap()
             .iter()
@@ -168,8 +204,8 @@ impl Env {
         let provider = SqliteMetadataProvider::new(&self.url()).await.unwrap();
         let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer))
             .unwrap()
-            .with_read_options(read_options(ext_file_order))
-            .with_write_options(write_options(ext_file_order));
+            .with_read_options(self.read_options(ext_file_order))
+            .with_write_options(self.write_options(ext_file_order));
         let ctx = SessionContext::new_with_config(
             SessionConfig::new()
                 .with_target_partitions(target_partitions)
@@ -180,36 +216,16 @@ impl Env {
     }
 }
 
-/// Writer options with the extension on.
-fn ext_options() -> DuckLakeWriteOptions {
-    write_options(true)
-}
-
-fn write_options(ext_file_order: bool) -> DuckLakeWriteOptions {
-    let options = DuckLakeWriteOptions::default();
-    if ext_file_order {
-        options.with_extension(Arc::new(FileOrder))
-    } else {
-        options
-    }
-}
-
-fn read_options(ext_file_order: bool) -> DuckLakeReadOptions {
-    let options = DuckLakeReadOptions::default();
-    if ext_file_order {
-        options.with_extension(Arc::new(FileOrder))
-    } else {
-        options
-    }
-}
-
 async fn setup() -> Env {
     let temp = TempDir::new().unwrap();
     let data_path = temp.path().join("data");
     std::fs::create_dir_all(&data_path).unwrap();
+    let url = format!("sqlite:{}?mode=rwc", temp.path().join("test.db").display());
+    let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
     let env = Env {
         temp,
         table_id: 0,
+        pool,
     };
     let writer = env.writer().await;
     writer.set_data_path(data_path.to_str().unwrap()).unwrap();
@@ -601,7 +617,7 @@ async fn inlined_rows_mixed_with_verified_files_and_flushed() {
     ingest_disjoint_sorted(&env, 3, 1_000).await;
     // Overlapping the files (1500, 2500), newer (9000), and NULL.
     env.append_with(&[batch(&[Some(1_500), None, Some(9_000), Some(2_500)])], {
-        let mut options = ext_options();
+        let mut options = env.ext_options();
         options.data_inlining_row_limit = Some(10);
         options
     })
@@ -617,7 +633,7 @@ async fn inlined_rows_mixed_with_verified_files_and_flushed() {
         Arc::new(env.writer().await),
     )
     .unwrap()
-    .with_extension(Arc::new(FileOrder));
+    .with_extension(env.order());
     let flushed = catalog
         .flush_inlined_data(&SessionContext::new().state(), Some("main"), Some("logs"))
         .await
@@ -961,13 +977,10 @@ async fn verify_racing_compaction_and_prune() {
         .get_table_files_for_select(env.table_id, provider.get_current_snapshot().unwrap())
         .unwrap()
         .iter()
-        .map(|f| {
-            order_fact(
-                &f.file.path,
-                f.file.file_size_bytes,
-                "1:desc:nulls_first",
-                "verify",
-            )
+        .map(|f| OrderRow {
+            path: f.file.path.clone(),
+            file_size_bytes: f.file.file_size_bytes,
+            sort_key: "1:desc:nulls_first".to_string(),
         })
         .collect();
     assert_eq!(before.len(), 2);
@@ -975,7 +988,7 @@ async fn verify_racing_compaction_and_prune() {
     // Compaction retires both unrecorded files; its output is recorded.
     let (ctx, table) = table_handle(&env).await;
     table
-        .with_write_options(ext_options())
+        .with_write_options(env.ext_options())
         .merge_adjacent_files(&ctx.state(), MergeOptions::default())
         .await
         .unwrap();
@@ -986,20 +999,19 @@ async fn verify_racing_compaction_and_prune() {
     // The verify pass read the two files before the merge and records now.
     // The rows are true of those objects, but the merge removed the files
     // from the catalog, so they match nothing.
-    let writer = env.writer().await;
-    assert_eq!(
-        writer
-            .record_file_facts(file_order::NAME, env.table_id, &before)
-            .unwrap(),
-        2
-    );
+    for row in &before {
+        order_table::record(&env.db(), env.table_id, row, "verify")
+            .await
+            .unwrap();
+    }
+    assert_eq!(sidecar_rows(&env).await, 3);
     for partitions in [1, 4] {
         assert_all_queries_correct(&env.ctx(partitions).await).await;
     }
 
     // Rows for paths no file of the table has are pruned; the merge output's
     // row stays.
-    assert_eq!(prune_file_orders(&writer).unwrap(), 2);
+    assert_eq!(prune_file_orders(&env.db()).await.unwrap(), 2);
     assert_eq!(sidecar_rows(&env).await, 1);
     assert_eq!(env.orders().await, orders);
 }
@@ -1007,18 +1019,18 @@ async fn verify_racing_compaction_and_prune() {
 /// Rows in the sidecar; 0 when it was never created.
 async fn sidecar_rows(env: &Env) -> i64 {
     use sqlx::Row;
-    let pool = sqlx::SqlitePool::connect(&env.url()).await.unwrap();
-    let exists: bool =
-        sqlx::query("SELECT count(*) > 0 FROM sqlite_master WHERE name = 'ext_ducklake_file_fact'")
-            .fetch_one(&pool)
-            .await
-            .unwrap()
-            .get(0);
+    let exists: bool = sqlx::query(
+        "SELECT count(*) > 0 FROM sqlite_master WHERE name = 'ext_ducklake_file_order'",
+    )
+    .fetch_one(&env.pool)
+    .await
+    .unwrap()
+    .get(0);
     if !exists {
         return 0;
     }
-    sqlx::query("SELECT count(*) FROM ext_ducklake_file_fact WHERE extension = 'file_order'")
-        .fetch_one(&pool)
+    sqlx::query("SELECT count(*) FROM ext_ducklake_file_order")
+        .fetch_one(&env.pool)
         .await
         .unwrap()
         .get(0)
@@ -1192,7 +1204,7 @@ async fn sidecar_row_never_vouches_for_a_file_that_reuses_its_id() {
 
     // What expiry plus such a writer leave behind: the sorted file's rows are
     // gone, and the unsorted file sits under the sorted file's id.
-    let pool = sqlx::SqlitePool::connect(&env.url()).await.unwrap();
+    let pool = env.pool.clone();
     let ids: Vec<i64> =
         sqlx::query_scalar("SELECT data_file_id FROM ducklake_data_file ORDER BY data_file_id")
             .fetch_all(&pool)
@@ -1418,7 +1430,7 @@ async fn sort_spec_change_then_compaction() {
 
     let (ctx, table) = table_handle(&env).await;
     table
-        .with_write_options(ext_options())
+        .with_write_options(env.ext_options())
         .merge_adjacent_files(&ctx.state(), MergeOptions::default())
         .await
         .unwrap();
@@ -1452,7 +1464,7 @@ async fn caller_named_files_are_not_recorded() {
         Arc::new(LocalFileSystem::new()),
     )
     .unwrap()
-    .with_options(&ext_options());
+    .with_options(&env.ext_options());
     let dir = env.data_path().join("main").join("logs");
     let mut session = writer
         .begin_write_to_path(
@@ -1712,9 +1724,8 @@ async fn top_n_over(table: DuckLakeTable) -> (String, Vec<i64>) {
 }
 
 async fn clear_sidecar(env: &Env) {
-    let pool = sqlx::SqlitePool::connect(&env.url()).await.unwrap();
-    sqlx::query("DELETE FROM ext_ducklake_file_fact WHERE extension = 'file_order'")
-        .execute(&pool)
+    sqlx::query("DELETE FROM ext_ducklake_file_order")
+        .execute(&env.pool)
         .await
         .unwrap();
 }
@@ -1751,11 +1762,12 @@ async fn warm_scans_reuse_the_sidecar_read() {
     assert_eq!(ids, want);
 }
 
-/// Rows the verify job adds after a table remembered "no row" are not seen by
-/// that table, which keeps sorting (correctly); a table built for the next
-/// snapshot sees them and skips the sort.
+/// Rows the verify job records apply at once to scans through the same
+/// `FileOrder`, which keeps what it records. Another instance that already
+/// remembered "no row" keeps sorting (correctly) until that memory expires;
+/// a fresh instance sees the rows and skips the sort.
 #[tokio::test(flavor = "multi_thread")]
-async fn rows_verified_after_a_scan_apply_from_the_next_snapshot() {
+async fn rows_verified_after_a_scan_apply_through_the_recording_instance() {
     let env = setup().await;
     for a in 0..3 {
         env.append_with(
@@ -1767,9 +1779,12 @@ async fn rows_verified_after_a_scan_apply_from_the_next_snapshot() {
     env.sort_by_ts_desc(NullOrder::NullsFirst).await;
 
     let (ctx, table) = table_handle(&env).await;
-    let (p, ids) = top_n_over(table.clone()).await;
-    assert!(sorts(&p), "{p}");
-    assert_eq!(ids, (293..300).rev().collect::<Vec<_>>());
+    let (_other_ctx, other) = table_handle(&env).await;
+    for scanned in [&table, &other] {
+        let (p, ids) = top_n_over(scanned.clone()).await;
+        assert!(sorts(&p), "{p}");
+        assert_eq!(ids, (293..300).rev().collect::<Vec<_>>());
+    }
 
     let result = table
         .verify_file_orders(&ctx.state(), VerifyOrderOptions::default())
@@ -1778,8 +1793,14 @@ async fn rows_verified_after_a_scan_apply_from_the_next_snapshot() {
     assert_eq!(result.files_recorded, 3, "{result:?}");
     let (p, ids) = top_n_over(table.clone()).await;
     assert!(
+        declares_ts_desc(&p) && !sorts(&p),
+        "the recording instance knows the rows: {p}"
+    );
+    assert_eq!(ids, (293..300).rev().collect::<Vec<_>>());
+    let (p, ids) = top_n_over(other.clone()).await;
+    assert!(
         sorts(&p),
-        "the table remembers the files as unverified: {p}"
+        "the other instance remembers the files as unverified: {p}"
     );
     assert_eq!(ids, (293..300).rev().collect::<Vec<_>>());
 

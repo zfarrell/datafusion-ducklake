@@ -645,15 +645,6 @@ impl MetadataProvider for MemoizedMetadataProvider {
 
     // Not memoized: a fact describes immutable bytes, so an extension that
     // wants to remember facts can do so itself.
-    fn file_facts(
-        &self,
-        extension: &str,
-        table_id: i64,
-        paths: &[&str],
-        keys: Option<&[i64]>,
-    ) -> Result<Vec<crate::extension::FileFact>> {
-        self.inner.file_facts(extension, table_id, paths, keys)
-    }
 
     fn get_table_statistics(&self, table_id: i64, snapshot_id: i64) -> Result<DuckLakeStatistics> {
         self.inner.get_table_statistics(table_id, snapshot_id)

@@ -71,6 +71,28 @@
 //!
 //! The cost is the threads this library starts without being asked, which is
 //! worth knowing if you are counting them.
+//!
+//! # Unstable: extensions
+//!
+//! The extension API ([`extension`], `DuckLakeTable::backfill` and the
+//! `DuckLakeTable` accessors extensions build on) is public only with the
+//! `unstable-extensions` feature, and carries no semver promise: any release
+//! may change it.
+
+/// `item`, public with the `unstable-extensions` feature and crate-private
+/// without it: the extension API carries no semver promise.
+macro_rules! unstable_extension_api {
+    ($(#[$meta:meta])* pub $($item:tt)*) => {
+        #[cfg(feature = "unstable-extensions")]
+        $(#[$meta])*
+        pub $($item)*
+
+        #[cfg(not(feature = "unstable-extensions"))]
+        #[allow(dead_code)]
+        $(#[$meta])*
+        pub(crate) $($item)*
+    };
+}
 
 pub mod catalog;
 mod catalog_read_memo;
@@ -80,11 +102,15 @@ pub mod delete_filter;
 mod delete_memo;
 pub mod encryption;
 pub mod error;
+#[cfg(feature = "unstable-extensions")]
 pub mod extension;
+#[cfg(not(feature = "unstable-extensions"))]
+#[allow(dead_code)]
+pub(crate) mod extension;
 #[cfg(feature = "write")]
+#[cfg_attr(not(feature = "unstable-extensions"), allow(dead_code))]
 mod extension_backfill;
 pub(crate) mod field_id_adapter;
-pub mod file_facts;
 pub mod information_schema;
 pub mod inlined_filter;
 pub(crate) mod lazy_delete_filter;
@@ -181,8 +207,9 @@ pub use catalog::DuckLakeCatalog;
 pub use catalog_read_memo::{CatalogReadMemo, MemoizedMetadataProvider};
 pub use delete_memo::DuckLakeReadOptions;
 pub use error::{DuckLakeError, TypeChangeOperation, TypeChangeWriteMode};
-pub use extension::{DuckLakeExtension, DuckLakeExtensions, FileFact};
-#[cfg(feature = "write")]
+#[cfg(feature = "unstable-extensions")]
+pub use extension::{DuckLakeExtension, DuckLakeExtensions};
+#[cfg(all(feature = "write", feature = "unstable-extensions"))]
 pub use extension_backfill::{BackfillOptions, BackfillResult};
 pub use metadata_provider::{
     ColumnTag, DuckLakeFileData, DuckLakeInlinedFileDeleteForFlush, DuckLakeInlinedFlushData,

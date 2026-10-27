@@ -23,6 +23,7 @@ use datafusion_ducklake::{
     ColumnDef, DuckLakeCatalog, DuckLakeReadOptions, DuckLakeTable, DuckLakeTableWriter,
     DuckLakeWriteOptions, MetadataWriter, SqliteMetadataProvider, SqliteMetadataWriter, WriteMode,
 };
+use datafusion_ducklake_ext::db::ExtensionDb;
 use datafusion_ducklake_ext::file_index::counts::{
     BUCKET_GRAIN_HOUR_US, BucketCountRule, bucket_counts_from_json, bucket_counts_to_json,
 };
@@ -31,12 +32,6 @@ use datafusion_ducklake_ext::file_index::{BuildIndexOptions, FileIndex, FileInde
 
 const H: i64 = BUCKET_GRAIN_HOUR_US;
 
-/// Read options with the counts rewrite on or off, and index scans off.
-fn counts_options(counts: bool) -> DuckLakeReadOptions {
-    DuckLakeReadOptions::default().with_extension(Arc::new(
-        FileIndex::new().with_scans(false).with_counts(counts),
-    ))
-}
 /// 2026-10-01T00:00:00Z in µs.
 const T0: i64 = 1_790_812_800_000_000;
 
@@ -57,6 +52,8 @@ struct Env {
     table_id: i64,
     tz: Option<&'static str>,
     next_id: std::cell::Cell<i64>,
+    /// The catalog database's pool: the extension's, and the test's own SQL.
+    pool: sqlx::SqlitePool,
 }
 
 /// Deterministic rows: `n` rows from `start` with `step` µs between them;
@@ -133,7 +130,17 @@ impl Env {
     }
 
     async fn pool(&self) -> sqlx::SqlitePool {
-        sqlx::SqlitePool::connect(&self.url()).await.unwrap()
+        self.pool.clone()
+    }
+
+    /// Read options with the counts rewrite on or off, and index scans off:
+    /// a fresh extension instance, which has read nothing yet.
+    fn counts_options(&self, counts: bool) -> DuckLakeReadOptions {
+        DuckLakeReadOptions::default().with_extension(Arc::new(
+            FileIndex::new(ExtensionDb::sqlite(self.pool.clone()))
+                .with_scans(false)
+                .with_counts(counts),
+        ))
     }
 
     /// Live data files: catalog path and size, in data_file_id order.
@@ -187,15 +194,13 @@ impl Env {
         let pool = self.pool().await;
         let mut out = Vec::new();
         for (path, _) in self.live_files().await {
-            let json: Option<String> = sqlx::query(
-                "SELECT json_extract(value, '$.bucket_counts') FROM ext_ducklake_file_fact
-                     WHERE extension = 'file_index' AND path = ?",
-            )
-            .bind(&path)
-            .fetch_optional(&pool)
-            .await
-            .unwrap()
-            .and_then(|row| row.get(0));
+            let json: Option<String> =
+                sqlx::query("SELECT bucket_counts FROM ext_ducklake_file_index WHERE path = ?")
+                    .bind(&path)
+                    .fetch_optional(&pool)
+                    .await
+                    .unwrap()
+                    .and_then(|row| row.get(0));
             let users = json
                 .and_then(|j| bucket_counts_from_json(&j, IndexValueType::Utf8))
                 .map(|c| {
@@ -218,7 +223,7 @@ impl Env {
         let catalog =
             DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(self.writer().await))
                 .unwrap()
-                .with_read_options(counts_options(counts));
+                .with_read_options(self.counts_options(counts));
         let ctx = SessionContext::new_with_config(
             SessionConfig::new()
                 .with_target_partitions(3)
@@ -235,11 +240,14 @@ impl Env {
 async fn setup(tz: Option<&'static str>) -> Env {
     let temp = TempDir::new().unwrap();
     std::fs::create_dir_all(temp.path().join("data")).unwrap();
+    let url = format!("sqlite:{}?mode=rwc", temp.path().join("test.db").display());
+    let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
     let mut env = Env {
         temp,
         table_id: 0,
         tz,
         next_id: std::cell::Cell::new(0),
+        pool,
     };
     let writer = env.writer().await;
     writer
@@ -474,28 +482,22 @@ async fn deletes_inlined_rows_and_bad_rows_scan() {
     let pool = env.pool().await;
     for (file, set) in [
         (&files[1].0, "file_size_bytes = file_size_bytes + 1"),
-        (
-            &files[3].0,
-            "value = json_set(value, '$.value_type', 'int64')",
-        ),
+        (&files[3].0, "value_type = 'int64'"),
     ] {
         inflate_counts(&pool, file).await;
         sqlx::query(sqlx::AssertSqlSafe(format!(
-            "UPDATE ext_ducklake_file_fact SET {set} WHERE extension = 'file_index' AND path = ?"
+            "UPDATE ext_ducklake_file_index SET {set} WHERE path = ?"
         )))
         .bind(file)
         .execute(&pool)
         .await
         .unwrap();
     }
-    sqlx::query(
-        "UPDATE ext_ducklake_file_fact SET value = json_set(value, '$.bucket_counts', '{\"v\":1')
-         WHERE extension = 'file_index' AND path = ?",
-    )
-    .bind(&files[2].0)
-    .execute(&pool)
-    .await
-    .unwrap();
+    sqlx::query("UPDATE ext_ducklake_file_index SET bucket_counts = '{\"v\":1' WHERE path = ?")
+        .bind(&files[2].0)
+        .execute(&pool)
+        .await
+        .unwrap();
     assert_matrix(&env, PREDS).await;
 }
 
@@ -551,29 +553,24 @@ async fn recorded_counts_are_what_serves_whole_hours() {
     env.record_counts().await;
     let files = env.live_files().await;
     let pool = env.pool().await;
-    let json: String = sqlx::query(
-        "SELECT json_extract(value, '$.bucket_counts') FROM ext_ducklake_file_fact
-             WHERE extension = 'file_index' AND path = ?",
-    )
-    .bind(&files[0].0)
-    .fetch_one(&pool)
-    .await
-    .unwrap()
-    .get(0);
+    let json: String =
+        sqlx::query("SELECT bucket_counts FROM ext_ducklake_file_index WHERE path = ?")
+            .bind(&files[0].0)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .get(0);
     let mut counts = bucket_counts_from_json(&json, IndexValueType::Utf8).unwrap();
     // keys[0] is u0.
     let bucket = &mut counts.keys[0].1[1];
     let inflated_hour = bucket.0;
     bucket.1 += 1000;
-    sqlx::query(
-        "UPDATE ext_ducklake_file_fact SET value = json_set(value, '$.bucket_counts', ?)
-         WHERE extension = 'file_index' AND path = ?",
-    )
-    .bind(bucket_counts_to_json(&counts))
-    .bind(&files[0].0)
-    .execute(&pool)
-    .await
-    .unwrap();
+    sqlx::query("UPDATE ext_ducklake_file_index SET bucket_counts = ? WHERE path = ?")
+        .bind(bucket_counts_to_json(&counts))
+        .bind(&files[0].0)
+        .execute(&pool)
+        .await
+        .unwrap();
     let sql = format!(
         "SELECT date_trunc('hour', ts) AS key, count(1) AS c FROM ducklake.main.logs \
          WHERE ts >= {} AND ts <= {} AND user_id = 'u0' GROUP BY key ORDER BY key",
@@ -608,30 +605,25 @@ async fn recorded_counts_are_what_serves_whole_hours() {
 /// Adds 1000 to every recorded bucket of `path`.
 async fn inflate_counts(pool: &sqlx::SqlitePool, path: &str) {
     use sqlx::Row;
-    let json: String = sqlx::query(
-        "SELECT json_extract(value, '$.bucket_counts') FROM ext_ducklake_file_fact
-             WHERE extension = 'file_index' AND path = ?",
-    )
-    .bind(path)
-    .fetch_one(pool)
-    .await
-    .unwrap()
-    .get(0);
+    let json: String =
+        sqlx::query("SELECT bucket_counts FROM ext_ducklake_file_index WHERE path = ?")
+            .bind(path)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+            .get(0);
     let mut counts = bucket_counts_from_json(&json, IndexValueType::Utf8).unwrap();
     for (_, buckets) in &mut counts.keys {
         for bucket in buckets {
             bucket.1 += 1000;
         }
     }
-    sqlx::query(
-        "UPDATE ext_ducklake_file_fact SET value = json_set(value, '$.bucket_counts', ?)
-         WHERE extension = 'file_index' AND path = ?",
-    )
-    .bind(bucket_counts_to_json(&counts))
-    .bind(path)
-    .execute(pool)
-    .await
-    .unwrap();
+    sqlx::query("UPDATE ext_ducklake_file_index SET bucket_counts = ? WHERE path = ?")
+        .bind(bucket_counts_to_json(&counts))
+        .bind(path)
+        .execute(pool)
+        .await
+        .unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -697,7 +689,7 @@ mod catalog_reads {
         let env = setup(None).await;
         populate(&env).await;
         env.record_counts().await;
-        let options = counts_options(true);
+        let options = env.counts_options(true);
         let (plain, plain_calls) = kept(&env, DuckLakeReadOptions::default(), false).await;
         let (rewritten, rewritten_calls) = kept(&env, options, true).await;
         let sql = kept_hist("u0");
@@ -721,7 +713,7 @@ mod catalog_reads {
         populate(&env).await;
         env.record_counts().await;
         for counts in [false, true] {
-            let base = counts_options(counts);
+            let base = env.counts_options(counts);
             let (memo, memo_calls) =
                 kept(&env, base.clone().with_listing_memo(1 << 20), counts).await;
             let (plain, _) = kept(&env, base, counts).await;

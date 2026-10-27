@@ -179,16 +179,6 @@ impl MetadataProvider for CountingProvider {
         self.inner
             .get_table_summary_statistics(table_id, snapshot_id)
     }
-    fn file_facts(
-        &self,
-        extension: &str,
-        table_id: i64,
-        paths: &[&str],
-        keys: Option<&[i64]>,
-    ) -> Result<Vec<datafusion_ducklake::FileFact>> {
-        self.count("file_facts");
-        self.inner.file_facts(extension, table_id, paths, keys)
-    }
     fn get_table_file_metadata_page(
         &self,
         table_id: i64,

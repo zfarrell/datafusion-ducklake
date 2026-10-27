@@ -3560,34 +3560,6 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         Ok(None)
     }
 
-    /// Record [`FileFact`](crate::extension::FileFact)s of `extension` about
-    /// `table_id`'s files, replacing any with the same path and key. A fact
-    /// describes the object at its path, so it needs no snapshot and may land
-    /// before the file's commit. Returns the facts written.
-    ///
-    /// Default: the backend keeps no facts; nothing is recorded.
-    fn record_file_facts(
-        &self,
-        _extension: &str,
-        _table_id: i64,
-        _facts: &[crate::extension::FileFact],
-    ) -> Result<u64> {
-        Ok(0)
-    }
-
-    /// Drop the facts of `extension` whose path no data file of their table
-    /// lists any more (expired, or never committed) and that were recorded at
-    /// least `min_age` ago, and return them. `min_age` spares the facts of
-    /// writes still in flight, whose files are not committed yet. Optional:
-    /// such facts are harmless.
-    fn prune_file_facts(
-        &self,
-        _extension: &str,
-        _min_age: std::time::Duration,
-    ) -> Result<Vec<crate::extension::FileFact>> {
-        Ok(Vec::new())
-    }
-
     /// Set the table's sort spec — the commit behind `ALTER TABLE … SET SORTED BY
     /// (…)`.
     ///

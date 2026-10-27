@@ -2746,20 +2746,6 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         Ok(statistics)
     }
 
-    /// The [`FileFact`](crate::extension::FileFact)s `extension` recorded
-    /// for `table_id`'s files at `paths`, all keys or only `keys`. A fact
-    /// applies to a listed file only when its size matches too, so the
-    /// default (no facts) is always correct: every file reads as unknown.
-    fn file_facts(
-        &self,
-        _extension: &str,
-        _table_id: i64,
-        _paths: &[&str],
-        _keys: Option<&[i64]>,
-    ) -> Result<Vec<crate::extension::FileFact>> {
-        Ok(Vec::new())
-    }
-
     /// Load one keyset-paginated batch of visible files and their statistics.
     ///
     /// `after_data_file_id` is exclusive. Implementations must return records

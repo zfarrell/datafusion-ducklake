@@ -1,29 +1,34 @@
 //! The extension API (`datafusion_ducklake::extension`) through a probe
-//! extension: what its hooks see, that a hook which errs or panics never
-//! fails a write or a scan, how its facts are recorded, the generic backfill,
-//! the state kept across queries, and pruning.
+//! extension that keeps its own records in memory: what its hooks see, when
+//! an observer is told a file is stored, that a hook which errs or panics
+//! never fails a write or a scan, and the generic backfill.
 
-#![cfg(all(feature = "write-sqlite", feature = "metadata-sqlite"))]
+#![cfg(all(
+    feature = "write-sqlite",
+    feature = "metadata-sqlite",
+    feature = "unstable-extensions"
+))]
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
-use arrow::array::{Array, Int64Array, RecordBatch, StringArray};
+use arrow::array::{Array, BinaryArray, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::prelude::*;
 use datafusion_ducklake::extension::{
-    DuckLakeExtension, FileFact, FileObserver, FileSelection, FileWriteHook, ScanContext, ScanFile,
-    ScanHook, StoredFile, WriteContext, WriteOrigin,
+    DuckLakeExtension, FileObserver, FileSelection, FileWriteHook, ScanContext, ScanFile, ScanHook,
+    StoredFile, WriteContext, WriteOrigin,
 };
 use datafusion_ducklake::metadata_provider::{DuckLakeTableFile, MetadataProvider};
+use datafusion_ducklake::metadata_writer::DataFileInfo;
 use datafusion_ducklake::{
     BackfillOptions, ColumnDef, DuckLakeCatalog, DuckLakeTable, DuckLakeTableWriter,
-    DuckLakeWriteOptions, MetadataWriter, SqliteMetadataProvider, SqliteMetadataWriter, WriteMode,
+    DuckLakeWriteOptions, MergeOptions, MetadataWriter, SqliteMetadataProvider,
+    SqliteMetadataWriter, WriteMode,
 };
 use object_store::local::LocalFileSystem;
+use object_store::path::Path as ObjectPath;
 use tempfile::TempDir;
 
 const NAME: &str = "probe";
@@ -61,16 +66,28 @@ enum Fault {
 /// `(name, field id)` of each field of an opened file.
 type OpenedFields = Vec<(String, String)>;
 
-/// What a [`Probe`] saw, shared with the test.
+/// What one stored file's observer kept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Record {
+    origin: WriteOrigin,
+    rows: usize,
+    object_path: ObjectPath,
+    /// Whether the catalog listed the file when its observer was told.
+    listed_when_stored: bool,
+}
+
+/// What a [`Probe`] saw and kept, shared with the test.
 #[derive(Debug, Default)]
 struct Seen {
     /// `(origin, schema field names with their field ids)` per opened file.
     opened: Mutex<Vec<(WriteOrigin, OpenedFields)>>,
-    /// `file_facts` reads made by scan hooks.
-    fact_reads: AtomicUsize,
+    /// The probe's own store: one record per `(path, size)`.
+    records: Mutex<HashMap<(String, i64), Record>>,
+    /// The locations scan hooks resolved, by path.
+    resolved: Mutex<HashMap<String, ObjectPath>>,
 }
 
-/// Records each file's row count, and skips scans of files it recorded with
+/// Keeps each file's row count, and skips scans of files it recorded with
 /// exactly `skip_rows` rows (a test-only breach of the "only skip what cannot
 /// match" contract, to make a skip observable in the result).
 #[derive(Debug)]
@@ -80,6 +97,8 @@ struct Probe {
     seen: Arc<Seen>,
     /// Files a backfill passes over.
     done: Vec<String>,
+    /// The catalog to check, when told a file is stored, whether it lists it.
+    catalog_url: Option<String>,
 }
 
 impl Probe {
@@ -89,6 +108,7 @@ impl Probe {
             skip_rows: None,
             seen: Arc::default(),
             done: Vec::new(),
+            catalog_url: None,
         }
     }
 }
@@ -108,8 +128,10 @@ impl DuckLakeExtension for Probe {
         Ok(Some(Arc::new(ProbeHook {
             fault: self.fault,
             origin: ctx.origin,
+            table_id: ctx.table_id,
             seen: Arc::clone(&self.seen),
             done: self.done.clone(),
+            catalog_url: self.catalog_url.clone(),
         })))
     }
 
@@ -129,8 +151,10 @@ impl DuckLakeExtension for Probe {
 struct ProbeHook {
     fault: Fault,
     origin: WriteOrigin,
+    table_id: i64,
     seen: Arc<Seen>,
     done: Vec<String>,
+    catalog_url: Option<String>,
 }
 
 impl FileWriteHook for ProbeHook {
@@ -154,7 +178,11 @@ impl FileWriteHook for ProbeHook {
         self.seen.opened.lock().unwrap().push((self.origin, fields));
         Some(Box::new(ProbeObserver {
             fault: self.fault,
+            origin: self.origin,
+            table_id: self.table_id,
             rows: 0,
+            seen: Arc::clone(&self.seen),
+            catalog_url: self.catalog_url.clone(),
         }))
     }
 
@@ -170,7 +198,11 @@ impl FileWriteHook for ProbeHook {
 #[derive(Debug)]
 struct ProbeObserver {
     fault: Fault,
+    origin: WriteOrigin,
+    table_id: i64,
     rows: usize,
+    seen: Arc<Seen>,
+    catalog_url: Option<String>,
 }
 
 #[async_trait]
@@ -189,10 +221,7 @@ impl FileObserver for ProbeObserver {
         Ok(())
     }
 
-    async fn stored(
-        self: Box<Self>,
-        file: &StoredFile,
-    ) -> datafusion_ducklake::Result<Vec<FileFact>> {
+    async fn stored(self: Box<Self>, file: &StoredFile) -> datafusion_ducklake::Result<()> {
         match self.fault {
             Fault::PanicStored => panic!("probe: stored"),
             Fault::ErrStored => {
@@ -202,18 +231,36 @@ impl FileObserver for ProbeObserver {
             },
             _ => {},
         }
-        Ok(vec![FileFact {
-            path: file.catalog_path.clone(),
-            file_size_bytes: file.file_size_bytes,
-            key: 0,
-            value: self.rows.to_string(),
-        }])
+        let listed_when_stored = match &self.catalog_url {
+            Some(url) => listed_paths(url, self.table_id)
+                .await
+                .contains(&file.catalog_path),
+            None => false,
+        };
+        self.seen.records.lock().unwrap().insert(
+            (file.catalog_path.clone(), file.file_size_bytes),
+            Record {
+                origin: self.origin,
+                rows: self.rows,
+                object_path: file.object_path.clone(),
+                listed_when_stored,
+            },
+        );
+        Ok(())
     }
 }
 
-/// The facts a catalog's scans have read, kept across queries.
-#[derive(Debug, Default)]
-struct KnownCounts(Mutex<HashMap<(String, i64), i64>>);
+/// The paths the catalog at `url` lists for `table_id` at its head.
+async fn listed_paths(url: &str, table_id: i64) -> Vec<String> {
+    let provider = SqliteMetadataProvider::new(url).await.unwrap();
+    let snapshot = provider.get_current_snapshot().unwrap();
+    provider
+        .get_table_files_for_select(table_id, snapshot)
+        .unwrap()
+        .into_iter()
+        .map(|f| f.file.path)
+        .collect()
+}
 
 #[derive(Debug)]
 struct ProbeScan {
@@ -226,42 +273,25 @@ struct ProbeScan {
 impl ScanHook for ProbeScan {
     async fn select(
         &self,
-        ctx: &ScanContext<'_>,
+        _ctx: &ScanContext<'_>,
         files: &[ScanFile<'_>],
     ) -> HashMap<i64, FileSelection> {
         if self.fault == Fault::PanicSelect {
             panic!("probe: select");
         }
-        let known = ctx.shared_state.get_or_default::<KnownCounts>();
-        let key = |f: &ScanFile<'_>| (f.file.file.path.clone(), f.file.file.file_size_bytes);
-        let missing: Vec<&str> = {
-            let known = known.0.lock().unwrap();
-            files
-                .iter()
-                .filter(|f| !known.contains_key(&key(f)))
-                .map(|f| f.file.file.path.as_str())
-                .collect()
-        };
-        if !missing.is_empty() {
-            self.seen.fact_reads.fetch_add(1, Ordering::SeqCst);
-            let facts = ctx
-                .metadata
-                .file_facts(NAME, ctx.table_id, &missing, None)
-                .unwrap();
-            let mut known = known.0.lock().unwrap();
-            for fact in facts {
-                known.insert(
-                    (fact.path, fact.file_size_bytes),
-                    fact.value.parse().unwrap(),
-                );
+        let records = self.seen.records.lock().unwrap();
+        let mut resolved = self.seen.resolved.lock().unwrap();
+        let mut out = HashMap::new();
+        for f in files {
+            resolved.insert(f.file.file.path.clone(), f.location().unwrap());
+            let rows = records
+                .get(&(f.file.file.path.clone(), f.file.file.file_size_bytes))
+                .map(|record| record.rows as i64);
+            if self.skip_rows.is_some() && rows == self.skip_rows {
+                out.insert(f.file.data_file_id, FileSelection::Skip);
             }
         }
-        let known = known.0.lock().unwrap();
-        files
-            .iter()
-            .filter(|f| self.skip_rows.is_some() && known.get(&key(f)).copied() == self.skip_rows)
-            .map(|f| (f.file.data_file_id, FileSelection::Skip))
-            .collect()
+        out
     }
 }
 
@@ -273,21 +303,15 @@ struct Env {
 impl Env {
     async fn new() -> Self {
         let temp = TempDir::new().unwrap();
-        let data = temp.path().join("data");
-        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(temp.path().join("data")).unwrap();
         let env = Self {
             temp,
             table_id: 0,
         };
         let writer = env.writer().await;
-        writer.set_data_path(data.to_str().unwrap()).unwrap();
-        let cols: Vec<ColumnDef> = schema()
-            .fields()
-            .iter()
-            .map(|f| ColumnDef::from_arrow(f.name(), f.data_type(), f.is_nullable()).unwrap())
-            .collect();
+        writer.set_data_path(env.data().to_str().unwrap()).unwrap();
         let s = writer
-            .begin_write_transaction("main", "t", &cols, WriteMode::Replace)
+            .begin_write_transaction("main", "t", &columns(), WriteMode::Replace)
             .unwrap();
         writer
             .publish_snapshot(
@@ -297,7 +321,7 @@ impl Env {
                 s.snapshot_id,
                 WriteMode::Replace,
                 s.base_snapshot_id,
-                &cols,
+                &columns(),
                 &s.column_ids,
             )
             .unwrap();
@@ -305,6 +329,10 @@ impl Env {
             table_id: s.table_id,
             ..env
         }
+    }
+
+    fn data(&self) -> std::path::PathBuf {
+        self.temp.path().join("data")
     }
 
     fn url(&self) -> String {
@@ -324,21 +352,40 @@ impl Env {
         SqliteMetadataProvider::new(&self.url()).await.unwrap()
     }
 
-    /// One data file of `rows`, written with `extension` (or none).
-    async fn append(&self, rows: std::ops::Range<i64>, extension: Option<Arc<Probe>>) {
-        let mut options = DuckLakeWriteOptions::default().with_data_inlining_row_limit(0);
-        if let Some(extension) = extension {
-            options = options.with_extension(extension);
+    fn options(extension: Option<Arc<Probe>>) -> DuckLakeWriteOptions {
+        let options = DuckLakeWriteOptions::default().with_data_inlining_row_limit(0);
+        match extension {
+            Some(extension) => options.with_extension(extension),
+            None => options,
         }
+    }
+
+    async fn table_writer(&self, extension: Option<Arc<Probe>>) -> DuckLakeTableWriter {
         DuckLakeTableWriter::new(
             Arc::new(self.writer().await),
             Arc::new(LocalFileSystem::new()),
         )
         .unwrap()
-        .with_options(&options)
-        .append_table("main", "t", &[batch(rows)])
-        .await
-        .unwrap();
+        .with_options(&Self::options(extension))
+    }
+
+    /// One data file of `rows`, written with `extension` (or none).
+    async fn append(&self, rows: std::ops::Range<i64>, extension: Option<Arc<Probe>>) {
+        self.table_writer(extension)
+            .await
+            .append_table("main", "t", &[batch(rows)])
+            .await
+            .unwrap();
+    }
+
+    /// One data file of `rows`, through a streaming write session.
+    async fn stream(&self, rows: std::ops::Range<i64>, extension: Arc<Probe>) {
+        let writer = self.table_writer(Some(extension)).await;
+        let mut session = writer
+            .begin_write("main", "t", schema().as_ref(), WriteMode::Append)
+            .unwrap();
+        session.write_batch(&batch(rows)).unwrap();
+        session.finish().await.unwrap();
     }
 
     async fn catalog(&self, extension: Arc<Probe>) -> DuckLakeCatalog {
@@ -347,6 +394,7 @@ impl Env {
             Arc::new(self.writer().await),
         )
         .unwrap()
+        .with_write_options(Self::options(None))
         .with_extension(extension)
     }
 
@@ -369,22 +417,28 @@ impl Env {
         files.sort();
         files
     }
+}
 
-    /// The probe's facts, `(path, size, value)`, sorted.
-    async fn facts(&self) -> Vec<(String, i64, String)> {
-        let files = self.files().await;
-        let paths: Vec<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
-        let mut facts: Vec<(String, i64, String)> = self
-            .provider()
-            .await
-            .file_facts(NAME, self.table_id, &paths, None)
-            .unwrap()
-            .into_iter()
-            .map(|f| (f.path, f.file_size_bytes, f.value))
-            .collect();
-        facts.sort();
-        facts
-    }
+fn columns() -> Vec<ColumnDef> {
+    schema()
+        .fields()
+        .iter()
+        .map(|f| ColumnDef::from_arrow(f.name(), f.data_type(), f.is_nullable()).unwrap())
+        .collect()
+}
+
+/// `probe`'s records of the live files, `(path, size) -> record`.
+async fn live_records(env: &Env, probe: &Probe) -> HashMap<(String, i64), Record> {
+    let live = env.files().await;
+    probe
+        .seen
+        .records
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(key, _)| live.contains(key))
+        .map(|(key, record)| (key.clone(), record.clone()))
+        .collect()
 }
 
 async fn sum_v(ctx: &SessionContext) -> i64 {
@@ -419,40 +473,56 @@ async fn table(ctx: &SessionContext) -> DuckLakeTable {
         .clone()
 }
 
-/// Every file a write names gets its observers' facts recorded, keyed by its
-/// path and size, with what the observer saw.
+/// Every file a write names reaches its observer once stored and before its
+/// commit, on every write path: a buffered append, a streaming session and a
+/// merge. The observer saw the written schema: catalog columns with field ids.
 #[tokio::test(flavor = "multi_thread")]
-async fn each_written_file_gets_its_facts() {
+async fn observers_see_each_file_stored_before_its_commit() {
     let env = Env::new().await;
-    let probe = Arc::new(Probe::new(Fault::None));
+    let probe = Arc::new(Probe {
+        catalog_url: Some(env.url()),
+        ..Probe::new(Fault::None)
+    });
     env.append(0..3, Some(Arc::clone(&probe))).await;
-    env.append(3..7, Some(Arc::clone(&probe))).await;
-    let files = env.files().await;
-    assert_eq!(files.len(), 2);
-    let facts = env.facts().await;
-    let mut want: Vec<(String, i64, String)> = files
-        .iter()
-        .map(|(path, size)| (path.clone(), *size, String::new()))
-        .collect();
-    for (fact, want) in facts.iter().zip(&mut want) {
-        want.2 = fact.2.clone();
-    }
-    assert_eq!(facts, want, "one fact per file, keyed by path and size");
-    let mut counts: Vec<&str> = facts.iter().map(|f| f.2.as_str()).collect();
-    counts.sort();
-    assert_eq!(counts, vec!["3", "4"]);
-    // The observer saw the written schema: catalog columns with field ids.
+    env.stream(3..7, Arc::clone(&probe)).await;
+    let records = live_records(&env, &probe).await;
+    assert_eq!(records.len(), 2, "{records:?}");
+    let mut rows: Vec<usize> = records.values().map(|r| r.rows).collect();
+    rows.sort();
+    assert_eq!(rows, vec![3, 4]);
+    assert!(
+        records.values().all(|r| r.origin == WriteOrigin::Insert),
+        "{records:?}"
+    );
+
+    let ctx = env.ctx(Arc::clone(&probe)).await;
+    let merged = table(&ctx)
+        .await
+        .merge_adjacent_files(&ctx.state(), MergeOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(merged.files_processed, 2, "{merged:?}");
+    let records = live_records(&env, &probe).await;
+    assert_eq!(records.len(), 1, "the merge output: {records:?}");
+    let output = records.values().next().unwrap();
+    assert_eq!((output.origin, output.rows), (WriteOrigin::Compaction, 7));
+
+    let all = probe.seen.records.lock().unwrap().clone();
+    assert!(
+        all.values().all(|r| !r.listed_when_stored),
+        "told before the commit: {all:?}"
+    );
     let opened = probe.seen.opened.lock().unwrap();
-    assert!(opened.iter().all(|(origin, fields)| {
-        *origin == WriteOrigin::Insert
-            && fields
-                .iter()
-                .any(|(name, id)| name == "v" && !id.is_empty())
+    assert!(opened.iter().all(|(_, fields)| {
+        fields
+            .iter()
+            .any(|(name, id)| name == "v" && !id.is_empty())
     }));
 }
 
 /// A hook that panics or errs, at any point of a write or a scan, leaves the
-/// write committed and the scan's answer unchanged, without its facts.
+/// write committed and the scan's answer unchanged; a failed observer keeps
+/// nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failing_hook_never_fails_a_write_or_a_scan() {
     for fault in [
@@ -470,9 +540,9 @@ async fn a_failing_hook_never_fails_a_write_or_a_scan() {
         env.append(0..10, Some(Arc::clone(&probe))).await;
         let write_fault = !matches!(fault, Fault::PanicScanHook | Fault::PanicSelect);
         assert_eq!(
-            env.facts().await.is_empty(),
+            live_records(&env, &probe).await.is_empty(),
             write_fault,
-            "{fault:?}: a failed observer records nothing"
+            "{fault:?}: a failed observer keeps nothing"
         );
         // Through a catalog, so the scan runs the hooks too.
         let ctx = env.ctx(Arc::clone(&probe)).await;
@@ -487,7 +557,7 @@ async fn a_failing_hook_never_fails_a_write_or_a_scan() {
 }
 
 /// A scan hook's skip is applied: the probe skips the file it recorded with
-/// 3 rows.
+/// 3 rows. The location a scan hook resolves is where the file was stored.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_skip_leaves_the_file_out() {
     let env = Env::new().await;
@@ -496,48 +566,34 @@ async fn a_skip_leaves_the_file_out() {
     env.append(100..104, Some(Arc::clone(&probe))).await;
     let skipping = Arc::new(Probe {
         skip_rows: Some(3),
+        seen: Arc::clone(&probe.seen),
         ..Probe::new(Fault::None)
     });
     assert_eq!(
         sum_v(&env.ctx(skipping).await).await,
         (100..104).sum::<i64>()
     );
-    let plain = Arc::new(Probe::new(Fault::None));
     assert_eq!(
-        sum_v(&env.ctx(plain).await).await,
+        sum_v(&env.ctx(Arc::clone(&probe)).await).await,
         (0..3).sum::<i64>() + (100..104).sum::<i64>()
     );
-}
-
-/// A catalog keeps `shared_state` across queries: the second query reads no
-/// facts. A table built by another catalog starts over.
-#[tokio::test(flavor = "multi_thread")]
-async fn shared_state_outlives_a_query() {
-    let env = Env::new().await;
-    env.append(0..3, Some(Arc::new(Probe::new(Fault::None))))
-        .await;
-    env.append(3..5, Some(Arc::new(Probe::new(Fault::None))))
-        .await;
-    let probe = Arc::new(Probe::new(Fault::None));
-    let ctx = env.ctx(Arc::clone(&probe)).await;
-    for _ in 0..3 {
-        assert_eq!(sum_v(&ctx).await, (0..5).sum::<i64>());
+    let records = probe.seen.records.lock().unwrap();
+    let resolved = probe.seen.resolved.lock().unwrap();
+    assert_eq!(resolved.len(), 2);
+    for ((path, _), record) in records.iter() {
+        assert_eq!(resolved.get(path), Some(&record.object_path), "{path}");
     }
-    assert_eq!(probe.seen.fact_reads.load(Ordering::SeqCst), 1);
-    let other = env.ctx(Arc::clone(&probe)).await;
-    sum_v(&other).await;
-    assert_eq!(probe.seen.fact_reads.load(Ordering::SeqCst), 2);
 }
 
 /// `backfill` replays the write hook over files written without it: only
 /// the columns the hook asks for, typed and tagged as the catalog has them;
-/// files the hook passes over are skipped; facts are recorded per file.
+/// files the hook passes over are skipped; an observer that errs fails its
+/// file.
 #[tokio::test(flavor = "multi_thread")]
 async fn backfill_observes_files_written_without_the_extension() {
     let env = Env::new().await;
     env.append(0..3, None).await;
     env.append(3..10, None).await;
-    assert!(env.facts().await.is_empty());
 
     let probe = Arc::new(Probe::new(Fault::None));
     let ctx = env.ctx(Arc::clone(&probe)).await;
@@ -552,10 +608,11 @@ async fn backfill_observes_files_written_without_the_extension() {
         "{result:?}"
     );
     assert!(result.bytes_read > 0);
-    assert_eq!(result.facts.len(), 2);
-    let mut counts: Vec<String> = env.facts().await.into_iter().map(|f| f.2).collect();
-    counts.sort();
-    assert_eq!(counts, vec!["3", "7"]);
+    let records = live_records(&env, &probe).await;
+    let mut rows: Vec<usize> = records.values().map(|r| r.rows).collect();
+    rows.sort();
+    assert_eq!(rows, vec![3, 7]);
+    assert!(records.values().all(|r| r.origin == WriteOrigin::Backfill));
     {
         let opened = probe.seen.opened.lock().unwrap();
         assert_eq!(opened.len(), 2);
@@ -578,12 +635,12 @@ async fn backfill_observes_files_written_without_the_extension() {
         .unwrap();
     assert_eq!((again.files_read, again.files_skipped), (0, 2), "{again:?}");
 
-    // An observer that errs counts its file as failed and records nothing.
+    // An observer that errs counts its file as failed and keeps nothing.
     let erring = Arc::new(Probe::new(Fault::ErrStored));
     let failed = table
         .backfill(
             &ctx.state(),
-            erring,
+            Arc::clone(&erring) as Arc<dyn DuckLakeExtension>,
             BackfillOptions::default().with_max_files(1),
         )
         .await
@@ -593,37 +650,66 @@ async fn backfill_observes_files_written_without_the_extension() {
         (0, 1),
         "{failed:?}"
     );
-    assert!(failed.facts.is_empty());
+    assert!(erring.seen.records.lock().unwrap().is_empty());
 }
 
-/// `prune_extension_facts` drops, for every registered extension, the facts
-/// of files no catalog row lists, and keeps the live files' facts.
+/// A file whose column cannot be cast to the catalog's type is skipped by
+/// the backfill, not read and failed on every pass.
 #[tokio::test(flavor = "multi_thread")]
-async fn prune_drops_facts_of_unlisted_files() {
+async fn backfill_skips_a_column_that_does_not_cast() {
     let env = Env::new().await;
-    let probe = Arc::new(Probe::new(Fault::None));
-    env.append(0..3, Some(Arc::clone(&probe))).await;
-    let ghost = FileFact {
-        path: "never-committed.parquet".to_string(),
-        file_size_bytes: 1,
-        key: 0,
-        value: "0".to_string(),
-    };
-    env.writer()
-        .await
-        .record_file_facts(NAME, env.table_id, std::slice::from_ref(&ghost))
+    // `v` stored as binary, with no field ids: an upload registered as is.
+    let stored = Arc::new(Schema::new(vec![
+        Field::new("v", DataType::Binary, true),
+        Field::new("label", DataType::Utf8, true),
+    ]));
+    let rows = RecordBatch::try_new(
+        Arc::clone(&stored),
+        vec![
+            Arc::new(BinaryArray::from_vec(vec![b"a".as_slice(), b"b"])),
+            Arc::new(StringArray::from(vec!["x", "y"])),
+        ],
+    )
+    .unwrap();
+    let dir = env.data().join("main").join("t");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("binary.parquet");
+    let mut out =
+        parquet::arrow::ArrowWriter::try_new(std::fs::File::create(&path).unwrap(), stored, None)
+            .unwrap();
+    out.write(&rows).unwrap();
+    out.close().unwrap();
+    let size = std::fs::metadata(&path).unwrap().len() as i64;
+    let writer = env.writer().await;
+    let setup = writer
+        .begin_write_transaction("main", "t", &columns(), WriteMode::Append)
         .unwrap();
-    let catalog = env.catalog(probe).await;
-    assert!(
-        catalog
-            .prune_extension_facts(Duration::from_secs(3_600))
-            .unwrap()
-            .is_empty(),
-        "inside the grace period"
-    );
+    writer
+        .register_data_file(
+            setup.table_id,
+            "main",
+            "t",
+            setup.snapshot_id,
+            &DataFileInfo::new("binary.parquet", size, 2),
+            WriteMode::Append,
+            setup.base_snapshot_id,
+            &columns(),
+            &setup.column_ids,
+        )
+        .unwrap();
+    assert_eq!(env.files().await.len(), 1);
+
+    let probe = Arc::new(Probe::new(Fault::None));
+    let ctx = env.ctx(Arc::clone(&probe)).await;
+    let result = table(&ctx)
+        .await
+        .backfill(&ctx.state(), probe.clone(), BackfillOptions::default())
+        .await
+        .unwrap();
     assert_eq!(
-        catalog.prune_extension_facts(Duration::ZERO).unwrap(),
-        vec![(NAME.to_string(), ghost)]
+        (result.files_read, result.files_skipped, result.files_failed),
+        (0, 1, 0),
+        "{result:?}"
     );
-    assert_eq!(env.facts().await.len(), 1, "the live file keeps its fact");
+    assert!(probe.seen.opened.lock().unwrap().is_empty());
 }

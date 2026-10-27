@@ -28,13 +28,15 @@ use tempfile::TempDir;
 
 use datafusion_ducklake::maintenance::{CleanupCriteria, ExpireCriteria};
 use datafusion_ducklake::{
-    ColumnDef, DuckLakeCatalog, DuckLakeTable, DuckLakeTableWriter, DuckLakeWriteOptions,
-    MergeOptions, MetadataWriter, RewriteOptions, SqliteMetadataProvider, SqliteMetadataWriter,
-    WriteMode,
+    ColumnDef, DuckLakeCatalog, DuckLakeReadOptions, DuckLakeTable, DuckLakeTableWriter,
+    DuckLakeWriteOptions, MergeOptions, MetadataWriter, RewriteOptions, SqliteMetadataProvider,
+    SqliteMetadataWriter, WriteMode,
 };
+use datafusion_ducklake_ext::db::ExtensionDb;
 use datafusion_ducklake_ext::file_index::format::{FileIndexMeta, IndexKey, IndexValueType};
+use datafusion_ducklake_ext::file_index::table as index_table;
 use datafusion_ducklake_ext::file_index::{
-    self, BuildIndexOptions, BuildIndexResult, FileIndex, FileIndexRow, FileIndexTableExt,
+    BuildIndexOptions, BuildIndexResult, FileIndex, FileIndexRow, FileIndexTableExt,
     file_index_rows, prune_file_indexes,
 };
 
@@ -157,6 +159,8 @@ struct Env {
     temp: TempDir,
     table_id: i64,
     store: Arc<Store>,
+    /// The catalog database's pool: the extension's, and the test's own SQL.
+    pool: sqlx::SqlitePool,
 }
 
 /// One sidecar row, as stored.
@@ -196,6 +200,20 @@ impl Env {
         Arc::clone(&self.store) as Arc<dyn ObjectStore>
     }
 
+    fn db(&self) -> ExtensionDb {
+        ExtensionDb::sqlite(self.pool.clone())
+    }
+
+    /// A fresh extension instance (nothing read yet) over the catalog's pool.
+    fn index(&self) -> Arc<FileIndex> {
+        Arc::new(FileIndex::new(self.db()))
+    }
+
+    /// [`options`] with the extension on for writes.
+    fn index_options(&self) -> DuckLakeWriteOptions {
+        options().with_extension(self.index())
+    }
+
     async fn declare(&self, columns: &str) {
         self.writer()
             .await
@@ -225,12 +243,15 @@ impl Env {
         self.catalog_with(options()).await
     }
 
+    /// Writes with `options`; reads (and `build_file_indexes`) with the
+    /// extension registered.
     async fn catalog_with(&self, options: DuckLakeWriteOptions) -> DuckLakeCatalog {
         DuckLakeCatalog::with_writer(
             Arc::new(SqliteMetadataProvider::new(&self.url()).await.unwrap()),
             Arc::new(self.writer().await),
         )
         .unwrap()
+        .with_read_options(DuckLakeReadOptions::default().with_extension(self.index()))
         .with_write_options(options)
     }
 
@@ -260,12 +281,12 @@ impl Env {
     }
 
     async fn pool(&self) -> sqlx::SqlitePool {
-        sqlx::SqlitePool::connect(&self.url()).await.unwrap()
+        self.pool.clone()
     }
 
     async fn has_sidecar(&self) -> bool {
         use sqlx::Row as _;
-        sqlx::query("SELECT count(*) > 0 FROM sqlite_master WHERE name = 'ext_ducklake_file_fact'")
+        sqlx::query("SELECT count(*) > 0 FROM sqlite_master WHERE name = 'ext_ducklake_file_index'")
             .fetch_one(&self.pool().await)
             .await
             .unwrap()
@@ -278,12 +299,10 @@ impl Env {
             return Vec::new();
         }
         sqlx::query(
-            "SELECT path, file_size_bytes, fact_key, json_extract(value, '$.index_path'),
-                    json_extract(value, '$.index_key'), json_extract(value, '$.index_size_bytes'),
-                    json_extract(value, '$.value_type'), json_extract(value, '$.row_count'),
-                    json_extract(value, '$.row_group_rows'), json_extract(value, '$.built_by')
-             FROM ext_ducklake_file_fact WHERE extension = 'file_index'
-             ORDER BY path, fact_key",
+            "SELECT path, file_size_bytes, column_id, index_path, index_key, index_size_bytes,
+                    value_type, row_count, row_group_rows, built_by
+             FROM ext_ducklake_file_index
+             ORDER BY path, column_id",
         )
         .fetch_all(&self.pool().await)
         .await
@@ -506,11 +525,6 @@ fn options() -> DuckLakeWriteOptions {
     options
 }
 
-/// [`options`] with the experimental write option on.
-fn index_options() -> DuckLakeWriteOptions {
-    options().with_extension(Arc::new(FileIndex::new()))
-}
-
 async fn setup() -> Env {
     let temp = TempDir::new().unwrap();
     std::fs::create_dir_all(temp.path().join("data")).unwrap();
@@ -518,10 +532,13 @@ async fn setup() -> Env {
         inner: LocalFileSystem::new(),
         fail_index_puts: AtomicBool::new(false),
     });
+    let url = format!("sqlite:{}?mode=rwc", temp.path().join("test.db").display());
+    let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
     let env = Env {
         temp,
         table_id: 0,
         store,
+        pool,
     };
     let writer = env.writer().await;
     writer
@@ -743,33 +760,30 @@ async fn unlisted_row_is_pruned_after_grace() {
     let live = env.rows().await;
     let ghost = format!("{}.ghost", live[0].index_key);
     std::fs::write(format!("/{ghost}"), b"x").unwrap();
-    env.writer()
-        .await
-        .record_file_facts(
-            file_index::NAME,
-            env.table_id,
-            &[FileIndexRow {
-                meta: FileIndexMeta {
-                    path: "never-committed.parquet".to_string(),
-                    ..sample_meta()
-                },
-                index_key: ghost.clone(),
-                built_by: "backfill".to_string(),
-            }
-            .to_fact()],
-        )
-        .unwrap();
+    index_table::record(
+        &env.db(),
+        env.table_id,
+        &[FileIndexRow {
+            meta: FileIndexMeta {
+                path: "never-committed.parquet".to_string(),
+                ..sample_meta()
+            },
+            index_key: ghost.clone(),
+            built_by: "backfill".to_string(),
+        }],
+    )
+    .await
+    .unwrap();
     assert_eq!(env.rows().await.len(), 3);
 
-    let writer = env.writer().await;
     // Inside the grace period: kept.
-    let kept = prune_file_indexes(&writer, env.store(), Duration::from_secs(3_600))
+    let kept = prune_file_indexes(&env.db(), env.store(), Duration::from_secs(3_600))
         .await
         .unwrap();
     assert!(kept.is_empty());
     assert_eq!(env.rows().await.len(), 3);
 
-    let pruned = prune_file_indexes(&writer, env.store(), Duration::ZERO)
+    let pruned = prune_file_indexes(&env.db(), env.store(), Duration::ZERO)
         .await
         .unwrap();
     assert_eq!(pruned, vec![ghost.clone()]);
@@ -823,7 +837,7 @@ async fn prune_after_expiry_removes_index_with_file() {
             .unwrap()
             .get::<i64, _>(0) as usize
     };
-    let mut pruned = prune_file_indexes(&writer, env.store(), Duration::ZERO)
+    let mut pruned = prune_file_indexes(&env.db(), env.store(), Duration::ZERO)
         .await
         .unwrap();
     if listed > 1 {
@@ -844,7 +858,7 @@ async fn prune_after_expiry_removes_index_with_file() {
     .await
     .unwrap();
     pruned.extend(
-        prune_file_indexes(&writer, env.store(), Duration::ZERO)
+        prune_file_indexes(&env.db(), env.store(), Duration::ZERO)
             .await
             .unwrap(),
     );
@@ -936,22 +950,19 @@ async fn backfill_rebuilds_a_mismatched_row() {
     env.backfill().await;
     let n_id = env.column_ids().await["n"];
     sqlx::query(
-        "UPDATE ext_ducklake_file_fact
-         SET file_size_bytes = 1, value = json_set(value, '$.built_by', 'stale')
-         WHERE extension = 'file_index' AND fact_key = ?",
+        "UPDATE ext_ducklake_file_index
+         SET file_size_bytes = 1, built_by = 'stale'
+         WHERE column_id = ?",
     )
     .bind(n_id)
     .execute(&env.pool().await)
     .await
     .unwrap();
-    sqlx::query(
-        "UPDATE ext_ducklake_file_fact SET value = json_set(value, '$.built_by', 'kept')
-         WHERE extension = 'file_index' AND fact_key != ?",
-    )
-    .bind(n_id)
-    .execute(&env.pool().await)
-    .await
-    .unwrap();
+    sqlx::query("UPDATE ext_ducklake_file_index SET built_by = 'kept' WHERE column_id != ?")
+        .bind(n_id)
+        .execute(&env.pool().await)
+        .await
+        .unwrap();
     let result = env.backfill().await;
     assert_eq!(result.files_indexed, 1, "{result:?}");
     let rows = env.rows().await;
@@ -1076,9 +1087,9 @@ async fn provider_rows_serve_exact_lookups() {
     let ids = env.column_ids().await;
     let live = env.live_files().await;
     let paths: Vec<&str> = live.iter().map(|(p, _)| p.as_str()).collect();
-    let provider = SqliteMetadataProvider::new(&env.url()).await.unwrap();
     let metas: Vec<FileIndexMeta> =
-        file_index_rows(&provider, env.table_id, &paths, &[ids["user_id"], ids["n"]])
+        file_index_rows(&env.db(), env.table_id, &paths, &[ids["user_id"], ids["n"]])
+            .await
             .unwrap()
             .into_iter()
             .map(|row| row.meta)
@@ -1125,9 +1136,9 @@ async fn provider_rows_serve_exact_lookups() {
 #[tokio::test(flavor = "multi_thread")]
 async fn written_session_and_rolled_files_are_indexed() {
     let env = indexed_env().await;
-    env.append(&[batch(0..700), batch(700..1_000)], &index_options())
+    env.append(&[batch(0..700), batch(700..1_000)], &env.index_options())
         .await;
-    let mut rolled = index_options();
+    let mut rolled = env.index_options();
     rolled.target_file_size = Some(4_000);
     env.append(
         &(0..10)
@@ -1149,7 +1160,7 @@ async fn written_session_and_rolled_files_are_indexed() {
 #[tokio::test(flavor = "multi_thread")]
 async fn written_buffered_and_flushed_files_are_indexed() {
     let env = indexed_env().await;
-    let mut opts = index_options();
+    let mut opts = env.index_options();
     opts.target_file_size = Some(4_000);
     env.table_writer(&opts)
         .await
@@ -1163,7 +1174,7 @@ async fn written_buffered_and_flushed_files_are_indexed() {
         .await
         .unwrap();
     assert!(env.live_files().await.len() > 1, "the write rolled");
-    let mut inline = index_options();
+    let mut inline = env.index_options();
     inline.data_inlining_row_limit = Some(1_000);
     let writer = env.table_writer(&inline).await;
     for i in 0..3 {
@@ -1177,7 +1188,7 @@ async fn written_buffered_and_flushed_files_are_indexed() {
             .unwrap();
     }
     let flushed = env
-        .catalog_with(index_options())
+        .catalog_with(env.index_options())
         .await
         .flush_inlined_data(&SessionContext::new().state(), Some("main"), Some("logs"))
         .await
@@ -1195,7 +1206,7 @@ async fn merge_and_rewrite_outputs_are_indexed() {
     }
     assert!(env.rows().await.is_empty());
 
-    let (ctx, table) = env.table_with(index_options()).await;
+    let (ctx, table) = env.table_with(env.index_options()).await;
     let merged = table
         .merge_adjacent_files(&ctx.state(), MergeOptions::default())
         .await
@@ -1204,7 +1215,7 @@ async fn merge_and_rewrite_outputs_are_indexed() {
     assert_eq!(env.live_files().await.len(), 1);
     env.assert_indexed(&["user_id", "n"], "compact").await;
 
-    let (ctx, table) = env.table_with(index_options()).await;
+    let (ctx, table) = env.table_with(env.index_options()).await;
     let ids: Vec<i64> = {
         use sqlx::Row as _;
         sqlx::query("SELECT data_file_id FROM ducklake_data_file WHERE end_snapshot IS NULL")
@@ -1237,7 +1248,7 @@ async fn merge_and_rewrite_outputs_are_indexed() {
 async fn failed_index_upload_keeps_the_data_write() {
     let env = indexed_env().await;
     env.store.fail_index_puts.store(true, Ordering::SeqCst);
-    env.append(&[batch(0..500)], &index_options()).await;
+    env.append(&[batch(0..500)], &env.index_options()).await;
     assert_eq!(env.live_files().await.len(), 1, "the data write committed");
     assert!(env.rows().await.is_empty(), "no row without its object");
     env.store.fail_index_puts.store(false, Ordering::SeqCst);
@@ -1248,7 +1259,144 @@ async fn failed_index_upload_keeps_the_data_write() {
 #[tokio::test(flavor = "multi_thread")]
 async fn option_on_with_nothing_declared_writes_nothing() {
     let env = setup().await;
-    env.append(&[batch(0..500)], &index_options()).await;
+    env.append(&[batch(0..500)], &env.index_options()).await;
     assert!(!env.has_sidecar().await);
     assert!(env.pidx_files().is_empty());
+}
+
+/// One pool serves the catalog writer, the provider and both extensions: the
+/// extensions open no connection of their own, and a pool of two connections
+/// carries a write that records its file's order, a backfill that indexes
+/// it, and a scan that reads both.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_pool_serves_the_catalog_and_both_extensions() {
+    use datafusion_ducklake::{NullOrder, SortDirection, SortField};
+    use datafusion_ducklake_ext::file_order::FileOrder;
+    use sqlx::Row as _;
+
+    let temp = TempDir::new().unwrap();
+    let data = temp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let url = format!("sqlite:{}?mode=rwc", temp.path().join("test.db").display());
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+
+    let writer = SqliteMetadataWriter::from_pool(pool.clone()).await.unwrap();
+    writer.initialize_schema().unwrap();
+    writer.set_data_path(data.to_str().unwrap()).unwrap();
+    let cols: Vec<ColumnDef> = schema()
+        .fields()
+        .iter()
+        .map(|f| ColumnDef::from_arrow(f.name(), f.data_type(), f.is_nullable()).unwrap())
+        .collect();
+    let s = writer
+        .begin_write_transaction("main", "logs", &cols, WriteMode::Replace)
+        .unwrap();
+    writer
+        .publish_snapshot(
+            s.table_id,
+            "main",
+            "logs",
+            s.snapshot_id,
+            WriteMode::Replace,
+            s.base_snapshot_id,
+            &cols,
+            &s.column_ids,
+        )
+        .unwrap();
+    writer
+        .set_table_setting(s.table_id, "ext_file_index_columns", "user_id")
+        .unwrap();
+    writer
+        .set_sort_spec(
+            s.table_id,
+            &[SortField::column(0, "ts", SortDirection::Asc, NullOrder::NullsLast)],
+        )
+        .unwrap();
+
+    let db = ExtensionDb::sqlite(pool.clone());
+    let order = Arc::new(FileOrder::new(db.clone()));
+    let index = Arc::new(FileIndex::new(db));
+    // Writes record order only; the index comes from the backfill.
+    let write_options = options().with_extension(Arc::clone(&order) as _);
+    for i in 0..2 {
+        DuckLakeTableWriter::new(Arc::new(writer.clone()), Arc::new(LocalFileSystem::new()))
+            .unwrap()
+            .with_options(&write_options)
+            .append_table("main", "logs", &[batch(i * 500..(i + 1) * 500)])
+            .await
+            .unwrap();
+    }
+
+    let catalog = DuckLakeCatalog::with_writer(
+        Arc::new(SqliteMetadataProvider::from_pool(pool.clone())),
+        Arc::new(writer.clone()),
+    )
+    .unwrap()
+    .with_read_options(
+        DuckLakeReadOptions::default()
+            .with_extension(index)
+            .with_extension(order),
+    )
+    .with_write_options(write_options);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("ducklake", Arc::new(catalog));
+    let table = ctx
+        .catalog("ducklake")
+        .unwrap()
+        .schema("main")
+        .unwrap()
+        .table("logs")
+        .await
+        .unwrap()
+        .unwrap();
+    let table = (table.as_ref() as &dyn std::any::Any)
+        .downcast_ref::<DuckLakeTable>()
+        .unwrap()
+        .clone();
+    let built = table
+        .build_file_indexes(&ctx.state(), BuildIndexOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        (built.files_indexed, built.files_failed),
+        (2, 0),
+        "{built:?}"
+    );
+
+    let count = |table: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM {table}")))
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+                .get::<i64, _>(0)
+        }
+    };
+    assert_eq!(count("ext_ducklake_file_order").await, 2);
+    assert_eq!(count("ext_ducklake_file_index").await, 2);
+
+    // `batch`'s `u0` rows: every 3rd, and the rare ids that wrap to `u0`.
+    let want = (0..1_000)
+        .filter(|i| i % 7 != 0 && (i % 3 == 0 || (i * 31) % 97 == 0))
+        .count() as i64;
+    let batches = ctx
+        .sql("SELECT count(*) FROM ducklake.main.logs WHERE user_id = 'u0'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let got = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(got, want);
+    assert!(pool.size() <= 2, "{}", pool.size());
 }

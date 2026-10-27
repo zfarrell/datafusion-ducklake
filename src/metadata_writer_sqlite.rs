@@ -807,7 +807,27 @@ impl SqliteMetadataWriter {
                 .await
         })
         .await?;
+        Self::adopt(pool, lock_path).await
+    }
 
+    /// A writer over an existing connection pool, so one pool can serve this
+    /// writer, a [`SqliteMetadataProvider::from_pool`](crate::SqliteMetadataProvider::from_pool)
+    /// and anything else that reads the catalog's database. See
+    /// [`SqliteMetadataProvider::from_pool`](crate::SqliteMetadataProvider::from_pool)
+    /// for what adopting a pool means for its connections.
+    pub async fn from_pool(pool: SqlitePool) -> Result<Self> {
+        let filename = pool.connect_options().get_filename().to_path_buf();
+        let lock_path = (!filename.as_os_str().is_empty()
+            && filename != std::path::Path::new(":memory:"))
+        .then(|| {
+            let mut path = filename.into_os_string();
+            path.push(".commit.lock");
+            PathBuf::from(path)
+        });
+        Self::adopt(pool, lock_path).await
+    }
+
+    async fn adopt(pool: SqlitePool, lock_path: Option<PathBuf>) -> Result<Self> {
         // Existing catalogs must migrate even when callers skip `initialize_schema`
         migrate_snapshot_changes_nullable(&pool).await?;
         sqlx::query(SQL_CREATE_INLINED_DATA_TABLES)
@@ -4551,112 +4571,6 @@ impl MetadataWriter for SqliteMetadataWriter {
             .await?;
             tx.commit().await?;
             Ok(new_snapshot)
-        })
-    }
-
-    fn record_file_facts(
-        &self,
-        extension: &str,
-        table_id: i64,
-        facts: &[crate::extension::FileFact],
-    ) -> Result<u64> {
-        if facts.is_empty() {
-            return Ok(0);
-        }
-        self.block_on(async {
-            async fn upsert(
-                pool: &sqlx::SqlitePool,
-                extension: &str,
-                table_id: i64,
-                facts: &[crate::extension::FileFact],
-            ) -> std::result::Result<u64, sqlx::Error> {
-                let mut tx = pool.begin().await?;
-                let mut written = 0;
-                for fact in facts {
-                    // A later fact about the same object wins: same bytes, so
-                    // only what the extension derived from them can differ.
-                    written += sqlx::query(
-                        "INSERT INTO ext_ducklake_file_fact
-                             (extension, table_id, path, fact_key, file_size_bytes, value)
-                         VALUES (?, ?, ?, ?, ?, ?)
-                         ON CONFLICT (extension, table_id, path, fact_key) DO UPDATE SET
-                             file_size_bytes = excluded.file_size_bytes,
-                             value = excluded.value,
-                             recorded_at = CURRENT_TIMESTAMP",
-                    )
-                    .bind(extension)
-                    .bind(table_id)
-                    .bind(&fact.path)
-                    .bind(fact.key)
-                    .bind(fact.file_size_bytes)
-                    .bind(&fact.value)
-                    .execute(&mut *tx)
-                    .await?
-                    .rows_affected();
-                }
-                tx.commit().await?;
-                Ok(written)
-            }
-            // The table is created on first use, so a catalog that never
-            // records anything never gets it.
-            match upsert(&self.pool, extension, table_id, facts).await {
-                Err(e) if crate::file_facts::is_missing_table(&e) => {
-                    sqlx::query(crate::file_facts::SQLITE_DDL)
-                        .execute(&self.pool)
-                        .await?;
-                    Ok(upsert(&self.pool, extension, table_id, facts).await?)
-                },
-                done => Ok(done?),
-            }
-        })
-    }
-
-    fn prune_file_facts(
-        &self,
-        extension: &str,
-        min_age: std::time::Duration,
-    ) -> Result<Vec<crate::extension::FileFact>> {
-        // CURRENT_TIMESTAMP's format, so the comparison is textual and exact.
-        // Second resolution, hence `<=`: a zero `min_age` prunes this second's rows.
-        let cutoff = chrono::Duration::from_std(min_age)
-            .ok()
-            .and_then(|age| chrono::Utc::now().checked_sub_signed(age))
-            .map_or_else(
-                || "0000-01-01 00:00:00".to_string(),
-                |at| at.format("%Y-%m-%d %H:%M:%S").to_string(),
-            );
-        self.block_on(async {
-            // Any catalog row for the path keeps it: a retired file is still
-            // read by time travel until expiry removes its row.
-            match sqlx::query(
-                "DELETE FROM ext_ducklake_file_fact
-                 WHERE extension = ?
-                   AND recorded_at <= ?
-                   AND NOT EXISTS (
-                     SELECT 1 FROM ducklake_data_file df
-                     WHERE df.table_id = ext_ducklake_file_fact.table_id
-                       AND df.path = ext_ducklake_file_fact.path)
-                 RETURNING path, file_size_bytes, fact_key, value",
-            )
-            .bind(extension)
-            .bind(cutoff)
-            .fetch_all(&self.pool)
-            .await
-            {
-                Ok(rows) => rows
-                    .iter()
-                    .map(|row| {
-                        Ok(crate::extension::FileFact {
-                            path: row.try_get(0)?,
-                            file_size_bytes: row.try_get(1)?,
-                            key: row.try_get(2)?,
-                            value: row.try_get(3)?,
-                        })
-                    })
-                    .collect(),
-                Err(e) if crate::file_facts::is_missing_table(&e) => Ok(Vec::new()),
-                Err(e) => Err(e.into()),
-            }
         })
     }
 

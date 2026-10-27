@@ -11,13 +11,15 @@ use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::prelude::*;
 use datafusion_ducklake::{
-    DuckLakeCatalog, DuckLakeTable, DuckLakeTableWriter, DuckLakeWriteOptions, MetadataWriter,
-    MulticatalogManager, MulticatalogProvider, PostgresMetadataWriter,
+    DuckLakeCatalog, DuckLakeReadOptions, DuckLakeTable, DuckLakeTableWriter, DuckLakeWriteOptions,
+    MetadataWriter, MulticatalogManager, MulticatalogProvider, PostgresMetadataWriter,
 };
+use datafusion_ducklake_ext::db::ExtensionDb;
 use datafusion_ducklake_ext::file_index::format::{FileIndexMeta, IndexKey, IndexValueType};
+use datafusion_ducklake_ext::file_index::table as index_table;
 use datafusion_ducklake_ext::file_index::{
-    self, BuildIndexOptions, BuildIndexResult, FileIndexRow, FileIndexTableExt, file_index_rows,
-    prune_file_indexes,
+    BuildIndexOptions, BuildIndexResult, FileIndex, FileIndexRow, FileIndexTableExt,
+    file_index_rows, prune_file_indexes,
 };
 use object_store::local::LocalFileSystem;
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -103,6 +105,10 @@ impl Env {
         env
     }
 
+    fn db(&self) -> ExtensionDb {
+        ExtensionDb::postgres(self.pool.clone())
+    }
+
     async fn writer(&self) -> Arc<PostgresMetadataWriter> {
         Arc::new(
             PostgresMetadataWriter::with_pool(self.pool.clone(), self.catalog_id)
@@ -131,6 +137,10 @@ impl Env {
         let catalog =
             DuckLakeCatalog::with_writer(Arc::new(self.provider().await), self.writer().await)
                 .unwrap()
+                .with_read_options(
+                    DuckLakeReadOptions::default()
+                        .with_extension(Arc::new(FileIndex::new(self.db()))),
+                )
                 .with_write_options(options());
         let ctx = SessionContext::new();
         ctx.register_catalog("cat", Arc::new(catalog));
@@ -185,9 +195,9 @@ impl Env {
         let live = self.live().await;
         let paths: Vec<&str> = live.iter().map(|(p, _)| p.as_str()).collect();
         let column = self.user_id_column().await;
-        let provider = self.provider().await;
         let mut metas: Vec<FileIndexMeta> =
-            file_index_rows(&provider, self.table_id, &paths, &[column])
+            file_index_rows(&self.db(), self.table_id, &paths, &[column])
+                .await
                 .unwrap()
                 .into_iter()
                 .map(|row| row.meta)
@@ -253,14 +263,12 @@ async fn backfilled_files_are_recorded_and_read_back() {
         ],
         "heavy hitters round-trip through the catalog"
     );
-    let key: String = sqlx::query_scalar(
-        "SELECT value::json->>'index_key' FROM ext_ducklake_file_fact
-             WHERE extension = 'file_index' AND path = $1",
-    )
-    .bind(&meta.path)
-    .fetch_one(&env.pool)
-    .await
-    .unwrap();
+    let key: String =
+        sqlx::query_scalar("SELECT index_key FROM ext_ducklake_file_index WHERE path = $1")
+            .bind(&meta.path)
+            .fetch_one(&env.pool)
+            .await
+            .unwrap();
     let bytes = std::fs::read(format!("/{key}")).unwrap();
     assert_eq!(meta.index_size_bytes, bytes.len() as i64);
 }
@@ -285,30 +293,28 @@ async fn backfill_then_prune() {
     assert_eq!(again.files_skipped, 2);
 
     // A row for a path no data file has: pruned only past the grace period.
-    let writer = env.writer().await;
     let mut ghost = env.metas().await[0].clone();
     ghost.path = "never-committed.parquet".to_string();
-    writer
-        .record_file_facts(
-            file_index::NAME,
-            env.table_id,
-            &[FileIndexRow {
-                meta: ghost,
-                index_key: "ghost/key.pidx".to_string(),
-                built_by: "write".to_string(),
-            }
-            .to_fact()],
-        )
-        .unwrap();
+    index_table::record(
+        &env.db(),
+        env.table_id,
+        &[FileIndexRow {
+            meta: ghost,
+            index_key: "ghost/key.pidx".to_string(),
+            built_by: "write".to_string(),
+        }],
+    )
+    .await
+    .unwrap();
     let store = Arc::new(LocalFileSystem::new());
     assert!(
-        prune_file_indexes(writer.as_ref(), store.clone(), Duration::from_secs(3_600))
+        prune_file_indexes(&env.db(), store.clone(), Duration::from_secs(3_600))
             .await
             .unwrap()
             .is_empty()
     );
     assert_eq!(
-        prune_file_indexes(writer.as_ref(), store, Duration::ZERO)
+        prune_file_indexes(&env.db(), store, Duration::ZERO)
             .await
             .unwrap(),
         vec!["ghost/key.pidx".to_string()]
@@ -340,19 +346,17 @@ async fn bucket_counts_round_trip() {
     };
     metas[0].bucket_counts = Some(counts.clone());
     let path = metas[0].path.clone();
-    env.writer()
-        .await
-        .record_file_facts(
-            file_index::NAME,
-            env.table_id,
-            &[FileIndexRow {
-                meta: metas[0].clone(),
-                index_key: "unused/key.pidx".to_string(),
-                built_by: "backfill".to_string(),
-            }
-            .to_fact()],
-        )
-        .unwrap();
+    index_table::record(
+        &env.db(),
+        env.table_id,
+        &[FileIndexRow {
+            meta: metas[0].clone(),
+            index_key: "unused/key.pidx".to_string(),
+            built_by: "backfill".to_string(),
+        }],
+    )
+    .await
+    .unwrap();
     let back = env.metas().await;
     let row = back.iter().find(|m| m.path == path).unwrap();
     assert_eq!(row.bucket_counts.as_ref(), Some(&counts));

@@ -9,7 +9,7 @@ use datafusion::catalog::Session;
 use datafusion_ducklake::{BackfillOptions, DuckLakeError, DuckLakeTable, Result};
 
 use super::check::{AttestedKey, encode};
-use super::{VerifyOrder, recorded_orders};
+use super::{FileOrder, VerifyOrder, VerifyPass, table};
 
 /// Options for [`FileOrderTableExt::verify_file_orders`].
 #[derive(Debug, Clone, Default)]
@@ -41,18 +41,21 @@ impl VerifyOrderOptions {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct VerifyOrderResult {
-    /// Files whose key columns were read and checked.
+    /// Files whose key columns were read and checked to the end.
     pub files_verified: usize,
     /// Of those, files recorded as ordered.
     pub files_recorded: u64,
     /// Of those, files whose rows are NOT in sort order in the catalog's
-    /// column types, or whose key values do not cast to them (nothing
-    /// recorded).
+    /// column types (nothing recorded).
     pub files_unsorted: usize,
     /// Files not read: already recorded under the current key, name-mapped,
     /// encrypted, a footer without the key columns, or a key column whose
     /// type does not cast to the catalog's.
     pub files_skipped: usize,
+    /// Files whose read failed, whose key values did not cast to the
+    /// catalog's types, or whose record could not be kept (warned; a later
+    /// pass retries them).
+    pub files_failed: usize,
     /// Compressed bytes of the key column chunks read.
     pub bytes_read: u64,
 }
@@ -73,9 +76,12 @@ pub trait FileOrderTableExt {
     /// object at that path, so it needs no snapshot and is true at every
     /// snapshot that lists the file. Concurrent maintenance is harmless: a
     /// record for a file compacted away meanwhile matches no live file and is
-    /// dropped by [`super::prune_file_orders`]. Idempotent. Records are made
-    /// once all candidates are read, so an error part way (a file vacuumed
-    /// after listing, say) records nothing for the pass.
+    /// dropped by [`super::prune_file_orders`]. Idempotent. Each file is
+    /// recorded as soon as it is checked, so an interrupted pass keeps its
+    /// progress.
+    ///
+    /// Records go to the [`FileOrder`] registered in the table's read
+    /// options (`DuckLakeCatalog::with_extension` registers it there).
     async fn verify_file_orders(
         &self,
         state: &dyn Session,
@@ -96,6 +102,12 @@ impl FileOrderTableExt for DuckLakeTable {
                     .to_string(),
             ));
         }
+        let Some(order) = self.read_options().extensions.get::<FileOrder>() else {
+            return Err(DuckLakeError::InvalidConfig(
+                "verify_file_orders: no FileOrder registered on the table's read options"
+                    .to_string(),
+            ));
+        };
         let Some(spec) = self.live_sort_spec()? else {
             return Ok(VerifyOrderResult::default());
         };
@@ -121,14 +133,17 @@ impl FileOrderTableExt for DuckLakeTable {
             })
             .collect::<Option<Vec<_>>>()
             .map(|keys| encode(&keys));
-        let files = self.data_files()?;
-        let paths: Vec<&str> = files.iter().map(|tf| tf.file.path.as_str()).collect();
-        let recorded: HashSet<(String, i64)> =
-            recorded_orders(self.metadata_provider().as_ref(), self.table_id(), &paths)?
-                .into_iter()
-                .filter(|(_, _, sort_key)| current_key.as_ref() == Some(sort_key))
-                .map(|(path, size, _)| (path, size))
-                .collect();
+        let paths: Vec<String> = self
+            .data_files()?
+            .into_iter()
+            .map(|tf| tf.file.path)
+            .collect();
+        let recorded: HashSet<(String, i64)> = table::read(order.db(), self.table_id(), &paths)
+            .await?
+            .into_iter()
+            .filter(|row| current_key.as_ref() == Some(&row.sort_key))
+            .map(|row| (row.path, row.file_size_bytes))
+            .collect();
 
         let mut backfill = BackfillOptions::default();
         if let Some(ids) = opts.data_file_ids {
@@ -137,24 +152,30 @@ impl FileOrderTableExt for DuckLakeTable {
         if let Some(max) = opts.max_files {
             backfill = backfill.with_max_files(max);
         }
+        let pass = Arc::new(VerifyPass {
+            recorded,
+            ..Default::default()
+        });
         let done = self
             .backfill(
                 state,
                 Arc::new(VerifyOrder {
-                    recorded: Arc::new(recorded),
+                    shared: Arc::clone(&order.0),
+                    pass: Arc::clone(&pass),
                 }),
                 backfill,
             )
             .await?;
-        // A file whose key values do not cast to the catalog's types fails
-        // the reader too: it was read, and is not in order.
-        let files_verified = (done.files_read + done.files_failed) as usize;
-        let files_recorded = done.facts.len() as u64;
+        let files_verified = done.files_read as usize;
+        let files_recorded = pass
+            .files_recorded
+            .load(std::sync::atomic::Ordering::Relaxed);
         Ok(VerifyOrderResult {
             files_verified,
             files_recorded,
             files_unsorted: files_verified.saturating_sub(files_recorded as usize),
             files_skipped: done.files_skipped as usize,
+            files_failed: done.files_failed as usize,
             bytes_read: done.bytes_read,
         })
     }
