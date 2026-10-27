@@ -89,7 +89,8 @@ impl CatalogDb {
     /// catalog. The SQLite file, or PostgreSQL's host, port, database and
     /// user. Two pools with one `id` can still differ in what they see (a
     /// role's `search_path`), so write through the pool the work came from:
-    /// see [`pool_id`](Self::pool_id).
+    /// see [`pool_id`](Self::pool_id). Read when the handle is made: a pool
+    /// repointed later (`set_connect_options`) keeps its old `id`.
     pub fn id(&self) -> u64 {
         self.id
     }
@@ -116,6 +117,17 @@ impl CatalogDb {
         T: Send + 'static,
     {
         AbortOnDrop(catalog_runtime().spawn(work(self.pool.clone()))).await
+    }
+
+    /// Start `work` on the catalog runtime and return at once. Nothing waits
+    /// for it or stops it: for work that must outlive whoever started it,
+    /// and must not need a runtime that caller may be blocking.
+    pub fn spawn<F, Fut>(&self, work: F)
+    where
+        F: FnOnce(CatalogPool) -> Fut,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        catalog_runtime().spawn(work(self.pool.clone()));
     }
 
     /// [`run`](Self::run) from synchronous code, on any runtime or none. It

@@ -110,7 +110,8 @@ pub(crate) fn sqlite_cutoff(min_age: Duration) -> String {
 /// concurrent uploads, one transaction serves many files rather than each
 /// taking a connection and, on SQLite, the write lock.
 ///
-/// A task of its own writes, not any caller: a caller returns once its rows
+/// A task of its own on the catalog runtime writes, not any caller: a caller
+/// returns once its rows
 /// are written, and one that is dropped (its query cancelled) loses no
 /// other caller's rows. Rows are grouped per pool, never per database: two
 /// pools on one database can see different tables (a role's `search_path`).
@@ -169,14 +170,11 @@ impl<R: Send + 'static> GroupCommit<R> {
             starts
         };
         if starts {
-            let flush = flush(Arc::clone(&self.queues), key, db.clone(), table_id, write);
-            match tokio::runtime::Handle::try_current() {
-                Ok(runtime) => {
-                    runtime.spawn(flush);
-                },
-                // Not on a tokio runtime: write here.
-                Err(_) => flush.await,
-            }
+            // On the catalog runtime, never the caller's, which the caller
+            // may be blocking while it waits.
+            let queues = Arc::clone(&self.queues);
+            let flushed_by = db.clone();
+            db.spawn(move |_| flush(queues, key, flushed_by, table_id, write));
         }
         match recorded.await {
             Ok(Ok(())) => Ok(()),
@@ -632,6 +630,32 @@ mod tests {
                 "rows written through a pool they did not come from: {rows:?}"
             );
         }
+    }
+
+    /// A caller that blocks its single-threaded runtime while it waits must
+    /// not be waiting on a write that runtime would have to run.
+    #[test]
+    fn a_caller_blocking_its_current_thread_runtime_still_gets_its_rows_written() {
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let recorded = runtime.block_on(async {
+                let db = db().await;
+                let commit = GroupCommit::<i32>::default();
+                let ok = |_: CatalogDb, _: i64, _: Vec<i32>| async { Ok(()) };
+                futures::executor::block_on(commit.record(&db, 1, vec![1], ok))
+            });
+            let _ = done.send(recorded.is_ok());
+        });
+        assert!(
+            finished
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the caller hung"),
+            "the rows were not recorded"
+        );
     }
 
     #[tokio::test]
