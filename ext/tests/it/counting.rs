@@ -70,6 +70,10 @@ impl CountingProvider {
 }
 
 impl MetadataProvider for CountingProvider {
+    // Not counted: it reads nothing.
+    fn catalog_db(&self) -> Option<datafusion_ducklake::extension::CatalogDb> {
+        self.inner.catalog_db()
+    }
     fn get_current_snapshot(&self) -> Result<i64> {
         self.count("get_current_snapshot");
         self.inner.get_current_snapshot()

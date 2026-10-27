@@ -28,14 +28,15 @@
 
 use std::time::Duration;
 
-use datafusion_ducklake::Result;
+use datafusion_ducklake::extension::{CatalogDb, CatalogPool};
+use datafusion_ducklake::{DuckLakeError, Result};
 
 use super::FileIndexRow;
 use super::format::{
     FileIndexMeta, IndexValueType, heavy_hitters_from_json, heavy_hitters_to_json,
     row_group_rows_from_json, row_group_rows_to_json,
 };
-use crate::db::{ExtensionDb, is_missing_table, sql_error, upsert_creating};
+use crate::db::{is_missing_table, run, sql_error, unsupported, upsert_creating};
 
 /// The table's name.
 pub const TABLE: &str = "ext_ducklake_file_index";
@@ -167,13 +168,32 @@ fn counts_json(row: &FileIndexRow) -> Option<String> {
 
 /// Record `rows` of `table_id`'s files, in one transaction (SQLite) or one
 /// statement (PostgreSQL).
-pub async fn record(db: &ExtensionDb, table_id: i64, rows: &[FileIndexRow]) -> Result<()> {
+pub async fn record(db: &CatalogDb, table_id: i64, rows: Vec<FileIndexRow>) -> Result<()> {
     if rows.is_empty() {
         return Ok(());
     }
-    match db {
-        #[cfg(feature = "sqlite")]
-        ExtensionDb::Sqlite(pool) => upsert_creating(pool, SQLITE_DDL, || async {
+    let unsupported = unsupported(db);
+    run(db, move |pool| async move {
+        match pool {
+            #[cfg(feature = "sqlite")]
+            CatalogPool::Sqlite(pool) => record_sqlite(&pool, table_id, &rows).await,
+            #[cfg(feature = "postgres")]
+            CatalogPool::Postgres(pool) => record_postgres(&pool, table_id, &rows).await,
+            #[allow(unreachable_patterns)]
+            _ => Err(unsupported),
+        }
+    })
+    .await
+}
+
+#[cfg(feature = "sqlite")]
+async fn record_sqlite(
+    pool: &sqlx::SqlitePool,
+    table_id: i64,
+    rows: &[FileIndexRow],
+) -> Result<()> {
+    {
+        upsert_creating(pool, SQLITE_DDL, || async {
             let mut tx = pool.begin().await?;
             for row in rows {
                 let meta = &row.meta;
@@ -217,9 +237,14 @@ pub async fn record(db: &ExtensionDb, table_id: i64, rows: &[FileIndexRow]) -> R
             tx.commit().await
         })
         .await
-        .map_err(sql_error),
-        #[cfg(feature = "postgres")]
-        ExtensionDb::Postgres(pool) => {
+        .map_err(sql_error)
+    }
+}
+
+#[cfg(feature = "postgres")]
+async fn record_postgres(pool: &sqlx::PgPool, table_id: i64, rows: &[FileIndexRow]) -> Result<()> {
+    {
+        {
             let paths: Vec<&str> = rows.iter().map(|r| r.meta.path.as_str()).collect();
             let sizes: Vec<i64> = rows.iter().map(|r| r.meta.file_size_bytes).collect();
             let columns: Vec<i64> = rows.iter().map(|r| r.meta.column_id).collect();
@@ -286,24 +311,37 @@ pub async fn record(db: &ExtensionDb, table_id: i64, rows: &[FileIndexRow]) -> R
             })
             .await
             .map_err(sql_error)
-        },
+        }
     }
 }
 
 /// The rows of `table_id`'s files at `paths` for `column_ids`. A row this
 /// build cannot interpret is left out.
 pub async fn read(
-    db: &ExtensionDb,
+    db: &CatalogDb,
     table_id: i64,
-    paths: &[String],
-    column_ids: &[i64],
+    paths: Vec<String>,
+    column_ids: Vec<i64>,
 ) -> Result<Vec<FileIndexRow>> {
     if paths.is_empty() || column_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let parts: std::result::Result<Vec<Parts>, sqlx::Error> = match db {
+    run(db, move |pool| read_on(pool, table_id, paths, column_ids)).await
+}
+
+/// [`read`], on `pool`: the work [`CatalogDb::run`] runs.
+pub(crate) async fn read_on(
+    pool: CatalogPool,
+    table_id: i64,
+    paths: Vec<String>,
+    column_ids: Vec<i64>,
+) -> Result<Vec<FileIndexRow>> {
+    if paths.is_empty() || column_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let parts: std::result::Result<Vec<Parts>, sqlx::Error> = match pool {
         #[cfg(feature = "sqlite")]
-        ExtensionDb::Sqlite(pool) => {
+        CatalogPool::Sqlite(pool) => {
             let columns = vec!["?"; column_ids.len()].join(",");
             let mut out = Vec::new();
             let mut failed = None;
@@ -318,10 +356,10 @@ pub async fn read(
                 for path in chunk {
                     query = query.bind(path);
                 }
-                for column_id in column_ids {
+                for column_id in &column_ids {
                     query = query.bind(*column_id);
                 }
-                match query.fetch_all(pool).await {
+                match query.fetch_all(&pool).await {
                     Ok(rows) => {
                         for row in &rows {
                             out.push(Parts::read(row));
@@ -339,16 +377,22 @@ pub async fn read(
             }
         },
         #[cfg(feature = "postgres")]
-        ExtensionDb::Postgres(pool) => sqlx::query(sqlx::AssertSqlSafe(format!(
+        CatalogPool::Postgres(pool) => sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT {SELECT_COLUMNS} FROM ext_ducklake_file_index
              WHERE table_id = $1 AND path = ANY($2) AND column_id = ANY($3)"
         )))
         .bind(table_id)
-        .bind(paths)
-        .bind(column_ids)
-        .fetch_all(pool)
+        .bind(&paths)
+        .bind(&column_ids)
+        .fetch_all(&pool)
         .await
         .and_then(|rows| rows.iter().map(Parts::read).collect()),
+        #[allow(unreachable_patterns)]
+        _ => {
+            return Err(DuckLakeError::Unsupported(
+                "extension tables on this catalog's backend".into(),
+            ));
+        },
     };
     match parts {
         Ok(parts) => Ok(parts.into_iter().filter_map(Parts::row).collect()),
@@ -359,12 +403,21 @@ pub async fn read(
 
 /// Drop the rows recorded at least `min_age` ago whose data file no catalog
 /// row lists any more; returns their index objects' store keys.
-pub(crate) async fn prune(db: &ExtensionDb, min_age: Duration) -> Result<Vec<String>> {
+pub(crate) async fn prune(db: &CatalogDb, min_age: Duration) -> Result<Vec<String>> {
+    let unsupported = unsupported(db);
+    run(db, move |pool| prune_on(pool, min_age, unsupported)).await
+}
+
+async fn prune_on(
+    pool: CatalogPool,
+    min_age: Duration,
+    unsupported: DuckLakeError,
+) -> Result<Vec<String>> {
     // Any catalog row for the path keeps it: a retired file is still read by
     // time travel until expiry removes its row.
-    let keys = match db {
+    let keys = match pool {
         #[cfg(feature = "sqlite")]
-        ExtensionDb::Sqlite(pool) => {
+        CatalogPool::Sqlite(pool) => {
             sqlx::query_scalar::<_, String>(
                 "DELETE FROM ext_ducklake_file_index
                  WHERE built_at <= ?
@@ -375,11 +428,11 @@ pub(crate) async fn prune(db: &ExtensionDb, min_age: Duration) -> Result<Vec<Str
                  RETURNING index_key",
             )
             .bind(crate::db::sqlite_cutoff(min_age))
-            .fetch_all(pool)
+            .fetch_all(&pool)
             .await
         },
         #[cfg(feature = "postgres")]
-        ExtensionDb::Postgres(pool) => {
+        CatalogPool::Postgres(pool) => {
             sqlx::query_scalar::<_, String>(
                 "DELETE FROM ext_ducklake_file_index i
                  WHERE i.built_at <= now() - make_interval(secs => $1::double precision / 1e6)
@@ -388,9 +441,11 @@ pub(crate) async fn prune(db: &ExtensionDb, min_age: Duration) -> Result<Vec<Str
                  RETURNING i.index_key",
             )
             .bind(i64::try_from(min_age.as_micros()).unwrap_or(i64::MAX))
-            .fetch_all(pool)
+            .fetch_all(&pool)
             .await
         },
+        #[allow(unreachable_patterns)]
+        _ => return Err(unsupported),
     };
     match keys {
         Ok(keys) => Ok(keys),
@@ -404,13 +459,17 @@ mod tests {
     use super::*;
     use crate::file_index::format::IndexKey;
 
-    async fn db() -> (ExtensionDb, sqlx::SqlitePool) {
+    async fn db() -> (CatalogDb, sqlx::SqlitePool) {
+        use datafusion_ducklake::MetadataProvider;
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        (ExtensionDb::sqlite(pool.clone()), pool)
+        let db = datafusion_ducklake::SqliteMetadataProvider::from_pool(pool.clone())
+            .catalog_db()
+            .unwrap();
+        (db, pool)
     }
 
     fn row(path: &str, column_id: i64) -> FileIndexRow {
@@ -438,46 +497,58 @@ mod tests {
         let (db, _pool) = db().await;
         let paths = vec!["a.parquet".to_string()];
         assert!(
-            read(&db, 1, &paths, &[7]).await.unwrap().is_empty(),
+            read(&db, 1, paths.clone(), vec![7])
+                .await
+                .unwrap()
+                .is_empty(),
             "no table yet"
         );
-        record(&db, 1, &[row("a.parquet", 7), row("a.parquet", 8)])
+        record(&db, 1, vec![row("a.parquet", 7), row("a.parquet", 8)])
             .await
             .unwrap();
         assert_eq!(
-            read(&db, 1, &paths, &[7]).await.unwrap(),
+            read(&db, 1, paths.clone(), vec![7]).await.unwrap(),
             vec![row("a.parquet", 7)]
         );
         assert!(
-            read(&db, 2, &paths, &[7]).await.unwrap().is_empty(),
+            read(&db, 2, paths.clone(), vec![7])
+                .await
+                .unwrap()
+                .is_empty(),
             "another table"
         );
 
         let mut rebuilt = row("a.parquet", 7);
         rebuilt.built_by = "backfill".into();
-        record(&db, 1, std::slice::from_ref(&rebuilt))
-            .await
-            .unwrap();
-        assert_eq!(read(&db, 1, &paths, &[7]).await.unwrap(), vec![rebuilt]);
+        record(&db, 1, vec![rebuilt.clone()]).await.unwrap();
+        assert_eq!(
+            read(&db, 1, paths.clone(), vec![7]).await.unwrap(),
+            vec![rebuilt]
+        );
     }
 
     #[tokio::test]
     async fn malformed_counts_lose_only_the_counts() {
         let (db, pool) = db().await;
-        record(&db, 1, &[row("a.parquet", 7)]).await.unwrap();
+        record(&db, 1, vec![row("a.parquet", 7)]).await.unwrap();
         sqlx::query("UPDATE ext_ducklake_file_index SET bucket_counts = '{\"v\":1'")
             .execute(&pool)
             .await
             .unwrap();
         let paths = vec!["a.parquet".to_string()];
         assert_eq!(
-            read(&db, 1, &paths, &[7]).await.unwrap(),
+            read(&db, 1, paths.clone(), vec![7]).await.unwrap(),
             vec![row("a.parquet", 7)]
         );
         sqlx::query("UPDATE ext_ducklake_file_index SET value_type = 'nope'")
             .execute(&pool)
             .await
             .unwrap();
-        assert!(read(&db, 1, &paths, &[7]).await.unwrap().is_empty());
+        assert!(
+            read(&db, 1, paths.clone(), vec![7])
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }

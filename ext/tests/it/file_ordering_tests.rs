@@ -20,12 +20,12 @@ use datafusion::prelude::*;
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 
+use datafusion_ducklake::extension::CatalogDb;
 use datafusion_ducklake::{
     ColumnDef, DuckLakeCatalog, DuckLakeReadOptions, DuckLakeTable, DuckLakeTableWriter,
     DuckLakeWriteOptions, MergeOptions, MetadataWriter, NullOrder, SortDirection, SortField,
     SqliteMetadataProvider, SqliteMetadataWriter, WriteMode,
 };
-use datafusion_ducklake_ext::db::ExtensionDb;
 use datafusion_ducklake_ext::file_order::table::{self as order_table, OrderRow};
 use datafusion_ducklake_ext::file_order::{
     FileOrder, FileOrderTableExt, VerifyOrderOptions, prune_file_orders,
@@ -73,13 +73,13 @@ struct Env {
 }
 
 impl Env {
-    fn db(&self) -> ExtensionDb {
-        ExtensionDb::sqlite(self.pool.clone())
+    fn db(&self) -> CatalogDb {
+        crate::sqlite_db(&self.pool)
     }
 
     /// A fresh extension instance (nothing read yet) over the catalog's pool.
     fn order(&self) -> Arc<FileOrder> {
-        Arc::new(FileOrder::new(self.db()))
+        Arc::new(FileOrder::new())
     }
 
     /// Writer options with the extension on.
@@ -1000,7 +1000,7 @@ async fn verify_racing_compaction_and_prune() {
     // The rows are true of those objects, but the merge removed the files
     // from the catalog, so they match nothing.
     for row in &before {
-        order_table::record(&env.db(), env.table_id, row, "verify")
+        order_table::record(&env.db(), env.table_id, vec![(row.clone(), "verify")])
             .await
             .unwrap();
     }

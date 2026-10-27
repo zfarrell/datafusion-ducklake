@@ -214,6 +214,29 @@ pub struct BucketCounts {
 }
 
 impl FileIndexMeta {
+    /// About the bytes this meta holds, for bounding what is kept in memory.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        let key = |key: &IndexKey| match key {
+            IndexKey::Utf8(bytes) => 24 + bytes.len(),
+            IndexKey::Int64(_) => 24,
+        };
+        self.path.len()
+            + self.index_path.len()
+            + self.row_group_rows.len() * 8
+            + self
+                .heavy_hitters
+                .iter()
+                .map(|(k, _)| key(k) + 8)
+                .sum::<usize>()
+            + self.bucket_counts.as_ref().map_or(0, |counts| {
+                counts
+                    .keys
+                    .iter()
+                    .map(|(k, buckets)| key(k) + 24 + buckets.len() * 16)
+                    .sum()
+            })
+    }
+
     /// The key's posting count if it is a heavy hitter in this file.
     pub fn heavy_hitter_count(&self, key: &IndexKey) -> Option<u64> {
         self.heavy_hitters

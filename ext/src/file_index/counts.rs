@@ -582,7 +582,7 @@ impl BucketCountRule {
         // The rewrite's resolution and both branch scans share one listing.
         table
             .read_options()
-            .extensions
+            .extensions()
             .get::<super::FileIndex>()
             .is_some_and(super::FileIndex::counts)
             .then(|| Arc::new(table.with_plan_listing_memo()))
@@ -1042,14 +1042,17 @@ fn try_resolve_bucket_counts(
 ) -> Result<Resolution> {
     // Counts ignore deletes and snapshot filters, and are keyed by column id,
     // so only files read exactly as stored qualify.
-    let Some(index) = table.read_options().extensions.get::<super::FileIndex>() else {
+    let Some(index) = table.read_options().extensions().get::<super::FileIndex>() else {
+        return Ok(Resolution::default());
+    };
+    let Some(db) = table.metadata_provider().catalog_db() else {
         return Ok(Resolution::default());
     };
     let eligible = table.plain_files()?;
     let paths: Vec<&str> = eligible.iter().map(|tf| tf.file.path.as_str()).collect();
     let rows = index
         .shared
-        .rows_blocking(table.table_id(), &paths, &[req.key_column_id]);
+        .rows_blocking(&db, table.table_id(), &paths, &[req.key_column_id]);
     let mut resolution = Resolution::default();
     for tf in &eligible {
         let Some(meta) = rows.get(&(tf.file.path.clone(), req.key_column_id)) else {

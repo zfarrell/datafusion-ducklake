@@ -142,10 +142,15 @@ impl FileIndexTableExt for DuckLakeTable {
                     .to_string(),
             )
         })?;
-        let Some(index) = self.read_options().extensions.get::<super::FileIndex>() else {
+        let Some(index) = self.read_options().extensions().get::<super::FileIndex>() else {
             return Err(DuckLakeError::InvalidConfig(
                 "build_file_indexes: no FileIndex registered on the table's read options"
                     .to_string(),
+            ));
+        };
+        let Some(db) = self.metadata_provider().catalog_db() else {
+            return Err(DuckLakeError::Unsupported(
+                "build_file_indexes: the catalog's backend keeps no extension tables".to_string(),
             ));
         };
         let setting = |key: &str| match self.schema_name() {
@@ -215,7 +220,7 @@ impl FileIndexTableExt for DuckLakeTable {
         let files = self.data_files()?;
         let paths: Vec<&str> = files.iter().map(|tf| tf.file.path.as_str()).collect();
         let done: HashSet<(String, i64, String)> =
-            super::file_index_rows(index.db(), self.table_id(), &paths, &wanted_ids)
+            super::file_index_rows(&db, self.table_id(), &paths, &wanted_ids)
                 .await?
                 .into_iter()
                 .map(|row| row.meta)

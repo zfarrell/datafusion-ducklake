@@ -26,14 +26,14 @@ use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion_ducklake::extension::{
-    DuckLakeExtension, FieldSort, FileObserver, FileWriteHook, ScanContext, ScanFile, ScanHook,
-    StoredFile, WriteContext, WriteOrigin,
+    CatalogDb, DuckLakeExtension, FieldSort, FileObserver, FileWriteHook, ScanContext, ScanFile,
+    ScanHook, StoredFile, WriteContext, WriteOrigin,
 };
 use datafusion_ducklake::metadata_provider::DuckLakeTableFile;
 use datafusion_ducklake::sort::{NullOrder, SortDirection};
 use parquet::file::metadata::SortingColumn;
 
-use crate::db::{ExtensionDb, Found, RowMemo};
+use crate::db::{Found, GroupCommit, RowMemo};
 use check::{AttestedKey, SortCheck};
 use table::OrderRow;
 pub use verify::{FileOrderTableExt, VerifyOrderOptions, VerifyOrderResult};
@@ -46,36 +46,36 @@ const BY_WRITE: &str = "write";
 /// Recorded by [`FileOrderTableExt::verify_file_orders`], after reading the file.
 const BY_VERIFY: &str = "verify";
 
-/// Records a [`FileOrder`] keeps in memory, across its tables.
-const MEMO_MAX_ENTRIES: u64 = 200_000;
+/// Bytes of records a [`FileOrder`] keeps in memory, across its catalogs.
+const MEMO_MAX_BYTES: u64 = 32 << 20;
 
 /// A recorded file's size and sort key.
 type Recorded = (i64, String);
 
 /// The verified file order extension. See the module docs.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct FileOrder(Arc<Shared>);
 
 #[derive(Debug)]
 struct Shared {
-    db: ExtensionDb,
     memo: RowMemo<Recorded>,
+    commits: GroupCommit<(OrderRow, &'static str)>,
+}
+
+impl Default for Shared {
+    fn default() -> Self {
+        Self {
+            memo: RowMemo::new(NAME, MEMO_MAX_BYTES, |(_, key)| key.len()),
+            commits: GroupCommit::default(),
+        }
+    }
 }
 
 impl FileOrder {
-    /// Records kept in `db`, the catalog's database (the pool given to
-    /// core). Register one instance per catalog: records are keyed by table
-    /// id.
-    pub fn new(db: ExtensionDb) -> Self {
-        Self(Arc::new(Shared {
-            db,
-            memo: RowMemo::new(NAME, MEMO_MAX_ENTRIES),
-        }))
-    }
-
-    /// Where the records are kept.
-    pub fn db(&self) -> &ExtensionDb {
-        &self.0.db
+    /// Records kept in the database of each catalog it runs in (see
+    /// [`table`]). One instance can serve every catalog.
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 
@@ -95,8 +95,12 @@ impl DuckLakeExtension for FileOrder {
         order_write_hook(ctx, &self.0, None)
     }
 
-    fn scan_hook(&self, _ctx: &ScanContext<'_>) -> Option<Arc<dyn ScanHook>> {
-        Some(Arc::new(OrderScanHook(Arc::clone(&self.0))))
+    /// `None` on a catalog without a database these extensions can use.
+    fn scan_hook(&self, ctx: &ScanContext<'_>) -> Option<Arc<dyn ScanHook>> {
+        Some(Arc::new(OrderScanHook {
+            shared: Arc::clone(&self.0),
+            db: ctx.db()?,
+        }))
     }
 }
 
@@ -114,6 +118,9 @@ fn order_write_hook(
     shared: &Arc<Shared>,
     verify: Option<Arc<VerifyPass>>,
 ) -> datafusion_ducklake::Result<Option<Arc<dyn FileWriteHook>>> {
+    let Some(db) = ctx.db() else {
+        return Ok(None);
+    };
     let Some(spec) = ctx.live_sort_spec()? else {
         return Ok(None);
     };
@@ -122,6 +129,7 @@ fn order_write_hook(
     };
     Ok(Some(Arc::new(OrderWriteHook {
         shared: Arc::clone(shared),
+        db,
         table_id: ctx.table_id,
         verified_by: match ctx.origin {
             WriteOrigin::Backfill => BY_VERIFY,
@@ -147,6 +155,7 @@ fn order_write_hook(
 #[derive(Debug)]
 struct OrderWriteHook {
     shared: Arc<Shared>,
+    db: CatalogDb,
     table_id: i64,
     verified_by: &'static str,
     keys: Vec<(String, SortOptions)>,
@@ -170,6 +179,7 @@ impl FileWriteHook for OrderWriteHook {
         let check = SortCheck::new(file_schema, &columns)?;
         Some(Box::new(OrderObserver {
             shared: Arc::clone(&self.shared),
+            db: self.db.clone(),
             table_id: self.table_id,
             verified_by: self.verified_by,
             check,
@@ -195,6 +205,7 @@ impl FileWriteHook for OrderWriteHook {
 #[derive(Debug)]
 struct OrderObserver {
     shared: Arc<Shared>,
+    db: CatalogDb,
     table_id: i64,
     verified_by: &'static str,
     check: SortCheck,
@@ -218,8 +229,17 @@ impl FileObserver for OrderObserver {
             file_size_bytes: file.file_size_bytes,
             sort_key: sort_key.clone(),
         };
-        table::record(&self.shared.db, self.table_id, &row, self.verified_by).await?;
+        self.shared
+            .commits
+            .record(
+                &self.db,
+                self.table_id,
+                vec![(row, self.verified_by)],
+                |db, table_id, rows| async move { table::record(&db, table_id, rows).await },
+            )
+            .await?;
         self.shared.memo.put(
+            &self.db,
             self.table_id,
             &file.catalog_path,
             0,
@@ -234,27 +254,31 @@ impl FileObserver for OrderObserver {
 
 /// The records of `table_id`'s files at `paths`, as the memo keeps them.
 async fn found(
-    db: &ExtensionDb,
+    db: &CatalogDb,
     table_id: i64,
     paths: Vec<String>,
 ) -> datafusion_ducklake::Result<Found<Recorded>> {
-    Ok(table::read(db, table_id, &paths)
+    Ok(table::read(db, table_id, paths)
         .await?
         .into_iter()
         .map(|row| ((row.path, 0), (row.file_size_bytes, row.sort_key)))
         .collect())
 }
 
-/// Drop the records whose file no catalog row of their table lists any more
-/// (expired, or never committed). Optional: such records are harmless. A
-/// record of a write still in flight can be dropped too, which leaves that
-/// file unknown, not wrong. Returns how many were dropped.
-pub async fn prune_file_orders(db: &ExtensionDb) -> datafusion_ducklake::Result<u64> {
+/// Drop the records in `db` whose file no catalog row of their table lists
+/// any more (expired, or never committed). Optional: such records are
+/// harmless. A record of a write still in flight can be dropped too, which
+/// leaves that file unknown, not wrong. Returns how many were dropped. `db`
+/// is the catalog's (`MetadataProvider::catalog_db`).
+pub async fn prune_file_orders(db: &CatalogDb) -> datafusion_ducklake::Result<u64> {
     table::prune(db).await
 }
 
 #[derive(Debug)]
-struct OrderScanHook(Arc<Shared>);
+struct OrderScanHook {
+    shared: Arc<Shared>,
+    db: CatalogDb,
+}
 
 #[async_trait]
 impl ScanHook for OrderScanHook {
@@ -267,10 +291,10 @@ impl ScanHook for OrderScanHook {
     ) -> HashMap<i64, Vec<FieldSort>> {
         let paths: Vec<&str> = files.iter().map(|f| f.file.file.path.as_str()).collect();
         let recorded = self
-            .0
+            .shared
             .memo
-            .get(ctx.table_id, &paths, &[0], |missing| {
-                found(&self.0.db, ctx.table_id, missing)
+            .get(&self.db, ctx.table_id, &paths, &[0], |missing| {
+                found(&self.db, ctx.table_id, missing)
             })
             .await;
         files

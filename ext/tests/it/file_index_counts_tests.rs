@@ -23,7 +23,6 @@ use datafusion_ducklake::{
     ColumnDef, DuckLakeCatalog, DuckLakeReadOptions, DuckLakeTable, DuckLakeTableWriter,
     DuckLakeWriteOptions, MetadataWriter, SqliteMetadataProvider, SqliteMetadataWriter, WriteMode,
 };
-use datafusion_ducklake_ext::db::ExtensionDb;
 use datafusion_ducklake_ext::file_index::counts::{
     BUCKET_GRAIN_HOUR_US, BucketCountRule, bucket_counts_from_json, bucket_counts_to_json,
 };
@@ -137,9 +136,7 @@ impl Env {
     /// a fresh extension instance, which has read nothing yet.
     fn counts_options(&self, counts: bool) -> DuckLakeReadOptions {
         DuckLakeReadOptions::default().with_extension(Arc::new(
-            FileIndex::new(ExtensionDb::sqlite(self.pool.clone()))
-                .with_scans(false)
-                .with_counts(counts),
+            FileIndex::new().with_scans(false).with_counts(counts),
         ))
     }
 

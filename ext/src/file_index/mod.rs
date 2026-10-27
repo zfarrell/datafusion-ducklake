@@ -28,11 +28,11 @@ use std::time::Duration;
 
 use datafusion::common::config::ConfigExtension;
 use datafusion_ducklake::extension::{
-    DuckLakeExtension, FileWriteHook, ScanContext, ScanHook, WriteContext,
+    CatalogDb, DuckLakeExtension, FileWriteHook, ScanContext, ScanHook, WriteContext,
 };
 use object_store::{ObjectStore, ObjectStoreExt};
 
-use crate::db::{ExtensionDb, Found, RowMemo};
+use crate::db::{Found, GroupCommit, RowMemo};
 use format::FileIndexMeta;
 
 pub use backfill::{BuildIndexOptions, BuildIndexResult, FileIndexTableExt};
@@ -41,8 +41,8 @@ pub use write::{COLUMNS_SETTING, COUNT_COLUMN_SETTING, FileIndexRow, object_key}
 /// The extension's name.
 pub const NAME: &str = "file_index";
 
-/// Index rows a [`FileIndex`] keeps in memory, across its tables.
-const MEMO_MAX_ENTRIES: u64 = 200_000;
+/// Bytes of index rows a [`FileIndex`] keeps in memory, across its catalogs.
+const MEMO_MAX_BYTES: u64 = 64 << 20;
 
 /// The file index extension. See the module docs.
 #[derive(Debug, Clone)]
@@ -52,22 +52,22 @@ pub struct FileIndex {
     shared: Arc<Shared>,
 }
 
-/// What every clone of one [`FileIndex`] shares: its database, and what it
-/// has read from it.
+/// What every clone of one [`FileIndex`] shares: what it has read, and the
+/// rows it is recording.
 #[derive(Debug)]
 pub(crate) struct Shared {
-    pub(crate) db: ExtensionDb,
     pub(crate) memo: RowMemo<FileIndexMeta>,
+    pub(crate) commits: GroupCommit<FileIndexRow>,
 }
 
 /// `read`'s rows as the memo keeps them.
 async fn found(
-    db: &ExtensionDb,
+    db: &CatalogDb,
     table_id: i64,
     paths: Vec<String>,
     column_ids: &[i64],
 ) -> datafusion_ducklake::Result<Found<FileIndexMeta>> {
-    Ok(table::read(db, table_id, &paths, column_ids)
+    Ok(table::read(db, table_id, paths, column_ids.to_vec())
         .await?
         .into_iter()
         .map(|row| ((row.meta.path.clone(), row.meta.column_id), row.meta))
@@ -75,56 +75,87 @@ async fn found(
 }
 
 impl Shared {
-    /// The index metas of `table_id`'s files at `paths` for `column_ids`, by
-    /// `(path, column_id)`. A caller applies one only when its size (and
-    /// format version and value type) match the listed file.
+    /// The index metas in `db` of `table_id`'s files at `paths` for
+    /// `column_ids`, by `(path, column_id)`. A caller applies one only when
+    /// its size (and format version and value type) match the listed file.
     pub(crate) async fn rows(
         &self,
+        db: &CatalogDb,
         table_id: i64,
         paths: &[&str],
         column_ids: &[i64],
     ) -> HashMap<(String, i64), Arc<FileIndexMeta>> {
         self.memo
-            .get(table_id, paths, column_ids, |missing| {
-                found(&self.db, table_id, missing, column_ids)
+            .get(db, table_id, paths, column_ids, |missing| {
+                found(db, table_id, missing, column_ids)
             })
             .await
     }
 
-    /// [`Self::rows`] from synchronous code: without a multi-threaded runtime
-    /// to block on, only the rows already in memory.
+    /// [`Self::rows`] from synchronous code, on any runtime: it blocks the
+    /// thread for the read.
     pub(crate) fn rows_blocking(
         &self,
+        db: &CatalogDb,
         table_id: i64,
         paths: &[&str],
         column_ids: &[i64],
     ) -> HashMap<(String, i64), Arc<FileIndexMeta>> {
         self.memo
-            .get_blocking(table_id, paths, column_ids, |missing| {
-                found(&self.db, table_id, missing, column_ids)
+            .get_blocking(db, table_id, paths, column_ids, |missing| {
+                let column_ids = column_ids.to_vec();
+                db.run_blocking(|pool| table::read_on(pool, table_id, missing, column_ids))?
+                    .map(|rows| {
+                        rows.into_iter()
+                            .map(|row| ((row.meta.path.clone(), row.meta.column_id), row.meta))
+                            .collect()
+                    })
             })
+    }
+
+    /// Record `rows` in `db`, with any other file's rows being recorded for
+    /// the table at the same time, and keep them in memory.
+    pub(crate) async fn record(
+        &self,
+        db: &CatalogDb,
+        table_id: i64,
+        rows: Vec<FileIndexRow>,
+    ) -> datafusion_ducklake::Result<()> {
+        self.commits
+            .record(
+                db,
+                table_id,
+                rows.clone(),
+                |db, table_id, rows| async move { table::record(&db, table_id, rows).await },
+            )
+            .await?;
+        for row in rows {
+            let (path, column_id) = (row.meta.path.clone(), row.meta.column_id);
+            self.memo.put(db, table_id, &path, column_id, row.meta);
+        }
+        Ok(())
+    }
+}
+
+impl Default for FileIndex {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 impl FileIndex {
-    /// Index rows kept in `db`, the catalog's database (the pool given to
-    /// core); scans use the index, and [`counts::BucketCountRule`] leaves the
-    /// table alone. Register one instance per catalog: rows are keyed by
-    /// table id.
-    pub fn new(db: ExtensionDb) -> Self {
+    /// Index rows kept in the database of each catalog it runs in (see
+    /// [`table`]); scans use the index, and [`counts::BucketCountRule`]
+    /// leaves the table alone. One instance can serve every catalog.
+    pub fn new() -> Self {
         Self {
             scans: true,
             counts: false,
             shared: Arc::new(Shared {
-                db,
-                memo: RowMemo::new(NAME, MEMO_MAX_ENTRIES),
+                memo: RowMemo::new(NAME, MEMO_MAX_BYTES, FileIndexMeta::heap_bytes),
+                commits: GroupCommit::default(),
             }),
         }
-    }
-
-    /// Where the index rows are kept.
-    pub fn db(&self) -> &ExtensionDb {
-        &self.shared.db
     }
 
     /// Whether scans read the index to skip files and rows. On by default.
@@ -162,20 +193,23 @@ impl DuckLakeExtension for FileIndex {
     }
 
     /// `None` when scans are off, for the table or for the session
-    /// ([`FileIndexSessionOptions`]), or when no filter is one the index
-    /// answers: the table is then never read.
+    /// ([`FileIndexSessionOptions`]), when no filter is one the index
+    /// answers, or on a catalog without a database these extensions can use:
+    /// the table is then never read.
     fn scan_hook(&self, ctx: &ScanContext<'_>) -> Option<Arc<dyn ScanHook>> {
         if !scans_enabled(ctx.session.config_options(), self.scans) {
             return None;
         }
         let predicates =
             scan::eligible_predicates(ctx.filters, ctx.physical_schema, ctx.column_ids);
-        (!predicates.is_empty()).then(|| {
-            Arc::new(scan::IndexScanHook {
-                shared: Arc::clone(&self.shared),
-                predicates,
-            }) as Arc<dyn ScanHook>
-        })
+        if predicates.is_empty() {
+            return None;
+        }
+        Some(Arc::new(scan::IndexScanHook {
+            shared: Arc::clone(&self.shared),
+            db: ctx.db()?,
+            predicates,
+        }))
     }
 }
 
@@ -208,13 +242,13 @@ impl ConfigExtension for FileIndexSessionOptions {
 /// value type) match the listed file; anything else, including no row, means
 /// "scan normally". A row this build cannot read is left out.
 pub async fn file_index_rows(
-    db: &ExtensionDb,
+    db: &CatalogDb,
     table_id: i64,
     paths: &[&str],
     column_ids: &[i64],
 ) -> datafusion_ducklake::Result<Vec<FileIndexRow>> {
     let paths: Vec<String> = paths.iter().map(|path| path.to_string()).collect();
-    table::read(db, table_id, &paths, column_ids).await
+    table::read(db, table_id, paths, column_ids.to_vec()).await
 }
 
 /// Drop the rows in `db` of index objects whose data file no catalog row
@@ -223,9 +257,10 @@ pub async fn file_index_rows(
 /// must exceed the longest write still running, as for the orphan sweep's
 /// cutoff. Returns the keys deleted. An object already gone counts as
 /// deleted; any other delete failure is warned and left for the orphan
-/// sweep, since its row is already gone.
+/// sweep, since its row is already gone. `db` is the catalog's
+/// (`MetadataProvider::catalog_db`).
 pub async fn prune_file_indexes(
-    db: &ExtensionDb,
+    db: &CatalogDb,
     object_store: Arc<dyn ObjectStore>,
     min_age: Duration,
 ) -> datafusion_ducklake::Result<Vec<String>> {

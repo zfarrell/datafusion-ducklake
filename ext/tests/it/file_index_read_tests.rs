@@ -26,12 +26,12 @@ use object_store::local::LocalFileSystem;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tempfile::TempDir;
 
+use datafusion_ducklake::extension::CatalogDb;
 use datafusion_ducklake::{
     ColumnDef, DuckLakeCatalog, DuckLakeReadOptions, DuckLakeTable, DuckLakeTableWriter,
     DuckLakeWriteOptions, MergeOptions, MetadataWriter, NullOrder, SortDirection, SortField,
     SqliteMetadataProvider, SqliteMetadataWriter, WriteMode,
 };
-use datafusion_ducklake_ext::db::ExtensionDb;
 use datafusion_ducklake_ext::file_index::format::{
     FileIndexMeta, IndexValueType, PostingBuilder, index_file_name,
 };
@@ -125,16 +125,16 @@ impl Env {
             .unwrap()
     }
 
-    fn db(&self) -> ExtensionDb {
-        ExtensionDb::sqlite(self.pool.clone())
+    fn db(&self) -> CatalogDb {
+        crate::sqlite_db(&self.pool)
     }
 
     fn write_options(&self) -> DuckLakeWriteOptions {
         let mut options =
-            DuckLakeWriteOptions::default().with_extension(Arc::new(FileOrder::new(self.db())));
+            DuckLakeWriteOptions::default().with_extension(Arc::new(FileOrder::new()));
         options.max_row_group_rows = Some(ROW_GROUP_ROWS);
         if self.write_index {
-            options = options.with_extension(Arc::new(FileIndex::new(self.db())));
+            options = options.with_extension(Arc::new(FileIndex::new()));
         }
         options
     }
@@ -266,7 +266,7 @@ impl Env {
             });
         }
         let n = metas.len();
-        index_table::record(&self.db(), self.table_id, &metas)
+        index_table::record(&self.db(), self.table_id, metas)
             .await
             .unwrap();
         n
@@ -290,9 +290,9 @@ impl Env {
         // Registered with scans off rather than left out, so a session's
         // `SET ducklake_file_index.enabled = true` can still turn it on.
         let mut read = DuckLakeReadOptions::default()
-            .with_extension(Arc::new(FileIndex::new(self.db()).with_scans(index)));
+            .with_extension(Arc::new(FileIndex::new().with_scans(index)));
         if shape.order {
-            read = read.with_extension(Arc::new(FileOrder::new(self.db())));
+            read = read.with_extension(Arc::new(FileOrder::new()));
         }
         let catalog = match shape.snapshot {
             Some(snapshot) => DuckLakeCatalog::with_snapshot(Arc::new(provider), snapshot)

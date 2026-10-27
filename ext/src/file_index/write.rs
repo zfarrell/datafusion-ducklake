@@ -17,7 +17,7 @@ use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion_ducklake::extension::{
-    FileObserver, FileWriteHook, StoredFile, WriteContext, WriteOrigin,
+    CatalogDb, FileObserver, FileWriteHook, StoredFile, WriteContext, WriteOrigin,
 };
 use datafusion_ducklake::metadata_provider::DuckLakeTableFile;
 use datafusion_ducklake::{DuckLakeError, Result};
@@ -89,6 +89,9 @@ pub(crate) fn write_hook(
     shared: &Arc<super::Shared>,
     backfill: Option<&Arc<BackfillConfig>>,
 ) -> Result<Option<Arc<dyn FileWriteHook>>> {
+    let Some(db) = ctx.db() else {
+        return Ok(None);
+    };
     let setting = |key: &str| match ctx.setting(key) {
         Ok(value) => value,
         Err(error) => {
@@ -117,6 +120,7 @@ pub(crate) fn write_hook(
     };
     Ok(Some(Arc::new(IndexWriteHook {
         shared: Arc::clone(shared),
+        db,
         table_id: ctx.table_id,
         store: Arc::clone(ctx.object_store),
         built_by: match ctx.origin {
@@ -133,6 +137,7 @@ pub(crate) fn write_hook(
 #[derive(Debug)]
 struct IndexWriteHook {
     shared: Arc<super::Shared>,
+    db: CatalogDb,
     table_id: i64,
     store: Arc<dyn ObjectStore>,
     built_by: &'static str,
@@ -153,6 +158,7 @@ impl FileWriteHook for IndexWriteHook {
         Some(Box::new(IndexObserver {
             builders: request.builders(),
             shared: Arc::clone(&self.shared),
+            db: self.db.clone(),
             table_id: self.table_id,
             backfill: self.backfill.clone(),
         }))
@@ -190,6 +196,7 @@ impl FileWriteHook for IndexWriteHook {
 struct IndexObserver {
     builders: FileIndexBuilders,
     shared: Arc<super::Shared>,
+    db: CatalogDb,
     table_id: i64,
     backfill: Option<Arc<BackfillConfig>>,
 }
@@ -206,6 +213,7 @@ impl FileObserver for IndexObserver {
         let Self {
             builders,
             shared,
+            db,
             table_id,
             backfill,
         } = *self;
@@ -219,15 +227,15 @@ impl FileObserver for IndexObserver {
                 file.row_group_rows.clone(),
             )
             .await?;
-        super::table::record(&shared.db, table_id, &rows).await?;
-        for row in rows {
-            if let Some(backfill) = &backfill {
-                backfill
-                    .bytes_written
-                    .fetch_add(row.meta.index_size_bytes.max(0) as u64, Ordering::Relaxed);
-            }
-            let (path, column_id) = (row.meta.path.clone(), row.meta.column_id);
-            shared.memo.put(table_id, &path, column_id, row.meta);
+        let bytes: i64 = rows
+            .iter()
+            .map(|row| row.meta.index_size_bytes.max(0))
+            .sum();
+        shared.record(&db, table_id, rows).await?;
+        if let Some(backfill) = &backfill {
+            backfill
+                .bytes_written
+                .fetch_add(bytes as u64, Ordering::Relaxed);
         }
         Ok(())
     }

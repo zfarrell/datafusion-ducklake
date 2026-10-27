@@ -26,13 +26,13 @@ use object_store::path::Path as ObjectPath;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tempfile::TempDir;
 
+use datafusion_ducklake::extension::CatalogDb;
 use datafusion_ducklake::maintenance::{CleanupCriteria, ExpireCriteria};
 use datafusion_ducklake::{
     ColumnDef, DuckLakeCatalog, DuckLakeReadOptions, DuckLakeTable, DuckLakeTableWriter,
     DuckLakeWriteOptions, MergeOptions, MetadataWriter, RewriteOptions, SqliteMetadataProvider,
     SqliteMetadataWriter, WriteMode,
 };
-use datafusion_ducklake_ext::db::ExtensionDb;
 use datafusion_ducklake_ext::file_index::format::{FileIndexMeta, IndexKey, IndexValueType};
 use datafusion_ducklake_ext::file_index::table as index_table;
 use datafusion_ducklake_ext::file_index::{
@@ -200,13 +200,13 @@ impl Env {
         Arc::clone(&self.store) as Arc<dyn ObjectStore>
     }
 
-    fn db(&self) -> ExtensionDb {
-        ExtensionDb::sqlite(self.pool.clone())
+    fn db(&self) -> CatalogDb {
+        crate::sqlite_db(&self.pool)
     }
 
     /// A fresh extension instance (nothing read yet) over the catalog's pool.
     fn index(&self) -> Arc<FileIndex> {
-        Arc::new(FileIndex::new(self.db()))
+        Arc::new(FileIndex::new())
     }
 
     /// [`options`] with the extension on for writes.
@@ -763,7 +763,7 @@ async fn unlisted_row_is_pruned_after_grace() {
     index_table::record(
         &env.db(),
         env.table_id,
-        &[FileIndexRow {
+        vec![FileIndexRow {
             meta: FileIndexMeta {
                 path: "never-committed.parquet".to_string(),
                 ..sample_meta()
@@ -1317,9 +1317,8 @@ async fn one_pool_serves_the_catalog_and_both_extensions() {
         )
         .unwrap();
 
-    let db = ExtensionDb::sqlite(pool.clone());
-    let order = Arc::new(FileOrder::new(db.clone()));
-    let index = Arc::new(FileIndex::new(db));
+    let order = Arc::new(FileOrder::new());
+    let index = Arc::new(FileIndex::new());
     // Writes record order only; the index comes from the backfill.
     let write_options = options().with_extension(Arc::clone(&order) as _);
     for i in 0..2 {

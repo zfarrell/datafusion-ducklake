@@ -18,7 +18,6 @@ use datafusion_ducklake::{
     MulticatalogManager, MulticatalogProvider, NullOrder, PostgresMetadataWriter, SortDirection,
     SortField,
 };
-use datafusion_ducklake_ext::db::ExtensionDb;
 use datafusion_ducklake_ext::file_order::{
     FileOrder, FileOrderTableExt, VerifyOrderOptions, prune_file_orders,
 };
@@ -61,12 +60,10 @@ fn batch(ts: impl IntoIterator<Item = i64>) -> RecordBatch {
     .unwrap()
 }
 
-fn ext_options(pool: &PgPool, enabled: bool) -> DuckLakeWriteOptions {
+fn ext_options(enabled: bool) -> DuckLakeWriteOptions {
     let mut options = DuckLakeWriteOptions::default().with_data_inlining_row_limit(0);
     if enabled {
-        options = options.with_extension(Arc::new(FileOrder::new(ExtensionDb::postgres(
-            pool.clone(),
-        ))));
+        options = options.with_extension(Arc::new(FileOrder::new()));
     }
     // Rows land in the order given, so a test decides which files are sorted.
     options.sort_on_insert = Some(false);
@@ -101,7 +98,7 @@ impl Env {
             .unwrap();
         let created = DuckLakeTableWriter::new(writer.clone(), Arc::new(LocalFileSystem::new()))
             .unwrap()
-            .with_options(&ext_options(&env.pool, false))
+            .with_options(&ext_options(false))
             .write_table("public", "logs", &[batch([0])])
             .await
             .unwrap();
@@ -127,7 +124,7 @@ impl Env {
     async fn append(&self, pool: &PgPool, rows: RecordBatch, ext_file_order: bool) {
         DuckLakeTableWriter::new(self.writer(pool).await, Arc::new(LocalFileSystem::new()))
             .unwrap()
-            .with_options(&ext_options(pool, ext_file_order))
+            .with_options(&ext_options(ext_file_order))
             .append_table("public", "logs", &[rows])
             .await
             .unwrap();
@@ -140,9 +137,7 @@ impl Env {
         let catalog =
             DuckLakeCatalog::with_writer(Arc::new(provider), self.writer(&self.pool).await)
                 .unwrap()
-                .with_extension(Arc::new(FileOrder::new(ExtensionDb::postgres(
-                    self.pool.clone(),
-                ))));
+                .with_extension(Arc::new(FileOrder::new()));
         let ctx = SessionContext::new_with_config(
             SessionConfig::new()
                 .with_target_partitions(partitions)
@@ -315,7 +310,7 @@ async fn multicatalog_records_verifies_and_declares() {
     }
     // Every row's file is listed: nothing to prune.
     assert_eq!(
-        prune_file_orders(&ExtensionDb::postgres(env.pool.clone()))
+        prune_file_orders(&crate::postgres_db(&env.pool))
             .await
             .unwrap(),
         0

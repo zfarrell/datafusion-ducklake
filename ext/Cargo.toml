@@ -20,7 +20,7 @@ parquet = { version = "59.2", features = ["async"] }
 object_store = { version = "0.13", default-features = false }
 async-trait = "0.1"
 futures = "0.3"
-tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+tokio = { version = "1", features = ["sync"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 datafusion-datasource = { version = "55", default-features = false }
 tracing = "0.1"
@@ -47,10 +47,10 @@ url = "2.5"
 [features]
 # Skip the PostgreSQL tests, which need Docker.
 skip-tests-with-docker = []
-# Fact stores in a SQLite or PostgreSQL database (`facts::FactStore`).
+# The catalog backends whose database the extensions keep their tables in.
 default = ["sqlite", "postgres"]
-sqlite = ["sqlx/sqlite"]
-postgres = ["sqlx/postgres"]
+sqlite = ["sqlx/sqlite", "datafusion-ducklake/metadata-sqlite"]
+postgres = ["sqlx/postgres", "datafusion-ducklake/metadata-postgres"]
 
 [[test]]
 name = "it"

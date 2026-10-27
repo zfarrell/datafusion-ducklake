@@ -10,11 +10,11 @@ use std::time::Duration;
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::prelude::*;
+use datafusion_ducklake::extension::CatalogDb;
 use datafusion_ducklake::{
     DuckLakeCatalog, DuckLakeReadOptions, DuckLakeTable, DuckLakeTableWriter, DuckLakeWriteOptions,
     MetadataWriter, MulticatalogManager, MulticatalogProvider, PostgresMetadataWriter,
 };
-use datafusion_ducklake_ext::db::ExtensionDb;
 use datafusion_ducklake_ext::file_index::format::{FileIndexMeta, IndexKey, IndexValueType};
 use datafusion_ducklake_ext::file_index::table as index_table;
 use datafusion_ducklake_ext::file_index::{
@@ -105,8 +105,8 @@ impl Env {
         env
     }
 
-    fn db(&self) -> ExtensionDb {
-        ExtensionDb::postgres(self.pool.clone())
+    fn db(&self) -> CatalogDb {
+        crate::postgres_db(&self.pool)
     }
 
     async fn writer(&self) -> Arc<PostgresMetadataWriter> {
@@ -138,8 +138,7 @@ impl Env {
             DuckLakeCatalog::with_writer(Arc::new(self.provider().await), self.writer().await)
                 .unwrap()
                 .with_read_options(
-                    DuckLakeReadOptions::default()
-                        .with_extension(Arc::new(FileIndex::new(self.db()))),
+                    DuckLakeReadOptions::default().with_extension(Arc::new(FileIndex::new())),
                 )
                 .with_write_options(options());
         let ctx = SessionContext::new();
@@ -298,7 +297,7 @@ async fn backfill_then_prune() {
     index_table::record(
         &env.db(),
         env.table_id,
-        &[FileIndexRow {
+        vec![FileIndexRow {
             meta: ghost,
             index_key: "ghost/key.pidx".to_string(),
             built_by: "write".to_string(),
@@ -349,7 +348,7 @@ async fn bucket_counts_round_trip() {
     index_table::record(
         &env.db(),
         env.table_id,
-        &[FileIndexRow {
+        vec![FileIndexRow {
             meta: metas[0].clone(),
             index_key: "unused/key.pidx".to_string(),
             built_by: "backfill".to_string(),

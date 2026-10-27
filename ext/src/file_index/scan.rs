@@ -22,7 +22,7 @@ use datafusion::logical_expr::Operator;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::{BinaryExpr, Column, InListExpr, Literal};
 use datafusion_datasource_parquet::ParquetAccessPlan;
-use datafusion_ducklake::extension::{FileSelection, ScanContext, ScanFile, ScanHook};
+use datafusion_ducklake::extension::{CatalogDb, FileSelection, ScanContext, ScanFile, ScanHook};
 use futures::StreamExt;
 use object_store::path::Path as ObjectPath;
 
@@ -318,6 +318,7 @@ impl ScanSummary {
 #[derive(Debug)]
 pub(crate) struct IndexScanHook {
     pub(crate) shared: Arc<super::Shared>,
+    pub(crate) db: CatalogDb,
     pub(crate) predicates: Vec<IndexPredicate>,
 }
 
@@ -361,7 +362,10 @@ impl IndexScanHook {
         column_ids.sort_unstable();
         column_ids.dedup();
         let paths: Vec<&str> = files.iter().map(|f| f.file.file.path.as_str()).collect();
-        let rows = self.shared.rows(ctx.table_id, &paths, &column_ids).await;
+        let rows = self
+            .shared
+            .rows(&self.db, ctx.table_id, &paths, &column_ids)
+            .await;
 
         let meta_for = |f: &ScanFile<'_>, p: &IndexPredicate| {
             usable_meta(

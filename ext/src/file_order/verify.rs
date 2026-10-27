@@ -102,10 +102,15 @@ impl FileOrderTableExt for DuckLakeTable {
                     .to_string(),
             ));
         }
-        let Some(order) = self.read_options().extensions.get::<FileOrder>() else {
+        let Some(order) = self.read_options().extensions().get::<FileOrder>() else {
             return Err(DuckLakeError::InvalidConfig(
                 "verify_file_orders: no FileOrder registered on the table's read options"
                     .to_string(),
+            ));
+        };
+        let Some(db) = self.metadata_provider().catalog_db() else {
+            return Err(DuckLakeError::Unsupported(
+                "verify_file_orders: the catalog's backend keeps no extension tables".to_string(),
             ));
         };
         let Some(spec) = self.live_sort_spec()? else {
@@ -138,7 +143,7 @@ impl FileOrderTableExt for DuckLakeTable {
             .into_iter()
             .map(|tf| tf.file.path)
             .collect();
-        let recorded: HashSet<(String, i64)> = table::read(order.db(), self.table_id(), &paths)
+        let recorded: HashSet<(String, i64)> = table::read(&db, self.table_id(), paths)
             .await?
             .into_iter()
             .filter(|row| current_key.as_ref() == Some(&row.sort_key))
