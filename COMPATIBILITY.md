@@ -1064,8 +1064,8 @@ semver promise) add per-file work to writes and scans. Core stores nothing for t
 extensions of `datafusion-ducklake-ext` keep outside the spec:
 
 - **Their own tables** in the catalog's database: `ext_ducklake_file_index` and
-  `ext_ducklake_file_order`, created on the first record. The caller hands each extension the
-  pool it gave core (`ExtensionDb`), so an extension opens no connection of its own. DuckDB's
+  `ext_ducklake_file_order`, created on the first record. Core hands each extension the
+  catalog's database (`CatalogDb`), so an extension opens no connection of its own. DuckDB's
   extension names the tables it reads and never enumerates the catalog, so it neither sees nor
   disturbs them. SQLite and PostgreSQL only.
 - **Companion objects** beside a data file, named `<data file>.parquet.<suffix>`. The orphan

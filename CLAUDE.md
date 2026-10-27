@@ -84,8 +84,11 @@ The codebase follows a layered architecture with clear separation of concerns:
      existing files. Public only with the `unstable-extensions` feature
      (`unstable_extension_api!` in `lib.rs` gates the `DuckLakeTable` accessors extensions use),
      with no semver promise. Extensions live in the `ext/` crate (`datafusion-ducklake-ext`:
-     file order, file index), which uses only that API and keeps its own tables through a pool
-     the caller shares with core (`ExtensionDb`)
+     file order, file index), which uses only that API and keeps its own tables in the catalog's
+     database. Core hands it out as `CatalogDb` (`extension/db.rs`, from `MetadataProvider::catalog_db`
+     and the hook contexts), which runs every query on core's catalog runtime: a pooled connection
+     an extension opened on the embedder's runtime would hang a later blocking catalog call. A
+     provider or writer that wraps another forwards `catalog_db`
    - `order_on_request.rs`: `OrderOnRequestExec` offers an ordered plan over files whose order an
      extension claims, only when a sort asks for it
    - `table_functions.rs`: `ducklake_snapshots()`, `ducklake_table_info()`, `ducklake_list_files()`, `ducklake_table_changes()`, `ducklake_table_deletions()`, `ducklake_table_insertions()`; registered via `register_ducklake_functions()`
