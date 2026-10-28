@@ -1031,6 +1031,25 @@ catalog or stored in Parquet; each handles both as official DuckLake's SQL does.
   a file with inlined deletions (merging it would lose them); `rewrite_data_files` counts them
   towards the deleted fraction and retires a file they empty.
 
+## Experimental: extensions
+
+Extensions (`datafusion_ducklake::extension`, behind the `unstable-extensions` feature, with no
+semver promise) add per-file work to writes and scans. Core stores nothing for them. An
+extension may keep outside the spec:
+
+- **Its own tables** in the catalog's database, named outside the spec's `ducklake_` prefix.
+  Core hands each extension the
+  catalog's database (`CatalogDb`), so an extension opens no connection of its own. DuckDB's
+  extension names the tables it reads and never enumerates the catalog, so it neither sees nor
+  disturbs them. SQLite and PostgreSQL only.
+- **Companion objects** beside a data file, named `<data file>.parquet.<suffix>`. The orphan
+  sweep deletes one once its data file is unreferenced. DuckDB's sweep ignores them, since they
+  do not end in `.parquet`.
+
+A file written by another client has no record and is read as without the extension.
+
+---
+
 ## Limitations
 
 - **`CatalogReadMemo` is not DuckLake behavior.** Official DuckLake lists a scan's files again

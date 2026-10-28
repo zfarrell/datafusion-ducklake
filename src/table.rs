@@ -12,6 +12,7 @@ use crate::Result;
 use crate::column_rename::ColumnRenameExec;
 use crate::delete_filter::DeleteFilterExec;
 use crate::delete_memo::{DeletePositionMemo, DuckLakeReadOptions};
+use crate::extension::{FieldSort, FileSelection, ScanContext, ScanFile, ScanHooks};
 use crate::field_id_adapter::{DefaultFill, FieldIdExprAdapterFactory, RowLineageProbes};
 use crate::inlined_filter::{InlinedDataScan, InlinedFilter, translate_inlined_filters};
 use crate::lazy_delete_filter::{
@@ -73,6 +74,7 @@ use datafusion::common::stats::Precision;
 use datafusion::common::{Column, ColumnStatistics, ScalarValue, Statistics};
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::memory::MemorySourceConfig;
+use datafusion::datasource::physical_plan::FileScanConfig;
 use datafusion::datasource::physical_plan::parquet::CachedParquetFileReaderFactory;
 use datafusion::datasource::physical_plan::{
     FileGroup, FileScanConfigBuilder, FileSource, ParquetFileReaderFactory, ParquetSource,
@@ -84,6 +86,7 @@ use datafusion::execution::object_store::ObjectStoreUrl;
 #[cfg(feature = "write")]
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
+use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_datasource_parquet::metadata::DFParquetMetadata;
 use object_store::ObjectMeta;
@@ -112,7 +115,7 @@ pub const DELETE_FILE_PATH_FIELD_ID: i32 = 2_147_483_646;
 /// 2`), NOT Iceberg's `2147483545`. See [`DELETE_FILE_PATH_FIELD_ID`].
 pub const DELETE_POS_FIELD_ID: i32 = 2_147_483_645;
 
-struct FileMetadataPages<'a> {
+pub(crate) struct FileMetadataPages<'a> {
     provider: &'a dyn MetadataProvider,
     table_id: i64,
     snapshot_id: i64,
@@ -981,17 +984,19 @@ pub(crate) struct ParquetFileLayout {
     pub(crate) row_count: i64,
 }
 
+unstable_extension_api! {
 /// The parquet reader's metadata size hint for a file whose catalog records
 /// `footer_size`. DuckLake records the footer's thrift metadata length alone,
 /// while the reader's suffix fetch must also cover the 8-byte tail (metadata
 /// length plus `PAR1`), so the hint adds it and the footer arrives in one read.
 /// A recorded value that already includes the tail over-fetches 8 bytes. A
 /// missing, zero, or negative value gives no hint.
-pub(crate) fn metadata_size_hint(footer_size: Option<i64>) -> Option<usize> {
+pub fn metadata_size_hint(footer_size: Option<i64>) -> Option<usize> {
     footer_size
         .filter(|&size| size > 0)
         .and_then(|size| usize::try_from(size).ok())
         .and_then(|size| size.checked_add(8))
+}
 }
 
 /// The [`ObjectMeta`] DuckLake's own scan-time `PartitionedFile::new(path,
@@ -1346,6 +1351,9 @@ pub struct DuckLakeTable {
     /// every clone, as the other caches are, and keyed by snapshot so that a
     /// clone at a later snapshot reads again.
     inlined_absent_through: Arc<AtomicI64>,
+    /// The table's whole listing at `snapshot_id`, when the read options keep
+    /// it ([`DuckLakeReadOptions::with_listing_memo`]). Shared across clones.
+    listing_memo: Arc<ListingMemo>,
     /// How this table reuses what its scans read. The delete memo is off by
     /// default.
     read_options: DuckLakeReadOptions,
@@ -1506,6 +1514,7 @@ impl DuckLakeTable {
             file_read_config_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             inlined_materialized_row_count: Arc::new(AtomicUsize::new(0)),
             inlined_absent_through: Arc::new(AtomicI64::new(i64::MIN)),
+            listing_memo: Arc::default(),
             read_options: DuckLakeReadOptions::default(),
             delete_memo: None,
             #[cfg(feature = "write")]
@@ -1538,6 +1547,7 @@ impl DuckLakeTable {
     /// The table starts with an empty memo.
     pub fn with_read_options(mut self, options: DuckLakeReadOptions) -> Self {
         self.delete_memo = DeletePositionMemo::new(options.delete_memo_bytes);
+        self.listing_memo = Arc::new(ListingMemo::new(options.listing_memo_bytes));
         self.read_options = options;
         self
     }
@@ -1778,7 +1788,7 @@ impl DuckLakeTable {
     /// may ignore the filter entirely (the trait method defaults to doing so)
     /// and because the in-memory pass prunes on things the catalog cannot see —
     /// partition-derived bounds among them.
-    fn file_metadata_pages<'a>(
+    pub(crate) fn file_metadata_pages<'a>(
         &'a self,
         page_name: &'static str,
         filter: Option<&'a StatsFilter>,
@@ -3253,6 +3263,7 @@ impl DuckLakeTable {
     /// row. Every other file shares one scan over the table's physical schema whose
     /// [`FieldIdExprAdapterFactory`] resolves the file's columns by field id as the
     /// reader opens it, which is when the file's schema is first known.
+    #[allow(clippy::too_many_arguments)]
     fn build_exec_for_files_without_deletes(
         &self,
         state: &dyn Session,
@@ -3261,6 +3272,7 @@ impl DuckLakeTable {
         summary_statistics: &HashMap<i64, Arc<Statistics>>,
         projection: Option<&Vec<usize>>,
         limit: Option<usize>,
+        selections: &FileSelections,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         // A name-mapped file reads under the schema its mapping describes, which
         // can differ from file to file. Files sharing a mapped schema share one
@@ -3272,7 +3284,11 @@ impl DuckLakeTable {
         let mut group_index: HashMap<String, usize> = HashMap::new();
 
         for table_file in files {
-            let pf = self.partitioned_data_file(table_file, false, file_statistics)?;
+            let pf = with_selection(
+                self.partitioned_data_file(table_file, false, file_statistics)?,
+                table_file.data_file_id,
+                selections,
+            );
             let (mapping, key, resolved_by_field_id) = match table_file.file.mapping_id {
                 Some(mapping_id) => {
                     let resolved_path = self.resolve_file_path(&table_file.file)?;
@@ -3293,8 +3309,17 @@ impl DuckLakeTable {
 
             // Kept positionally alongside the group's files so the rollup can
             // refuse a group where any file lacks a summary, rather than
-            // silently merging a subset.
-            let summary = summary_statistics.get(&table_file.data_file_id).cloned();
+            // silently merging a subset. A file read through an extension's
+            // selection publishes none: its row count is not what it yields.
+            let summary = summary_statistics
+                .get(&table_file.data_file_id)
+                .filter(|_| {
+                    !matches!(
+                        selections.get(&table_file.data_file_id),
+                        Some(FileSelection::Select(_))
+                    )
+                })
+                .cloned();
             match group_index.get(&key) {
                 Some(&gi) => {
                     groups[gi].files.push(pf);
@@ -4735,6 +4760,7 @@ impl DuckLakeTable {
             file_read_config_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             inlined_materialized_row_count: Arc::clone(&self.inlined_materialized_row_count),
             inlined_absent_through: Arc::clone(&self.inlined_absent_through),
+            listing_memo: Arc::clone(&self.listing_memo),
             read_options: self.read_options.clone(),
             delete_memo: self.delete_memo.clone(),
             #[cfg(feature = "encryption")]
@@ -4745,12 +4771,13 @@ impl DuckLakeTable {
         }
     }
 
+    unstable_extension_api! {
     /// Physical (data-column) schema this table reads/writes, without the
     /// synthetic `rowid`. Used by [`DuckLakeUpdateExec`] to author the rewritten
     /// data file.
-    #[cfg(feature = "write")]
-    pub(crate) fn physical_schema(&self) -> SchemaRef {
+    pub fn physical_schema(&self) -> SchemaRef {
         self.physical_schema.clone()
+    }
     }
 
     /// This table opened again at the catalog's head, with the same writer and
@@ -4774,11 +4801,13 @@ impl DuckLakeTable {
         Ok(table)
     }
 
+    unstable_extension_api! {
     /// The metadata writer, when this table was opened writable
     /// (`DuckLakeCatalog::with_writer`). Used by the compaction ops.
     #[cfg(feature = "write")]
-    pub(crate) fn writer(&self) -> Option<&Arc<dyn MetadataWriter>> {
+    pub fn writer(&self) -> Option<&Arc<dyn MetadataWriter>> {
         self.writer.as_ref()
+    }
     }
 
     /// Resolved catalog settings with explicit Rust overrides applied. Used by
@@ -4788,17 +4817,20 @@ impl DuckLakeTable {
         &self.write_options
     }
 
+    unstable_extension_api! {
     /// The schema name, when this table was opened writable. Used by the
     /// compaction ops to author output file paths.
     #[cfg(feature = "write")]
-    pub(crate) fn schema_name(&self) -> Option<&str> {
+    pub fn schema_name(&self) -> Option<&str> {
         self.schema_name.as_deref()
     }
+    }
 
+    unstable_extension_api! {
     /// This table's name. Used by the compaction ops for output file paths.
-    #[cfg(feature = "write")]
-    pub(crate) fn table_name(&self) -> &str {
+    pub fn table_name(&self) -> &str {
         &self.table_name
+    }
     }
 
     pub(crate) fn snapshot_id(&self) -> i64 {
@@ -4814,10 +4846,12 @@ impl DuckLakeTable {
         self
     }
 
+    unstable_extension_api! {
     /// This table's catalog `table_id`. Used by the compaction commit and the snapshot
     /// consistency rule.
-    pub(crate) fn table_id(&self) -> i64 {
+    pub fn table_id(&self) -> i64 {
         self.table_id
+    }
     }
 
     /// The metadata provider this table reads through.
@@ -4826,11 +4860,12 @@ impl DuckLakeTable {
         &self.provider
     }
 
+    unstable_extension_api! {
     /// The table's resolved data directory, which relative file paths resolve
     /// against.
-    #[cfg(feature = "write")]
-    pub(crate) fn table_path(&self) -> &str {
+    pub fn table_path(&self) -> &str {
         &self.table_path
+    }
     }
 
     /// The snapshot this table was opened at — the base the compaction sources
@@ -4840,20 +4875,22 @@ impl DuckLakeTable {
         self.snapshot_id
     }
 
+    unstable_extension_api! {
     /// The object store URL for resolving this table's file paths.
-    #[cfg(feature = "write")]
-    pub(crate) fn object_store_url(&self) -> &Arc<ObjectStoreUrl> {
+    pub fn object_store_url(&self) -> &Arc<ObjectStoreUrl> {
         &self.object_store_url
     }
+    }
 
+    unstable_extension_api! {
     /// The table's live sort spec at the current catalog head, if any. The write
     /// and compaction paths use it to order rows before writing (tightening
     /// per-file min/max). Read at the head, not the pinned read snapshot, so a
     /// `SET SORTED BY` applied after this provider was opened is honored.
-    #[cfg(feature = "write")]
-    pub(crate) fn live_sort_spec(&self) -> crate::Result<Option<crate::sort::SortSpec>> {
+    pub fn live_sort_spec(&self) -> crate::Result<Option<crate::sort::SortSpec>> {
         let head = self.provider.get_current_snapshot()?;
         self.provider.get_sort_spec(self.table_id, head)
+    }
     }
 
     /// The table's partition spec live at the CURRENT catalog head (not the
@@ -4880,9 +4917,12 @@ impl DuckLakeTable {
         ids
     }
 
-    #[cfg(feature = "write")]
-    pub(crate) fn top_level_column_ids(&self) -> Vec<i64> {
+    unstable_extension_api! {
+    /// The catalog `column_id` of each top-level column, in the order of
+    /// [`Self::physical_schema`]'s fields.
+    pub fn top_level_column_ids(&self) -> Vec<i64> {
         self.columns.iter().map(|column| column.column_id).collect()
+    }
     }
 
     /// What `merge_adjacent_files` needs from one candidate's PARQUET FOOTER.
@@ -5506,53 +5546,60 @@ pub(crate) struct FileUpdateOutput {
     pub(crate) cumulative_positions: Vec<i64>,
 }
 
-#[async_trait]
-impl TableProvider for DuckLakeTable {
-    fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
-    }
+unstable_extension_api! {
+/// A subset of a scan's files: see [`DuckLakeTable::scan_restricted`].
+pub struct ScanRestriction<'a> {
+    /// Files (after plan-time pruning) the scan keeps.
+    pub keep: &'a (dyn Fn(&DuckLakeTableFile) -> bool + Send + Sync),
+    /// Whether inlined (catalog-stored) rows are scanned.
+    pub include_inlined: bool,
+}
+}
 
-    fn table_type(&self) -> TableType {
-        TableType::Base
-    }
+/// Each file's [`FileSelection`] from the scan's extensions, by
+/// `data_file_id`. Files without an entry are read whole.
+type FileSelections = HashMap<i64, FileSelection>;
 
-    fn get_column_default(&self, column: &str) -> Option<&Expr> {
-        self.column_defaults.get(column)
+/// `pf` with the access plan an extension selected for it, if any.
+fn with_selection(
+    mut pf: PartitionedFile,
+    data_file_id: i64,
+    selections: &FileSelections,
+) -> PartitionedFile {
+    if let Some(FileSelection::Select(plan)) = selections.get(&data_file_id) {
+        pf.extensions.insert_arc(Arc::clone(plan));
     }
+    pf
+}
 
-    fn statistics(&self) -> Option<Statistics> {
-        let mut statistics = self.table_statistics.clone();
-        if self.row_lineage {
-            statistics
-                .column_statistics
-                .push(ColumnStatistics::new_unknown());
+/// The ordered alternative's ingredients, from the orderings extensions claim
+/// for files, gathered across a scan's pages of files and only used if a sort
+/// asks for them (see [`crate::order_on_request`]).
+struct OrderRecipe {
+    /// The verified files every page agreed on, to be chained.
+    files: Vec<PartitionedFile>,
+    ordering: Option<LexOrdering>,
+    /// False once declaring is off (no extension, a rowid scan) or the pages
+    /// disagree on the ordering.
+    ok: bool,
+}
+
+impl OrderRecipe {
+    fn new(enabled: bool) -> Self {
+        Self {
+            files: Vec::new(),
+            ordering: None,
+            ok: enabled,
         }
-        Some(statistics)
     }
+}
 
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&Expr],
-    ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
-        // Inexact here is ALSO what keeps a filtered `count(*)` correct: it is the
-        // retained `FilterExec` that stops `AggregateStatistics` folding the scan's
-        // published (post-prune, pre-filter) row count into the answer. That rule
-        // runs before `FilterPushdown`, so nothing downstream would catch it.
-        // Before declaring any filter class Exact, read `roll_up_scan_statistics`.
-        //
-        // Mark all filters as Inexact because we apply delete filters after the scan.
-        // DataFusion will reapply these filters after the delete filter to ensure
-        // correctness, but Parquet can still use them for:
-        // - Row group pruning via statistics
-        // - Page-level filtering with late materialization
-        // - Bloom filter lookups (if available)
-        Ok(filters
-            .iter()
-            .map(|_| TableProviderFilterPushDown::Inexact)
-            .collect())
-    }
-
-    async fn scan(
+impl DuckLakeTable {
+    unstable_extension_api! {
+    /// [`TableProvider::scan`], optionally over a subset of the listed files
+    /// (`restriction`): for a rewrite that answers some files another way and
+    /// scans the rest.
+    pub async fn scan_restricted(
         &self,
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
@@ -5564,6 +5611,7 @@ impl TableProvider for DuckLakeTable {
         // scan — pruning here only ever removes provably non-matching files.
         filters: &[Expr],
         limit: Option<usize>,
+        restriction: Option<&ScanRestriction<'_>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let inlined_filter = translate_inlined_filters(filters);
 
@@ -5606,6 +5654,18 @@ impl TableProvider for DuckLakeTable {
         // (`session_parquet_source`), so an `IN` list that prunes row groups
         // prunes files too instead of the two layers disagreeing.
         let max_in_list_size = state.config_options().execution.parquet.max_in_list_size;
+        let column_ids: Vec<i64> = self.columns.iter().map(|c| c.column_id).collect();
+        let hook_filters = conjuncts.clone();
+        let hook_ctx = ScanContext {
+            session: state,
+            table_id: self.table_id,
+            physical_schema: &self.physical_schema,
+            column_ids: &column_ids,
+            filters: &hook_filters,
+            metadata: &self.provider,
+            object_store_url: &self.object_store_url,
+        };
+        let hooks = ScanHooks::begin(&self.read_options.extensions, &hook_ctx);
         let pruning = match self.pruning_predicates(conjuncts, Some(max_in_list_size)) {
             Ok(pruning) => pruning,
             Err(error) => {
@@ -5613,7 +5673,8 @@ impl TableProvider for DuckLakeTable {
                 Vec::new()
             },
         };
-        for metadata in self.file_metadata_pages("planning", stats_filter.as_ref()) {
+        let mut order_recipe = OrderRecipe::new(!rowid_in_proj && !hooks.is_empty());
+        for metadata in self.listed_file_pages("planning", stats_filter.as_ref()) {
             let (table_files, file_statistics, summary_statistics) =
                 self.page_files_with_both_statistics(metadata?);
             #[cfg(feature = "encryption")]
@@ -5621,6 +5682,31 @@ impl TableProvider for DuckLakeTable {
 
             let table_files =
                 self.prune_table_files_iteratively(&pruning, &table_files, &file_statistics);
+            let table_files: Vec<&DuckLakeTableFile> = match restriction {
+                Some(restriction) => table_files
+                    .into_iter()
+                    .filter(|tf| (restriction.keep)(tf))
+                    .collect(),
+                None => table_files,
+            };
+            // Extensions skip files that cannot match, before any of them is
+            // grouped or chained. Only a file read as it is (no deletes, no
+            // snapshot filter, no rowid) takes a row selection.
+            let selections = if hooks.is_empty() {
+                FileSelections::new()
+            } else {
+                let files = self.scan_files(&table_files, &file_statistics, |tf| {
+                    !rowid_in_proj
+                        && !self.needs_snapshot_filter(tf)
+                        && tf.delete_file.is_none()
+                        && !inlined_deletes.contains_key(&tf.data_file_id)
+                });
+                hooks.select(&hook_ctx, &files).await
+            };
+            let table_files: Vec<&DuckLakeTableFile> = table_files
+                .into_iter()
+                .filter(|tf| !matches!(selections.get(&tf.data_file_id), Some(FileSelection::Skip)))
+                .collect();
 
             if rowid_in_proj {
                 let rowid_idx = rowid_idx.unwrap();
@@ -5682,6 +5768,15 @@ impl TableProvider for DuckLakeTable {
                 });
 
             if !files_without_deletes.is_empty() {
+                self.add_to_order_recipe(
+                    &mut order_recipe,
+                    &hooks,
+                    &hook_ctx,
+                    &files_without_deletes,
+                    &file_statistics,
+                    &selections,
+                )
+                .await?;
                 execs.push(self.build_exec_for_files_without_deletes(
                     state,
                     &files_without_deletes,
@@ -5689,6 +5784,7 @@ impl TableProvider for DuckLakeTable {
                     &summary_statistics,
                     projection,
                     limit,
+                    &selections,
                 )?);
             }
             if !files_with_deletes.is_empty() {
@@ -5743,8 +5839,10 @@ impl TableProvider for DuckLakeTable {
                 .unwrap_or_else(|| (0..self.schema.fields().len()).collect());
             // Inlined rows carry their stable row ids as data, so they join the
             // row-lineage plan as one more branch with `rowid` filled in.
-            if let Some(exec) =
-                self.inlined_rowid_exec(&user_proj, rowid_idx, inlined_filter.as_ref())?
+            let include_inlined = restriction.is_none_or(|r| r.include_inlined);
+            if include_inlined
+                && let Some(exec) =
+                    self.inlined_rowid_exec(&user_proj, rowid_idx, inlined_filter.as_ref())?
             {
                 execs.push(exec);
             }
@@ -5760,16 +5858,18 @@ impl TableProvider for DuckLakeTable {
         // in the catalog (not in Parquet). Union them in so SELECT / COUNT(*)
         // include them. Providers without inlined data — or that don't implement
         // the read — return empty, so this is a no-op for ordinary catalogs.
-        let inlined = self.scan_inlined_rows(inlined_filter.as_ref())?;
-        self.inlined_materialized_row_count
-            .store(inlined.materialized_row_count, Ordering::Relaxed);
-        if inlined.batches.iter().any(|b| b.num_rows() > 0) {
-            let exec = MemorySourceConfig::try_new_exec(
-                &[inlined.batches],
-                self.physical_schema.clone(),
-                projection.cloned(),
-            )?;
-            execs.push(exec);
+        if restriction.is_none_or(|r| r.include_inlined) {
+            let inlined = self.scan_inlined_rows(inlined_filter.as_ref())?;
+            self.inlined_materialized_row_count
+                .store(inlined.materialized_row_count, Ordering::Relaxed);
+            if inlined.batches.iter().any(|b| b.num_rows() > 0) {
+                let exec = MemorySourceConfig::try_new_exec(
+                    &[inlined.batches],
+                    self.physical_schema.clone(),
+                    projection.cloned(),
+                )?;
+                execs.push(exec);
+            }
         }
 
         // Handle empty tables (no data files)
@@ -5782,8 +5882,318 @@ impl TableProvider for DuckLakeTable {
             return Ok(Arc::new(EmptyExec::new(projected_schema)));
         }
 
-        // Combine execution plans
-        combine_execution_plans(execs)
+        let plan = combine_execution_plans(execs)?;
+        // With verified files the plan is still today's plan; the wrapper only
+        // offers an ordered alternative to a sort that asks for one.
+        let plan = self.offer_order(state, plan, order_recipe);
+        Ok(plan)
+    }
+    }
+
+    /// Add one page's files without deletes to `recipe`: the orderings the
+    /// extensions claim for them, then the files sharing the declarable one.
+    #[allow(clippy::too_many_arguments)]
+    async fn add_to_order_recipe(
+        &self,
+        recipe: &mut OrderRecipe,
+        hooks: &ScanHooks,
+        hook_ctx: &ScanContext<'_>,
+        files: &[&DuckLakeTableFile],
+        file_statistics: &HashMap<i64, Arc<Statistics>>,
+        selections: &FileSelections,
+    ) -> DataFusionResult<()> {
+        if !recipe.ok {
+            return Ok(());
+        }
+        let attested = self
+            .claimed_file_orderings(hooks, hook_ctx, files, file_statistics)
+            .await;
+        match self.declarable_ordering(files, &attested, file_statistics) {
+            Some((ordering, ids)) if recipe.ordering.as_ref().is_none_or(|o| *o == ordering) => {
+                for table_file in files {
+                    if ids.contains(&table_file.data_file_id) {
+                        recipe.files.push(with_selection(
+                            self.partitioned_data_file(table_file, false, file_statistics)?,
+                            table_file.data_file_id,
+                            selections,
+                        ));
+                    }
+                }
+                recipe.ordering = Some(ordering);
+            },
+            // Pages disagreeing on the ordering: declare nothing.
+            Some(_) => recipe.ok = false,
+            None => {},
+        }
+        Ok(())
+    }
+
+    /// `plan` wrapped in [`OrderOnRequestExec`](crate::order_on_request::OrderOnRequestExec)
+    /// when `recipe` chains into at most `target_partitions` groups; `plan`
+    /// itself otherwise.
+    fn offer_order(
+        &self,
+        state: &dyn Session,
+        plan: Arc<dyn ExecutionPlan>,
+        recipe: OrderRecipe,
+    ) -> Arc<dyn ExecutionPlan> {
+        let chained = recipe
+            .ok
+            .then_some(recipe.ordering)
+            .flatten()
+            .filter(|_| !recipe.files.is_empty())
+            .and_then(|ordering| {
+                self.ordered_file_groups(state, &FileGroup::new(recipe.files), ordering)
+            });
+        let Some((chains, ordering)) = chained else {
+            return plan;
+        };
+        let options = state.config_options();
+        Arc::new(crate::order_on_request::OrderOnRequestExec::new(
+            plan,
+            chains,
+            ordering,
+            options.execution.sort_pushdown_buffer_capacity,
+            options.optimizer.repartition_file_scans.then(|| {
+                (
+                    state.config().target_partitions(),
+                    options.optimizer.repartition_file_min_size,
+                )
+            }),
+        ))
+    }
+
+    /// `files` as offered to scan hooks: each with its statistics and whether
+    /// it is `selectable`. A name-mapped file resolves its columns by name,
+    /// not field id, so it is not offered.
+    fn scan_files<'f>(
+        &'f self,
+        files: &[&'f DuckLakeTableFile],
+        file_statistics: &'f HashMap<i64, Arc<Statistics>>,
+        selectable: impl Fn(&DuckLakeTableFile) -> bool,
+    ) -> Vec<ScanFile<'f>> {
+        files
+            .iter()
+            .copied()
+            .filter(|tf| tf.file.mapping_id.is_none())
+            .map(|tf| ScanFile {
+                file: tf,
+                statistics: file_statistics.get(&tf.data_file_id),
+                selectable: selectable(tf),
+                table: self,
+            })
+            .collect()
+    }
+
+    /// Where a scan reads `file`, in the session's object store for the table.
+    pub(crate) fn scan_location(&self, file: &DuckLakeFileData) -> DataFusionResult<ObjectPath> {
+        Ok(self.partitioned_file(file)?.object_meta.location)
+    }
+
+    /// Each file's ordering over the table schema, as the scan's extensions
+    /// claim it. A claim for a column that is gone, or that the cross-file
+    /// check cannot compare, ends the ordering there.
+    async fn claimed_file_orderings(
+        &self,
+        hooks: &ScanHooks,
+        hook_ctx: &ScanContext<'_>,
+        files: &[&DuckLakeTableFile],
+        file_statistics: &HashMap<i64, Arc<Statistics>>,
+    ) -> HashMap<i64, LexOrdering> {
+        let offered = self.scan_files(files, file_statistics, |_| true);
+        hooks
+            .orderings(hook_ctx, &offered)
+            .await
+            .into_iter()
+            .filter_map(|(id, keys)| Some((id, self.ordering_for_attestation(&keys)?)))
+            .collect()
+    }
+
+    /// The longest prefix of `keys` this scan can declare: keys resolve by field
+    /// id to a CURRENT column (a dropped or re-added column ends the prefix), and
+    /// only fixed-width, totally ordered types qualify, since the cross-file
+    /// check compares catalog min/max, which for strings may be truncated and
+    /// for floats ignore NaN.
+    fn ordering_for_attestation(&self, keys: &[FieldSort]) -> Option<LexOrdering> {
+        use datafusion::physical_expr::expressions::Column as PhysicalColumn;
+        let mut exprs = Vec::with_capacity(keys.len());
+        for key in keys {
+            let Some(index) = self
+                .columns
+                .iter()
+                .position(|column| column.column_id == key.field_id)
+            else {
+                break;
+            };
+            let Some(field) = self.physical_schema.fields().get(index) else {
+                break;
+            };
+            if !matches!(
+                field.data_type(),
+                DataType::Int8
+                    | DataType::Int16
+                    | DataType::Int32
+                    | DataType::Int64
+                    | DataType::UInt8
+                    | DataType::UInt16
+                    | DataType::UInt32
+                    | DataType::UInt64
+                    | DataType::Date32
+                    | DataType::Date64
+                    | DataType::Timestamp(_, _)
+                    | DataType::Decimal128(_, _)
+            ) {
+                break;
+            }
+            // The attested null order is dropped for SQL's default (NULLS LAST
+            // ascending, NULLS FIRST descending): the ordering is only declared
+            // for files whose key columns hold no NULL (`declarable_ordering`),
+            // where the two are one order. Without this, a DuckDB-style
+            // `SORTED BY (ts DESC NULLS LAST)` never satisfies `ORDER BY ts DESC`
+            // (DataFusion keeps one ordering per expression, not both).
+            exprs.push(PhysicalSortExpr::new(
+                Arc::new(PhysicalColumn::new(field.name(), index)),
+                arrow::compute::SortOptions {
+                    descending: key.options.descending,
+                    nulls_first: key.options.descending,
+                },
+            ));
+        }
+        LexOrdering::new(exprs)
+    }
+
+    /// The ordering to declare over `files`, and which files share it: the
+    /// ordering most of the attesting files carry, restricted to files whose
+    /// catalog statistics show no NULL in any key column. A NULL sits at one
+    /// end of its own file but outside the min/max the cross-file check
+    /// compares, so a file holding one could break the order between files.
+    fn declarable_ordering(
+        &self,
+        files: &[&DuckLakeTableFile],
+        attested: &HashMap<i64, LexOrdering>,
+        file_statistics: &HashMap<i64, Arc<Statistics>>,
+    ) -> Option<(LexOrdering, HashSet<i64>)> {
+        use datafusion::physical_expr::expressions::Column as PhysicalColumn;
+        let mut counts: Vec<(&LexOrdering, usize)> = Vec::new();
+        for file in files {
+            if let Some(ordering) = attested.get(&file.data_file_id) {
+                match counts.iter_mut().find(|(o, _)| *o == ordering) {
+                    Some((_, n)) => *n += 1,
+                    None => counts.push((ordering, 1)),
+                }
+            }
+        }
+        let (ordering, _) = counts.into_iter().max_by_key(|(_, n)| *n)?;
+        let key_columns: Vec<usize> = ordering
+            .iter()
+            .filter_map(|e| e.expr.downcast_ref::<PhysicalColumn>().map(|c| c.index()))
+            .collect();
+        let ids: HashSet<i64> = files
+            .iter()
+            .filter(|file| file.file.mapping_id.is_none())
+            .filter(|file| attested.get(&file.data_file_id) == Some(ordering))
+            .filter(|file| {
+                file_statistics
+                    .get(&file.data_file_id)
+                    .is_some_and(|stats| {
+                        key_columns.iter().all(|&i| {
+                            stats
+                                .column_statistics
+                                .get(i)
+                                .is_some_and(|c| c.null_count == Precision::Exact(0))
+                        })
+                    })
+            })
+            .map(|file| file.data_file_id)
+            .collect();
+        (!ids.is_empty()).then(|| (ordering.clone(), ids))
+    }
+
+    /// Split `files` into groups that are each a non-overlapping chain in
+    /// `ordering` (DataFusion's first-fit by min/max statistics), at most
+    /// `target_partitions` of them. `None` — declare nothing, scan as before —
+    /// when the statistics are missing or the files overlap too much to chain
+    /// into that many groups (live ingest before compaction).
+    fn ordered_file_groups(
+        &self,
+        state: &dyn Session,
+        files: &FileGroup,
+        ordering: LexOrdering,
+    ) -> Option<(Vec<FileGroup>, LexOrdering)> {
+        let target = state.config().target_partitions().max(1);
+        let groups = FileScanConfig::split_groups_by_statistics_with_target_partitions(
+            &self.physical_schema,
+            std::slice::from_ref(files),
+            &ordering,
+            target,
+        )
+        .inspect_err(|error| tracing::debug!(%error, "not declaring file ordering"))
+        .ok()?;
+        (groups.len() <= target).then_some((groups, ordering))
+    }
+}
+
+#[async_trait]
+impl TableProvider for DuckLakeTable {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    fn get_column_default(&self, column: &str) -> Option<&Expr> {
+        self.column_defaults.get(column)
+    }
+
+    fn statistics(&self) -> Option<Statistics> {
+        let mut statistics = self.table_statistics.clone();
+        if self.row_lineage {
+            statistics
+                .column_statistics
+                .push(ColumnStatistics::new_unknown());
+        }
+        Some(statistics)
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+        // Inexact here is ALSO what keeps a filtered `count(*)` correct: it is the
+        // retained `FilterExec` that stops `AggregateStatistics` folding the scan's
+        // published (post-prune, pre-filter) row count into the answer. That rule
+        // runs before `FilterPushdown`, so nothing downstream would catch it.
+        // Before declaring any filter class Exact, read `roll_up_scan_statistics`.
+        //
+        // Mark all filters as Inexact because we apply delete filters after the scan.
+        // DataFusion will reapply these filters after the delete filter to ensure
+        // correctness, but Parquet can still use them for:
+        // - Row group pruning via statistics
+        // - Page-level filtering with late materialization
+        // - Bloom filter lookups (if available)
+        Ok(filters
+            .iter()
+            .map(|_| TableProviderFilterPushDown::Inexact)
+            .collect())
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        // Filters drive plan-time file pruning below: iterative conjunct pruning drops
+        // files whose catalog statistics prove they cannot match. They are also
+        // pushed down to the parquet scanner by DataFusion's optimizer for row
+        // group / page-level filtering. We declare them Inexact in
+        // `supports_filters_pushdown`, so DataFusion reapplies them after our
+        // scan — pruning here only ever removes provably non-matching files.
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        self.scan_restricted(state, projection, filters, limit, None)
+            .await
     }
 
     #[cfg(feature = "write")]
@@ -6365,6 +6775,166 @@ impl PruningStatistics for FilePruningStatistics {
         self.base.contained(column, values)
     }
 }
+
+impl DuckLakeTable {
+    unstable_extension_api! {
+    /// Every data file listed at this table's snapshot.
+    pub fn data_files(&self) -> DataFusionResult<Vec<DuckLakeTableFile>> {
+        let mut out = Vec::new();
+        for page in self.file_metadata_pages("data files", None) {
+            out.extend(page?.into_iter().map(|metadata| metadata.file));
+        }
+        Ok(out)
+    }
+    }
+
+    unstable_extension_api! {
+    /// The object store key `file` is stored under, in this table's object
+    /// store ([`Self::object_store_url`]).
+    pub fn data_file_location(&self, file: &DuckLakeFileData) -> crate::Result<ObjectPath> {
+        Ok(ObjectPath::from(resolve_path(
+            &self.table_path,
+            &file.path,
+            file.path_is_relative,
+        )?))
+    }
+    }
+
+    unstable_extension_api! {
+    /// The DuckLake `column_id` of the top-level column `name`.
+    pub fn top_level_column_id(&self, name: &str) -> Option<i64> {
+        self.columns
+            .iter()
+            .find(|column| column.column_name == name)
+            .map(|column| column.column_id)
+    }
+    }
+
+    unstable_extension_api! {
+    /// The catalog this table reads.
+    pub fn metadata_provider(&self) -> &Arc<dyn MetadataProvider> {
+        &self.provider
+    }
+    }
+
+    unstable_extension_api! {
+    /// The options this table's scans read with.
+    pub fn read_options(&self) -> &DuckLakeReadOptions {
+        &self.read_options
+    }
+    }
+
+    unstable_extension_api! {
+    /// The table's data files at its snapshot that a scan reads exactly as
+    /// stored: no delete file, no inlined deletion, no snapshot filter, and
+    /// bound by field id. A fact about such a file's bytes is a fact about the
+    /// rows a scan returns from it.
+    pub fn plain_files(&self) -> DataFusionResult<Vec<DuckLakeTableFile>> {
+        let inlined_deletes = self.inlined_deletes_by_file()?;
+        let mut out = Vec::new();
+        for metadata in self.listed_file_pages("plain files", None) {
+            for metadata in metadata? {
+                let tf = metadata.file;
+                if tf.delete_file.is_none()
+                    && !inlined_deletes.contains_key(&tf.data_file_id)
+                    && !self.needs_snapshot_filter(&tf)
+                    && tf.file.mapping_id.is_none()
+                {
+                    out.push(tf);
+                }
+            }
+        }
+        Ok(out)
+    }
+    }
+}
+
+/// See [`DuckLakeReadOptions::with_listing_memo`]: one table's whole listing
+/// at its snapshot, read once.
+#[derive(Debug, Default)]
+pub(crate) struct ListingMemo {
+    /// Zero = off.
+    max_bytes: usize,
+    kept: std::sync::Mutex<Option<Arc<Vec<DuckLakeFileMetadata>>>>,
+    /// The listing did not fit: read it on every scan, as without a memo.
+    too_large: std::sync::atomic::AtomicBool,
+}
+
+impl ListingMemo {
+    pub(crate) fn new(max_bytes: usize) -> Self {
+        Self {
+            max_bytes,
+            ..Default::default()
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.max_bytes > 0 && !self.too_large.load(Ordering::Relaxed)
+    }
+
+    fn kept(&self) -> Option<Arc<Vec<DuckLakeFileMetadata>>> {
+        self.kept
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+impl DuckLakeTable {
+    /// The scan's file pages: [`Self::file_metadata_pages`], or the kept
+    /// whole listing as one page when the listing memo is on. A first read
+    /// lists every file, unfiltered, and keeps it if it fits.
+    pub(crate) fn listed_file_pages<'a>(
+        &'a self,
+        page_name: &'static str,
+        filter: Option<&'a StatsFilter>,
+    ) -> Box<dyn Iterator<Item = Result<Vec<DuckLakeFileMetadata>>> + Send + 'a> {
+        let memo = &self.listing_memo;
+        if !memo.enabled() {
+            return Box::new(self.file_metadata_pages(page_name, filter));
+        }
+        if let Some(kept) = memo.kept() {
+            return Box::new(std::iter::once(Ok(kept.as_ref().clone())));
+        }
+        let mut listing = Vec::new();
+        for page in self.file_metadata_pages(page_name, None) {
+            match page {
+                Ok(page) => listing.extend(page),
+                Err(error) => return Box::new(std::iter::once(Err(error))),
+            }
+        }
+        let bytes: usize = listing
+            .iter()
+            .map(crate::catalog_read_memo::file_metadata_bytes)
+            .sum();
+        if bytes > memo.max_bytes {
+            memo.too_large.store(true, Ordering::Relaxed);
+        } else {
+            *memo
+                .kept
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(listing.clone()));
+        }
+        Box::new(std::iter::once(Ok(listing)))
+    }
+
+    unstable_extension_api! {
+    /// A clone whose listing memo is its own and on, for one plan whose
+    /// scans should share one listing (a rewrite's branches), unless this
+    /// table already keeps its listing.
+    pub fn with_plan_listing_memo(&self) -> Self {
+        let mut table = self.clone();
+        if !table.listing_memo.enabled() {
+            table.listing_memo = Arc::new(ListingMemo::new(PLAN_LISTING_MEMO_BYTES));
+        }
+        table
+    }
+    }
+}
+
+/// Budget of [`DuckLakeTable::with_plan_listing_memo`]: the default of
+/// [`crate::CatalogReadMemo`].
+const PLAN_LISTING_MEMO_BYTES: usize = 64 << 20;
 
 #[cfg(test)]
 mod tests {

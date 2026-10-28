@@ -807,7 +807,27 @@ impl SqliteMetadataWriter {
                 .await
         })
         .await?;
+        Self::adopt(pool, lock_path).await
+    }
 
+    /// A writer over an existing connection pool, so one pool can serve this
+    /// writer, a [`SqliteMetadataProvider::from_pool`](crate::SqliteMetadataProvider::from_pool)
+    /// and anything else that reads the catalog's database. See
+    /// [`SqliteMetadataProvider::from_pool`](crate::SqliteMetadataProvider::from_pool)
+    /// for what adopting a pool means for its connections.
+    pub async fn from_pool(pool: SqlitePool) -> Result<Self> {
+        let filename = pool.connect_options().get_filename().to_path_buf();
+        let lock_path = (!filename.as_os_str().is_empty()
+            && filename != std::path::Path::new(":memory:"))
+        .then(|| {
+            let mut path = filename.into_os_string();
+            path.push(".commit.lock");
+            PathBuf::from(path)
+        });
+        Self::adopt(pool, lock_path).await
+    }
+
+    async fn adopt(pool: SqlitePool, lock_path: Option<PathBuf>) -> Result<Self> {
         // Existing catalogs must migrate even when callers skip `initialize_schema`
         migrate_snapshot_changes_nullable(&pool).await?;
         sqlx::query(SQL_CREATE_INLINED_DATA_TABLES)
@@ -3703,6 +3723,11 @@ impl SqliteMetadataWriter {
 }
 
 impl MetadataWriter for SqliteMetadataWriter {
+    #[cfg(feature = "unstable-extensions")]
+    fn catalog_db(&self) -> Option<crate::extension::CatalogDb> {
+        Some(crate::extension::CatalogDb::sqlite(&self.pool))
+    }
+
     fn maintenance(&self) -> Option<&dyn crate::maintenance::CatalogMaintenance> {
         Some(self)
     }

@@ -1512,6 +1512,11 @@ impl PostgresMetadataProvider {
 }
 
 impl MetadataProvider for PostgresMetadataProvider {
+    #[cfg(feature = "unstable-extensions")]
+    fn catalog_db(&self) -> Option<crate::extension::CatalogDb> {
+        Some(crate::extension::CatalogDb::postgres(&self.pool))
+    }
+
     fn get_current_snapshot(&self) -> Result<i64> {
         block_on(async {
             let row = sqlx::query("SELECT COALESCE(MAX(snapshot_id), 0) FROM ducklake_snapshot")

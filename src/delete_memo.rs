@@ -45,6 +45,13 @@ pub struct DuckLakeReadOptions {
     /// Bytes of delete-file positions a table can keep across scans. Zero, the
     /// default, turns the delete memo off.
     pub delete_memo_bytes: usize,
+    /// Extensions whose scan hooks decide how this table's scans read each
+    /// file (see `crate::extension`). Empty by default.
+    pub(crate) extensions: crate::extension::DuckLakeExtensions,
+    /// Bytes of file listing a table may keep for the life of the table (and
+    /// its clones). Zero, the default, reads the listing on every scan. See
+    /// [`Self::with_listing_memo`].
+    pub listing_memo_bytes: usize,
 }
 
 impl DuckLakeReadOptions {
@@ -63,6 +70,47 @@ impl DuckLakeReadOptions {
     #[must_use]
     pub fn with_delete_memo(mut self, max_bytes: usize) -> Self {
         self.delete_memo_bytes = max_bytes;
+        self
+    }
+
+    unstable_extension_api! {
+    /// Register `extension`'s scan hook (see [`crate::extension`]).
+    #[must_use]
+    pub fn with_extension(
+        mut self,
+        extension: Arc<dyn crate::extension::DuckLakeExtension>,
+    ) -> Self {
+        self.extensions = self.extensions.with(extension);
+        self
+    }
+    }
+
+    unstable_extension_api! {
+    /// The extensions whose scan hooks this table's scans run.
+    pub fn extensions(&self) -> &crate::extension::DuckLakeExtensions {
+        &self.extensions
+    }
+    }
+
+    /// Keep each table's whole file listing at its snapshot, up to
+    /// `max_bytes`, so later scans of the same table (and its clones, such as
+    /// one rebound per query with `DuckLakeTable::with_metadata_provider`)
+    /// read no listing. Zero turns it off.
+    ///
+    /// **Not DuckLake behaviour.** Official DuckLake lists a scan's files in
+    /// every transaction. A listing at one snapshot is final only until a
+    /// merge, rewrite or flush commits: those also rewrite the listing of
+    /// older snapshots. Turn this on only when each table instance is dropped
+    /// once its table commits again, as a caller does that keys built tables
+    /// by the table's own latest snapshot (RuntimeDB keys them by the
+    /// generation it republishes after every commit, compaction included).
+    /// A kept listing then serves only reads at a snapshot whose listing no
+    /// later commit has rewritten. The catalog-side statistics filter is not
+    /// applied to a kept listing; the scan prunes it in memory, as it prunes
+    /// every page.
+    #[must_use]
+    pub fn with_listing_memo(mut self, max_bytes: usize) -> Self {
+        self.listing_memo_bytes = max_bytes;
         self
     }
 }

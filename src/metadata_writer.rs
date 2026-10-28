@@ -170,6 +170,9 @@ pub(crate) fn normalize_setting_value(key: &str, value: &str) -> Result<String> 
                 },
             }
         },
+        // This crate's own (official refuses them): an extension's settings,
+        // stored as given for the extension to read (see `crate::extension`).
+        key if key.starts_with("ext_") => value.to_string(),
         "delete_older_than" | "expire_older_than" => {
             if !value.is_empty() && crate::maintenance::parse_duckdb_interval(value).is_none() {
                 return Err(invalid(format!("{key} is not a valid interval value.")));
@@ -4730,6 +4733,17 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// files only, and refuse to update inlined rows.
     fn supports_inlined_row_mutations(&self) -> bool {
         false
+    }
+
+    /// The catalog's database, for an extension to keep its own tables in
+    /// (see [`CatalogDb`](crate::extension::CatalogDb)). `None` for a backend
+    /// that does not offer it (DuckDB, MySQL).
+    #[cfg(all(
+        feature = "unstable-extensions",
+        any(feature = "metadata-sqlite", feature = "metadata-postgres")
+    ))]
+    fn catalog_db(&self) -> Option<crate::extension::CatalogDb> {
+        None
     }
 }
 

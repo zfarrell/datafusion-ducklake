@@ -556,6 +556,10 @@ impl MulticatalogManager {
                             // partition, rolling over only an unpartitioned one.
                             values.is_none(),
                             &mut paths,
+                            // No extension hooks: the destination table gets
+                            // its id only when the fork commits, and a fact is
+                            // keyed by table id.
+                            None,
                         )
                         .await;
                     written.extend(paths);

@@ -22,6 +22,9 @@ use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 use crate::Result;
+use crate::extension::{
+    FileHooks, FileObservers, StoredFile, WriteContext, WriteLookups, WriteOrigin,
+};
 use crate::metadata_provider::DuckLakeInlinedData;
 use crate::metadata_writer::{
     ColumnDef, DataFileInfo, DeleteFileEntry, DeleteFileInfo, InlinedRowRef, MetadataWriter,
@@ -212,6 +215,12 @@ pub struct DuckLakeWriteOptions {
     /// When merge and rewrite first flush the table's inlined data; `None`
     /// takes [`InlinedFlushPolicy::default`], which never does.
     pub inlined_flush_policy: Option<InlinedFlushPolicy>,
+    /// Extensions whose write hooks see every data file written (see
+    /// `crate::extension`). Empty by default.
+    pub(crate) extensions: crate::extension::DuckLakeExtensions,
+    /// The table's `ext_` settings, when these options were read from the
+    /// catalog, so a write hook reads them without a query.
+    ext_settings: Option<Arc<HashMap<String, String>>>,
     deferred_error: Option<String>,
 }
 
@@ -274,6 +283,14 @@ impl DuckLakeWriteOptions {
                 Some(0.95),
             )?,
             inlined_flush_policy: None,
+            extensions: Default::default(),
+            ext_settings: Some(Arc::new(
+                settings
+                    .iter()
+                    .filter(|(key, _)| key.starts_with("ext_"))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            )),
             deferred_error: None,
         })
     }
@@ -302,12 +319,36 @@ impl DuckLakeWriteOptions {
         self
     }
 
+    unstable_extension_api! {
+    /// Register `extension`'s write hook (see [`crate::extension`]).
+    #[must_use]
+    pub fn with_extension(
+        mut self,
+        extension: Arc<dyn crate::extension::DuckLakeExtension>,
+    ) -> Self {
+        self.extensions = self.extensions.with(extension);
+        self
+    }
+    }
+
+    unstable_extension_api! {
+    /// The extensions whose write hooks see every data file written.
+    pub fn extensions(&self) -> &crate::extension::DuckLakeExtensions {
+        &self.extensions
+    }
+    }
+
     /// Sets when merge and rewrite first flush a table's inlined data
     /// ([`InlinedFlushPolicy`]).
     #[must_use]
     pub fn with_inlined_flush_policy(mut self, policy: InlinedFlushPolicy) -> Self {
         self.inlined_flush_policy = Some(policy);
         self
+    }
+
+    /// See `Self::ext_settings`.
+    pub(crate) fn ext_settings(&self) -> Option<Arc<HashMap<String, String>>> {
+        self.ext_settings.clone()
     }
 
     pub(crate) fn validate(&self) -> Result<()> {
@@ -358,6 +399,12 @@ impl DuckLakeWriteOptions {
         }
         if overrides.inlined_flush_policy.is_some() {
             self.inlined_flush_policy = overrides.inlined_flush_policy;
+        }
+        for extension in overrides.extensions.iter() {
+            self.extensions = self.extensions.with(Arc::clone(extension));
+        }
+        if overrides.ext_settings.is_some() {
+            self.ext_settings = overrides.ext_settings.clone();
         }
         self
     }
@@ -705,6 +752,10 @@ pub struct DuckLakeTableWriter {
     /// `sort_on_insert` says, as official's flush does.
     flushing_inlined: bool,
     hive_file_pattern: bool,
+    /// See [`DuckLakeWriteOptions::extensions`].
+    extensions: crate::extension::DuckLakeExtensions,
+    /// See `DuckLakeWriteOptions::ext_settings`.
+    ext_settings: Option<Arc<HashMap<String, String>>>,
 }
 
 /// Whether an error came from the metadata database or the object store or
@@ -750,6 +801,8 @@ impl DuckLakeTableWriter {
             sort_on_insert: true,
             flushing_inlined: false,
             hive_file_pattern: true,
+            extensions: Default::default(),
+            ext_settings: None,
         })
     }
 
@@ -857,7 +910,40 @@ impl DuckLakeTableWriter {
         if let Some(hive_file_pattern) = options.hive_file_pattern {
             self.hive_file_pattern = hive_file_pattern;
         }
+        for extension in options.extensions.iter() {
+            self.extensions = self.extensions.with(Arc::clone(extension));
+        }
+        if options.ext_settings.is_some() {
+            self.ext_settings = options.ext_settings.clone();
+        }
         self
+    }
+
+    /// The extensions' per-file work for one write of `table_id` (see
+    /// [`crate::extension`]); `None` when no extension has any.
+    pub(crate) fn file_hooks(
+        &self,
+        table_id: i64,
+        schema_name: &str,
+        table_name: &str,
+        origin: WriteOrigin,
+    ) -> Option<FileHooks> {
+        if self.extensions.is_empty() {
+            return None;
+        }
+        let lookups = WriteLookups::new(self.ext_settings.clone());
+        FileHooks::begin(
+            &self.extensions,
+            &WriteContext::new(
+                table_id,
+                schema_name,
+                table_name,
+                origin,
+                &self.metadata,
+                &self.object_store,
+                &lookups,
+            ),
+        )
     }
 
     /// Build the parquet [`WriterProperties`] shared by every write path from this
@@ -1254,13 +1340,25 @@ impl DuckLakeTableWriter {
             props_builder = props_builder.set_max_row_group_bytes(Some(bytes));
         }
         let props = props_builder.build();
+        // Extension hooks only for a file name this writer mints: a fact
+        // describes the object at its path, and a caller that picks the name
+        // (`begin_write_to_path`) may write other bytes there after a failed
+        // attempt.
+        let hooks = if path_is_relative {
+            self.file_hooks(setup.table_id, schema_name, table_name, WriteOrigin::Insert)
+        } else {
+            None
+        };
         // Stream the parquet to a local staging file rather than an in-memory
         // buffer: a multi-GB table would otherwise be held whole in RAM and,
         // worse, uploaded as a single PUT (object stores cap a single PUT at
         // 5 GiB). `finish()` streams this file out via a multipart upload.
         let temp = NamedTempFile::new()?;
         let staging = std::io::BufWriter::new(temp.reopen()?);
-        let writer = RowGroupSampledWriter::new(staging, schema_with_ids.clone(), props);
+        let mut writer = RowGroupSampledWriter::new(staging, schema_with_ids.clone(), props);
+        if let Some(hooks) = &hooks {
+            writer.set_observers(hooks.open_file(&schema_with_ids));
+        }
 
         // A partitioned target routes rows through a per-partition sink. The
         // single-file writer above is still created: with zero rows the sink
@@ -1286,6 +1384,7 @@ impl DuckLakeTableWriter {
                         table_key: table_key.clone(),
                         schema_with_ids: schema_with_ids.clone(),
                         props: self.build_writer_props(),
+                        hooks: hooks.clone(),
                         target_file_size: self.target_file_size,
                         max_open: self.max_open_partitions,
                         hive_file_pattern: self.hive_file_pattern,
@@ -1303,7 +1402,7 @@ impl DuckLakeTableWriter {
         // A partitioned target already rolls inside its per-partition sink, so a
         // second roller would be redundant (and would double-write).
         let roller = if roll && partition_sink.is_none() {
-            Some(RollingFileWriter::new(
+            let mut roller = RollingFileWriter::new(
                 table_key.clone(),
                 None,
                 schema_with_ids.clone(),
@@ -1312,7 +1411,9 @@ impl DuckLakeTableWriter {
                 self.target_file_size,
                 // Keep `TableWriteSession::file_path` accurate for the first file.
                 Some(catalog_path.clone()),
-            ))
+            );
+            roller.set_hooks(hooks.clone());
+            Some(roller)
         } else {
             None
         };
@@ -1833,6 +1934,7 @@ impl DuckLakeTableWriter {
         partition_subpath: Option<&str>,
         roll_over: bool,
         written: &mut Vec<ObjectPath>,
+        hooks: Option<FileHooks>,
     ) -> Result<Vec<DataFileInfo>> {
         self.refuse_encrypted_parquet("write a data file")?;
         let scoped_base = match self.metadata.catalog_id() {
@@ -1862,6 +1964,7 @@ impl DuckLakeTableWriter {
             },
             None,
         );
+        roller.set_hooks(hooks);
         let mut files = Vec::new();
         for batch in batches {
             if let Some(staged) = roller.write(batch)? {
@@ -1968,6 +2071,9 @@ impl DuckLakeTableWriter {
             true,
             embed_snapshot_id,
             partition_subpath,
+            // A caller of this low-level writer registers the file itself,
+            // under a table this writer is not told about.
+            None,
         )
         .await
     }
@@ -1992,6 +2098,7 @@ impl DuckLakeTableWriter {
         embed_rowid: bool,
         embed_snapshot_id: bool,
         partition_subpath: Option<&str>,
+        hooks: Option<FileHooks>,
     ) -> Result<DataFileInfo> {
         self.refuse_encrypted_parquet("write a compacted data file")?;
         let scoped_base = match self.metadata.catalog_id() {
@@ -2041,6 +2148,9 @@ impl DuckLakeTableWriter {
         let temp = NamedTempFile::new()?;
         let staging = std::io::BufWriter::new(temp.reopen()?);
         let mut writer = RowGroupSampledWriter::new(staging, schema_with_ids.clone(), props);
+        if let Some(hooks) = &hooks {
+            writer.set_observers(hooks.open_file(&schema_with_ids));
+        }
         let mut row_count: i64 = 0;
         let mut leaf_stats = crate::stats_collect::WrittenLeafStats::default();
         while let Some(batch) = batches.next().await {
@@ -2057,7 +2167,15 @@ impl DuckLakeTableWriter {
             writer.write(&batch_with_ids)?;
             row_count += batch.num_rows() as i64;
         }
-        let staged = writer.into_inner()?;
+        // Scoped: a local borrowed before an await stays in the future across
+        // it, and the writer is large.
+        let (observers, (staged, row_group_rows)) = {
+            let mut writer = writer;
+            (
+                writer.take_observers(),
+                writer.into_inner_with_row_groups()?,
+            )
+        };
         let mut file = staged
             .into_inner()
             .map_err(|e| crate::error::DuckLakeError::Io(e.into_error()))?;
@@ -2066,8 +2184,18 @@ impl DuckLakeTableWriter {
 
         let local = tokio::fs::File::open(temp.path()).await?;
         let mut reader = tokio::io::BufReader::new(local);
-        let mut upload = ObjectBufWriter::new(Arc::clone(&self.object_store), object_path);
+        let mut upload = ObjectBufWriter::new(Arc::clone(&self.object_store), object_path.clone());
         stream_to_upload(&mut reader, &mut upload).await?;
+        if !observers.is_empty() {
+            observers
+                .stored(&StoredFile {
+                    catalog_path: file_name.clone(),
+                    object_path: object_path.clone(),
+                    file_size_bytes: file_size,
+                    row_group_rows,
+                })
+                .await;
+        }
 
         // Collect stats for catalog columns only. NaN presence and string
         // bounds were tracked while consuming the stream: the footer records
@@ -2316,6 +2444,7 @@ impl DuckLakeTableWriter {
                 .collect::<Result<Vec<_>>>()?,
             None => groups,
         };
+        let hooks = self.file_hooks(setup.table_id, schema_name, table_name, WriteOrigin::Insert);
         let file_infos = self
             .write_partition_groups(
                 &table_key,
@@ -2324,6 +2453,7 @@ impl DuckLakeTableWriter {
                 partition_id,
                 key_names,
                 &groups,
+                hooks,
             )
             .await?;
         let records_written: i64 = file_infos.iter().map(|f| f.record_count).sum();
@@ -2556,6 +2686,7 @@ impl DuckLakeTableWriter {
             None
         };
 
+        let hooks = self.file_hooks(setup.table_id, schema_name, table_name, WriteOrigin::Insert);
         let file_infos = match partition.as_ref() {
             Some(spec) => {
                 let output_schema: SchemaRef = Arc::new(arrow_schema.clone());
@@ -2568,6 +2699,7 @@ impl DuckLakeTableWriter {
                     spec.partition_id,
                     &spec.key_names(),
                     &groups,
+                    hooks,
                 )
                 .await?
             },
@@ -2578,6 +2710,7 @@ impl DuckLakeTableWriter {
                     schema_with_ids,
                     &setup.column_ids,
                     batches,
+                    hooks,
                 )
                 .await?
             },
@@ -2715,6 +2848,7 @@ impl DuckLakeTableWriter {
         } else {
             None
         };
+        let hooks = self.file_hooks(setup.table_id, schema_name, table_name, WriteOrigin::Insert);
         let file_infos = match partition.as_ref() {
             Some(spec) => {
                 let output_schema = Arc::new(arrow_schema.clone());
@@ -2727,6 +2861,7 @@ impl DuckLakeTableWriter {
                     spec.partition_id,
                     &spec.key_names(),
                     &groups,
+                    hooks,
                 )
                 .await?
             },
@@ -2737,6 +2872,7 @@ impl DuckLakeTableWriter {
                     schema_with_ids,
                     &setup.column_ids,
                     batches,
+                    hooks,
                 )
                 .await?
             },
@@ -3127,6 +3263,7 @@ impl DuckLakeTableWriter {
     /// A group may roll over into several files (each a contiguous slice of the
     /// group's rows); all of them share that group's partition values, so the
     /// catalog records one partition per file as the spec requires.
+    #[allow(clippy::too_many_arguments)]
     async fn write_partition_groups(
         &self,
         table_key: &str,
@@ -3135,6 +3272,7 @@ impl DuckLakeTableWriter {
         partition_id: i64,
         key_names: &[String],
         groups: &[PartitionGroup],
+        hooks: Option<FileHooks>,
     ) -> Result<Vec<DataFileInfo>> {
         let mut file_infos: Vec<DataFileInfo> = Vec::with_capacity(groups.len());
         for (values, batches) in groups {
@@ -3157,6 +3295,7 @@ impl DuckLakeTableWriter {
                     schema_with_ids.clone(),
                     column_ids,
                     batches,
+                    hooks.clone(),
                 )
                 .await?;
             let partition_values: Vec<(i32, Option<String>)> = values
@@ -3184,6 +3323,7 @@ impl DuckLakeTableWriter {
     /// Returns one [`DataFileInfo`] per file (relative catalog path set, stats and
     /// footer harvested); empty rows produce no file, and a write below
     /// `target_file_size` yields exactly one.
+    #[allow(clippy::too_many_arguments)]
     async fn write_rolled_files(
         &self,
         table_key: &str,
@@ -3191,6 +3331,7 @@ impl DuckLakeTableWriter {
         schema_with_ids: SchemaRef,
         column_ids: &[i64],
         batches: &[RecordBatch],
+        hooks: Option<FileHooks>,
     ) -> Result<Vec<DataFileInfo>> {
         self.refuse_encrypted_parquet("write a data file")?;
         let data_column_count = schema_with_ids.fields().len();
@@ -3203,6 +3344,7 @@ impl DuckLakeTableWriter {
             self.target_file_size,
             None,
         );
+        roller.set_hooks(hooks);
         let mut files: Vec<DataFileInfo> = Vec::new();
         for batch in batches {
             if let Some(staged) = roller.write(batch)? {
@@ -4107,6 +4249,28 @@ struct OpenFile {
     leaf_stats: crate::stats_collect::WrittenLeafStats,
 }
 
+/// A finished file's extension observers, told once the file is uploaded.
+#[derive(Debug)]
+struct PendingObservers {
+    observers: FileObservers,
+    row_group_rows: Vec<u64>,
+    file_size_bytes: i64,
+}
+
+impl PendingObservers {
+    /// Tell the observers the file is stored at `object_path`.
+    async fn stored(self, catalog_path: &str, object_path: &ObjectPath) {
+        self.observers
+            .stored(&StoredFile {
+                catalog_path: catalog_path.to_string(),
+                object_path: object_path.clone(),
+                file_size_bytes: self.file_size_bytes,
+                row_group_rows: self.row_group_rows,
+            })
+            .await;
+    }
+}
+
 /// A finished parquet whose footer is written and whose staging file is complete on
 /// disk, awaiting upload.
 ///
@@ -4121,6 +4285,8 @@ struct StagedFile {
     object_path: ObjectPath,
     row_count: i64,
     leaf_stats: crate::stats_collect::WrittenLeafStats,
+    /// Extension observers, told once the file is uploaded.
+    observers: Option<PendingObservers>,
 }
 
 /// Writes batches into a sequence of parquet files, starting a new one whenever the
@@ -4155,6 +4321,8 @@ struct RollingFileWriter {
     /// `target_file_size`, only) file, so rolling does not silently change what an
     /// existing caller observes. Taken on first use.
     first_catalog_path: Option<String>,
+    /// Extension hooks every file is observed by.
+    hooks: Option<FileHooks>,
 }
 
 impl RollingFileWriter {
@@ -4176,7 +4344,13 @@ impl RollingFileWriter {
             props,
             target_file_size,
             open: None,
+            hooks: None,
         }
+    }
+
+    /// Have `hooks` observe every file, and be told of its upload.
+    fn set_hooks(&mut self, hooks: Option<FileHooks>) {
+        self.hooks = hooks;
     }
 
     /// Append `batch`, opening a file if none is in progress. Returns the finished
@@ -4244,8 +4418,11 @@ impl RollingFileWriter {
         let object_path = ObjectPath::from(object_path_str.trim_start_matches('/'));
         let temp = NamedTempFile::new()?;
         let staging = std::io::BufWriter::new(temp.reopen()?);
-        let writer =
+        let mut writer =
             RowGroupSampledWriter::new(staging, self.schema_with_ids.clone(), self.props.clone());
+        if let Some(hooks) = &self.hooks {
+            writer.set_observers(hooks.open_file(&self.schema_with_ids));
+        }
         Ok(OpenFile {
             writer,
             temp,
@@ -4260,19 +4437,27 @@ impl RollingFileWriter {
 /// Write the parquet footer and flush the staging file to disk, releasing its
 /// descriptor. Synchronous, so a streaming write needs no await to roll a file.
 #[tracing::instrument(name = "ducklake.finalize_open_file", level = "info", skip_all)]
-fn finalize_open_file(file: OpenFile) -> Result<StagedFile> {
-    let staged = file.writer.into_inner()?;
+fn finalize_open_file(mut file: OpenFile) -> Result<StagedFile> {
+    let observers = file.writer.take_observers();
+    let (staged, row_group_rows) = file.writer.into_inner_with_row_groups()?;
     // `into_inner` flushes the buffered footer bytes to the OS file; dropping the
     // returned handle closes that descriptor.
-    staged
+    let handle = staged
         .into_inner()
         .map_err(|e| crate::error::DuckLakeError::Io(e.into_error()))?;
+    let file_size = handle.metadata()?.len() as i64;
+    drop(handle);
     Ok(StagedFile {
         temp: file.temp.into_temp_path(),
         catalog_path: file.catalog_path,
         object_path: file.object_path,
         row_count: file.row_count,
         leaf_stats: file.leaf_stats,
+        observers: (!observers.is_empty()).then_some(PendingObservers {
+            observers,
+            row_group_rows,
+            file_size_bytes: file_size,
+        }),
     })
 }
 
@@ -4300,6 +4485,11 @@ async fn upload_staged_file(
     let mut reader = tokio::io::BufReader::new(local);
     let mut upload = ObjectBufWriter::new(Arc::clone(object_store), staged.object_path.clone());
     stream_to_upload(&mut reader, &mut upload).await?;
+    if let Some(observers) = staged.observers {
+        observers
+            .stored(&staged.catalog_path, &staged.object_path)
+            .await;
+    }
 
     let column_stats = crate::stats_collect::collect_own_written_column_stats(
         &staged.temp,
@@ -4352,6 +4542,8 @@ struct PartitionSink {
     /// Field-id-tagged schema every written batch carries.
     schema_with_ids: SchemaRef,
     props: WriterProperties,
+    /// See [`RollingFileWriter::set_hooks`].
+    hooks: Option<FileHooks>,
     target_file_size: usize,
     max_open: usize,
     hive_file_pattern: bool,
@@ -4404,22 +4596,21 @@ impl PartitionSink {
                 } else {
                     String::new()
                 };
-                self.open.push((
-                    values.to_vec(),
-                    RollingFileWriter::new(
-                        self.table_key.clone(),
-                        if rel.is_empty() {
-                            None
-                        } else {
-                            Some(rel)
-                        },
-                        self.schema_with_ids.clone(),
-                        self.schema_with_ids.fields().len(),
-                        self.props.clone(),
-                        self.target_file_size,
-                        None,
-                    ),
-                ));
+                let mut roller = RollingFileWriter::new(
+                    self.table_key.clone(),
+                    if rel.is_empty() {
+                        None
+                    } else {
+                        Some(rel)
+                    },
+                    self.schema_with_ids.clone(),
+                    self.schema_with_ids.fields().len(),
+                    self.props.clone(),
+                    self.target_file_size,
+                    None,
+                );
+                roller.set_hooks(self.hooks.clone());
+                self.open.push((values.to_vec(), roller));
                 self.open.len() - 1
             },
         };
@@ -5654,7 +5845,15 @@ impl TableWriteSession {
         // Finalise the parquet footer, then unwrap the `BufWriter` (its
         // `into_inner` flushes any buffered footer bytes to the OS file) so the
         // staging file on disk is the complete parquet.
-        let staged = writer.into_inner()?;
+        // Scoped: a local borrowed before an await stays in the future across
+        // it, and the writer is large.
+        let (observers, (staged, row_group_rows)) = {
+            let mut writer = writer;
+            (
+                writer.take_observers(),
+                writer.into_inner_with_row_groups()?,
+            )
+        };
         let mut file = staged
             .into_inner()
             .map_err(|e| crate::error::DuckLakeError::Io(e.into_error()))?;
@@ -5677,6 +5876,15 @@ impl TableWriteSession {
                 tracing::warn!(error = %failure, "failed to remove a data file after a failed upload");
             }
             return Err(error.into());
+        }
+        if !observers.is_empty() {
+            PendingObservers {
+                observers,
+                row_group_rows,
+                file_size_bytes: file_size,
+            }
+            .stored(&self.catalog_path, &self.object_path)
+            .await;
         }
 
         // Harvest per-column statistics from the parquet footer we just wrote

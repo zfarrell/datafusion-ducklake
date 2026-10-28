@@ -859,6 +859,12 @@ async fn write_inlined_table(
     // 1.5.6, ducklake 664400c5); an encrypted catalog is refused before this,
     // so the setting alone decides.
     let hive = table.write_options().hive_file_pattern.unwrap_or(true);
+    let hooks = table_writer.file_hooks(
+        table.table_id(),
+        schema_name,
+        table.table_name(),
+        crate::extension::WriteOrigin::InlinedFlush,
+    );
     let mut files = Vec::new();
     for (partition, group) in groups {
         if group.num_rows() == 0 {
@@ -890,6 +896,7 @@ async fn write_inlined_table(
                 // unpartitioned one (`DuckLakeInsert::GetCopyOptions`).
                 partition.is_none(),
                 written,
+                hooks.clone(),
             )
             .await?;
 

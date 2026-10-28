@@ -529,7 +529,7 @@ fn listing_page(
 }
 
 /// Estimated memory one file of a listing holds.
-fn file_metadata_bytes(metadata: &DuckLakeFileMetadata) -> usize {
+pub(crate) fn file_metadata_bytes(metadata: &DuckLakeFileMetadata) -> usize {
     let file = &metadata.file;
     let delete_file = file.delete_file.as_ref().map_or(0, |delete_file| {
         size_of::<DuckLakeFileData>() + file_data_heap_bytes(delete_file)
@@ -571,6 +571,14 @@ fn file_data_heap_bytes(file: &DuckLakeFileData) -> usize {
 }
 
 impl MetadataProvider for MemoizedMetadataProvider {
+    #[cfg(all(
+        feature = "unstable-extensions",
+        any(feature = "metadata-sqlite", feature = "metadata-postgres")
+    ))]
+    fn catalog_db(&self) -> Option<crate::extension::CatalogDb> {
+        self.inner.catalog_db()
+    }
+
     fn get_current_snapshot(&self) -> Result<i64> {
         self.inner.get_current_snapshot()
     }
@@ -642,6 +650,9 @@ impl MetadataProvider for MemoizedMetadataProvider {
     fn get_sort_spec(&self, table_id: i64, snapshot_id: i64) -> Result<Option<SortSpec>> {
         self.inner.get_sort_spec(table_id, snapshot_id)
     }
+
+    // Not memoized: a fact describes immutable bytes, so an extension that
+    // wants to remember facts can do so itself.
 
     fn get_table_statistics(&self, table_id: i64, snapshot_id: i64) -> Result<DuckLakeStatistics> {
         self.inner.get_table_statistics(table_id, snapshot_id)

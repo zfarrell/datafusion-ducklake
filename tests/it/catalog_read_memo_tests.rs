@@ -41,7 +41,7 @@ type Hook = (&'static str, Box<dyn FnOnce() + Send>);
 
 /// Forwards every `MetadataProvider` method to `inner` and counts the calls.
 #[derive(Clone)]
-struct CountingProvider {
+pub(crate) struct CountingProvider {
     inner: Arc<dyn MetadataProvider>,
     calls: Arc<Mutex<BTreeMap<&'static str, usize>>>,
     hook: Arc<Mutex<Option<Hook>>>,
@@ -56,7 +56,7 @@ impl std::fmt::Debug for CountingProvider {
 }
 
 impl CountingProvider {
-    fn new(inner: Arc<dyn MetadataProvider>) -> Self {
+    pub(crate) fn new(inner: Arc<dyn MetadataProvider>) -> Self {
         Self {
             inner,
             calls: Arc::new(Mutex::new(BTreeMap::new())),
@@ -80,7 +80,7 @@ impl CountingProvider {
     }
 
     /// The calls made since the last `take`, cleared.
-    fn take(&self) -> BTreeMap<&'static str, usize> {
+    pub(crate) fn take(&self) -> BTreeMap<&'static str, usize> {
         std::mem::take(&mut *self.calls.lock().unwrap())
     }
 }

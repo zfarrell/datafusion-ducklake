@@ -5149,6 +5149,11 @@ pub(crate) fn with_postgres_commit_lock(
 }
 
 impl MetadataWriter for PostgresMetadataWriter {
+    #[cfg(feature = "unstable-extensions")]
+    fn catalog_db(&self) -> Option<crate::extension::CatalogDb> {
+        Some(crate::extension::CatalogDb::postgres(&self.pool))
+    }
+
     fn maintenance(&self) -> Option<&dyn crate::maintenance::CatalogMaintenance> {
         Some(self)
     }

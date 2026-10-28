@@ -1004,6 +1004,11 @@ fn decode_page_statistics(
 }
 
 impl MetadataProvider for MulticatalogProvider {
+    #[cfg(feature = "unstable-extensions")]
+    fn catalog_db(&self) -> Option<crate::extension::CatalogDb> {
+        Some(crate::extension::CatalogDb::postgres(&self.pool))
+    }
+
     fn get_current_snapshot(&self) -> Result<i64> {
         block_on(async {
             let row = self

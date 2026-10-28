@@ -1119,6 +1119,15 @@ impl DuckLakeTable {
         let column_ids = self.column_ids();
         let top_level_column_ids = self.top_level_column_ids();
         let physical_schema = self.physical_schema();
+        // One set of extension hooks for every output: their catalog reads
+        // happen once, and their facts are recorded together once the outputs
+        // are committed (when the hooks are dropped).
+        let hooks = table_writer.file_hooks(
+            self.table_id(),
+            schema_name,
+            self.table_name(),
+            crate::extension::WriteOrigin::Compaction,
+        );
 
         // Apply the table's live sort order to each merged file (mirroring official
         // DuckLake compaction), so the compacted file's rows are ordered and its
@@ -1292,6 +1301,7 @@ impl DuckLakeTable {
                     carried_row_id_start.is_none(),
                     partial,
                     subpath.as_deref(),
+                    hooks.clone(),
                 )
                 .await?;
             if let Some(start) = carried_row_id_start {
@@ -1571,6 +1581,15 @@ impl DuckLakeTable {
         let column_ids = self.column_ids();
         let top_level_column_ids = self.top_level_column_ids();
         let physical_schema = self.physical_schema();
+        // One set of extension hooks for every output: their catalog reads
+        // happen once, and their facts are recorded together once the outputs
+        // are committed (when the hooks are dropped).
+        let hooks = table_writer.file_hooks(
+            self.table_id(),
+            schema_name,
+            self.table_name(),
+            crate::extension::WriteOrigin::Compaction,
+        );
 
         // Select the files to rewrite up front, so a table with nothing over the
         // threshold stays a pure no-op — it must not fail on, say, a sort order
@@ -1686,15 +1705,17 @@ impl DuckLakeTable {
                     )
                 });
             let file = table_writer
-                .write_compacted_file_stream(
+                .write_compacted_file_stream_with_lineage(
                     schema_name,
                     self.table_name(),
                     physical_schema.as_ref(),
                     &column_ids,
                     &top_level_column_ids,
                     sorted,
+                    true,
                     false,
                     subpath.as_deref(),
+                    hooks.clone(),
                 )
                 .await?;
             rows_written += file.record_count;

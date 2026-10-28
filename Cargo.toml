@@ -113,6 +113,10 @@ write-mysql = ["write", "metadata-mysql"]
 # Multicatalog read provider (independent of write support)
 multicatalog-postgres = ["metadata-postgres"]
 
+# The extension API (`extension`, `DuckLakeTable::backfill` and the table
+# accessors extensions use), with no semver promise. See `src/lib.rs`.
+unstable-extensions = []
+
 # Rowid verification examples need both the DuckDB extension (writes the
 # catalog + writes data) and the postgres provider (DataFusion-side reads).
 [[example]]

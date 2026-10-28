@@ -257,6 +257,8 @@ pub(crate) struct RowGroupSampledWriter<W: Write + Send> {
     buffered_rows: usize,
     buffered_bytes: usize,
     writer: Option<ArrowWriter<W>>,
+    /// Extension observers of this file, fed every row in write order.
+    observers: crate::extension::FileObservers,
 }
 
 impl<W: Write + Send> RowGroupSampledWriter<W> {
@@ -267,12 +269,29 @@ impl<W: Write + Send> RowGroupSampledWriter<W> {
             buffered_rows: 0,
             buffered_bytes: 0,
             writer: None,
+            observers: Default::default(),
         }
+    }
+
+    /// Feed every row written to `observers` (see [`crate::extension`]);
+    /// take them back with [`Self::take_observers`].
+    pub(crate) fn set_observers(&mut self, observers: crate::extension::FileObservers) {
+        self.observers = observers;
+    }
+
+    /// The observers fed so far. Take before [`Self::into_inner_with_row_groups`].
+    pub(crate) fn take_observers(&mut self) -> crate::extension::FileObservers {
+        std::mem::take(&mut self.observers)
     }
 
     /// Write `batch`, which must carry the file's parquet schema. Buffers it while
     /// the first row group is incomplete, and opens the file once it is.
     pub(crate) fn write(&mut self, batch: &RecordBatch) -> Result<()> {
+        if !self.observers.is_empty() {
+            // Positions are the running row count: rows reach the file in
+            // exactly this order, buffered or not.
+            self.observers.observe(batch);
+        }
         if let Some(writer) = &mut self.writer {
             writer.write(batch)?;
             return Ok(());
@@ -318,7 +337,23 @@ impl<W: Write + Send> RowGroupSampledWriter<W> {
             .map_or(0, ArrowWriter::in_progress_size)
     }
 
+    /// [`Self::into_inner`], also returning each row group's row count.
+    pub(crate) fn into_inner_with_row_groups(mut self) -> Result<(W, Vec<u64>)> {
+        if self.writer.is_none() {
+            self.open()?;
+        }
+        let mut writer = self.writer.take().expect("writer opened above");
+        writer.flush()?;
+        let groups = writer
+            .flushed_row_groups()
+            .iter()
+            .map(|rg| rg.num_rows().max(0) as u64)
+            .collect();
+        Ok((writer.into_inner()?, groups))
+    }
+
     /// Write the footer and return the sink.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn into_inner(mut self) -> Result<W> {
         if self.writer.is_none() {
             self.open()?;

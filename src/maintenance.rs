@@ -946,6 +946,22 @@ async fn run_orphan_cleanup(
     // file is as old as the write itself, and is unreferenced until it commits.
     let mut orphans: Vec<ObjectPath> = Vec::new();
     for meta in entries {
+        // An extension's companion object lives exactly as long as its data
+        // file: never `.parquet` (official's sweep must not see it as data),
+        // and an orphan only once its data file is unreferenced.
+        if let Some(data) = crate::extension::companion_data_key(meta.location.as_ref()) {
+            if let CleanupCriteria::OlderThan(cutoff) = &criteria
+                && meta.last_modified >= *cutoff
+            {
+                continue;
+            }
+            // `parse`, not `from`: the listed key is already encoded.
+            let data = ObjectPath::parse(data).unwrap_or_else(|_| ObjectPath::from(data));
+            if !referenced_set.contains(&data) {
+                orphans.push(meta.location);
+            }
+            continue;
+        }
         if !meta.location.as_ref().ends_with(".parquet") {
             continue;
         }

@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- EXPERIMENTAL extension API (`datafusion_ducklake::extension`, feature `unstable-extensions`,
+  no semver promise): per-file write and scan hooks, registered with `with_extension`, and the
+  catalog's database for an extension's own tables.
+- `SqliteMetadataWriter::from_pool`, so one pool can serve the writer, provider and extensions.
 - `CatalogReadMemo` keeps a table's scan-time catalog reads across queries, bound once per query.
   It is opt-in and not DuckLake behavior, as `COMPATIBILITY.md` explains (#338).
 - `DuckLakeReadOptions` lets a table keep the delete-file positions its scans read (#338).
