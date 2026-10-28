@@ -1,0 +1,48 @@
+[package]
+name = "datafusion-ducklake-ext"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94.0"
+description = "Experimental extensions for datafusion-ducklake: verified file order."
+license = "Apache-2.0"
+repository = "https://github.com/hotdata-dev/datafusion-ducklake"
+publish = false
+# One integration-test binary, as in the parent crate.
+autotests = false
+
+[dependencies]
+# Only the public API, through `datafusion_ducklake::extension` (unstable).
+datafusion-ducklake = { path = "..", default-features = false, features = ["write", "unstable-extensions"] }
+datafusion = { version = "55", default-features = false, features = ["parquet", "sql"] }
+arrow = "59.2"
+parquet = { version = "59.2", features = ["async"] }
+async-trait = "0.1"
+futures = "0.3"
+tokio = { version = "1", features = ["sync"] }
+tracing = "0.1"
+moka = { version = "0.12", features = ["sync"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio"] }
+
+[dev-dependencies]
+datafusion-ducklake = { path = "..", features = ["duckdb-bundled", "write-sqlite", "write-postgres"] }
+datafusion = "55"
+object_store = { version = "0.13", features = ["fs"] }
+tokio = { version = "1", features = ["full"] }
+tempfile = "3.14"
+anyhow = "1.0"
+sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "postgres"] }
+duckdb = { version = "1.10505.0", features = ["bundled"] }
+testcontainers = "0.23"
+testcontainers-modules = { version = "0.11", features = ["postgres"] }
+
+[features]
+# Skip the PostgreSQL tests, which need Docker.
+skip-tests-with-docker = []
+# The catalog backends whose database the extensions keep their tables in.
+default = ["sqlite", "postgres"]
+sqlite = ["sqlx/sqlite", "datafusion-ducklake/metadata-sqlite"]
+postgres = ["sqlx/postgres", "datafusion-ducklake/metadata-postgres"]
+
+[[test]]
+name = "it"
+path = "tests/it/main.rs"
