@@ -101,3 +101,54 @@ async fn a_batch_with_two_rows_for_one_file_records_the_later() {
         vec![row("1:desc:nulls_first")]
     );
 }
+
+/// The same for the index: one batch can hold two rows for one file and
+/// column (a write and a backfill stored together).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_batch_with_two_index_rows_for_one_file_records_the_later() {
+    use datafusion_ducklake_ext::file_index::FileIndexRow;
+    use datafusion_ducklake_ext::file_index::format::{FileIndexMeta, IndexValueType};
+    use datafusion_ducklake_ext::file_index::table as index_table;
+
+    let container = Postgres::default().start().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let pool = PgPoolOptions::new()
+        .connect(&format!(
+            "postgresql://postgres:postgres@127.0.0.1:{port}/postgres"
+        ))
+        .await
+        .unwrap();
+    let db = crate::postgres_db(&pool);
+    let row = |index_path: &str, built_by: &str| FileIndexRow {
+        meta: FileIndexMeta {
+            path: "a.parquet".to_string(),
+            file_size_bytes: 10,
+            column_id: 1,
+            index_path: index_path.to_string(),
+            index_size_bytes: 1,
+            format_version: 1,
+            value_type: IndexValueType::Int64,
+            row_count: 1,
+            row_group_rows: vec![1],
+            heavy_hitters: Vec::new(),
+            bucket_counts: None,
+        },
+        index_key: index_path.to_string(),
+        built_by: built_by.to_string(),
+    };
+    index_table::record(
+        &db,
+        1,
+        vec![row("first.pidx", "write"), row("second.pidx", "backfill")],
+    )
+    .await
+    .unwrap();
+    let read = index_table::read(&db, 1, vec!["a.parquet".to_string()], vec![1])
+        .await
+        .unwrap();
+    let read: Vec<_> = read
+        .iter()
+        .map(|row| (row.meta.index_path.as_str(), row.built_by.as_str()))
+        .collect();
+    assert_eq!(read, vec![("second.pidx", "backfill")]);
+}
