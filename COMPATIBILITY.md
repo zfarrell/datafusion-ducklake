@@ -1060,10 +1060,10 @@ per-file sort record in the spec itself.
 ## Experimental: extensions
 
 Extensions (`datafusion_ducklake::extension`, behind the `unstable-extensions` feature, with no
-semver promise) add per-file work to writes and scans. Core stores nothing for them. An
-extension may keep outside the spec:
+semver promise) add per-file work to writes and scans. Core stores nothing for them. The
+extensions of `datafusion-ducklake-ext` keep outside the spec:
 
-- **Its own tables** in the catalog's database, such as `datafusion-ducklake-ext`'s
+- **Their own tables** in the catalog's database: `ext_ducklake_file_index` and
   `ext_ducklake_file_order`, created on the first record. Core hands each extension the
   catalog's database (`CatalogDb`), so an extension opens no connection of its own. DuckDB's
   extension names the tables it reads and never enumerates the catalog, so it neither sees nor

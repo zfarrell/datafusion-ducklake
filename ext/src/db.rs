@@ -87,6 +87,20 @@ where
     }
 }
 
+/// The time `min_age` ago in SQLite's `CURRENT_TIMESTAMP` format, so the
+/// comparison is textual and exact. Second resolution: compare with `<=`, so
+/// a zero `min_age` takes this second's rows.
+#[cfg(feature = "sqlite")]
+pub(crate) fn sqlite_cutoff(min_age: Duration) -> String {
+    chrono::Duration::from_std(min_age)
+        .ok()
+        .and_then(|age| chrono::Utc::now().checked_sub_signed(age))
+        .map_or_else(
+            || "0000-01-01 00:00:00".to_string(),
+            |at| at.format("%Y-%m-%d %H:%M:%S").to_string(),
+        )
+}
+
 // ---------------------------------------------------------------------------
 // Recording
 // ---------------------------------------------------------------------------
@@ -343,6 +357,24 @@ impl<V: Send + Sync + 'static> RowMemo<V> {
         let missing = self.missing(at, paths, keys);
         if !missing.is_empty() {
             let found = read(missing.clone()).await;
+            self.fill(at, missing, keys, found);
+        }
+        self.collect(at, paths, keys)
+    }
+
+    /// [`Self::get`] from synchronous code, with `read` blocking.
+    pub(crate) fn get_blocking(
+        &self,
+        db: &CatalogDb,
+        table_id: i64,
+        paths: &[&str],
+        keys: &[i64],
+        read: impl FnOnce(Vec<String>) -> Result<Found<V>>,
+    ) -> HashMap<(String, i64), Arc<V>> {
+        let at = (db.id(), table_id);
+        let missing = self.missing(at, paths, keys);
+        if !missing.is_empty() {
+            let found = read(missing.clone());
             self.fill(at, missing, keys, found);
         }
         self.collect(at, paths, keys)

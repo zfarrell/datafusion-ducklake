@@ -3,7 +3,7 @@ name = "datafusion-ducklake-ext"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.94.0"
-description = "Experimental extensions for datafusion-ducklake: verified file order."
+description = "Experimental extensions for datafusion-ducklake: verified file order and a per-file secondary index."
 license = "Apache-2.0"
 repository = "https://github.com/hotdata-dev/datafusion-ducklake"
 publish = false
@@ -14,13 +14,20 @@ autotests = false
 # Only the public API, through `datafusion_ducklake::extension` (unstable).
 datafusion-ducklake = { path = "..", default-features = false, features = ["write", "unstable-extensions"] }
 datafusion = { version = "55", default-features = false, features = ["parquet", "sql"] }
+datafusion-datasource-parquet = { version = "55", default-features = false }
 arrow = "59.2"
 parquet = { version = "59.2", features = ["async"] }
+object_store = { version = "0.13", default-features = false }
 async-trait = "0.1"
 futures = "0.3"
 tokio = { version = "1", features = ["sync"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+datafusion-datasource = { version = "55", default-features = false }
 tracing = "0.1"
+bytes = "1"
 moka = { version = "0.12", features = ["sync"] }
+serde_json = "1"
+base64 = "0.22"
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio"] }
 
 [dev-dependencies]
@@ -34,6 +41,8 @@ sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "postgres"] }
 duckdb = { version = "1.10505.0", features = ["bundled"] }
 testcontainers = "0.23"
 testcontainers-modules = { version = "0.11", features = ["postgres"] }
+chrono = "0.4"
+url = "2.5"
 
 [features]
 # Skip the PostgreSQL tests, which need Docker.

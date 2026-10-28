@@ -84,7 +84,7 @@ The codebase follows a layered architecture with clear separation of concerns:
      existing files. Public only with the `unstable-extensions` feature
      (`unstable_extension_api!` in `lib.rs` gates the `DuckLakeTable` accessors extensions use),
      with no semver promise. Extensions live in the `ext/` crate (`datafusion-ducklake-ext`:
-     file order), which uses only that API and keeps its own tables in the catalog's
+     file order, file index), which uses only that API and keeps its own tables in the catalog's
      database. Core hands it out as `CatalogDb` (`extension/db.rs`, from `MetadataProvider::catalog_db`
      and the hook contexts), which runs every query on core's catalog runtime: a pooled connection
      an extension opened on the embedder's runtime would hang a later blocking catalog call. A
